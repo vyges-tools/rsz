@@ -1,0 +1,37 @@
+VERSION 5.8 ;
+DIVIDERCHAR "/" ;
+BUSBITCHARS "[]" ;
+DESIGN long_wire ;
+UNITS DISTANCE MICRONS 2000 ;
+DIEAREA ( 0 0 ) ( 4000000 28000 ) ;
+ROW ROW_0 core 0 0 N DO 10000 BY 1 STEP 400 0 ;
+COMPONENTS 7 ;
+    - drv BUF_X4 + PLACED ( 20000 0 ) N ;
+    - load BUF_X2 + PLACED ( 3820000 0 ) N ;
+    - wire1 BUF_X4 + SOURCE TIMING + PLACED ( 3060300 0 ) N ;
+    - wire2 BUF_X4 + SOURCE TIMING + PLACED ( 2300300 0 ) N ;
+    - wire3 BUF_X4 + SOURCE TIMING + PLACED ( 1540300 0 ) N ;
+    - wire4 BUF_X4 + SOURCE TIMING + PLACED ( 819345 0 ) N ;
+    - wire5 BUF_X4 + SOURCE TIMING + PLACED ( 22500 0 ) N ;
+END COMPONENTS
+PINS 2 ;
+    - in1 + NET in1 + DIRECTION INPUT + USE SIGNAL
+      + PORT
+        + LAYER M1 ( -100 -100 ) ( 100 100 )
+        + PLACED ( 200 1400 ) N ;
+    - out1 + NET out1 + DIRECTION OUTPUT + USE SIGNAL
+      + PORT
+        + LAYER M1 ( -100 -100 ) ( 100 100 )
+        + PLACED ( 3999800 1400 ) N ;
+END PINS
+NETS 8 ;
+    - in1 ( PIN in1 ) ( drv A ) + USE SIGNAL ;
+    - n1 ( wire5 A ) ( drv Z ) + USE SIGNAL ;
+    - net1 ( load A ) ( wire1 Z ) + USE SIGNAL ;
+    - net2 ( wire1 A ) ( wire2 Z ) + USE SIGNAL ;
+    - net3 ( wire2 A ) ( wire3 Z ) + USE SIGNAL ;
+    - net4 ( wire3 A ) ( wire4 Z ) + USE SIGNAL ;
+    - net5 ( wire4 A ) ( wire5 Z ) + USE SIGNAL ;
+    - out1 ( PIN out1 ) ( load Z ) + USE SIGNAL ;
+END NETS
+END DESIGN

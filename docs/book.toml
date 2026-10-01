@@ -1,0 +1,14 @@
+[book]
+title = "vyges-rsz"
+description = "Electrical repair of a placed design: repeaters along each net's Steiner tree, drivers resized"
+authors = ["Vyges"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/vyges-tools/rsz"
+
+# The chapter (src/rsz.md) and the CLI reference (src/reference/vyges-rsz.md) are written to drop
+# into the Vyges book unchanged, as engines/rsz.md and engines/reference/vyges-rsz.md.

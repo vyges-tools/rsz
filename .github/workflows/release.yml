@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: Apache-2.0
+# Release the `vyges-rsz` CLI (part of the `vyges install loom` suite).
+#
+# Modelled on vyges-tools/opendb's release-opendb.yml, and for the same reason: vyges-rsz reads
+# the design database through vyges-opendb, which statically links libodb (a C++ library built
+# from source). That makes this unix-only and native per-target — no cross-compilation.
+#
+# Produces vyges-rsz-<rust-triple>.tar.gz assets whose names + contents match what the vyges CLI
+# expects: install_one() fetches `vyges-rsz-<target>.tar.gz` from
+# github.com/vyges-tools/rsz/releases/latest/download/ and extracts a `vyges-rsz` binary.
+#
+# This has to exist BEFORE `rsz` is added to the CLI's install list: an engine listed with no
+# release behind it turns every install into a 404.
+#
+# Trigger: push a tag `v*` (publishes a Release with all three assets), or run manually to smoke
+# the build (workflow_dispatch uploads artifacts only, no Release).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # create the Release + upload assets on a tag
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: vyges-tools-rsz
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Same support matrix as opendb, which this transitively builds: Linux x86_64/arm64 +
+          # Apple Silicon on macos-15 (Xcode 16 — new enough for cxx, stable for fmt 11.0.2;
+          # macos-latest/Xcode 26.5 breaks fmt consteval). Intel Mac is unsupported.
+          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu  }
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: macos-15,         target: aarch64-apple-darwin      }
+    steps:
+      # Sibling layout: <ws>/vyges-tools-rsz + opendb + opendb-lib,
+      # so both `[patch]` path entries in Cargo.toml resolve on CI. Every patched dependency needs
+      # a checkout here — a patch whose path does not exist is a hard `failed to load source` at
+      # build time, not a fall-back to the git source.
+      - uses: actions/checkout@v4
+        with:
+          path: vyges-tools-rsz
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/opendb
+          path: vyges-tools-opendb
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/opendb-lib
+          path: vyges-tools-opendb-lib
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/sta
+          path: vyges-tools-sta
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/grt
+          path: vyges-tools-grt
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/est
+          path: vyges-tools-est
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/stt
+          path: vyges-tools-stt
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/loom
+          path: vyges-tools-loom
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/layout
+          path: vyges-tools-layout
+
+      - name: Toolchain (Linux)
+        # Boost (headers) + zlib only; fmt/spdlog/abseil are built from source by libodb's build.
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ git bison libboost-dev libboost-iostreams-dev libbz2-dev zlib1g-dev
+
+      - name: Toolchain (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake boost bison   # bison for the LEF/DEF parsers
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build (release; libodb built from source, static)
+        # No --locked: the [patch] resolves the opendb
+        # crates to the freshly-checked-out siblings @ main — let Cargo resolve.
+        # macOS: put the (keg-only, newer) brew bison ahead of the 2.x system one for the LEF/DEF
+        # parsers.
+        run: |
+          [ "${{ runner.os }}" = "macOS" ] && export PATH="$(brew --prefix bison)/bin:$PATH"
+          cargo build --release --features cli --bin vyges-rsz
+
+      - name: Package vyges-rsz-${{ matrix.target }}.tar.gz
+        id: pkg
+        run: |
+          set -eu
+          NAME="vyges-rsz-${{ matrix.target }}"
+          STAGE="$RUNNER_TEMP/$NAME"
+          mkdir -p "$STAGE"
+          cp target/release/vyges-rsz "$STAGE/"
+          strip "$STAGE/vyges-rsz" 2>/dev/null || strip -x "$STAGE/vyges-rsz" || true
+          cp LICENSE NOTICE README.md "$STAGE/" 2>/dev/null || true
+          cp THIRD_PARTY_LICENSES.md "$STAGE/" 2>/dev/null || true
+          tar -C "$RUNNER_TEMP" -czf "$GITHUB_WORKSPACE/$NAME.tar.gz" "$NAME"
+          ( cd "$GITHUB_WORKSPACE" && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256" )
+          echo "asset=$NAME.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "--- $NAME.tar.gz ---"; tar -tzf "$GITHUB_WORKSPACE/$NAME.tar.gz"; cat "$GITHUB_WORKSPACE/$NAME.tar.gz.sha256"
+
+      - name: Upload build artifact (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.asset }}
+          path: |
+            ${{ steps.pkg.outputs.asset }}
+            ${{ steps.pkg.outputs.asset }}.sha256
+          if-no-files-found: error
+
+      - name: Attach to Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.pkg.outputs.asset }}
+            ${{ steps.pkg.outputs.asset }}.sha256

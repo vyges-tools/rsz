@@ -1,0 +1,140 @@
+# Build & test on every push to main and on pull requests (plus manual dispatch).
+#
+# Two jobs, because the crate has two faces:
+#   - `lib`: the default features, no C++ — the pure rules (the preamble's buffer pick, the
+#     trace format) build and test on their own, and must keep doing so.
+#   - `cli`: the `vyges-rsz` engine, which reads the design database through vyges-opendb, which
+#     statically links libodb (C++, built from source). That needs the sibling layout below and a
+#     C toolchain, as release.yml does.
+#
+# ⚠️ The sibling checkouts are not optional decoration: every `[patch]` path in Cargo.toml must
+# resolve, and a patch whose path is missing is a hard `failed to load source` rather than a
+# fall-back to the git source.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lib:
+    name: library (no C++)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vyges-tools-rsz
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: vyges-tools-rsz
+      # The [patch] paths must resolve even when the features that use them are off.
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/opendb
+          path: vyges-tools-opendb
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/opendb-lib
+          path: vyges-tools-opendb-lib
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/sta
+          path: vyges-tools-sta
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/grt
+          path: vyges-tools-grt
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/est
+          path: vyges-tools-est
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/stt
+          path: vyges-tools-stt
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/loom
+          path: vyges-tools-loom
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/layout
+          path: vyges-tools-layout
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Test
+        run: cargo test --verbose
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+  cli:
+    name: engine (build & test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: vyges-tools-rsz
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: vyges-tools-rsz
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/opendb
+          path: vyges-tools-opendb
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/opendb-lib
+          path: vyges-tools-opendb-lib
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/sta
+          path: vyges-tools-sta
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/grt
+          path: vyges-tools-grt
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/est
+          path: vyges-tools-est
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/stt
+          path: vyges-tools-stt
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/loom
+          path: vyges-tools-loom
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/layout
+          path: vyges-tools-layout
+
+      - name: Toolchain
+        # Boost (headers) + zlib only; fmt/spdlog/abseil are built from source by libodb's build.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ git bison libboost-dev libboost-iostreams-dev libbz2-dev zlib1g-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # No --locked: the [patch] resolves the opendb crates to the freshly checked-out siblings @
+      # main, which the committed lock file cannot know — let Cargo resolve.
+      - name: Build
+        run: cargo build --release --features cli --verbose
+      - name: Test
+        run: cargo test --release --features cli --verbose
+      - name: Smoke the contract
+        run: |
+          ./target/release/vyges-rsz --version
+          ./target/release/vyges-rsz --describe | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["name"]=="rsz" and len(d["openroad_pin"])==40, d'
+          # A job with no repair_design step is VACUOUS and must exit 2, not 0.
+          echo '{"steps":[]}' > /tmp/empty.json
+          set +e; ./target/release/vyges-rsz repair_design /tmp/empty.json; rc=$?; set -e
+          test "$rc" = 2

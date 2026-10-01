@@ -1,0 +1,64 @@
+[package]
+name = "vyges-rsz"
+version = "0.1.39"
+edition = "2021"
+description = "Electrical repair of placed designs: repeaters inserted along each net's Steiner tree to fix long wires, max-capacitance and max-slew violations."
+license = "Apache-2.0"
+authors = ["Vyges <https://vyges.com/contact>"]
+homepage = "https://vyges.com"
+repository = "https://github.com/vyges-tools/rsz"
+
+[features]
+# The design database: masters, sites, the netlist being repaired. OFF by default, so the rules
+# stay testable without the C++ build.
+odb = ["dep:vyges-opendb", "vyges-opendb/gen-write"]
+# The command-line engine: the database, the netlist and placement parasitics the timer reads
+# (the timer adapter shared with the router, the estimator, the Steiner-tree builder), the SDC
+# reader, and JSON jobs.
+cli = ["odb", "dep:vyges-grt", "dep:vyges-est", "dep:vyges-stt", "dep:vyges-loom", "dep:serde_json", "dep:flate2", "dep:vyges-events"]
+
+[dependencies]
+# The timer's library model: cells, ports, arcs and their tables.
+vyges-sta = { git = "https://github.com/vyges-tools/sta.git", branch = "main" }
+vyges-opendb = { git = "https://github.com/vyges-tools/opendb.git", branch = "main", optional = true }
+vyges-grt = { git = "https://github.com/vyges-tools/grt.git", branch = "main", default-features = false, features = ["odb"], optional = true }
+vyges-est = { git = "https://github.com/vyges-tools/est.git", branch = "main", features = ["odb"], optional = true }
+vyges-stt = { git = "https://github.com/vyges-tools/stt.git", branch = "main", optional = true }
+vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "main", optional = true }
+vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main", default-features = false, optional = true }
+serde_json = { version = "1", optional = true }
+flate2 = { version = "1", optional = true }
+
+[lib]
+name = "vyges_rsz"
+path = "src/lib.rs"
+
+[[bin]]
+name = "vyges-rsz"
+path = "src/main.rs"
+required-features = ["cli"]
+
+# Local development against the sibling checkouts; a no-op for consumers pulling this by git.
+[patch."https://github.com/vyges-tools/opendb.git"]
+vyges-opendb = { path = "../vyges-tools-opendb" }
+
+[patch."https://github.com/vyges-tools/opendb-lib.git"]
+vyges-opendb-lib = { path = "../vyges-tools-opendb-lib" }
+
+[patch."https://github.com/vyges-tools/sta.git"]
+vyges-sta = { path = "../vyges-tools-sta" }
+
+[patch."https://github.com/vyges-tools/grt.git"]
+vyges-grt = { path = "../vyges-tools-grt" }
+
+[patch."https://github.com/vyges-tools/est.git"]
+vyges-est = { path = "../vyges-tools-est" }
+
+[patch."https://github.com/vyges-tools/stt.git"]
+vyges-stt = { path = "../vyges-tools-stt" }
+
+[patch."https://github.com/vyges-tools/loom.git"]
+vyges-loom = { path = "../vyges-tools-loom" }
+
+[patch."https://github.com/vyges-tools/layout"]
+vyges-layout = { path = "../vyges-tools-layout" }

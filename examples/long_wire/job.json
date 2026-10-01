@@ -1,0 +1,12 @@
+{
+  "steps": [
+    { "cmd": "read_lef",            "args": ["cells.lef"] },
+    { "cmd": "read_def",            "args": ["long_wire.def"] },
+    { "cmd": "read_liberty",        "args": ["cells.lib"] },
+    { "cmd": "set_wire_rc",         "args": ["-resistance", "0.0008", "-capacitance", "0.0002"] },
+    { "cmd": "estimate_parasitics", "args": ["-placement"] },
+    { "cmd": "repair_design",       "args": ["-max_wire_length", "400"] }
+  ],
+  "write_def": "repaired.def",
+  "trace": "repair.trace"
+}
