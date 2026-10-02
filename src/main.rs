@@ -516,9 +516,8 @@ impl buffer_ports::PortDesign for CliDesign<'_> {
         self.libs.link_cell(&self.db.inst_master(inst)).map(|c| c.is_buffer())
     }
     /// `Network::drivers(net)`: its output (or inout) instance terminals and its input (or inout)
-    /// ports; tristate when the liberty port is (`isAnyTristate`: tristate or bidirect).
+    /// ports; tristate when the liberty port is (`isAnyTristate`).
     fn net_drivers(&self, net: &str) -> Vec<(String, bool)> {
-        use vyges_sta::liberty::Direction;
         let mut out = Vec::new();
         for it in self.db.net_iterms(net) {
             if !self.is_driver_pin(&it) {
@@ -529,7 +528,7 @@ impl buffer_ports::PortDesign for CliDesign<'_> {
                 .libs
                 .link_cell(&self.db.inst_master(inst))
                 .and_then(|c| c.ports.iter().find(|p| p.name == term))
-                .is_some_and(|p| matches!(p.direction, Direction::Tristate | Direction::Bidirect));
+                .is_some_and(|p| p.is_any_tristate());
             out.push((it, tristate));
         }
         out.extend(self.db.net_bterms(net).into_iter().filter(|b| self.is_driver_pin(b)).map(|b| (b, false)));
@@ -873,7 +872,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     }
                     None => vyges_rsz::preamble::find_buffers(&libs, &m, &dont_use).map_err(|e| e.message().to_string())?.lowest,
                 };
-                let clock_sources: Vec<String> = sdc.as_ref().map(|s| s.clocks.iter().filter(|c| !c.is_virtual()).map(|c| c.source.clone()).collect()).unwrap_or_default();
+                let clock_sources: Vec<String> = sdc.as_ref().map(|s| s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect()).unwrap_or_default();
                 rc.sort_clk_and_signal_layers();
                 // Inside the guard every edit marks its nets invalid — once parasitics exist.
                 let parasitics = match (carried.take(), estimated) {
@@ -928,7 +927,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     // `set_max_fanout` takes a float, unscaled.
                     design_max_fanout: sdc.as_ref().and_then(|s| s.max_fanout).map(|v| v as f32),
                 };
-                let clock_sources: Vec<String> = sdc.as_ref().map(|s| s.clocks.iter().filter(|c| !c.is_virtual()).map(|c| c.source.clone()).collect()).unwrap_or_default();
+                let clock_sources: Vec<String> = sdc.as_ref().map(|s| s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect()).unwrap_or_default();
                 let netlist = vyges_grt::timer::netlist(&db);
                 if !estimated {
                     return Err("repair_design without estimate_parasitics -placement: not modelled".into());
