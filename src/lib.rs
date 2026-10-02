@@ -19,6 +19,7 @@
 //! - [`order`]: sorts whose order is a value.
 //! - [`trace`]: the call-sequence trace, one line per decision.
 
+pub mod buffer_ports;
 pub mod buffered_net;
 pub mod design;
 pub mod driver_slew;

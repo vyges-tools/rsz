@@ -15,6 +15,7 @@ use std::process::ExitCode;
 
 use serde_json::{json, Value};
 use vyges_opendb::Db;
+use vyges_rsz::buffer_ports;
 use vyges_rsz::preamble::{Libs, Master};
 use vyges_rsz::repair_design::{self, Args, Inputs};
 use vyges_rsz::trace::Trace;
@@ -65,7 +66,27 @@ fn net_parasitic(db: &Db, rc: &vyges_est::rc::Rc, n: &vyges_est::placement::NetE
 /// `estimate_parasitics -placement` as the timer reads it: every net's estimate, per scene ("make
 /// separate parasitics for each corner"). Empty where the estimator makes none (EST-0018). `rc`'s
 /// layers must be sorted already.
-fn placement_parasitics_at(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], alpha: f32, scenes: usize) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
+/// The ports' `set_load -pin_load`, as an SDC holds them (`SdcEnv::port_pin_cap`).
+type PortCaps = HashMap<String, [[Option<f32>; 2]; 2]>;
+
+/// The port loads in force at a step: from the SDC the step carries (`"sdc"`: the constraints
+/// as the reference held them when it ran), else from the job's SDC.
+fn port_caps_at(path: Option<&str>, current: Option<&vyges_loom::sdc::Sdc>, libs: &Libs, nl: &vyges_sta::netlist::Netlist) -> Result<PortCaps, String> {
+    let loaded;
+    let s = match path {
+        Some(p) => {
+            loaded = vyges_loom::sdc::Sdc::load(p).map_err(|e| format!("{p}: {}", e.0))?;
+            Some(&loaded)
+        }
+        None => current,
+    };
+    Ok(match s {
+        Some(s) => sdc_env(s, libs, nl)?.port_pin_cap,
+        None => PortCaps::new(),
+    })
+}
+
+fn placement_parasitics_at(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], alpha: f32, scenes: usize, port_caps: &PortCaps) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
     use vyges_est::placement::{estimate_wire_parasitics, Timing};
     if no_signal_cap(db, rc) {
         return Ok(vec![HashMap::new(); scenes]);
@@ -75,12 +96,31 @@ fn placement_parasitics_at(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est:
     let mut out = vec![HashMap::new(); scenes];
     for (k, map) in out.iter_mut().enumerate() {
         for n in &nets {
-            if let Some(p) = net_parasitic(db, rc, n, k)? {
+            if let Some(mut p) = net_parasitic(db, rc, n, k)? {
+                // Reduced now, against the port loads in force now.
+                p.port_pin_caps = Some(port_caps.clone());
                 map.insert(n.net.clone(), p);
             }
         }
     }
     Ok(out)
+}
+
+/// The estimator's state when a command first reads it: every net estimated on the design the
+/// estimate saw (`seen`, when cells moved after it; else the design now). Only a MOVE is modelled
+/// between the two — a netlist edit is replayed by the command that made it, not read back.
+#[allow(clippy::too_many_arguments)]
+fn estimate_state(db: &Db, seen: Option<&str>, netlist: &vyges_sta::netlist::Netlist, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], alpha: f32, scenes: usize, port_caps: &PortCaps) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
+    match seen {
+        None => placement_parasitics_at(db, rc, liberty, clock_sources, alpha, scenes, port_caps),
+        Some(path) => {
+            let seen = Db::open(path).map_err(|e| format!("{path}: {e}"))?;
+            if &vyges_grt::timer::netlist(&seen) != netlist {
+                return Err("the netlist was edited between estimate_parasitics and this command by a step the job does not carry: not modelled".into());
+            }
+            placement_parasitics_at(&seen, rc, liberty, clock_sources, alpha, scenes, port_caps)
+        }
+    }
 }
 
 /// `Resizer::clampLocToCore`: with a core, the origin held inside it so the master fits — the
@@ -258,6 +298,8 @@ struct CliDesign<'a> {
     info: NetInfo,
     /// `core_` and `core_exists_`.
     core: Option<(i32, i32, i32, i32)>,
+    /// The port loads in force while this command runs: what an estimate made now is reduced against.
+    port_caps: PortCaps,
 }
 
 impl CliDesign<'_> {
@@ -316,7 +358,10 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
         let e = vyges_est::placement::estimate_net(self.db, &timing, net, &drvr, self.alpha, &est_stt)?;
         for k in 0..self.parasitics.len() {
             match net_parasitic(self.db, self.rc, &e, k)? {
-                Some(p) => self.parasitics[k].insert(net.to_string(), p),
+                Some(mut p) => {
+                    p.port_pin_caps = Some(self.port_caps.clone());
+                    self.parasitics[k].insert(net.to_string(), p)
+                }
                 None => self.parasitics[k].remove(net),
             };
         }
@@ -436,6 +481,99 @@ impl CliDesign<'_> {
             Some((inst, term)) if !self.netlist.ports.iter().any(|p| p.0 == pin) => matches!(self.db.iterm_get_io_type(inst, term).as_str(), "OUTPUT" | "INOUT"),
             _ => matches!(self.db.bterm_get_io_type(pin).as_str(), "INPUT" | "INOUT"),
         }
+    }
+}
+
+impl buffer_ports::PortDesign for CliDesign<'_> {
+    fn top_ports(&self) -> Vec<String> {
+        self.db.block_get_b_terms()
+    }
+    fn port_direction(&self, port: &str) -> String {
+        self.db.bterm_get_io_type(port)
+    }
+    fn port_net(&self, port: &str) -> Option<String> {
+        Some(self.db.bterm_net(port)).filter(|n| !n.is_empty())
+    }
+    fn net_dont_touch(&self, net: &str) -> bool {
+        self.db.net_is_do_not_touch(net)
+    }
+    fn net_special(&self, net: &str) -> bool {
+        self.db.net_is_special(net)
+    }
+    fn net_iterms(&self, net: &str) -> Vec<String> {
+        self.db.net_iterms(net)
+    }
+    fn net_bterms(&self, net: &str) -> Vec<String> {
+        self.db.net_bterms(net)
+    }
+    fn net_first_output(&self, net: &str) -> Option<String> {
+        Some(self.db.net_get_first_output(net)).filter(|t| !t.is_empty())
+    }
+    fn inst_dont_touch(&self, inst: &str) -> bool {
+        self.db.inst_is_do_not_touch(inst)
+    }
+    fn inst_is_buffer(&self, inst: &str) -> Option<bool> {
+        self.libs.link_cell(&self.db.inst_master(inst)).map(|c| c.is_buffer())
+    }
+    /// `Network::drivers(net)`: its output (or inout) instance terminals and its input (or inout)
+    /// ports; tristate when the liberty port is (`isAnyTristate`: tristate or bidirect).
+    fn net_drivers(&self, net: &str) -> Vec<(String, bool)> {
+        use vyges_sta::liberty::Direction;
+        let mut out = Vec::new();
+        for it in self.db.net_iterms(net) {
+            if !self.is_driver_pin(&it) {
+                continue;
+            }
+            let (inst, term) = it.rsplit_once('/').expect("inst/pin");
+            let tristate = self
+                .libs
+                .link_cell(&self.db.inst_master(inst))
+                .and_then(|c| c.ports.iter().find(|p| p.name == term))
+                .is_some_and(|p| matches!(p.direction, Direction::Tristate | Direction::Bidirect));
+            out.push((it, tristate));
+        }
+        out.extend(self.db.net_bterms(net).into_iter().filter(|b| self.is_driver_pin(b)).map(|b| (b, false)));
+        out
+    }
+    /// A top-level port is in the clock network when it is a clock's source.
+    fn port_is_clock(&self, port: &str) -> bool {
+        self.clock_sources.iter().any(|c| c == port)
+    }
+    fn insert_buffer_after_driver(&mut self, drvr: &str, cell: &str, reason: &str) -> Result<String, String> {
+        let term = self.term(drvr);
+        let inst = self.db.insert_buffer_after_driver(term, cell, None, reason, None, "ALWAYS").map_err(|e| e.to_string())?;
+        self.insert_buffer_post_process(&inst, cell)?;
+        Ok(inst)
+    }
+    fn insert_buffer_before_load(&mut self, load: &str, cell: &str, reason: &str) -> Result<String, String> {
+        let term = self.term(load);
+        let inst = self.db.insert_buffer_before_load(term, cell, None, reason, None, "ALWAYS").map_err(|e| e.to_string())?;
+        self.insert_buffer_post_process(&inst, cell)?;
+        Ok(inst)
+    }
+}
+
+impl CliDesign<'_> {
+    /// A pin as the database addresses it: a port, or an instance's terminal.
+    fn term<'p>(&self, pin: &'p str) -> (Option<&'p str>, &'p str) {
+        match pin.rsplit_once('/') {
+            Some((inst, t)) if !self.netlist.ports.iter().any(|p| p.0 == pin) => (Some(inst), t),
+            _ => (None, pin),
+        }
+    }
+
+    /// `insertBufferPostProcess` (`setLocation`: clamped to the core, placed), and the odb
+    /// callbacks: the nets on the new buffer's input and output marked invalid.
+    fn insert_buffer_post_process(&mut self, inst: &str, cell: &str) -> Result<(), String> {
+        let at = self.clamp_loc_to_core(self.db.inst_location(inst), cell);
+        self.db.set_inst_location(inst, at.0, at.1).map_err(|e| e.to_string())?;
+        let c = self.libs.link_cell(cell).ok_or_else(|| format!("{cell}: no liberty cell"))?;
+        let (input, output) = c.buffer_ports().ok_or_else(|| format!("{cell}: not a buffer"))?;
+        let in_net = self.db.net_of(inst, &input.name);
+        let out_net = self.db.net_of(inst, &output.name);
+        self.invalidate(&in_net);
+        self.invalidate(&out_net);
+        self.refresh()
     }
 }
 
@@ -575,6 +713,9 @@ fn run(job: &Value) -> Result<Value, String> {
     // estimate step: the reference keeps an estimate across a later cell MOVE — est has no callback
     // for one — so it repairs on the earlier placement's parasitics).
     let mut estimate_db: Option<String> = None;
+    // The constraints as the estimate saw them (an estimate step's "sdc"), when a port load was
+    // set after it: the estimate's pi models were reduced without it.
+    let mut estimate_sdc: Option<String> = None;
     // The RC in force when the estimate ran (later re-estimates read the RC in force then).
     let mut estimate_rc: Option<vyges_est::rc::Rc> = None;
     let units = |l: &vyges_est::liberty::LibertyClocks| -> Result<vyges_est::rc::Units, String> {
@@ -583,6 +724,10 @@ fn run(job: &Value) -> Result<Value, String> {
     };
     let mut trace = Trace::default();
     let mut outcome: Option<Result<repair_design::Outcome, Stop>> = None;
+    // The estimator's per-net state after an edit made inside its incremental guard (buffer_ports):
+    // a later repair starts from it rather than from a fresh estimate.
+    let mut carried: Option<Vec<HashMap<String, NetParasitics>>> = None;
+    let mut buffered: Vec<buffer_ports::Outcome> = Vec::new();
     for step in job["steps"].as_array().ok_or("steps")? {
         let cmd = step["cmd"].as_str().ok_or("cmd")?;
         let args: Vec<String> = step["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
@@ -639,6 +784,10 @@ fn run(job: &Value) -> Result<Value, String> {
             // `set_dont_use_cmd`: each element of the list through `get_lib_cells` — a cell-name
             // glob (`*`, `?`) over every library read so far; no match only warns.
             "set_dont_use" => {
+                // The buffer list is found once and kept (findBuffers returns early when it has one).
+                if !buffered.is_empty() {
+                    return Err("set_dont_use after buffer_ports: the kept buffer list is not modelled".into());
+                }
                 for a in &args {
                     for pat in a.split_whitespace() {
                         if pat.contains(['/', '[', ']', '\\']) {
@@ -670,8 +819,10 @@ fn run(job: &Value) -> Result<Value, String> {
                     return Err("estimate_parasitics without -placement: not modelled".into());
                 }
                 estimated = true;
+                carried = None;
                 estimate_alpha = routing_alpha;
                 estimate_db = step["db"].as_str().map(String::from);
+                estimate_sdc = step["sdc"].as_str().map(String::from);
                 estimate_rc = Some(rc.clone());
             }
             "set_routing_alpha" => {
@@ -696,6 +847,65 @@ fn run(job: &Value) -> Result<Value, String> {
                     return Err(format!("{path}: {} not modelled", unmodelled.join(", ")));
                 }
                 sdc = Some(s);
+            }
+            "buffer_ports" => {
+                let o = buffer_ports::Options::parse(&args)?;
+                let mut dont_use = set_dont_use.clone();
+                for lib in &libs.libs {
+                    dont_use.extend(lib.cells.values().filter(|c| c.dont_use).map(|c| c.name.clone()));
+                }
+                let m = masters(&db)?;
+                if !db.block_get_mod_insts().is_empty() {
+                    return Err("buffer_ports on a hierarchical design: not modelled".into());
+                }
+                let netlist = vyges_grt::timer::netlist(&db);
+                // `isConstant` holds nowhere: case analysis is refused at read_sdc, constant cells here.
+                if let Some(why) = vyges_rsz::timing::constant_cells(&libs.libs, &netlist) {
+                    return Err(format!("{why} (not modelled)"));
+                }
+                // selectBufferCell: the user's cell (a buffer), else findBuffers' weakest.
+                let weakest = match &o.buffer_cell {
+                    Some(c) => {
+                        if !libs.link_cell(c).is_some_and(|c| c.is_buffer()) {
+                            return Err(format!("buffer_ports -buffer_cell {c}: not a buffer"));
+                        }
+                        c.clone()
+                    }
+                    None => vyges_rsz::preamble::find_buffers(&libs, &m, &dont_use).map_err(|e| e.message().to_string())?.lowest,
+                };
+                let clock_sources: Vec<String> = sdc.as_ref().map(|s| s.clocks.iter().filter(|c| !c.is_virtual()).map(|c| c.source.clone()).collect()).unwrap_or_default();
+                rc.sort_clk_and_signal_layers();
+                // Inside the guard every edit marks its nets invalid — once parasitics exist.
+                let parasitics = match (carried.take(), estimated) {
+                    (Some(p), _) => p,
+                    (None, true) => {
+                        let mut est_rc = estimate_rc.clone().expect("estimated");
+                        est_rc.sort_clk_and_signal_layers();
+                        let caps = port_caps_at(estimate_sdc.as_deref(), sdc.as_ref(), &libs, &netlist)?;
+                        estimate_state(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, estimate_alpha, libs.scene_count(), &caps)?
+                    }
+                    (None, false) => vec![HashMap::new(); libs.scene_count()],
+                };
+                let info = net_info(&db, &netlist)?;
+                let estimating = estimated && !no_signal_cap(&db, &rc);
+                let core = (db.block_get_core_area_x_min(), db.block_get_core_area_y_min(), db.block_get_core_area_x_max(), db.block_get_core_area_y_max());
+                let core = (core != (0, 0, 0, 0)).then_some(core);
+                let port_caps = port_caps_at(step["sdc"].as_str(), sdc.as_ref(), &libs, &netlist)?;
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps };
+                let r = buffer_ports::buffer_ports(&mut design, &o, &weakest);
+                let parasitics = std::mem::take(&mut design.parasitics);
+                match r {
+                    Ok(b) => buffered.push(b),
+                    Err(Stop::Refused { msg, .. }) => return Err(format!("{msg} (not modelled)")),
+                    Err(Stop::Error { code, msg }) => return Err(format!("{code}: {msg}")),
+                }
+                if estimated {
+                    carried = Some(parasitics);
+                }
+                // The design as buffer_ports left it.
+                if let Some(path) = step["write_def"].as_str() {
+                    db.write_def(path).map_err(|e| format!("{path}: {e}"))?;
+                }
             }
             "repair_design" => {
                 if outcome.is_some() {
@@ -727,16 +937,12 @@ fn run(job: &Value) -> Result<Value, String> {
                 rc.sort_clk_and_signal_layers();
                 let mut est_rc = estimate_rc.clone().expect("estimated");
                 est_rc.sort_clk_and_signal_layers();
-                let parasitics = match &estimate_db {
-                    None => placement_parasitics_at(&db, &est_rc, &liberty, &clock_sources, estimate_alpha, libs.scene_count())?,
-                    Some(path) => {
-                        let seen = Db::open(path).map_err(|e| format!("{path}: {e}"))?;
-                        // Only a move is modelled: a netlist edit since the estimate leaves the
-                        // reference with an incremental state (its own updates) this does not replay.
-                        if vyges_grt::timer::netlist(&seen) != netlist {
-                            return Err("the netlist was edited between estimate_parasitics and repair_design (e.g. buffer_ports): the reference's incremental parasitics are not modelled".into());
-                        }
-                        placement_parasitics_at(&seen, &est_rc, &liberty, &clock_sources, estimate_alpha, libs.scene_count())?
+                // The estimator's state as an earlier edit (buffer_ports) left it, else the estimate.
+                let parasitics = match carried.take() {
+                    Some(p) => p,
+                    None => {
+                        let caps = port_caps_at(estimate_sdc.as_deref(), sdc.as_ref(), &libs, &netlist)?;
+                        estimate_state(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, estimate_alpha, libs.scene_count(), &caps)?
                     }
                 };
                 let wire_rc: Vec<vyges_rsz::buffered_net::WireRc> = (0..libs.scene_count())
@@ -767,7 +973,8 @@ fn run(job: &Value) -> Result<Value, String> {
                     g.find_delays(&parasitics[0], Some(&mut lines))?;
                     std::fs::write(path, lines.join("\n") + "\n").map_err(|e| format!("{path}: {e}"))?;
                 }
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core };
+                let port_caps = env.port_pin_cap.clone();
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps };
                 let inputs = Inputs { libs: &libs, masters: &m, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins };
                 outcome = Some(repair_design::repair_design(&inputs, &mut design, &a, &mut trace));
             }
@@ -783,7 +990,14 @@ fn run(job: &Value) -> Result<Value, String> {
     }
     let tags: Vec<&str> = trace.tags.iter().copied().collect();
     let mut report = match outcome {
-        None => json!({ "tool": "vyges-rsz", "status": "vacuous", "reason": "no repair_design step" }),
+        None if buffered.is_empty() => json!({ "tool": "vyges-rsz", "status": "vacuous", "reason": "no repair_design or buffer_ports step" }),
+        // buffer_ports alone: the ports it walked are what it checked.
+        None => {
+            let inserted: usize = buffered.iter().map(|b| b.inserted_inputs + b.inserted_outputs).sum();
+            let checked: usize = buffered.iter().map(|b| b.ports_checked).sum();
+            let status = if inserted > 0 { "repaired" } else if checked > 0 { "up_to_date" } else { "vacuous" };
+            json!({ "tool": "vyges-rsz", "status": status, "ports_checked": checked, "inserted_buffers": inserted })
+        }
         // Every driver checked and none needed a repair: a CHECKED nothing-to-do, with its count.
         Some(Ok(o)) => {
             let summary: Vec<Value> = o.summary().into_iter().map(|(code, text)| json!({ "code": code, "message": text })).collect();
@@ -803,6 +1017,15 @@ fn run(job: &Value) -> Result<Value, String> {
         Some(Err(Stop::Error { code, msg })) => json!({ "tool": "vyges-rsz", "status": "error", "code": code, "reason": msg }),
     };
     report["traced"] = json!(tags);
+    if !buffered.is_empty() {
+        report["buffer_ports"] = buffered
+            .iter()
+            .map(|b| {
+                let lines: Vec<Value> = b.lines.iter().map(|l| json!({ "code": l.code, "severity": if l.warning { "warning" } else { "info" }, "message": l.text })).collect();
+                json!({ "inserted_inputs": b.inserted_inputs, "inserted_outputs": b.inserted_outputs, "ports_checked": b.ports_checked, "lines": lines })
+            })
+            .collect();
+    }
     Ok(report)
 }
 
@@ -812,6 +1035,7 @@ drivers resized, where a wire is too long or a capacitance, fanout or transition
 
 USAGE:
   vyges loom rsz repair_design <job.json> [-o FILE]
+  vyges loom rsz buffer_ports <job.json> [-o FILE]     (the same job runner; a job may hold either)
   vyges loom rsz --describe
   vyges loom rsz --help
   vyges loom rsz --version
@@ -821,9 +1045,12 @@ JOB FIELDS:
                script passes them:
                  read_lef, read_def, read_db, define_corners, read_liberty [-corner C],
                  read_sdc, set_dont_use, set_layer_rc, set_wire_rc, set_routing_alpha,
-                 estimate_parasitics -placement, repair_design [options]
+                 estimate_parasitics -placement, buffer_ports [options], repair_design [options]
                an estimate_parasitics step may carry \"db\": the database as the estimate saw it,
                when cells were moved between it and the repair
+               a buffer_ports step may carry \"write_def\": the design as it left it, as DEF
+               an estimate_parasitics or buffer_ports step may carry \"sdc\": the constraints in
+               force when it ran, when a port's set_load comes after it
   trace        write one line per decision, in the order the repair makes them, to this path
   write_def    write the design as the repair left it, as DEF, to this path
   dcalc_trace  (diagnostic) write the timer's delay-calculation trace of the design as read
@@ -834,6 +1061,15 @@ REPAIR_DESIGN OPTIONS:
   -cap_margin P         percent taken off every capacitance limit
   -verbose              accepted
   refused: -pre_placement / -buffer_gain, -match_cell_footprint, -reroute, -max_utilization
+
+BUFFER_PORTS OPTIONS:
+  -inputs / -outputs    which side (neither: both) — a buffer after each input port, before
+                        each output port, unless its net is dont-touch, special or pinless, an
+                        input is a clock source, an input's loads are all buffers or one is
+                        dont-touch, or an output's driver is tristate or dont-touch
+  -buffer_cell C        the buffer to use (default: the weakest buffer the repair would pick)
+  -verbose              each port's decision in the report's lines
+  refused: -max_utilization, a hierarchical design
 
 CONSTRAINTS READ FROM SDC:
   create_clock, set_max_transition and set_max_fanout on the design, set_load on nets and ports,
@@ -849,7 +1085,8 @@ OPTIONS:
   --star                star this tool on GitHub
 
 REPORT:
-  status, nets_checked, nets_repaired, inserted_buffers, resized, drivers_skipped, violations
+  buffer_ports (per step: inserted_inputs, inserted_outputs, ports_checked, lines — each with its
+  code and severity), status, nets_checked, nets_repaired, inserted_buffers, resized, drivers_skipped, violations
   {slew, capacitance, fanout, length}, and summary — the repair's closing lines, each with its code
 
 EXIT STATUS:
@@ -870,12 +1107,12 @@ const DESCRIBE: &str = r#"{
   "schema": "vyges-tool-descriptor/1.1",
   "openroad_pin": "@OPENROAD_PIN@",
   "name": "rsz",
-  "summary": "electrical repair of a placed design: repeaters inserted along each net's Steiner tree for long wires, max capacitance and max slew",
+  "summary": "electrical repair of a placed design: repeaters inserted along each net's Steiner tree for long wires, max capacitance and max slew; and port buffering",
   "maturity": "experimental",
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
-    "status is one of repaired, up_to_date, vacuous, refused or error. repaired means the design changed (buffers inserted or drivers resized); up_to_date means drivers were checked and none needed a change (nets_checked says how many); vacuous means nothing was checked and is NOT a pass. The declared assertion passes on repaired or up_to_date. Exit status is 0 for repaired and up_to_date, 2 for vacuous and for error, 3 for refused.",
-    "Modelled: placement parasitics, one or more corners, flat and hierarchical netlists, the default buffer selection, the SDC constraints the usage lists. Refused rather than guessed: global-route parasitics, the early sizing round, footprint matching, rerouting, a netlist edited between the estimate and the repair, a tristate driver or a bidirect pin on a net, and any other timing-affecting SDC command."
+    "status is one of repaired, up_to_date, vacuous, refused or error. repaired means the design changed (buffers inserted or drivers resized); up_to_date means drivers were checked and none needed a change (nets_checked says how many; for a job with buffer_ports and no repair_design, ports_checked); vacuous means nothing was checked and is NOT a pass. The declared assertion passes on repaired or up_to_date. Exit status is 0 for repaired and up_to_date, 2 for vacuous and for error, 3 for refused.",
+    "Modelled: placement parasitics, one or more corners, flat and hierarchical netlists, the default buffer selection, the SDC constraints the usage lists, buffer_ports before the repair (the estimate it leaves carried into it). Refused rather than guessed: global-route parasitics, the early sizing round, footprint matching, rerouting, any other netlist edit between the estimate and the repair, buffer_ports on a hierarchical design, a tristate driver or a bidirect pin on a net, and any other timing-affecting SDC command."
   ],
   "invocation": {
     "args_template": ["repair_design", "{job}"],
@@ -992,7 +1229,7 @@ fn main() -> ExitCode {
             println!("{label}:\n  {url}");
             return ExitCode::SUCCESS;
         }
-        Some("repair_design") if positional.len() == 2 => {}
+        Some("repair_design") | Some("buffer_ports") if positional.len() == 2 => {}
         _ => {
             eprint!("{USAGE}");
             return ExitCode::from(2);

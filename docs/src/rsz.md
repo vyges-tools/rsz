@@ -140,16 +140,32 @@ limit; from the leaves up, each full group of loads, and each leftover group of 
 limit, is buffered at the load nearest the driver, and that buffer's net is repaired with the
 fanout check off.
 
+## buffer_ports
+
+A `buffer_ports` step puts a buffer after each input port and before each output port, so every
+port is driven by, or drives, one known cell (`vyges loom rsz buffer_ports job.json` runs the same
+job runner). Ports are walked in the database's order. A port is left alone when its net is
+dont-touch, special or has no instance pins, when an input is a clock source or its loads are all
+buffers (or one is dont-touch), and when an output's driver is tristate or dont-touch. The buffer
+is the weakest one the repair would choose, or `-buffer_cell`.
+
+Run after `estimate_parasitics`, it keeps the estimate as an incremental estimator would: the two
+nets each insertion touches are estimated again when the walk ends, and every other net keeps its
+estimate. A later `repair_design` starts from that state. Each estimate is reduced against the
+port loads in force when it was made. Give a step the constraints it saw, as `"sdc"`, when a
+port's `set_load` comes later. That later load is then compared against the earlier estimate, and
+an estimate smaller than the load is set aside (the driver is timed against the load alone).
+
 ## Correlation
 
 Scored against the reference implementation of the same command on its 35 regression cases, at
 the build pin `--describe` publishes, three ways: the call-sequence trace line for line, the
 repaired design (every component, pin and net), and the repair's closing summary lines.
 
-- **33 of 35** cases match on all three, across Nangate45 and sky130, one and two corners, flat
+- **35 of 35** cases match on all three, across Nangate45 and sky130, one and two corners, flat
   and hierarchical netlists, with up to 84 repeaters in a run.
-- The other **2** are refused: both edit the netlist with another command between the parasitic
-  estimate and the repair, leaving an incremental state this engine does not replay.
+- Two of them run `buffer_ports` between the parasitic estimate and the repair. Its stage is
+  scored on its own as well: the design it leaves, and its closing lines.
 
 ⚠️ **A number here means nothing without the build.** The reference's own answer moves between
 releases; the pin is part of the claim.
@@ -161,8 +177,10 @@ A refusal is named in `reason`. Nothing is approximated:
 - global-route or detailed-route parasitics; only `estimate_parasitics -placement` is modelled
 - `-pre_placement` / `-buffer_gain` (the early sizing round), `-match_cell_footprint`, `-reroute`,
   `-max_utilization`
-- a netlist edited between `estimate_parasitics` and `repair_design` (a cell MOVED in between is
-  modelled: give the estimate step the database it saw, as `"db"`)
+- a netlist edited between `estimate_parasitics` and `repair_design` by anything but a
+  `buffer_ports` step (a cell MOVED in between is modelled: give the estimate step the database
+  it saw, as `"db"`)
+- `buffer_ports` on a hierarchical design, or with `-max_utilization`
 - a tristate driver or a bidirect pin on a net
 - liberty `bus` and `bundle` pins; `ff_bank`, `latch_bank` and statetable cells where their
   equivalence decides a swap

@@ -8,6 +8,7 @@ drivers resized, where a wire is too long or a capacitance, fanout or transition
 
 USAGE:
   vyges loom rsz repair_design <job.json> [-o FILE]
+  vyges loom rsz buffer_ports <job.json> [-o FILE]     (the same job runner; a job may hold either)
   vyges loom rsz --describe
   vyges loom rsz --help
   vyges loom rsz --version
@@ -17,9 +18,12 @@ JOB FIELDS:
                script passes them:
                  read_lef, read_def, read_db, define_corners, read_liberty [-corner C],
                  read_sdc, set_dont_use, set_layer_rc, set_wire_rc, set_routing_alpha,
-                 estimate_parasitics -placement, repair_design [options]
+                 estimate_parasitics -placement, buffer_ports [options], repair_design [options]
                an estimate_parasitics step may carry "db": the database as the estimate saw it,
                when cells were moved between it and the repair
+               a buffer_ports step may carry "write_def": the design as it left it, as DEF
+               an estimate_parasitics or buffer_ports step may carry "sdc": the constraints in
+               force when it ran, when a port's set_load comes after it
   trace        write one line per decision, in the order the repair makes them, to this path
   write_def    write the design as the repair left it, as DEF, to this path
   dcalc_trace  (diagnostic) write the timer's delay-calculation trace of the design as read
@@ -30,6 +34,15 @@ REPAIR_DESIGN OPTIONS:
   -cap_margin P         percent taken off every capacitance limit
   -verbose              accepted
   refused: -pre_placement / -buffer_gain, -match_cell_footprint, -reroute, -max_utilization
+
+BUFFER_PORTS OPTIONS:
+  -inputs / -outputs    which side (neither: both) — a buffer after each input port, before
+                        each output port, unless its net is dont-touch, special or pinless, an
+                        input is a clock source, an input's loads are all buffers or one is
+                        dont-touch, or an output's driver is tristate or dont-touch
+  -buffer_cell C        the buffer to use (default: the weakest buffer the repair would pick)
+  -verbose              each port's decision in the report's lines
+  refused: -max_utilization, a hierarchical design
 
 CONSTRAINTS READ FROM SDC:
   create_clock, set_max_transition and set_max_fanout on the design, set_load on nets and ports,
@@ -45,7 +58,8 @@ OPTIONS:
   --star                star this tool on GitHub
 
 REPORT:
-  status, nets_checked, nets_repaired, inserted_buffers, resized, drivers_skipped, violations
+  buffer_ports (per step: inserted_inputs, inserted_outputs, ports_checked, lines — each with its
+  code and severity), status, nets_checked, nets_repaired, inserted_buffers, resized, drivers_skipped, violations
   {slew, capacitance, fanout, length}, and summary — the repair's closing lines, each with its code
 
 EXIT STATUS:
