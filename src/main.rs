@@ -86,12 +86,14 @@ fn port_caps_at(path: Option<&str>, current: Option<&vyges_loom::sdc::Sdc>, libs
     })
 }
 
-fn placement_parasitics_at(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], alpha: f32, scenes: usize, port_caps: &PortCaps) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
+#[allow(clippy::too_many_arguments)]
+fn placement_parasitics_at(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagated: bool, alpha: f32, scenes: usize, port_caps: &PortCaps) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
     use vyges_est::placement::{estimate_wire_parasitics, Timing};
     if no_signal_cap(db, rc) {
         return Ok(vec![HashMap::new(); scenes]);
     }
-    let timing = Timing { liberty: Some(liberty), clock_sources: clock_sources.to_vec(), propagated: false };
+    // `isSkipPin`: an ideal clock's nets get no network; a propagated clock's do.
+    let timing = Timing { liberty: Some(liberty), clock_sources: clock_sources.to_vec(), propagated };
     let nets = estimate_wire_parasitics(db, &timing, alpha, &est_stt).map_err(|e| e.to_string())?;
     let mut out = vec![HashMap::new(); scenes];
     for (k, map) in out.iter_mut().enumerate() {
@@ -110,15 +112,15 @@ fn placement_parasitics_at(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est:
 /// estimate saw (`seen`, when cells moved after it; else the design now). Only a MOVE is modelled
 /// between the two — a netlist edit is replayed by the command that made it, not read back.
 #[allow(clippy::too_many_arguments)]
-fn estimate_state(db: &Db, seen: Option<&str>, netlist: &vyges_sta::netlist::Netlist, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], alpha: f32, scenes: usize, port_caps: &PortCaps) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
+fn estimate_state(db: &Db, seen: Option<&str>, netlist: &vyges_sta::netlist::Netlist, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagated: bool, alpha: f32, scenes: usize, port_caps: &PortCaps) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
     match seen {
-        None => placement_parasitics_at(db, rc, liberty, clock_sources, alpha, scenes, port_caps),
+        None => placement_parasitics_at(db, rc, liberty, clock_sources, propagated, alpha, scenes, port_caps),
         Some(path) => {
             let seen = Db::open(path).map_err(|e| format!("{path}: {e}"))?;
             if &vyges_grt::timer::netlist(&seen) != netlist {
                 return Err("the netlist was edited between estimate_parasitics and this command by a step the job does not carry: not modelled".into());
             }
-            placement_parasitics_at(&seen, rc, liberty, clock_sources, alpha, scenes, port_caps)
+            placement_parasitics_at(&seen, rc, liberty, clock_sources, propagated, alpha, scenes, port_caps)
         }
     }
 }
@@ -696,6 +698,138 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
     Ok(a)
 }
 
+/// The constraints the setup search reads (one clock and its port delays), from the SDC as the
+/// reference wrote it. Everything else that moves a setup slack is refused here, never dropped.
+///
+/// ⚠️ The parsed SDC keeps an I/O delay's value and ports but not its flags, so the delays are read
+/// from the text: `-max` / `-rise` / `-fall` place the value; a `-min`-only delay bounds hold paths
+/// and is not a setup input; any other flag is refused.
+fn search_sdc(s: &vyges_loom::sdc::Sdc, text: &str, time_scale: f32, propagated: bool) -> Result<vyges_sta::sdc::Sdc, String> {
+    use vyges_sta::sdc::{Clock, PortDelay};
+    let real: Vec<&vyges_loom::sdc::SdcClock> = s.clocks.iter().filter(|c| !c.is_virtual()).collect();
+    let [clock] = real.as_slice() else {
+        return Err(format!("repair_timing with {} clocks: one is modelled", real.len()));
+    };
+    let [source] = clock.sources.as_slice() else {
+        return Err(format!("clock {} on {} sources: one is modelled", clock.name, clock.sources.len()));
+    };
+    if real.len() != s.clocks.len() {
+        return Err("a virtual clock: not modelled".into());
+    }
+    if s.setup_uncertainty != 0.0 || s.hold_uncertainty != 0.0 {
+        return Err("set_clock_uncertainty: not modelled".into());
+    }
+    if s.clock_latency != 0.0 || s.late_derate.is_some() || s.early_derate.is_some() || !s.exceptions.is_empty() || !s.async_groups.is_empty() {
+        return Err("clock latency, derates, timing exceptions or clock groups: not modelled".into());
+    }
+    if text.contains("-waveform") {
+        return Err("create_clock -waveform: not modelled".into());
+    }
+    // Per side (input, output): each port and its delay by `[rf][min/max]`, as set so far.
+    type Delays = Vec<(String, [[Option<f32>; 2]; 2])>;
+    let mut delays: [Delays; 2] = [Vec::new(), Vec::new()];
+    for line in text.lines() {
+        let line = line.trim();
+        let side = if line.starts_with("set_input_delay ") { 0 } else if line.starts_with("set_output_delay ") { 1 } else { continue };
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let value: f64 = words.get(1).and_then(|w| w.parse().ok()).ok_or_else(|| format!("{line}: the delay value is not modelled"))?;
+        let flag = |f: &str| words.contains(&f);
+        for f in ["-clock_fall", "-network_latency_included", "-source_latency_included", "-reference_pin"] {
+            if flag(f) {
+                return Err(format!("{} {f}: not modelled", words[0]));
+            }
+        }
+        let clock_name = line.split("[get_clocks {").nth(1).and_then(|r| r.split('}').next()).ok_or_else(|| format!("{line}: a delay without -clock is not modelled"))?;
+        if clock_name != clock.name {
+            return Err(format!("{line}: a delay on another clock is not modelled"));
+        }
+        let ports = line.split("[get_ports {").nth(1).and_then(|r| r.split('}').next()).ok_or_else(|| format!("{line}: ports not read"))?;
+        let mms: Vec<usize> = match (flag("-min"), flag("-max")) {
+            (true, false) => continue, // hold only
+            (false, true) => vec![1],
+            _ => vec![0, 1],
+        };
+        let rfs: Vec<usize> = match (flag("-rise"), flag("-fall")) {
+            (true, false) => vec![0],
+            (false, true) => vec![1],
+            _ => vec![0, 1],
+        };
+        let v = vyges_sta::sdc::user_to_sta(value, time_scale);
+        for port in ports.split_whitespace() {
+            let list = &mut delays[side];
+            let k = match list.iter().position(|(p, _)| p == port) {
+                Some(k) => k,
+                None => {
+                    list.push((port.to_string(), [[None; 2]; 2]));
+                    list.len() - 1
+                }
+            };
+            for &rf in &rfs {
+                for &mm in &mms {
+                    list[k].1[rf][mm] = Some(v);
+                }
+            }
+        }
+    }
+    let finish = |list: &Delays| -> Result<Vec<PortDelay>, String> {
+        list.iter()
+            .map(|(p, d)| {
+                let max = |rf: usize| d[rf][1].ok_or_else(|| format!("port {p}: a delay set for one transition only is not modelled"));
+                let (r, f) = (max(0)?, max(1)?);
+                Ok(PortDelay { port: p.clone(), delay: [[d[0][0].unwrap_or(r), r], [d[1][0].unwrap_or(f), f]] })
+            })
+            .collect()
+    };
+    Ok(vyges_sta::sdc::Sdc {
+        clock: Clock::new(&clock.name, vyges_sta::sdc::user_to_sta(clock.period, time_scale), source, propagated),
+        input_delays: finish(&delays[0])?,
+        output_delays: finish(&delays[1])?,
+    })
+}
+
+/// The search's endpoints (`Sta::endpoints`, in vertex order) and startpoints (input ports and
+/// register outputs that are not clock pins, `walkStartpoints`), each with its slack.
+///
+/// An endpoint (`Search::isEndpoint`): a vertex with fanin that has timing checks, carries an
+/// output delay, or has no fanout. ⚠️ One WITH fanout times its slack through the path ends
+/// downstream (`wnsSlacks`), which is not modelled: refused.
+fn timing_points(g: &vyges_sta::graph::Graph<'_>, search: &vyges_sta::search::Search<'_, '_>, ssdc: &vyges_sta::sdc::Sdc, libs: &Libs, clocks: &BTreeSet<usize>) -> Result<(Vec<vyges_rsz::repair_timing::Point>, Vec<vyges_rsz::repair_timing::Point>), String> {
+    use vyges_rsz::repair_timing::Point;
+    use vyges_sta::graph::EdgeKind;
+    use vyges_sta::liberty::Role;
+    let role = |e: usize| match g.edges[e].kind {
+        EdgeKind::Gate { set } => {
+            let vx = &g.vertices[g.edges[e].to];
+            Some(g.libs[vx.lib.expect("an instance pin")].cells[vx.cell.as_deref().expect("its cell")].arc_sets[set].role)
+        }
+        EdgeKind::Wire => None,
+    };
+    let is_check = |e: usize| matches!(role(e), Some(Role::Setup | Role::Hold | Role::Recovery | Role::Removal));
+    let mut ends = Vec::new();
+    let mut starts = Vec::new();
+    for (v, vx) in g.vertices.iter().enumerate() {
+        let fanin = g.in_edges[v].iter().any(|&e| !is_check(e));
+        let fanout = g.out_edges[v].iter().any(|&e| !is_check(e));
+        let checks = g.in_edges[v].iter().any(|&e| is_check(e));
+        let port = vx.lib.is_none();
+        let constrained = port && ssdc.output_delays.iter().any(|d| d.port == vx.name);
+        if fanin && (checks || constrained || !fanout) {
+            if fanout {
+                return Err(format!("endpoint {} has fanout: its slack through the path ends downstream is not modelled", vx.name));
+            }
+            ends.push(Point { pin: vx.name.clone(), slack: search.vertex_slack(v) });
+        }
+        if clocks.contains(&v) || !vx.is_driver {
+            continue;
+        }
+        let register = vx.cell.as_deref().and_then(|c| libs.link_cell(c)).is_some_and(|c| !c.sequentials.is_empty() || c.has_seq_bank);
+        if port || register {
+            starts.push(Point { pin: vx.name.clone(), slack: search.vertex_slack(v) });
+        }
+    }
+    Ok((ends, starts))
+}
+
 fn run(job: &Value) -> Result<Value, String> {
     let mut db = Db::new();
     let mut libs = Libs::default();
@@ -727,6 +861,15 @@ fn run(job: &Value) -> Result<Value, String> {
     // a later repair starts from it rather than from a fresh estimate.
     let mut carried: Option<Vec<HashMap<String, NetParasitics>>> = None;
     let mut buffered: Vec<buffer_ports::Outcome> = Vec::new();
+    // `set_propagated_clock` on the clock, and as the estimate saw it.
+    let mut propagated = false;
+    let mut estimate_propagated = false;
+    // The SDC file last read (its text: the I/O delays' flags).
+    let mut sdc_path: Option<String> = None;
+    let mut sdc_propagated = false;
+    // Each repair_timing's preamble lines; a refusal after them stops the job.
+    let mut timing_runs: Vec<Value> = Vec::new();
+    let mut timing_stop: Option<String> = None;
     for step in job["steps"].as_array().ok_or("steps")? {
         let cmd = step["cmd"].as_str().ok_or("cmd")?;
         let args: Vec<String> = step["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
@@ -823,7 +966,10 @@ fn run(job: &Value) -> Result<Value, String> {
                 estimate_db = step["db"].as_str().map(String::from);
                 estimate_sdc = step["sdc"].as_str().map(String::from);
                 estimate_rc = Some(rc.clone());
+                estimate_propagated = propagated;
             }
+            // One clock is modelled, so the clock it names is that one.
+            "set_propagated_clock" => propagated = true,
             "set_routing_alpha" => {
                 if args.iter().any(|a| a.starts_with('-')) {
                     return Err(format!("set_routing_alpha {}: per-net / min_fanout / min_hpwl alphas are not modelled", args.join(" ")));
@@ -840,14 +986,21 @@ fn run(job: &Value) -> Result<Value, String> {
                 let unmodelled: Vec<&str> = s
                     .ignored_affecting_timing()
                     .into_iter()
-                    .filter(|c| (*c != "set_max_transition" || s.max_transition_on_objects) && (*c != "set_max_fanout" || s.max_fanout_on_objects) && *c != "set_driving_cell")
+                    .filter(|c| (*c != "set_max_transition" || s.max_transition_on_objects) && (*c != "set_max_fanout" || s.max_fanout_on_objects) && *c != "set_driving_cell" && *c != "set_propagated_clock")
                     .collect();
                 if !unmodelled.is_empty() {
                     return Err(format!("{path}: {} not modelled", unmodelled.join(", ")));
                 }
+                // `set_propagated_clock` in the file: read by repair_timing's search; the other
+                // commands refuse it when they run.
+                sdc_propagated = s.ignored.iter().any(|c| c == "set_propagated_clock");
                 sdc = Some(s);
+                sdc_path = Some(path.clone());
             }
             "buffer_ports" => {
+                if sdc_propagated {
+                    return Err("set_propagated_clock: not modelled for buffer_ports".into());
+                }
                 let o = buffer_ports::Options::parse(&args)?;
                 let mut dont_use = set_dont_use.clone();
                 for lib in &libs.libs {
@@ -881,7 +1034,7 @@ fn run(job: &Value) -> Result<Value, String> {
                         let mut est_rc = estimate_rc.clone().expect("estimated");
                         est_rc.sort_clk_and_signal_layers();
                         let caps = port_caps_at(estimate_sdc.as_deref(), sdc.as_ref(), &libs, &netlist)?;
-                        estimate_state(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, estimate_alpha, libs.scene_count(), &caps)?
+                        estimate_state(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, estimate_propagated, estimate_alpha, libs.scene_count(), &caps)?
                     }
                     (None, false) => vec![HashMap::new(); libs.scene_count()],
                 };
@@ -909,6 +1062,9 @@ fn run(job: &Value) -> Result<Value, String> {
             "repair_design" => {
                 if outcome.is_some() {
                     return Err("a second repair_design: not modelled".into());
+                }
+                if sdc_propagated {
+                    return Err("set_propagated_clock: not modelled for repair_design".into());
                 }
                 let a = parse_args(&args)?;
                 // dont_use_: every liberty dont_use cell (copyDontUseFromLiberty), then set_dont_use.
@@ -941,7 +1097,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     Some(p) => p,
                     None => {
                         let caps = port_caps_at(estimate_sdc.as_deref(), sdc.as_ref(), &libs, &netlist)?;
-                        estimate_state(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, estimate_alpha, libs.scene_count(), &caps)?
+                        estimate_state(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, estimate_propagated, estimate_alpha, libs.scene_count(), &caps)?
                     }
                 };
                 let wire_rc: Vec<vyges_rsz::buffered_net::WireRc> = (0..libs.scene_count())
@@ -977,6 +1133,95 @@ fn run(job: &Value) -> Result<Value, String> {
                 let inputs = Inputs { libs: &libs, masters: &m, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins };
                 outcome = Some(repair_design::repair_design(&inputs, &mut design, &a, &mut trace));
             }
+            "repair_timing" => {
+                use vyges_rsz::repair_timing as rt;
+                let a = rt::Args::parse(&args)?;
+                if a.recover_power {
+                    return Err("repair_timing -recover_power: not modelled".into());
+                }
+                if a.phases.is_some() {
+                    return Err("repair_timing -phases: not modelled".into());
+                }
+                if !a.setup {
+                    return Err("repair_timing -hold: not modelled".into());
+                }
+                if !estimated {
+                    return Err("repair_timing without estimate_parasitics -placement: not modelled".into());
+                }
+                if libs.scene_count() != 1 {
+                    return Err("repair_timing over several corners: not modelled".into());
+                }
+                let m = masters(&db)?;
+                if let Some((n, _)) = m.iter().find(|(_, mm)| !mm.implant_obs.is_empty()) {
+                    return Err(format!("master {n} has IMPLANT obstructions: VT categories are not modelled"));
+                }
+                let lib0 = libs.default_library().ok_or("repair_timing before any liberty library")?;
+                let time_scale = lib0.time_scale;
+                let s = sdc.as_ref().ok_or("repair_timing without constraints: not modelled")?;
+                let text = read_text(sdc_path.as_deref().ok_or("repair_timing: no SDC file")?)?;
+                let netlist = vyges_grt::timer::netlist(&db);
+                if let Some(why) = vyges_rsz::timing::constant_cells(&libs.libs, &netlist) {
+                    return Err(format!("{why} (not modelled)"));
+                }
+                let clock_sources: Vec<String> = s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect();
+                let parasitics = match carried.take() {
+                    Some(p) => p,
+                    None => {
+                        let mut est_rc = estimate_rc.clone().expect("estimated");
+                        est_rc.sort_clk_and_signal_layers();
+                        let caps = port_caps_at(estimate_sdc.as_deref(), sdc.as_ref(), &libs, &netlist)?;
+                        estimate_state(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, estimate_propagated, estimate_alpha, libs.scene_count(), &caps)?
+                    }
+                };
+                let env = sdc_env(s, &libs, &netlist)?;
+                let mpins = master_pins(&db)?;
+                let mut g = repair_design::timer_graph(&libs, 0, &netlist, &env, &mpins).map_err(|e| e.message().to_string())?;
+                let clock_propagated = propagated || sdc_propagated;
+                let clocks = vyges_rsz::timing::clock_pins(&g, &clock_sources);
+                if text.contains("set_clock_transition") || text.contains("set_clock_latency") {
+                    return Err("set_clock_transition / set_clock_latency: not modelled".into());
+                }
+                // An ideal clock's network (`ClkNetwork::isIdealClock`): its registers read the
+                // ideal clock slew, 0.
+                if !clock_propagated {
+                    g.ideal_clock = clocks.iter().copied().collect();
+                }
+                g.find_delays(&parasitics[0], None)?;
+                let ssdc = search_sdc(s, &text, time_scale, clock_propagated)?;
+                let mut search = vyges_sta::search::Search::in_graph_order(&g, &ssdc);
+                search.find_arrivals()?;
+                search.find_requireds()?;
+                // A diagnostic: every vertex's max-path arrivals, requireds and slews (seconds),
+                // to set against the reference's `report_checks -fields {slew}` along a path.
+                if let Ok(path) = std::env::var("VYGES_RSZ_TIMING_DUMP") {
+                    let mut out = String::new();
+                    for (v, vx) in g.vertices.iter().enumerate() {
+                        for p in search.paths[v].iter().filter(|p| p.tag.mm == 1) {
+                            out.push_str(&format!("{} rf={} clk={} arr={:e} req={:e} slew={:e}\n", vx.name, p.tag.rf, p.tag.is_clock, p.arrival, p.required, g.slew[v][p.tag.rf][1]));
+                        }
+                    }
+                    std::fs::write(&path, out).map_err(|e| format!("{path}: {e}"))?;
+                }
+                let (ends, starts) = timing_points(&g, &search, &ssdc, &libs, &clocks)?;
+                let margin = vyges_sta::sdc::user_to_sta(a.setup_margin, time_scale);
+                let violating = rt::collect_violating(&ends, margin);
+                let violating_starts = rt::collect_violating(&starts, margin);
+                let seq = rt::move_sequence(&a, false);
+                let mut lines = rt::preamble(&seq, violating.len(), a.repair_tns_end_percent);
+                if !violating.is_empty() {
+                    lines.extend(rt::row0(&ends, violating.len(), &violating_starts, time_scale));
+                }
+                timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len() }));
+                // Past the preamble every repair is a move, and the moves are not modelled.
+                if !violating.is_empty() {
+                    timing_stop = Some("repair_timing: the setup repair moves are not modelled".into());
+                    break;
+                }
+                if a.hold {
+                    timing_stop = Some("repair_timing -hold: not modelled".into());
+                    break;
+                }
+            }
             other => return Err(format!("step {other}: not modelled")),
         }
     }
@@ -989,6 +1234,15 @@ fn run(job: &Value) -> Result<Value, String> {
     }
     let tags: Vec<&str> = trace.tags.iter().copied().collect();
     let mut report = match outcome {
+        // repair_timing alone: its preamble, then either the moves it would make (refused) or a
+        // CHECKED nothing-to-do with the endpoints it checked.
+        None if buffered.is_empty() && !timing_runs.is_empty() => match &timing_stop {
+            Some(reason) => json!({ "tool": "vyges-rsz", "status": "refused", "reason": reason }),
+            None => {
+                let checked: u64 = timing_runs.iter().filter_map(|r| r["endpoints"].as_u64()).sum();
+                json!({ "tool": "vyges-rsz", "status": if checked > 0 { "up_to_date" } else { "vacuous" }, "endpoints_checked": checked })
+            }
+        },
         None if buffered.is_empty() => json!({ "tool": "vyges-rsz", "status": "vacuous", "reason": "no repair_design or buffer_ports step" }),
         // buffer_ports alone: the ports it walked are what it checked.
         None => {
@@ -1018,6 +1272,9 @@ fn run(job: &Value) -> Result<Value, String> {
         Some(Err(Stop::Error { code, msg })) => json!({ "tool": "vyges-rsz", "status": "error", "code": code, "reason": msg }),
     };
     report["traced"] = json!(tags);
+    if !timing_runs.is_empty() {
+        report["repair_timing"] = json!(timing_runs);
+    }
     if !buffered.is_empty() {
         report["buffer_ports"] = buffered
             .iter()
@@ -1046,7 +1303,8 @@ JOB FIELDS:
                script passes them:
                  read_lef, read_def, read_db, define_corners, read_liberty [-corner C],
                  read_sdc, set_dont_use, set_layer_rc, set_wire_rc, set_routing_alpha,
-                 estimate_parasitics -placement, buffer_ports [options], repair_design [options]
+                 estimate_parasitics -placement, set_propagated_clock, buffer_ports [options],
+                 repair_design [options], repair_timing [options]
                an estimate_parasitics step may carry \"db\": the database as the estimate saw it,
                when cells were moved between it and the repair
                a buffer_ports step may carry \"write_def\": the design as it left it, as DEF
@@ -1071,6 +1329,14 @@ BUFFER_PORTS OPTIONS:
   -buffer_cell C        the buffer to use (default: the weakest buffer the repair would pick)
   -verbose              each port's decision in the report's lines
   refused: -max_utilization, a hierarchical design
+
+REPAIR_TIMING (-setup):
+  the preamble only — the move sequence (RSZ-0100), RSZ-0094 / RSZ-0099 or RSZ-0098, and the
+  progress table's first row (WNS, StTNS, EnTNS, violating endpoints, the worst endpoint), in the
+  report's repair_timing[].lines. One clock, ideal or propagated, with its I/O delays. With
+  violations the repair moves are not modelled: status refused, after the lines. Refused before
+  them: -hold, -phases, -recover_power, several corners, VT libraries, a latch, a virtual clock,
+  clock uncertainty / latency / transition, derates, path exceptions.
 
 CONSTRAINTS READ FROM SDC:
   create_clock, set_max_transition and set_max_fanout on the design, set_load on nets and ports,
@@ -1115,7 +1381,8 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "status is one of repaired, up_to_date, vacuous, refused or error. repaired means the design changed (buffers inserted or drivers resized); up_to_date means drivers were checked and none needed a change (nets_checked says how many; for a job with buffer_ports and no repair_design, ports_checked); vacuous means nothing was checked and is NOT a pass. The declared assertion passes on repaired or up_to_date. Exit status is 0 for repaired and up_to_date, 2 for vacuous and for error, 3 for refused.",
-    "Modelled: placement parasitics, one or more corners, flat and hierarchical netlists, the default buffer selection, the SDC constraints the usage lists, buffer_ports before the repair (the estimate it leaves carried into it). Refused rather than guessed: global-route parasitics, the early sizing round, footprint matching, rerouting, any other netlist edit between the estimate and the repair, buffer_ports on a hierarchical design, a tristate driver or a bidirect pin on a net, and any other timing-affecting SDC command."
+    "Modelled: placement parasitics, one or more corners, flat and hierarchical netlists, the default buffer selection, the SDC constraints the usage lists, buffer_ports before the repair (the estimate it leaves carried into it). Refused rather than guessed: global-route parasitics, the early sizing round, footprint matching, rerouting, any other netlist edit between the estimate and the repair, buffer_ports on a hierarchical design, a tristate driver or a bidirect pin on a net, and any other timing-affecting SDC command.",
+    "repair_timing -setup is modelled up to its first progress row (the move sequence, the violation summary, WNS / StTNS / EnTNS / violating endpoints / worst endpoint) for one ideal or propagated clock; with violations the moves are refused after those lines, and -hold, -phases, several corners, VT libraries, latches, virtual clocks, clock uncertainty, latency or transition, derates and exceptions are refused before them."
   ],
   "invocation": {
     "args_template": ["repair_design", "{job}"],

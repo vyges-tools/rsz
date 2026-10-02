@@ -7,6 +7,7 @@
 //! - [`preamble`]: what the repair reads about the libraries before any net — the buffers, their
 //!   target slews and each cell's target load, the slew shape factor.
 //! - [`repair_design`]: the driver loop, a thin sequencer of the stages in their order.
+//! - [`repair_timing`]: `repair_timing -setup` up to its first progress row.
 //! - [`timing`]: what the repair asks the timer — slew, capacitance and fanout checks per scene, the
 //!   forward pass, the driver order.
 //! - [`driver_slew`]: a driver's own slew violation — the size that fits, else the load cap that
@@ -28,6 +29,7 @@ pub mod max_wire_length;
 pub mod order;
 pub mod preamble;
 pub mod repair_design;
+pub mod repair_timing;
 pub mod sizing;
 pub mod timing;
 pub mod trace;
