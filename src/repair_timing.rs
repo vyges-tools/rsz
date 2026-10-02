@@ -11,8 +11,8 @@
 //! - [`preamble`] — the summary lines;
 //! - [`row0`] — the progress header and row 0.
 //!
-//! The repair moves themselves are not modelled: with violations to repair, the caller refuses
-//! after these lines.
+//! The repair itself — the pass loop and its moves — is [`crate::repair_setup`]'s; where its
+//! moves are not modelled, the caller refuses after these lines.
 
 use vyges_sta::fuzzy;
 
@@ -38,6 +38,17 @@ pub struct Args {
     pub skip_buffering: bool,
     pub skip_buffer_removal: bool,
     pub skip_vt_swap: bool,
+    /// `-max_passes` (10000), `-max_iterations` (−1: no limit), `-max_repairs_per_pass` (1).
+    pub max_passes: i64,
+    pub max_iterations: i64,
+    pub max_repairs_per_pass: i64,
+    /// `-max_utilization`, when given.
+    pub max_utilization: Option<String>,
+    pub verbose: bool,
+    pub skip_last_gasp: bool,
+    pub skip_crit_vt_swap: bool,
+    pub match_cell_footprint: bool,
+    pub allow_setup_violations: bool,
 }
 
 /// `MoveType`, by the name `moveName` prints.
@@ -121,6 +132,15 @@ impl Args {
             skip_buffering: false,
             skip_buffer_removal: false,
             skip_vt_swap: false,
+            max_passes: 10000,
+            max_iterations: -1,
+            max_repairs_per_pass: 1,
+            max_utilization: None,
+            verbose: false,
+            skip_last_gasp: false,
+            skip_crit_vt_swap: false,
+            match_cell_footprint: false,
+            allow_setup_violations: false,
         };
         let mut i = 0;
         while i < args.len() {
@@ -150,15 +170,32 @@ impl Args {
                     a.recover_power = true;
                     i += 1;
                 }
-                // Read by the repair moves only, which are not modelled: accepted with their value.
-                "-max_passes" | "-max_iterations" | "-max_repairs_per_pass" | "-max_utilization" | "-max_buffer_percent" | "-hold_margin" | "-libraries" => i += 1,
+                "-max_passes" | "-max_iterations" | "-max_repairs_per_pass" => {
+                    let v: i64 = value(i)?.parse().map_err(|_| format!("repair_timing {f}: not an integer"))?;
+                    match f {
+                        "-max_passes" => a.max_passes = v,
+                        "-max_iterations" => a.max_iterations = v,
+                        _ => a.max_repairs_per_pass = v,
+                    }
+                    i += 1;
+                }
+                "-max_utilization" => {
+                    a.max_utilization = Some(value(i)?);
+                    i += 1;
+                }
+                // Read by the hold repair and the library selection only: accepted with their value.
+                "-max_buffer_percent" | "-hold_margin" | "-libraries" => i += 1,
                 "-skip_pin_swap" => a.skip_pin_swap = true,
                 "-skip_gate_cloning" => a.skip_gate_cloning = true,
                 "-skip_size_down" => a.skip_size_down_fanout = true,
                 "-skip_buffering" => a.skip_buffering = true,
                 "-skip_buffer_removal" => a.skip_buffer_removal = true,
                 "-skip_vt_swap" => a.skip_vt_swap = true,
-                "-skip_last_gasp" | "-skip_crit_vt_swap" | "-allow_setup_violations" | "-match_cell_footprint" | "-verbose" => {}
+                "-skip_last_gasp" => a.skip_last_gasp = true,
+                "-skip_crit_vt_swap" => a.skip_crit_vt_swap = true,
+                "-allow_setup_violations" => a.allow_setup_violations = true,
+                "-match_cell_footprint" => a.match_cell_footprint = true,
+                "-verbose" => a.verbose = true,
                 other => return Err(format!("repair_timing {other}: not modelled")),
             }
             i += 1;
@@ -220,8 +257,9 @@ pub fn collect_violating(points: &[Point], margin: f32) -> Vec<Point> {
 }
 
 /// The summary `prepareForPhasePipeline` logs after the move sequence: RSZ-0098 when nothing
-/// violates, else RSZ-0094 and RSZ-0099 with `max(int(N × repair_tns), 1)` endpoints to repair.
-pub fn preamble(seq: &[Move], violating: usize, repair_tns_end_percent: f64) -> Vec<String> {
+/// violates, else RSZ-0094 and RSZ-0099 with `max(int(N × repair_tns), 1)` endpoints to repair,
+/// and RSZ-0221 for a custom phase list.
+pub fn preamble(seq: &[Move], violating: usize, repair_tns_end_percent: f64, phases: Option<&str>) -> Vec<String> {
     let mut lines = vec![format!(
         "[INFO RSZ-0100] Repair move sequence: {}",
         seq.iter().map(|m| format!("{} ", m.name())).collect::<String>()
@@ -236,6 +274,10 @@ pub fn preamble(seq: &[Move], violating: usize, repair_tns_end_percent: f64) -> 
         "[INFO RSZ-0099] Repairing {max_end_repairs} out of {violating} ({:.2}%) violating endpoints...",
         repair_tns_end_percent * 100.0
     ));
+    // `reportCustomPhaseSetup`: the phase list as the user gave it.
+    if let Some(p) = phases.filter(|p| !p.is_empty()) {
+        lines.push(format!("[INFO RSZ-0221] Using custom phase sequence: {p}"));
+    }
     lines
 }
 
@@ -279,31 +321,115 @@ pub fn startpoint_tns(violating_startpoints: &[Point]) -> f32 {
     tns
 }
 
-/// The progress header and row 0 (`printProgress(0, …, '*')`): nothing moved yet, area unchanged.
-pub fn row0(endpoints: &[Point], violating_endpoints: usize, violating_startpoints: &[Point], time_scale: f32) -> Vec<String> {
-    let (wns, worst) = worst_slack(endpoints);
-    let st_tns = startpoint_tns(violating_startpoints);
-    let en_tns = total_negative_slack(endpoints);
+/// The progress table's three header lines (`printProgress(0, …)`).
+pub fn progress_header() -> Vec<String> {
     vec![
         "   Iter   | Removed | Resized | Inserted | Cloned |  Pin  |   Area   |    WNS   |   StTNS    |   EnTNS    |  Viol  |  Worst  ".to_string(),
         "          | Buffers |  Gates  | Buffers  |  Gates | Swaps |          |          |            |            | Endpts | St/EnPt ".to_string(),
         "-".repeat(126),
-        format!(
-            "{: >9} | {: >7} | {: >7} | {: >8} | {: >6} | {: >5} | {: >+7.1}% | {: >8} | {: >10} | {: >10} | {: >6} | {}",
-            "0*",
-            0,
-            0,
-            0,
-            0,
-            0,
-            0.0f64,
-            delay_as_string(wns, 3, time_scale),
-            delay_as_string(st_tns, 1, time_scale),
-            delay_as_string(en_tns, 1, time_scale),
-            violating_endpoints,
-            worst.map(|p| p.pin.as_str()).unwrap_or("")
-        ),
     ]
+}
+
+/// One progress row's values: the move totals by column, the area growth (%), the slacks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Row<'a> {
+    pub iter: &'a str,
+    pub removed: i64,
+    pub resized: i64,
+    pub inserted: i64,
+    pub cloned: i64,
+    pub swaps: i64,
+    pub area_growth_percent: f64,
+    pub wns: f32,
+    pub st_tns: f32,
+    pub en_tns: f32,
+    pub viol: usize,
+    pub worst: &'a str,
+}
+
+/// A progress row as `printProgress` / `printFinalProgress` format it.
+pub fn progress_row(r: &Row<'_>, time_scale: f32) -> String {
+    format!(
+        "{: >9} | {: >7} | {: >7} | {: >8} | {: >6} | {: >5} | {: >+7.1}% | {: >8} | {: >10} | {: >10} | {: >6} | {}",
+        r.iter,
+        r.removed,
+        r.resized,
+        r.inserted,
+        r.cloned,
+        r.swaps,
+        r.area_growth_percent,
+        delay_as_string(r.wns, 3, time_scale),
+        delay_as_string(r.st_tns, 1, time_scale),
+        delay_as_string(r.en_tns, 1, time_scale),
+        r.viol,
+        r.worst
+    )
+}
+
+/// The progress header and row 0 (`printProgress(0, …, '*')`): nothing moved yet, area unchanged.
+pub fn row0(endpoints: &[Point], violating_endpoints: usize, violating_startpoints: &[Point], time_scale: f32) -> Vec<String> {
+    let (wns, worst) = worst_slack(endpoints);
+    let mut lines = progress_header();
+    lines.push(progress_row(
+        &Row {
+            iter: "0*",
+            removed: 0,
+            resized: 0,
+            inserted: 0,
+            cloned: 0,
+            swaps: 0,
+            area_growth_percent: 0.0,
+            wns,
+            st_tns: startpoint_tns(violating_startpoints),
+            en_tns: total_negative_slack(endpoints),
+            viol: violating_endpoints,
+            worst: worst.map(|p| p.pin.as_str()).unwrap_or(""),
+        },
+        time_scale,
+    ));
+    lines
+}
+
+/// The search's endpoints (`Sta::endpoints`, in vertex order) and startpoints (input ports and
+/// register outputs that are not clock pins, `walkStartpoints`), each with its slack.
+///
+/// An endpoint (`Search::isEndpoint`): a vertex with fanin that has timing checks, carries an
+/// output delay, or has no fanout. ⚠️ One WITH fanout times its slack through the path ends
+/// downstream (`wnsSlacks`), which is not modelled: refused.
+pub fn timing_points(g: &vyges_sta::graph::Graph<'_>, search: &vyges_sta::search::Search<'_, '_>, ssdc: &vyges_sta::sdc::Sdc, libs: &crate::preamble::Libs, clocks: &std::collections::BTreeSet<usize>) -> Result<(Vec<Point>, Vec<Point>), String> {
+    use vyges_sta::graph::EdgeKind;
+    use vyges_sta::liberty::Role;
+    let role = |e: usize| match g.edges[e].kind {
+        EdgeKind::Gate { set } => {
+            let vx = &g.vertices[g.edges[e].to];
+            Some(g.libs[vx.lib.expect("an instance pin")].cells[vx.cell.as_deref().expect("its cell")].arc_sets[set].role)
+        }
+        EdgeKind::Wire => None,
+    };
+    let is_check = |e: usize| matches!(role(e), Some(Role::Setup | Role::Hold | Role::Recovery | Role::Removal));
+    let mut ends = Vec::new();
+    let mut starts = Vec::new();
+    for (v, vx) in g.vertices.iter().enumerate() {
+        let fanin = g.in_edges[v].iter().any(|&e| !is_check(e));
+        let fanout = g.out_edges[v].iter().any(|&e| !is_check(e));
+        let checks = g.in_edges[v].iter().any(|&e| is_check(e));
+        let port = vx.lib.is_none();
+        let constrained = port && ssdc.output_delays.iter().any(|d| d.port == vx.name);
+        if fanin && (checks || constrained || !fanout) {
+            if fanout {
+                return Err(format!("endpoint {} has fanout: its slack through the path ends downstream is not modelled", vx.name));
+            }
+            ends.push(Point { pin: vx.name.clone(), slack: search.vertex_slack(v) });
+        }
+        if clocks.contains(&v) || !vx.is_driver {
+            continue;
+        }
+        let register = vx.cell.as_deref().and_then(|c| libs.link_cell(c)).is_some_and(|c| !c.sequentials.is_empty() || c.has_seq_bank);
+        if port || register {
+            starts.push(Point { pin: vx.name.clone(), slack: search.vertex_slack(v) });
+        }
+    }
+    Ok((ends, starts))
 }
 
 #[cfg(test)]
@@ -332,11 +458,14 @@ mod tests {
     /// Rule (prepareForPhasePipeline): RSZ-0099 repairs max(int(N × pct), 1) endpoints.
     #[test]
     fn the_summary_names_what_will_be_repaired() {
-        let l = preamble(&[Move::SizeUp], 4, 1.0);
+        let l = preamble(&[Move::SizeUp], 4, 1.0, None);
         assert_eq!(l[0], "[INFO RSZ-0100] Repair move sequence: SizeUpMove ");
         assert_eq!(l[2], "[INFO RSZ-0099] Repairing 4 out of 4 (100.00%) violating endpoints...");
-        assert_eq!(preamble(&[], 3, 0.1)[2], "[INFO RSZ-0099] Repairing 1 out of 3 (10.00%) violating endpoints...");
-        assert_eq!(preamble(&[], 0, 1.0)[1], "[INFO RSZ-0098] No setup violations found");
+        assert_eq!(preamble(&[], 3, 0.1, None)[2], "[INFO RSZ-0099] Repairing 1 out of 3 (10.00%) violating endpoints...");
+        assert_eq!(preamble(&[], 0, 1.0, Some("LEGACY"))[1], "[INFO RSZ-0098] No setup violations found");
+        // RSZ-0221 only after a violation summary (`prepareForPhasePipeline` returns before it).
+        assert_eq!(preamble(&[], 2, 1.0, Some("LEGACY"))[3], "[INFO RSZ-0221] Using custom phase sequence: LEGACY");
+        assert_eq!(preamble(&[], 0, 1.0, Some("LEGACY")).len(), 2);
     }
 
     /// Rules (worstSlack, collectViolating*): the FIRST strictly worse endpoint wins a tie; the

@@ -302,6 +302,8 @@ struct CliDesign<'a> {
     core: Option<(i32, i32, i32, i32)>,
     /// The port loads in force while this command runs: what an estimate made now is reduced against.
     port_caps: PortCaps,
+    /// `set_propagated_clock` in force: a re-estimated clock net is a propagated one.
+    propagated: bool,
 }
 
 impl CliDesign<'_> {
@@ -356,7 +358,7 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
             self.invalid.remove(net);
             return Ok(());
         };
-        let timing = vyges_est::placement::Timing { liberty: Some(self.liberty), clock_sources: self.clock_sources.to_vec(), propagated: false };
+        let timing = vyges_est::placement::Timing { liberty: Some(self.liberty), clock_sources: self.clock_sources.to_vec(), propagated: self.propagated };
         let e = vyges_est::placement::estimate_net(self.db, &timing, net, &drvr, self.alpha, &est_stt)?;
         for k in 0..self.parasitics.len() {
             match net_parasitic(self.db, self.rc, &e, k)? {
@@ -473,6 +475,32 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
                 pins
             }
         }
+    }
+}
+
+impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
+    /// `Resizer::computeDesignArea`: over the block's instances in order, each master's
+    /// `width × height` in m² (`dbuToMeters` each side) — 0 for a master that is not core
+    /// autoplaceable (`isCoreAutoPlaceable`) — fillers (`CORE SPACER`) left out.
+    fn design_area(&self) -> f64 {
+        let dbu = f64::from(self.db.tech_get_db_units_per_micron());
+        let mut area = 0.0f64;
+        for inst in self.db.inst_names() {
+            let master = self.db.inst_master(&inst);
+            let t = self.db.master_get_type(&master).unwrap_or_default().replace(' ', "_");
+            if t == "CORE_SPACER" {
+                continue;
+            }
+            let placeable = (t.starts_with("CORE") || t.starts_with("BLOCK") || t.starts_with("ENDCAP")) && !matches!(t.as_str(), "ENDCAP_TOPLEFT" | "ENDCAP_TOPRIGHT" | "ENDCAP_BOTTOMLEFT" | "ENDCAP_BOTTOMRIGHT");
+            if placeable {
+                area += f64::from(self.db.master_get_width(&master)) / (dbu * 1e6) * (f64::from(self.db.master_get_height(&master)) / (dbu * 1e6));
+            }
+        }
+        area
+    }
+
+    fn as_design(&self) -> &dyn vyges_rsz::design::Design {
+        self
     }
 }
 
@@ -787,49 +815,6 @@ fn search_sdc(s: &vyges_loom::sdc::Sdc, text: &str, time_scale: f32, propagated:
     })
 }
 
-/// The search's endpoints (`Sta::endpoints`, in vertex order) and startpoints (input ports and
-/// register outputs that are not clock pins, `walkStartpoints`), each with its slack.
-///
-/// An endpoint (`Search::isEndpoint`): a vertex with fanin that has timing checks, carries an
-/// output delay, or has no fanout. ⚠️ One WITH fanout times its slack through the path ends
-/// downstream (`wnsSlacks`), which is not modelled: refused.
-fn timing_points(g: &vyges_sta::graph::Graph<'_>, search: &vyges_sta::search::Search<'_, '_>, ssdc: &vyges_sta::sdc::Sdc, libs: &Libs, clocks: &BTreeSet<usize>) -> Result<(Vec<vyges_rsz::repair_timing::Point>, Vec<vyges_rsz::repair_timing::Point>), String> {
-    use vyges_rsz::repair_timing::Point;
-    use vyges_sta::graph::EdgeKind;
-    use vyges_sta::liberty::Role;
-    let role = |e: usize| match g.edges[e].kind {
-        EdgeKind::Gate { set } => {
-            let vx = &g.vertices[g.edges[e].to];
-            Some(g.libs[vx.lib.expect("an instance pin")].cells[vx.cell.as_deref().expect("its cell")].arc_sets[set].role)
-        }
-        EdgeKind::Wire => None,
-    };
-    let is_check = |e: usize| matches!(role(e), Some(Role::Setup | Role::Hold | Role::Recovery | Role::Removal));
-    let mut ends = Vec::new();
-    let mut starts = Vec::new();
-    for (v, vx) in g.vertices.iter().enumerate() {
-        let fanin = g.in_edges[v].iter().any(|&e| !is_check(e));
-        let fanout = g.out_edges[v].iter().any(|&e| !is_check(e));
-        let checks = g.in_edges[v].iter().any(|&e| is_check(e));
-        let port = vx.lib.is_none();
-        let constrained = port && ssdc.output_delays.iter().any(|d| d.port == vx.name);
-        if fanin && (checks || constrained || !fanout) {
-            if fanout {
-                return Err(format!("endpoint {} has fanout: its slack through the path ends downstream is not modelled", vx.name));
-            }
-            ends.push(Point { pin: vx.name.clone(), slack: search.vertex_slack(v) });
-        }
-        if clocks.contains(&v) || !vx.is_driver {
-            continue;
-        }
-        let register = vx.cell.as_deref().and_then(|c| libs.link_cell(c)).is_some_and(|c| !c.sequentials.is_empty() || c.has_seq_bank);
-        if port || register {
-            starts.push(Point { pin: vx.name.clone(), slack: search.vertex_slack(v) });
-        }
-    }
-    Ok((ends, starts))
-}
-
 fn run(job: &Value) -> Result<Value, String> {
     let mut db = Db::new();
     let mut libs = Libs::default();
@@ -867,8 +852,10 @@ fn run(job: &Value) -> Result<Value, String> {
     // The SDC file last read (its text: the I/O delays' flags).
     let mut sdc_path: Option<String> = None;
     let mut sdc_propagated = false;
-    // Each repair_timing's preamble lines; a refusal after them stops the job.
+    // Each repair_timing's lines; a refusal after them stops the job.
     let mut timing_runs: Vec<Value> = Vec::new();
+    // `set_debug_level`: each (tool, group) and its level.
+    let mut debug_levels: BTreeMap<(String, String), i64> = BTreeMap::new();
     let mut timing_stop: Option<String> = None;
     for step in job["steps"].as_array().ok_or("steps")? {
         let cmd = step["cmd"].as_str().ok_or("cmd")?;
@@ -932,6 +919,11 @@ fn run(job: &Value) -> Result<Value, String> {
                 }
                 for a in &args {
                     for pat in a.split_whitespace() {
+                        // A SWIG object handle (`_<hex>_p_LibertyCell`) is a cell object logged
+                        // without its name: as a pattern it would silently match nothing.
+                        if pat.starts_with('_') && pat.contains("_p_") {
+                            return Err(format!("set_dont_use {pat}: an object handle, not a cell name (not modelled)"));
+                        }
                         if pat.contains(['/', '[', ']', '\\']) {
                             return Err(format!("set_dont_use {pat}: library-qualified or bracketed patterns are not modelled"));
                         }
@@ -970,6 +962,13 @@ fn run(job: &Value) -> Result<Value, String> {
             }
             // One clock is modelled, so the clock it names is that one.
             "set_propagated_clock" => propagated = true,
+            // `set_debug_level <tool> <group> <level>`: debug lines are not output this engine
+            // scores, except a group that adds report lines (the move tracker's, RSZ-0211 on).
+            "set_debug_level" => {
+                let [tool, group, level] = args.as_slice() else { return Err(format!("set_debug_level {}: needs a tool, a group and a level", args.join(" "))) };
+                let level: i64 = level.parse().map_err(|_| format!("set_debug_level {level}: not an integer"))?;
+                debug_levels.insert((tool.clone(), group.clone()), level);
+            }
             "set_routing_alpha" => {
                 if args.iter().any(|a| a.starts_with('-')) {
                     return Err(format!("set_routing_alpha {}: per-net / min_fanout / min_hpwl alphas are not modelled", args.join(" ")));
@@ -1043,7 +1042,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 let core = (db.block_get_core_area_x_min(), db.block_get_core_area_y_min(), db.block_get_core_area_x_max(), db.block_get_core_area_y_max());
                 let core = (core != (0, 0, 0, 0)).then_some(core);
                 let port_caps = port_caps_at(step["sdc"].as_str(), sdc.as_ref(), &libs, &netlist)?;
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false };
                 let r = buffer_ports::buffer_ports(&mut design, &o, &weakest);
                 let parasitics = std::mem::take(&mut design.parasitics);
                 match r {
@@ -1129,7 +1128,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     std::fs::write(path, lines.join("\n") + "\n").map_err(|e| format!("{path}: {e}"))?;
                 }
                 let port_caps = env.port_pin_cap.clone();
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false };
                 let inputs = Inputs { libs: &libs, masters: &m, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins };
                 outcome = Some(repair_design::repair_design(&inputs, &mut design, &a, &mut trace));
             }
@@ -1139,7 +1138,9 @@ fn run(job: &Value) -> Result<Value, String> {
                 if a.recover_power {
                     return Err("repair_timing -recover_power: not modelled".into());
                 }
-                if a.phases.is_some() {
+                // A phase list of LEGACY alone is the default pipeline without LAST_GASP.
+                let legacy_only = a.phases.as_deref().is_some_and(|p| p.split_whitespace().eq(["LEGACY"]));
+                if a.phases.is_some() && !legacy_only {
                     return Err("repair_timing -phases: not modelled".into());
                 }
                 if !a.setup {
@@ -1202,20 +1203,77 @@ fn run(job: &Value) -> Result<Value, String> {
                     }
                     std::fs::write(&path, out).map_err(|e| format!("{path}: {e}"))?;
                 }
-                let (ends, starts) = timing_points(&g, &search, &ssdc, &libs, &clocks)?;
+                let (ends, starts) = rt::timing_points(&g, &search, &ssdc, &libs, &clocks)?;
                 let margin = vyges_sta::sdc::user_to_sta(a.setup_margin, time_scale);
                 let violating = rt::collect_violating(&ends, margin);
                 let violating_starts = rt::collect_violating(&starts, margin);
                 let seq = rt::move_sequence(&a, false);
-                let mut lines = rt::preamble(&seq, violating.len(), a.repair_tns_end_percent);
-                if !violating.is_empty() {
+                let mut lines = rt::preamble(&seq, violating.len(), a.repair_tns_end_percent, a.phases.as_deref());
+                // The moves modelled: SizeUp alone, in the LEGACY phase alone.
+                let unmodelled = if seq != [rt::Move::SizeUp] {
+                    Some(format!("repair_timing: the {} moves are not modelled (SizeUpMove alone is)", seq.iter().map(|m| m.name()).collect::<Vec<_>>().join(" ")))
+                } else if !a.skip_last_gasp && !legacy_only {
+                    Some("repair_timing: the LAST_GASP phase is not modelled (-skip_last_gasp)".into())
+                } else if a.match_cell_footprint {
+                    Some("repair_timing -match_cell_footprint: not modelled".into())
+                } else if debug_levels.get(&("RSZ".to_string(), "move_tracker".to_string())).is_some_and(|&l| l > 0) {
+                    Some("repair_timing: the move tracker's reports (set_debug_level RSZ move_tracker) are not modelled".into())
+                } else {
+                    None
+                };
+                if violating.is_empty() {
+                    timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": 0 }));
+                } else if let Some(why) = unmodelled {
                     lines.extend(rt::row0(&ends, violating.len(), &violating_starts, time_scale));
-                }
-                timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len() }));
-                // Past the preamble every repair is a move, and the moves are not modelled.
-                if !violating.is_empty() {
-                    timing_stop = Some("repair_timing: the setup repair moves are not modelled".into());
+                    timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len() }));
+                    timing_stop = Some(why);
                     break;
+                } else {
+                    // Resizer::resizePreamble: the equivalent cells, the buffers, the target slews.
+                    let mut dont_use = set_dont_use.clone();
+                    for lib in &libs.libs {
+                        dont_use.extend(lib.cells.values().filter(|c| c.dont_use).map(|c| c.name.clone()));
+                    }
+                    let equiv = vyges_rsz::sizing::make_equiv_cells(&libs);
+                    let buffers = vyges_rsz::preamble::find_buffers(&libs, &m, &dont_use).map_err(|e| format!("{}: {}", e.code(), e.message()))?;
+                    let (tgt_slews, tgt_scene, target_loads) = vyges_rsz::preamble::find_target_loads(&libs, &buffers.cells, &dont_use);
+                    let sizing = vyges_rsz::sizing::Sizing { libs: &libs, masters: &m, dont_use: &dont_use, equiv: &equiv, target_loads: &target_loads, tgt_slews, tgt_scene };
+                    let ctx = vyges_rsz::repair_setup::Ctx {
+                        libs: &libs,
+                        sizing: &sizing,
+                        env: &env,
+                        master_pins: &mpins,
+                        ssdc: &ssdc,
+                        clock_sources: &clock_sources,
+                        ideal_clock: !clock_propagated,
+                        margin,
+                        time_scale,
+                    };
+                    drop(search);
+                    drop(g);
+                    let info = net_info(&db, &netlist)?;
+                    let estimating = !no_signal_cap(&db, &rc);
+                    rc.sort_clk_and_signal_layers();
+                    let core = (db.block_get_core_area_x_min(), db.block_get_core_area_y_min(), db.block_get_core_area_x_max(), db.block_get_core_area_y_max());
+                    let core = (core != (0, 0, 0, 0)).then_some(core);
+                    let port_caps = env.port_pin_cap.clone();
+                    let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated };
+                    let r = vyges_rsz::repair_setup::repair_setup(&ctx, &mut design, &a);
+                    carried = Some(std::mem::take(&mut design.parasitics));
+                    let o = match r {
+                        Ok(o) => o,
+                        Err(Stop::Refused { msg, .. }) => {
+                            timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len() }));
+                            timing_stop = Some(format!("{msg} (not modelled)"));
+                            break;
+                        }
+                        Err(Stop::Error { code, msg }) => return Err(format!("{code}: {msg}")),
+                    };
+                    if let Some(path) = job["timing_trace"].as_str() {
+                        std::fs::write(path, o.trace.join("\n") + "\n").map_err(|e| format!("{path}: {e}"))?;
+                    }
+                    lines.extend(o.lines);
+                    timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len(), "resized": o.resized }));
                 }
                 if a.hold {
                     timing_stop = Some("repair_timing -hold: not modelled".into());
@@ -1234,13 +1292,17 @@ fn run(job: &Value) -> Result<Value, String> {
     }
     let tags: Vec<&str> = trace.tags.iter().copied().collect();
     let mut report = match outcome {
-        // repair_timing alone: its preamble, then either the moves it would make (refused) or a
-        // CHECKED nothing-to-do with the endpoints it checked.
+        // repair_timing alone: its preamble, then the repair it made, the moves it would make
+        // (refused), or a CHECKED nothing-to-do with the endpoints it checked.
         None if buffered.is_empty() && !timing_runs.is_empty() => match &timing_stop {
             Some(reason) => json!({ "tool": "vyges-rsz", "status": "refused", "reason": reason }),
             None => {
                 let checked: u64 = timing_runs.iter().filter_map(|r| r["endpoints"].as_u64()).sum();
-                json!({ "tool": "vyges-rsz", "status": if checked > 0 { "up_to_date" } else { "vacuous" }, "endpoints_checked": checked })
+                let resized: u64 = timing_runs.iter().filter_map(|r| r["resized"].as_u64()).sum();
+                let violating: u64 = timing_runs.iter().filter_map(|r| r["violating_endpoints"].as_u64()).sum();
+                // A repair that ran: what it changed. Nothing to repair: a CHECKED nothing-to-do.
+                let status = if resized > 0 { "repaired" } else if violating > 0 { "unrepaired" } else if checked > 0 { "up_to_date" } else { "vacuous" };
+                json!({ "tool": "vyges-rsz", "status": status, "endpoints_checked": checked, "resized": resized })
             }
         },
         None if buffered.is_empty() => json!({ "tool": "vyges-rsz", "status": "vacuous", "reason": "no repair_design or buffer_ports step" }),
@@ -1331,12 +1393,16 @@ BUFFER_PORTS OPTIONS:
   refused: -max_utilization, a hierarchical design
 
 REPAIR_TIMING (-setup):
-  the preamble only — the move sequence (RSZ-0100), RSZ-0094 / RSZ-0099 or RSZ-0098, and the
-  progress table's first row (WNS, StTNS, EnTNS, violating endpoints, the worst endpoint), in the
-  report's repair_timing[].lines. One clock, ideal or propagated, with its I/O delays. With
-  violations the repair moves are not modelled: status refused, after the lines. Refused before
-  them: -hold, -phases, -recover_power, several corners, VT libraries, a latch, a virtual clock,
-  clock uncertainty / latency / transition, derates, path exceptions.
+  -sequence sizeup with -skip_last_gasp or -phases LEGACY: the whole repair — the move sequence
+  (RSZ-0100), RSZ-0094 / RSZ-0099 (and RSZ-0221) or RSZ-0098, every progress row, the summary
+  (RSZ-0051, RSZ-0062) in the report's repair_timing[].lines, the resized cells in the design
+  (write_def); status repaired (moves kept), unrepaired (violations, no move kept) or
+  up_to_date. A job's timing_trace file gets the pass-by-pass decisions. Any other move
+  sequence, or the LAST_GASP phase: the preamble and the first progress row, then status
+  refused. One clock, ideal or propagated, with its I/O delays. Refused before the lines: -hold,
+  -phases other than LEGACY, -recover_power, several corners, VT libraries, a latch, a virtual
+  clock, clock uncertainty / latency / transition, derates, path exceptions; refused during the
+  repair: -max_utilization, more than one repair per pass.
 
 CONSTRAINTS READ FROM SDC:
   create_clock, set_max_transition and set_max_fanout on the design, set_load on nets and ports,
@@ -1382,7 +1448,7 @@ const DESCRIBE: &str = r#"{
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "status is one of repaired, up_to_date, vacuous, refused or error. repaired means the design changed (buffers inserted or drivers resized); up_to_date means drivers were checked and none needed a change (nets_checked says how many; for a job with buffer_ports and no repair_design, ports_checked); vacuous means nothing was checked and is NOT a pass. The declared assertion passes on repaired or up_to_date. Exit status is 0 for repaired and up_to_date, 2 for vacuous and for error, 3 for refused.",
     "Modelled: placement parasitics, one or more corners, flat and hierarchical netlists, the default buffer selection, the SDC constraints the usage lists, buffer_ports before the repair (the estimate it leaves carried into it). Refused rather than guessed: global-route parasitics, the early sizing round, footprint matching, rerouting, any other netlist edit between the estimate and the repair, buffer_ports on a hierarchical design, a tristate driver or a bidirect pin on a net, and any other timing-affecting SDC command.",
-    "repair_timing -setup is modelled up to its first progress row (the move sequence, the violation summary, WNS / StTNS / EnTNS / violating endpoints / worst endpoint) for one ideal or propagated clock; with violations the moves are refused after those lines, and -hold, -phases, several corners, VT libraries, latches, virtual clocks, clock uncertainty, latency or transition, derates and exceptions are refused before them."
+    "repair_timing -setup is modelled in full for SizeUp moves in the LEGACY phase (-sequence sizeup with -skip_last_gasp or -phases LEGACY): every progress row, the summary and the resized design, for one ideal or propagated clock; any other move sequence is modelled up to its first progress row and refused after it; -hold, -phases, several corners, VT libraries, latches, virtual clocks, clock uncertainty, latency or transition, derates and exceptions are refused before the lines."
   ],
   "invocation": {
     "args_template": ["repair_design", "{job}"],
