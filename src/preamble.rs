@@ -132,9 +132,12 @@ fn is_clock_buffer(cell: &Cell) -> bool {
 ///   resistance × input capacitance, and with one dominant site its first two taken;
 /// - the weakest buffer is the last one taken.
 ///
+/// - with buffers on more than one site: the two sites with the largest shares, and from each
+///   bucket the first buffer (by R·Cin) on each of them, in site order — one per site, not two.
+///
 /// Refused rather than modelled (no corpus witness): a buffer master with IMPLANT obstructions
-/// (the VT categories are numbered in the order masters are first asked about), and buffers on
-/// more than one site (the two-site pick).
+/// (the VT categories are numbered in the order masters are first asked about), and two sites
+/// with equal shares (ordered by the reference's site pointers).
 pub fn find_buffers(libs: &Libs, masters: &BTreeMap<String, Master>, dont_use: &std::collections::BTreeSet<String>) -> Result<Buffers, Stop> {
     // getBufferList
     let mut list: Vec<&Cell> = Vec::new();
@@ -174,9 +177,14 @@ pub fn find_buffers(libs: &Libs, masters: &BTreeMap<String, Master>, dont_use: &
             }
         }
     }
-    if by_site.len() > 1 {
-        return Err(Stop::refused("RSZ-SITES", format!("buffers on {} sites: the two-site buffer pick is not modelled", by_site.len())));
+    // The two dominant sites: by their share of the buffer list, largest first. The counts are
+    // kept in a map keyed by the site's pointer, so a tie would be ordered by pointer: refused.
+    let mut sites: Vec<(&str, usize)> = by_site.iter().map(|(s, c)| (*s, *c)).collect();
+    sites.sort_by_key(|s| std::cmp::Reverse(s.1));
+    if sites.len() > 1 && sites.windows(2).take(2).any(|w| w[0].1 == w[1].1) {
+        return Err(Stop::refused("RSZ-SITES", format!("buffer sites with equal shares ({}): their order is the reference's pointer order, not modelled", sites.iter().map(|(s, c)| format!("{s}:{c}")).collect::<Vec<_>>().join(" "))));
     }
+    let best_sites: Vec<&str> = sites.iter().take(2).map(|(s, _)| *s).collect();
     let kept: Vec<&Cell> = list.into_iter().filter(|c| best_footprint.is_none_or(|fp| c.footprint == fp)).collect();
 
     // Five buckets, two buffers each by R·Cin.
@@ -196,7 +204,16 @@ pub fn find_buffers(libs: &Libs, masters: &BTreeMap<String, Master>, dont_use: &
             .collect();
         std_sort_by(&mut members, |a, b| a.1.partial_cmp(&b.1).expect("R·C is a number"))
             .map_err(|t| Stop::refused("RSZ-ORDER", format!("a bucket of {} buffers with equal R·C", t.len)))?;
-        cells.extend(members.iter().take(2).map(|(c, _)| c.name.clone()));
+        if best_sites.len() == 1 {
+            cells.extend(members.iter().take(2).map(|(c, _)| c.name.clone()));
+        } else {
+            // One per dominant site, in site order: the bucket's first buffer on that site.
+            for site in &best_sites {
+                if let Some((c, _)) = members.iter().find(|(c, _)| masters.get(&c.name).is_some_and(|m| m.site == *site)) {
+                    cells.push(c.name.clone());
+                }
+            }
+        }
     }
     let lowest = cells.last().cloned().ok_or_else(|| Stop::error("RSZ-0022", "no buffers found.".into()))?;
     Ok(Buffers { cells, lowest })
@@ -459,9 +476,33 @@ mod tests {
         assert_eq!(find_buffers(&libs, &m, &Default::default()).unwrap().cells, ["F1", "F2"]);
     }
 
-    // Rules: IMPLANT obstructions (VT categories) and two sites are refused, never guessed.
+    // Rule (findBuffers sites): two sites, the larger share first; each bucket gives, per site in
+    // that order, its first buffer (by R·Cin) on the site — one per site, not its best two.
+    // Sorted by R: A1 A2 | T1 A3 | A4 | T2 | A5 (sizes 2,2,1,1,1).
     #[test]
-    fn vt_categories_and_two_sites_are_refused() {
+    fn two_sites_take_one_buffer_per_site_from_each_bucket() {
+        let libs = library(&[
+            buf("A1", 1.0, 1.0, ""),
+            buf("A2", 2.0, 1.0, ""),
+            buf("T1", 2.5, 1.0, ""),
+            buf("A3", 3.0, 1.0, ""),
+            buf("A4", 4.0, 1.0, ""),
+            buf("T2", 4.5, 1.0, ""),
+            buf("A5", 5.0, 1.0, ""),
+        ]);
+        let mut m = masters(&["A1", "A2", "T1", "A3", "A4", "T2", "A5"]);
+        for t in ["T1", "T2"] {
+            m.get_mut(t).unwrap().site = "tall".into();
+        }
+        let b = find_buffers(&libs, &m, &Default::default()).unwrap();
+        assert_eq!(b.cells, ["A1", "A3", "T1", "A4", "T2", "A5"]);
+        assert_eq!(b.lowest, "A5");
+    }
+
+    // Rules: IMPLANT obstructions (VT categories), and two sites with EQUAL shares (their order is
+    // the reference's site pointers), are refused, never guessed.
+    #[test]
+    fn vt_categories_and_tied_sites_are_refused() {
         let libs = library(&[buf("B1", 1.0, 1.0, ""), buf("B2", 2.0, 1.0, "")]);
         let mut m = masters(&["B1", "B2"]);
         m.get_mut("B2").unwrap().site = "tall".into();
