@@ -24,6 +24,7 @@ pub mod buffered_net;
 pub mod design;
 pub mod driver_slew;
 pub mod fanout;
+pub mod max_wire_length;
 pub mod order;
 pub mod preamble;
 pub mod repair_design;

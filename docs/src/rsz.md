@@ -166,6 +166,9 @@ repaired design (every component, pin and net), and the repair's closing summary
   and hierarchical netlists, with up to 84 repeaters in a run.
 - Two of them run `buffer_ports` between the parasitic estimate and the repair. Its stage is
   scored on its own as well: the design it leaves, and its closing lines.
+- The pre-repair warning (RSZ-0065) matches on all 35: five warn, thirty do not.
+- `buffer_ports` alone, on the reference's own 13 port-buffering cases (flat, hierarchical, liberty
+  buses, macro pins): **13 of 13** leave the same design and write the same lines.
 
 ⚠️ **A number here means nothing without the build.** The reference's own answer moves between
 releases; the pin is part of the claim.
@@ -187,8 +190,10 @@ A refusal is named in `reason`. Nothing is approximated:
 - any timing-affecting SDC command beyond those the [CLI reference](./reference/vyges-rsz.md)
   lists, `set_load -wire_load`, and library-qualified `set_dont_use` patterns
 
-Not reported: the advisory warning that `-max_wire_length` is shorter than the length at which a
-buffer starts to pay for itself. It does not change the repair.
+Before it repairs, the command computes the wire length past which splitting a wire with a buffer
+is faster, for every buffer it may use. When `-max_wire_length` asks for less, it warns
+(RSZ-0065, in `warnings`); the lengths are in `max_wire_lengths`. The warning does not change the
+repair. It is scored like the rest: the same warning, on the same cases, as the reference's log.
 
 ## Where it sits
 

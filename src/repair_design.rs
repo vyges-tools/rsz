@@ -72,6 +72,10 @@ pub struct Outcome {
     pub resized: usize,
     /// Drivers `repairDriver` passed over: no net, dont_touch, connected by abutment, a clock.
     pub drivers_skipped: usize,
+    /// Warnings the command writes before it repairs (`check_max_wire_length`: RSZ-0065).
+    pub warnings: Vec<(&'static str, String)>,
+    /// `check_max_wire_length`'s per-buffer lengths: (scene, buffer, meters), in computed order.
+    pub max_wire_lengths: Vec<(usize, String, f64)>,
 }
 
 impl Outcome {
@@ -125,6 +129,12 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
     let equiv = sizing::make_equiv_cells(inputs.libs);
     let buffers = preamble::find_buffers(inputs.libs, inputs.masters, inputs.dont_use)?;
     let (tgt_slews, tgt_scene, target_loads) = preamble::find_target_loads(inputs.libs, &buffers.cells, inputs.dont_use);
+    // check_max_wire_length (the command's Tcl, before repair_design_cmd): the same buffer list and
+    // target slews (findMaxWireLength runs findBuffers and findTargetLoads too).
+    let mwl = crate::max_wire_length::Ctx { libs: inputs.libs, buffers: &buffers.cells, tgt_slews, wire_rc: &inputs.wire_rc, master_pins: &inputs.master_pins };
+    let check = crate::max_wire_length::check_max_wire_length(&mwl, args.max_wire_length)?;
+    let warnings: Vec<(&'static str, String)> = check.warning.into_iter().collect();
+    let max_wire_lengths = check.lengths;
     let slew_shape_factor = preamble::compute_slew_shape_factor(lib)?;
 
     // RepairDesign::repairDesign
@@ -196,7 +206,7 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
         pre: PreCheck::default(),
     };
     trace.ran(&["drv"]);
-    let mut outcome = Outcome::default();
+    let mut outcome = Outcome { warnings, max_wire_lengths, ..Default::default() };
     for i in (0..drivers.len()).rev() {
         trace.push(format!("drv|{i}|{}", drivers[i]));
         repair_driver(design, &drivers[i], &mut ctx, &mut outcome, trace)?;

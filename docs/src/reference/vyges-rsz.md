@@ -60,7 +60,9 @@ OPTIONS:
 REPORT:
   buffer_ports (per step: inserted_inputs, inserted_outputs, ports_checked, lines — each with its
   code and severity), status, nets_checked, nets_repaired, inserted_buffers, resized, drivers_skipped, violations
-  {slew, capacitance, fanout, length}, and summary — the repair's closing lines, each with its code
+  {slew, capacitance, fanout, length}, summary — the repair's closing lines, each with its code —
+  warnings (RSZ-0065: -max_wire_length shorter than the length at which a buffer pays for itself),
+  and max_wire_lengths (that length per buffer and scene, meters, as the check computed it)
 
 EXIT STATUS:
   0  repaired     the design changed: buffers inserted or drivers resized

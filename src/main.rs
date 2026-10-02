@@ -1010,6 +1010,8 @@ fn run(job: &Value) -> Result<Value, String> {
                 "drivers_skipped": o.drivers_skipped,
                 "violations": { "slew": o.slew_violations, "capacitance": o.cap_violations, "fanout": o.fanout_violations, "length": o.length_violations },
                 "summary": summary,
+                "warnings": o.warnings.iter().map(|(code, text)| json!({ "code": code, "message": text })).collect::<Vec<_>>(),
+                "max_wire_lengths": o.max_wire_lengths.iter().map(|(k, b, m)| json!({ "scene": k, "buffer": b, "meters": m })).collect::<Vec<_>>(),
             })
         }
         Some(Err(Stop::Refused { code, msg })) => json!({ "tool": "vyges-rsz", "status": "refused", "code": code, "reason": msg }),
@@ -1086,7 +1088,9 @@ OPTIONS:
 REPORT:
   buffer_ports (per step: inserted_inputs, inserted_outputs, ports_checked, lines — each with its
   code and severity), status, nets_checked, nets_repaired, inserted_buffers, resized, drivers_skipped, violations
-  {slew, capacitance, fanout, length}, and summary — the repair's closing lines, each with its code
+  {slew, capacitance, fanout, length}, summary — the repair's closing lines, each with its code —
+  warnings (RSZ-0065: -max_wire_length shorter than the length at which a buffer pays for itself),
+  and max_wire_lengths (that length per buffer and scene, meters, as the check computed it)
 
 EXIT STATUS:
   0  repaired     the design changed: buffers inserted or drivers resized
