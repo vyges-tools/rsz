@@ -108,7 +108,7 @@ pub fn buffer_drive_resistance(cell: &Cell) -> f32 {
 
 /// `LibertyPort::capacitance()`: the largest of the port's rise/fall min/max capacitances.
 fn port_capacitance_max(c: &[[f32; 2]; 2]) -> f32 {
-    c.iter().flatten().copied().fold(f32::MIN, f32::max)
+    c.iter().flatten().copied().fold(-1e30, crate::rebuffer::std_max)
 }
 
 /// `getBufferUse` with no `set_opt_config` clock-buffer pattern: a clock buffer is a cell with
@@ -138,14 +138,28 @@ fn is_clock_buffer(cell: &Cell) -> bool {
 /// Refused rather than modelled (no corpus witness): a buffer master with IMPLANT obstructions
 /// (the VT categories are numbered in the order masters are first asked about), and two sites
 /// with equal shares (ordered by the reference's site pointers).
-pub fn find_buffers(libs: &Libs, masters: &BTreeMap<String, Master>, dont_use: &std::collections::BTreeSet<String>) -> Result<Buffers, Stop> {
-    // getBufferList
+/// `Resizer::getBufferList`: the buffer list and what it tallies (`lib_data_`).
+pub struct BufferList<'l> {
+    /// Sorted by VT category, then output drive resistance (libc++ `std::sort`).
+    pub cells: Vec<&'l Cell>,
+    /// `cells_by_site` / `cells_by_footprint`, by name.
+    pub by_site: BTreeMap<String, usize>,
+    pub by_footprint: BTreeMap<String, usize>,
+}
+
+/// `Resizer::getBufferList`: libraries in read order; each library's `buffers()` — its cells in
+/// NAME order that are not liberty `dont_use` and are buffers; a clock buffer skipped when
+/// `exclude_clock_buffers` (setup) and kept otherwise (`repairHold`); kept: not in `dont_use`,
+/// not always-on / isolation / level shifter, the link cell, with a LEF master. Sorted by VT
+/// category then drive resistance — one category here (a master with IMPLANT obstructions is
+/// refused), so by drive resistance, in libc++'s order for ties.
+pub fn get_buffer_list<'l>(libs: &'l Libs, masters: &BTreeMap<String, Master>, dont_use: &std::collections::BTreeSet<String>, exclude_clock_buffers: bool) -> Result<BufferList<'l>, Stop> {
     let mut list: Vec<&Cell> = Vec::new();
-    let mut by_site: BTreeMap<&str, usize> = BTreeMap::new();
-    let mut by_footprint: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut by_site: BTreeMap<String, usize> = BTreeMap::new();
+    let mut by_footprint: BTreeMap<String, usize> = BTreeMap::new();
     for (li, lib) in libs.libs.iter().enumerate() {
         for cell in lib.cells.values().filter(|c| !c.dont_use && c.is_buffer()) {
-            if is_clock_buffer(cell) {
+            if exclude_clock_buffers && is_clock_buffer(cell) {
                 continue;
             }
             if dont_use.contains(&cell.name) || cell.always_on || cell.is_isolation_cell || cell.is_level_shifter || !libs.is_link_cell(li, &cell.name) {
@@ -155,21 +169,25 @@ pub fn find_buffers(libs: &Libs, masters: &BTreeMap<String, Master>, dont_use: &
             if !master.implant_obs.is_empty() {
                 return Err(Stop::refused("RSZ-VT", format!("buffer {} has IMPLANT obstructions ({}): VT categories are not modelled", cell.name, master.implant_obs.join(" "))));
             }
-            *by_site.entry(master.site.as_str()).or_default() += 1;
+            *by_site.entry(master.site.clone()).or_default() += 1;
             if !cell.footprint.is_empty() {
-                *by_footprint.entry(cell.footprint.as_str()).or_default() += 1;
+                *by_footprint.entry(cell.footprint.clone()).or_default() += 1;
             }
             list.push(cell);
         }
     }
-    // One VT category ("-"), so the sort is by drive resistance alone.
-    std_sort_by(&mut list, |a, b| buffer_drive_resistance(a).partial_cmp(&buffer_drive_resistance(b)).expect("a drive resistance is a number"))
-        .map_err(|t| Stop::refused("RSZ-ORDER", format!("{} buffers with equal drive resistance: the reference's sort order of a tie is not modelled", t.len)))?;
+    crate::order::libcxx_sort_by(&mut list, |a, b| buffer_drive_resistance(a) < buffer_drive_resistance(b))
+        .map_err(|h| Stop::refused("RSZ-ORDER", format!("{} buffers reach the sort's heap fallback, which is not modelled", h.len)))?;
+    Ok(BufferList { cells: list, by_site, by_footprint })
+}
+
+pub fn find_buffers(libs: &Libs, masters: &BTreeMap<String, Master>, dont_use: &std::collections::BTreeSet<String>, exclude_clock_buffers: bool) -> Result<Buffers, Stop> {
+    let BufferList { cells: list, by_site, by_footprint } = get_buffer_list(libs, masters, dont_use, exclude_clock_buffers)?;
 
     // findBuffers: the footprint.
     let mut best_footprint: Option<&str> = None;
     if by_footprint.len() > 1 {
-        for (fp, &count) in &by_footprint {
+        for (fp, &count) in by_footprint.iter().map(|(f, c)| (f.as_str(), c)) {
             let ratio = count as f32 / list.len() as f32;
             if f64::from(ratio) > 0.5 {
                 best_footprint = Some(fp);
@@ -179,7 +197,7 @@ pub fn find_buffers(libs: &Libs, masters: &BTreeMap<String, Master>, dont_use: &
     }
     // The two dominant sites: by their share of the buffer list, largest first. The counts are
     // kept in a map keyed by the site's pointer, so a tie would be ordered by pointer: refused.
-    let mut sites: Vec<(&str, usize)> = by_site.iter().map(|(s, c)| (*s, *c)).collect();
+    let mut sites: Vec<(&str, usize)> = by_site.iter().map(|(s, c)| (s.as_str(), *c)).collect();
     sites.sort_by_key(|s| std::cmp::Reverse(s.1));
     if sites.len() > 1 && sites.windows(2).take(2).any(|w| w[0].1 == w[1].1) {
         return Err(Stop::refused("RSZ-SITES", format!("buffer sites with equal shares ({}): their order is the reference's pointer order, not modelled", sites.iter().map(|(s, c)| format!("{s}:{c}")).collect::<Vec<_>>().join(" "))));
@@ -439,7 +457,7 @@ mod tests {
             buf("NOMASTER", 3.0, 1.0, ""),
         ]);
         let m = masters(&["B1", "B2", "B4", "B8", "B16", "CLKBUF_X1", "BX"]);
-        let b = find_buffers(&libs, &m, &Default::default()).unwrap();
+        let b = find_buffers(&libs, &m, &Default::default(), true).unwrap();
         assert_eq!(b.cells, ["B1", "B2", "B4", "B8", "B16"]);
         assert_eq!(b.lowest, "B16");
     }
@@ -458,7 +476,7 @@ mod tests {
             buf("A7", 7.0, 1.0, ""),
         ]);
         let m = masters(&["A1", "A2", "A3", "A4", "A5", "A6", "A7"]);
-        let b = find_buffers(&libs, &m, &Default::default()).unwrap();
+        let b = find_buffers(&libs, &m, &Default::default(), true).unwrap();
         // bucket 0 = {A1 (R·C 3), A2 (2)} → A2, A1.
         assert_eq!(b.cells, ["A2", "A1", "A3", "A4", "A5", "A6", "A7"]);
     }
@@ -473,7 +491,7 @@ mod tests {
             buf("D1", 3.0, 1.0, r#"cell_footprint : "dly" ;"#),
         ]);
         let m = masters(&["F1", "F2", "D1"]);
-        assert_eq!(find_buffers(&libs, &m, &Default::default()).unwrap().cells, ["F1", "F2"]);
+        assert_eq!(find_buffers(&libs, &m, &Default::default(), true).unwrap().cells, ["F1", "F2"]);
     }
 
     // Rule (findBuffers sites): two sites, the larger share first; each bucket gives, per site in
@@ -494,7 +512,7 @@ mod tests {
         for t in ["T1", "T2"] {
             m.get_mut(t).unwrap().site = "tall".into();
         }
-        let b = find_buffers(&libs, &m, &Default::default()).unwrap();
+        let b = find_buffers(&libs, &m, &Default::default(), true).unwrap();
         assert_eq!(b.cells, ["A1", "A3", "T1", "A4", "T2", "A5"]);
         assert_eq!(b.lowest, "A5");
     }
@@ -506,10 +524,10 @@ mod tests {
         let libs = library(&[buf("B1", 1.0, 1.0, ""), buf("B2", 2.0, 1.0, "")]);
         let mut m = masters(&["B1", "B2"]);
         m.get_mut("B2").unwrap().site = "tall".into();
-        assert!(matches!(find_buffers(&libs, &m, &Default::default()), Err(Stop::Refused { code: "RSZ-SITES", .. })));
+        assert!(matches!(find_buffers(&libs, &m, &Default::default(), true), Err(Stop::Refused { code: "RSZ-SITES", .. })));
         let mut m = masters(&["B1", "B2"]);
         m.get_mut("B1").unwrap().implant_obs = vec!["LVT".into()];
-        assert!(matches!(find_buffers(&libs, &m, &Default::default()), Err(Stop::Refused { code: "RSZ-VT", .. })));
+        assert!(matches!(find_buffers(&libs, &m, &Default::default(), true), Err(Stop::Refused { code: "RSZ-VT", .. })));
     }
 
     // Rule (findTargetLoad): for a slew linear in the load, the lower bisection bound within 1 %

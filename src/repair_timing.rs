@@ -26,6 +26,10 @@ pub struct Args {
     pub hold: bool,
     /// `-setup_margin`, user time units.
     pub setup_margin: f64,
+    /// `-hold_margin`, user time units.
+    pub hold_margin: f64,
+    /// `-max_buffer_percent` (20 by default), percent.
+    pub max_buffer_percent: f64,
     /// `-repair_tns` as a fraction (1.0 by default).
     pub repair_tns_end_percent: f64,
     /// `-sequence`, parsed (`parseMoveSequence`); empty for the default sequence.
@@ -122,6 +126,8 @@ impl Args {
             setup: false,
             hold: false,
             setup_margin: 0.0,
+            hold_margin: 0.0,
+            max_buffer_percent: 20.0,
             repair_tns_end_percent: 1.0,
             sequence: Vec::new(),
             phases: None,
@@ -183,8 +189,20 @@ impl Args {
                     a.max_utilization = Some(value(i)?);
                     i += 1;
                 }
-                // Read by the hold repair and the library selection only: accepted with their value.
-                "-max_buffer_percent" | "-hold_margin" | "-libraries" => i += 1,
+                "-hold_margin" => {
+                    a.hold_margin = value(i)?.parse().map_err(|_| "repair_timing -hold_margin: not a number".to_string())?;
+                    i += 1;
+                }
+                "-max_buffer_percent" => {
+                    let v: f64 = value(i)?.parse().map_err(|_| "repair_timing -max_buffer_percent: not a number".to_string())?;
+                    if !(0.0..=100.0).contains(&v) {
+                        return Err("repair_timing -max_buffer_percent: must be between 0 and 100".into());
+                    }
+                    a.max_buffer_percent = v;
+                    i += 1;
+                }
+                // Read by the library selection only: accepted with its value.
+                "-libraries" => i += 1,
                 "-skip_pin_swap" => a.skip_pin_swap = true,
                 "-skip_gate_cloning" => a.skip_gate_cloning = true,
                 "-skip_size_down" => a.skip_size_down_fanout = true,
@@ -281,9 +299,23 @@ pub fn preamble(seq: &[Move], violating: usize, repair_tns_end_percent: f64, pha
     lines
 }
 
-/// `delayAsString(value, digits)`: the time in the user unit, `%.<digits>f`.
+/// `Unit::asString(float value, digits)`: `INF` / `-INF` when `|value| ≥ INF × .1` (`float`
+/// against a `double` product, compared in `double`); else `value / scale` in `float`, an
+/// absolute value under 1e-6 printed as 0 (no `-0.000`), `%.<digits>f`.
+pub fn unit_as_string(value: f32, scale: f32, digits: usize) -> String {
+    if f64::from(value.abs()) >= f64::from(1e30f32) * 0.1 {
+        return if value > 0.0 { "INF".into() } else { "-INF".into() };
+    }
+    let mut scaled = value / scale;
+    if scaled.abs() < 1e-6 {
+        scaled = 0.0;
+    }
+    format!("{:.*}", digits, f64::from(scaled))
+}
+
+/// `delayAsString(value, digits)`: the time unit's [`unit_as_string`].
 pub fn delay_as_string(value: f32, digits: usize, time_scale: f32) -> String {
-    format!("{:.*}", digits, f64::from(value / time_scale))
+    unit_as_string(value, time_scale, digits)
 }
 
 /// A float as `fmt`'s `{}` prints it: the shortest digits that read back to the same float, in
@@ -476,6 +508,17 @@ mod tests {
         let s = Args::parse(&["-sequence".into(), "size_down_fanout sizeup".into()]).unwrap();
         assert_eq!(move_sequence(&s, false), [Move::SizeDownFanout, Move::SizeUp]);
         assert_eq!(parse_move_sequence("size").unwrap(), [Move::SizeUp, Move::SizeDownFanout]);
+    }
+
+    /// Rule (Unit::asString): INF past 1e29, and a value under 1e-6 in the unit prints as 0 —
+    /// never `-0.000`.
+    #[test]
+    fn a_delay_prints_inf_and_never_negative_zero() {
+        assert_eq!(delay_as_string(1e30, 3, 1e-9), "INF");
+        assert_eq!(delay_as_string(-1e30, 3, 1e-9), "-INF");
+        assert_eq!(delay_as_string(-1e-16, 3, 1e-9), "0.000");
+        assert_eq!(delay_as_string(-0.0004e-9, 3, 1e-9), "-0.000");
+        assert_eq!(delay_as_string(-0.088e-9, 3, 1e-9), "-0.088");
     }
 
     /// Rule (fmt `{}` on a float): shortest round-trip digits; fixed for exponents -4..6, else

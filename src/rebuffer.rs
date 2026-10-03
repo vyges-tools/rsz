@@ -201,21 +201,11 @@ impl Ctx<'_> {
     fn cell(&self, name: &str) -> &Cell {
         self.libs.link_cell(name).expect("a buffer cell")
     }
-    /// `Unit::asString(float, digits)`: in the unit, zero under 1e-6, INF past 1e29.
+    /// `Unit::asString(float, digits)`.
     fn unit(v: f32, scale: f32, digits: usize) -> String {
-        if v.abs() >= INF * 0.1 {
-            return if v > 0.0 { "INF".into() } else { "-INF".into() };
-        }
-        let mut s = v / scale;
-        if s.abs() < 1e-6 {
-            s = 0.0;
-        }
-        format!("{:.*}", digits, f64::from(s))
+        crate::repair_timing::unit_as_string(v, scale, digits)
     }
     fn delay(&self, v: f32) -> String {
-        if v.abs() >= INF * 0.1 {
-            return if v > 0.0 { "INF".into() } else { "-INF".into() };
-        }
         delay_as_string(v, 3, self.time_scale)
     }
     fn cap_str(&self, v: f32) -> String {
@@ -227,25 +217,36 @@ impl Ctx<'_> {
 }
 
 /// `Resizer::gateDelays(port, load, …)` at the target slews: per output transition, the largest
-/// delay and slew over the non-check arcs into the port.
-fn gate_delays(cell: &Cell, port: &str, load_cap: f32, tgt: [f32; 2]) -> ([f32; 2], [f32; 2]) {
+/// delay and slew over the non-check arcs into the port (`std::max`: the first unless the second
+/// is greater — not `f32::max`, which differs on a NaN and on ±0).
+pub fn gate_delays(cell: &Cell, port: &str, load_cap: f32, tgt: [f32; 2]) -> ([f32; 2], [f32; 2]) {
     let mut d = [-INF; 2];
     let mut s = [-INF; 2];
     for set in cell.arc_sets.iter().filter(|a| a.to == port && !a.role.is_timing_check()) {
         for arc in &set.arcs {
             if let Model::Gate(m) = &arc.model {
                 let (gd, gs) = m.gate_delay(tgt[arc.from_rf], load_cap);
-                d[arc.to_rf] = d[arc.to_rf].max(gd);
-                s[arc.to_rf] = s[arc.to_rf].max(gs);
+                d[arc.to_rf] = std_max(d[arc.to_rf], gd);
+                s[arc.to_rf] = std_max(s[arc.to_rf], gs);
             }
         }
     }
     (d, s)
 }
 
-/// `LibertyPort::capacitance()`: the largest value.
-fn port_cap(cell: &Cell, port: &str) -> f32 {
-    cell.port(port).map_or(0.0, |p| p.capacitance.iter().flatten().fold(f32::MIN, |a, &b| a.max(b)))
+/// `std::max(a, b)`: `a < b ? b : a`.
+pub fn std_max(a: f32, b: f32) -> f32 {
+    if a < b { b } else { a }
+}
+
+/// `std::min(a, b)`: `b < a ? b : a`.
+pub fn std_min(a: f32, b: f32) -> f32 {
+    if b < a { b } else { a }
+}
+
+/// `LibertyPort::capacitance()` (`RiseFallMinMax::maxValue`): the `std::max` of every value.
+pub fn port_cap(cell: &Cell, port: &str) -> f32 {
+    cell.port(port).map_or(0.0, |p| p.capacitance.iter().flatten().fold(-INF, |a, &b| std_max(a, b)))
 }
 
 /// `LibertyPort::intrinsicDelay`: the largest intrinsic delay fuzzily above 0 over the non-check
@@ -323,7 +324,7 @@ pub fn characterize(ci: &CharInputs<'_>, buffer_cells: &[String]) -> Result<Vec<
 
 /// `Resizer::findFastBuffers`: by input capacitance (stable), each size kept unless the last kept
 /// one outmatches it, popping the kept ones it outmatches.
-fn find_fast_buffers(ci: &CharInputs<'_>, buffer_cells: &[String]) -> Vec<String> {
+pub fn find_fast_buffers(ci: &CharInputs<'_>, buffer_cells: &[String]) -> Vec<String> {
     let ctx = ci.ctx;
     let mut by_cap: Vec<&String> = buffer_cells.iter().collect();
     let cin = |n: &str| ctx.cell(n).buffer_ports().map_or(0.0, |(i, _)| port_cap(ctx.cell(n), &i.name));

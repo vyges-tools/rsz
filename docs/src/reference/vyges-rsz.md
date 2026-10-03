@@ -18,7 +18,8 @@ JOB FIELDS:
                script passes them:
                  read_lef, read_def, read_db, define_corners, read_liberty [-corner C],
                  read_sdc, set_dont_use, set_layer_rc, set_wire_rc, set_routing_alpha,
-                 estimate_parasitics -placement, buffer_ports [options], repair_design [options]
+                 estimate_parasitics -placement, set_propagated_clock, buffer_ports [options],
+                 repair_design [options], repair_timing [options]
                an estimate_parasitics step may carry "db": the database as the estimate saw it,
                when cells were moved between it and the repair
                a buffer_ports step may carry "write_def": the design as it left it, as DEF
@@ -43,6 +44,22 @@ BUFFER_PORTS OPTIONS:
   -buffer_cell C        the buffer to use (default: the weakest buffer the repair would pick)
   -verbose              each port's decision in the report's lines
   refused: -max_utilization, a hierarchical design
+
+REPAIR_TIMING:
+  -setup: every move of the default sequence (UnbufferMove, SizeUpMove, SwapPinsMove,
+  BufferMove, CloneMove, SplitLoadMove; SizeUpMatchMove) in the LEGACY phase and LAST_GASP —
+  the move sequence (RSZ-0100), RSZ-0094 / RSZ-0099 (and RSZ-0221) or RSZ-0098, every progress
+  row, the summary (RSZ-0051, RSZ-0062) in the report's repair_timing[].lines, and the design it
+  leaves (write_def). A job's timing_trace file gets the pass-by-pass decisions.
+  -hold (alone): the hold buffer, RSZ-0046 or RSZ-0033, every progress row, RSZ-0064 / RSZ-0066,
+  RSZ-0132, RSZ-0032 and the buffers it inserts; -max_utilization or -max_buffer_percent reached
+  ends it with RSZ-0050 / RSZ-0060 (status error).
+  status repaired (the design changed), unrepaired (violations, nothing kept), up_to_date or
+  error. One clock, ideal or propagated, with its I/O delays. -setup and -hold together (or
+  neither): the setup repair, then refused. Refused before the lines: -phases other than
+  LEGACY, -recover_power, several corners, VT libraries, a latch, a virtual clock, clock
+  uncertainty / latency / transition, derates, path exceptions; refused during the repair:
+  -setup with -max_utilization, more than one repair per pass.
 
 CONSTRAINTS READ FROM SDC:
   create_clock, set_max_transition and set_max_fanout on the design, set_load on nets and ports,

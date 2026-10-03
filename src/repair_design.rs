@@ -127,7 +127,7 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
     // Resizer::resizePreamble
     let lib = inputs.libs.default_library().ok_or_else(|| Stop::error("RSZ-LIB", "no liberty library read".into()))?;
     let equiv = sizing::make_equiv_cells(inputs.libs);
-    let buffers = preamble::find_buffers(inputs.libs, inputs.masters, inputs.dont_use)?;
+    let buffers = preamble::find_buffers(inputs.libs, inputs.masters, inputs.dont_use, true)?;
     let (tgt_slews, tgt_scene, target_loads) = preamble::find_target_loads(inputs.libs, &buffers.cells, inputs.dont_use);
     // check_max_wire_length (the command's Tcl, before repair_design_cmd): the same buffer list and
     // target slews (findMaxWireLength runs findBuffers and findTargetLoads too).

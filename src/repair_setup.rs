@@ -208,6 +208,31 @@ impl Timer {
 /// estimator's current ones; `edits`, what the timer has not seen. `want`: the endpoints whose
 /// worst path the repair will read.
 fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], timer: &mut Timer, edits: TimerEdits) -> Result<Snapshot, Stop> {
+    timed(ctx, design, timer, edits, |g, search, clocks| {
+        let (ends, starts) = timing_points(g, search, ctx.ssdc, ctx.libs, clocks).map_err(timer_stop)?;
+        let ideal = if ctx.ideal_clock { clocks.clone() } else { BTreeSet::new() };
+        let mut names: Vec<String> = want.to_vec();
+        if let (_, Some(w)) = worst_slack(&ends) {
+            names.push(w.pin.clone());
+        }
+        let mut paths = HashMap::new();
+        for n in names {
+            if paths.contains_key(&n) {
+                continue;
+            }
+            let Some(v) = g.vertices.iter().position(|x| x.name == n) else { continue };
+            if let Some(view) = expand(ctx, g, search, design, v, &ideal)? {
+                paths.insert(n, view);
+            }
+        }
+        Ok(Snapshot { ends, starts, paths })
+    })
+}
+
+/// The incremental timer brought up to date with the design (`edits` replayed, then delays,
+/// arrivals and requireds in full — the reference's `findRequireds`), and `read` run over the
+/// graph, the search and the clock network's pins.
+fn timed<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits: TimerEdits, read: impl FnOnce(&Graph<'_>, &Search<'_, '_>, &BTreeSet<usize>) -> Result<R, Stop>) -> Result<R, Stop> {
     let netlist = design.netlist();
     let mut g = crate::repair_design::timer_graph(ctx.libs, 0, netlist, ctx.env, ctx.master_pins)?;
     let clocks = crate::timing::clock_pins(&g, ctx.clock_sources);
@@ -254,23 +279,7 @@ fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], timer: &mut Tim
         }
         let _ = std::fs::write(path, s);
     }
-    let (ends, starts) = timing_points(&g, &search, ctx.ssdc, ctx.libs, &clocks).map_err(timer_stop)?;
-    let ideal = if ctx.ideal_clock { clocks } else { BTreeSet::new() };
-    let mut names: Vec<String> = want.to_vec();
-    if let (_, Some(w)) = worst_slack(&ends) {
-        names.push(w.pin.clone());
-    }
-    let mut paths = HashMap::new();
-    for n in names {
-        if paths.contains_key(&n) {
-            continue;
-        }
-        let Some(v) = g.vertices.iter().position(|x| x.name == n) else { continue };
-        if let Some(view) = expand(ctx, &g, &search, design, v, &ideal)? {
-            paths.insert(n, view);
-        }
-    }
-    Ok(Snapshot { ends, starts, paths })
+    read(&g, &search, &clocks)
 }
 
 /// The edits replayed into the incremental timer (`dbStaCbk`), the estimator's
@@ -951,6 +960,11 @@ pub trait SetupDesign: Design {
     /// `Resizer::computeDesignArea`: over the block's instances, each non-filler master's area
     /// (m², core-autoplaceable masters only).
     fn design_area(&self) -> f64;
+    /// `Resizer::area(dbMaster)`: `dbuToMeters(width) × dbuToMeters(height)`, 0 for a master that
+    /// is not core autoplaceable.
+    fn master_area(&self, cell: &str) -> f64;
+    /// `Resizer::coreArea`: `dbuToMeters(core dx) × dbuToMeters(core dy)` (0 without a core).
+    fn core_area(&self) -> f64;
     fn as_design(&self) -> &dyn Design;
     /// `odb::dbDatabase::beginEco`: a nested journal level.
     fn begin_journal(&mut self) -> Result<(), String>;
@@ -984,6 +998,470 @@ pub trait SetupDesign: Design {
     /// `Resizer::insertBufferBeforeLoads(net, loads, cell, loc, base, "net", ALWAYS, diff_nets)`.
     #[allow(clippy::too_many_arguments)]
     fn insert_buffer_before_loads(&mut self, net: Option<&str>, loads: &[String], cell: &str, loc: (i32, i32), reason: &str, loads_on_diff_nets: bool, uniquify: &str) -> Result<crate::design::Repeater, String>;
+}
+
+/// `Resizer::repairHold` → `RepairHold::repairHold`: the hold buffer, then the passes over the
+/// endpoints' hold violations, on the incremental timer — every timer read is a full update of
+/// it (the reference's lazy reads, measured: one level-limited delay pass per inserted buffer,
+/// with no edit before the full pass that follows it).
+pub fn repair_hold(ctx: &Ctx<'_>, hctx: &crate::repair_hold::HoldCtx<'_>, design: &mut dyn SetupDesign, ha: &crate::repair_hold::HoldArgs) -> Result<crate::repair_hold::HoldOutcome, Stop> {
+    let timer = Timer::new(design)?;
+    let initial_area = design.design_area();
+    // `setMaxUtilization`: the core area times the fraction; 0 (no limit) without one.
+    let max_area = ha.max_utilization.map_or(0.0, |u| design.core_area() * u);
+    let mut h = HoldRepair { ctx, hctx, ha, design, timer, out: crate::repair_hold::HoldOutcome::default(), inserted: 0, resized: 0, initial_area, max_buffer_count: 0, design_area: initial_area, max_area };
+    h.run()?;
+    h.out.inserted = h.inserted;
+    h.out.resized = h.resized;
+    Ok(h.out)
+}
+
+/// `RepairHold`'s state over one call.
+struct HoldRepair<'c, 'd> {
+    ctx: &'c Ctx<'c>,
+    hctx: &'c crate::repair_hold::HoldCtx<'c>,
+    ha: &'c crate::repair_hold::HoldArgs,
+    design: &'d mut dyn SetupDesign,
+    timer: Timer,
+    out: crate::repair_hold::HoldOutcome,
+    /// `inserted_buffer_count_`, `resize_count_`.
+    inserted: i64,
+    resized: i64,
+    initial_area: f64,
+    max_buffer_count: i64,
+    /// `design_area_`: recomputed by `Resizer::init` (the preamble, every `journalRestore`), else
+    /// moved by `designAreaIncr(float)` — each master's area narrowed to `float` and added to the
+    /// `double`.
+    design_area: f64,
+    /// `max_area_`.
+    max_area: f64,
+}
+
+/// A fanout of a driver on a hold path, as `repairEndHold` reads it.
+struct HoldFanout {
+    pin: String,
+    hold_slack: f32,
+    /// `Sta::slacks`: `[rf][min/max]`, each from `INF`.
+    slacks: [[f32; 2]; 2],
+    /// An input (or bidirect) pin, or a top-level port.
+    input_or_port: bool,
+    /// A top-level output port.
+    out_port: bool,
+    /// Its liberty port's capacitance, 0 for a port.
+    cap: f32,
+}
+
+/// The worst hold path to an endpoint, as `repairEndHold` copies it out.
+struct HoldPath {
+    slack: f32,
+    /// `PathExpanded::size()`.
+    len: usize,
+    /// From `startIndex()` to the end: each pin and whether it is a driver.
+    vertices: Vec<(String, bool)>,
+}
+
+const MIN: usize = 0;
+
+impl HoldRepair<'_, '_> {
+    fn debug(&mut self, group: &str, level: i64, line: String) {
+        if self.ctx.debug.get(&("RSZ".to_string(), group.to_string())).is_some_and(|&l| l >= level) {
+            self.out.trace.push(format!("[DEBUG RSZ-{group}] {line}"));
+        }
+    }
+
+    fn report(&mut self, line: String) {
+        self.out.trace.push(line.clone());
+        self.out.lines.push(line);
+    }
+
+    fn ds(&self, v: f32) -> String {
+        delay_as_string(v, 3, self.ctx.time_scale)
+    }
+
+    /// A read of the timer: the edits so far replayed, then a full update ([`timed`]).
+    fn query<R>(&mut self, read: impl FnOnce(&Graph<'_>, &Search<'_, '_>, &BTreeSet<usize>) -> Result<R, Stop>) -> Result<R, Stop> {
+        let edits = self.design.take_timer_edits();
+        self.timer.trace_at = self.out.trace.len();
+        timed(self.ctx, self.design.as_design(), &mut self.timer, edits, read)
+    }
+
+    /// The endpoints in vertex order with their min and max slacks (`findRequireds`, then
+    /// `Sta::slack` of each).
+    fn hold_ends(&mut self) -> Result<Vec<crate::repair_hold::HoldEnd>, Stop> {
+        let ctx = self.ctx;
+        self.query(|g, s, clocks| {
+            let (ends, _) = timing_points(g, s, ctx.ssdc, ctx.libs, clocks).map_err(timer_stop)?;
+            Ok(ends
+                .iter()
+                .map(|p| {
+                    let v = g.vertices.iter().position(|x| x.name == p.pin).expect("an endpoint vertex");
+                    crate::repair_hold::HoldEnd { pin: p.pin.clone(), hold_slack: s.slack_of(v, MIN, None), setup_slack: p.slack, is_clock: clocks.contains(&v) }
+                })
+                .collect())
+        })
+    }
+
+    /// `Sta::worstSlack(max)`.
+    fn setup_wns(&mut self) -> Result<f32, Stop> {
+        let ctx = self.ctx;
+        self.query(|g, s, clocks| {
+            let (ends, _) = timing_points(g, s, ctx.ssdc, ctx.libs, clocks).map_err(timer_stop)?;
+            Ok(worst_slack(&ends).0)
+        })
+    }
+
+    /// `Sta::worstSlack(max)` and `Sta::slew(pin, riseFall, scenes, max)` (the larger of the max
+    /// slews) together.
+    fn setup_wns_and_slew(&mut self, pin: &str) -> Result<(f32, f32), Stop> {
+        let ctx = self.ctx;
+        let pin = pin.to_string();
+        self.query(move |g, s, clocks| {
+            let (ends, _) = timing_points(g, s, ctx.ssdc, ctx.libs, clocks).map_err(timer_stop)?;
+            let v = g.vertices.iter().position(|x| x.name == pin).ok_or_else(|| timer_stop(format!("{pin}: not in the timing graph")))?;
+            let slew = crate::rebuffer::std_max(g.slew[v][0][MAX], g.slew[v][1][MAX]);
+            Ok((worst_slack(&ends).0, slew))
+        })
+    }
+
+    /// `printProgress(iteration, force, end)`; the timer is read only when a row prints.
+    fn progress(&mut self, iteration: i64, force: bool, end: bool) -> Result<(), Stop> {
+        let prints = iteration == 0 || iteration % 10 == 0 || force || end;
+        let ends = if prints { self.hold_ends()? } else { Vec::new() };
+        let p = crate::repair_hold::Progress { resized: self.resized, inserted: self.inserted, cloned: 0, initial_area: self.initial_area, design_area: if prints { self.design.design_area() } else { self.initial_area } };
+        crate::repair_hold::print_progress(self.hctx, &ends, &p, iteration, force, end, &mut self.out);
+        Ok(())
+    }
+
+    /// `Resizer::overMaxArea`: a limit, and `fuzzyGreaterEqual` of the two (`float` arguments).
+    fn over_max_area(&self) -> bool {
+        self.max_area != 0.0 && {
+            let (a, m) = (self.design_area as f32, self.max_area as f32);
+            a > m || fuzzy::equal(a, m)
+        }
+    }
+
+    /// `designAreaIncr(area(master))`.
+    fn design_area_incr(&mut self, delta: f64) {
+        self.design_area += f64::from(delta as f32);
+    }
+
+    /// `logger_->error`: the line, then the call ends (it throws).
+    fn error(&mut self, code: &str, msg: &str) {
+        self.report(format!("[ERROR {code}] {msg}"));
+        self.out.error = Some(format!("{code}: {msg}"));
+    }
+
+    /// `RepairHold::repairHold(ends, buffer, …)`.
+    fn run(&mut self) -> Result<(), Stop> {
+        let buffer = crate::repair_hold::find_hold_buffer(self.hctx, &mut self.out)?.ok_or_else(|| Stop::refused("RSZ-HOLD", "no hold buffer with an area: not modelled".into()))?;
+        let ends = self.hold_ends()?;
+        // `max_buffer_percent * instanceCount()` (`float`), truncated; at least 100.
+        let instances = self.design.as_design().netlist().insts.len();
+        self.max_buffer_count = i64::from(((self.ha.max_buffer_percent * instances as f32) as i32).max(100));
+        let margin = self.ha.hold_margin;
+        let (mut worst, viol) = crate::repair_hold::find_hold_violations(self.hctx, &ends, margin, &mut self.out);
+        let mut fails: Vec<String> = viol.iter().map(|&i| ends[i].pin.clone()).collect();
+        self.out.violating = fails.len();
+        if fails.is_empty() {
+            self.report("[INFO RSZ-0033] No hold violations found.".into());
+            return Ok(());
+        }
+        self.report(format!("[INFO RSZ-0046] Found {} endpoints with hold violations.", fails.len()));
+        self.progress(0, true, false)?;
+        let mut progress = true;
+        let mut pass: i64 = 1;
+        while f64::from(worst) < margin && progress && !self.over_max_area() && self.inserted <= self.max_buffer_count && pass <= self.ha.max_passes && (self.ha.max_iterations < 0 || pass <= self.ha.max_iterations) {
+            if self.ha.verbose || pass == 1 {
+                self.progress(pass, false, false)?;
+            }
+            let wns = self.setup_wns()?;
+            self.debug("repair_hold", 1, format!("pass {} hold slack {} setup slack {}", pass, self.ds(worst), self.ds(wns)));
+            let before = self.inserted;
+            self.repair_hold_pass(&mut fails, &buffer, &mut pass)?;
+            self.debug("repair_hold", 1, format!("inserted {}", self.inserted - before));
+            let ends = self.hold_ends()?;
+            let (w, viol) = crate::repair_hold::find_hold_violations(self.hctx, &ends, margin, &mut self.out);
+            worst = w;
+            fails = viol.iter().map(|&i| ends[i].pin.clone()).collect();
+            progress = self.inserted > before;
+        }
+        self.progress(pass, true, true)?;
+        // `fuzzyLess(float, float)`: the margin narrowed to `float` as the call passes it.
+        if margin == 0.0 && fuzzy::less(worst, 0.0) {
+            self.report("[WARNING RSZ-0066] Unable to repair all hold violations.".into());
+        } else if fuzzy::less(worst, margin as f32) {
+            self.report("[WARNING RSZ-0064] Unable to repair all hold checks within margin.".into());
+        }
+        if self.resized > 0 {
+            self.report(format!("[INFO RSZ-0132] Resized {} instances.", self.resized));
+        }
+        if self.inserted > 0 {
+            self.report(format!("[INFO RSZ-0032] Inserted {} hold buffers.", self.inserted));
+        }
+        if self.inserted > self.max_buffer_count {
+            self.error("RSZ-0060", "Max buffer count reached.");
+        } else if self.over_max_area() {
+            self.error("RSZ-0050", "Max utilization reached.");
+        }
+        Ok(())
+    }
+
+    /// `repairHoldPass`: the estimates brought up to date, the failing endpoints sorted by hold
+    /// slack (libc++ `std::sort`), each repaired in turn, `pass` counting them.
+    fn repair_hold_pass(&mut self, fails: &mut [String], buffer: &str, pass: &mut i64) -> Result<(), Stop> {
+        self.design.update_parasitics().map_err(|e| Stop::error("RSZ-EST", e))?;
+        let ends = self.hold_ends()?;
+        let slack: HashMap<String, f32> = ends.iter().map(|e| (e.pin.clone(), e.hold_slack)).collect();
+        crate::order::libcxx_sort_by(fails, |a, b| slack[a] < slack[b]).map_err(|h| Stop::refused("RSZ-ORDER", format!("{} hold failures reach the sort's heap fallback, which is not modelled", h.len)))?;
+        for end in fails.iter() {
+            if self.ha.verbose {
+                self.progress(*pass, false, false)?;
+            }
+            self.repair_end_hold(end, buffer)?;
+            *pass += 1;
+            if self.inserted > self.max_buffer_count {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// `vertexWorstSlackPath(end, min)` expanded (`PathExpanded`, from `startIndex`), with the
+    /// end's setup slack.
+    fn worst_hold_path(&mut self, end: &str) -> Result<Option<(HoldPath, f32)>, Stop> {
+        let end = end.to_string();
+        self.query(move |g, s, _| {
+            let Some(v) = g.vertices.iter().position(|x| x.name == end) else { return Ok(None) };
+            let mut worst = None;
+            let mut min_slack = INF;
+            for p in s.paths[v].iter().filter(|p| p.tag.mm == MIN) {
+                let slack = p.arrival - p.required;
+                if fuzzy::less(slack, min_slack) {
+                    min_slack = slack;
+                    worst = Some(*p);
+                }
+            }
+            let Some(mut p) = worst else { return Ok(None) };
+            let mut chain = vec![v];
+            let mut start_from_end = None;
+            let mut i = 0;
+            while let Some(prev) = p.prev {
+                if start_from_end.is_none() {
+                    match edge_arc_set(g, prev.edge).map(|a| a.role) {
+                        Some(Role::RegClkToQ | Role::LatchEnToQ) => start_from_end = Some(i),
+                        Some(Role::LatchDtoQ) => return Err(Stop::refused("RSZ-LATCH", "a hold path through a latch D->Q arc: not modelled".into())),
+                        _ => {}
+                    }
+                }
+                p = *s.paths[prev.vertex].iter().find(|q| q.tag == prev.tag).ok_or_else(|| timer_stop(format!("{}: a path's prev path is not at its vertex", g.vertices[prev.vertex].name)))?;
+                chain.push(prev.vertex);
+                i += 1;
+            }
+            let n = chain.len();
+            let start = n - 1 - start_from_end.unwrap_or(n - 1);
+            chain.reverse();
+            let vertices = chain[start..].iter().map(|&u| (g.vertices[u].name.clone(), g.vertices[u].is_driver)).collect();
+            Ok(Some((HoldPath { slack: min_slack, len: n, vertices }, s.slack_of(v, MAX, None))))
+        })
+    }
+
+    /// The driver's fanouts through its out edges (`RepairHoldPredicate`: every edge but timing
+    /// checks and latch D→Q), with what `repairEndHold` reads of each.
+    fn driver_fanouts(&mut self, drvr: &str) -> Result<Vec<HoldFanout>, Stop> {
+        let drvr = drvr.to_string();
+        let libs = self.ctx.libs;
+        self.query(move |g, s, _| {
+            let v = g.vertices.iter().position(|x| x.name == drvr).ok_or_else(|| timer_stop(format!("{drvr}: not in the timing graph")))?;
+            let mut out = Vec::new();
+            for &e in &g.out_edges[v] {
+                if g.is_check(e) || matches!(edge_arc_set(g, e).map(|a| a.role), Some(Role::LatchDtoQ)) {
+                    continue;
+                }
+                let to = g.edges[e].to;
+                let vx = &g.vertices[to];
+                let port = vx.lib.is_none();
+                let mut slacks = [[INF; 2]; 2];
+                for (rf, row) in slacks.iter_mut().enumerate() {
+                    for (mm, cell) in row.iter_mut().enumerate() {
+                        *cell = s.slack_of(to, mm, Some(rf));
+                    }
+                }
+                let cell = vx.cell.as_deref().and_then(|c| libs.link_cell(c));
+                let direction = cell.and_then(|c| vx.port.as_deref().and_then(|pn| c.port(pn))).map(|p| p.direction);
+                let input_or_port = port || matches!(direction, Some(vyges_sta::liberty::Direction::Input | vyges_sta::liberty::Direction::Bidirect));
+                let out_port = port && !vx.is_driver;
+                let cap = match (cell, vx.port.as_deref()) {
+                    (Some(c), Some(pn)) => crate::rebuffer::port_cap(c, pn),
+                    _ => 0.0,
+                };
+                out.push(HoldFanout { pin: vx.name.clone(), hold_slack: s.slack_of(to, MIN, None), slacks, input_or_port, out_port, cap });
+            }
+            Ok(out)
+        })
+    }
+
+    /// `repairEndHold`.
+    fn repair_end_hold(&mut self, end: &str, buffer: &str) -> Result<(), Stop> {
+        let Some((path, end_setup)) = self.worst_hold_path(end)? else { return Ok(()) };
+        self.debug("repair_hold", 3, format!("repair end {} hold_slack={} setup_slack={}", end, self.ds(path.slack), self.ds(end_setup)));
+        if path.len <= 1 {
+            return Ok(());
+        }
+        let (sm, hm) = (self.ha.setup_margin, self.ha.hold_margin);
+        for i in 0..path.vertices.len().saturating_sub(1) {
+            let (pin, is_driver) = path.vertices[i].clone();
+            if !is_driver || !self.design.ok_to_buffer_net(&pin) {
+                continue;
+            }
+            let mut loads: Vec<String> = Vec::new();
+            // mergeInit / mergeInto: min of the min slacks, max of the max slacks (`std::min`,
+            // `std::max`).
+            let mut slacks = [[INF, -INF], [INF, -INF]];
+            let mut loads_have_out_port = false;
+            let mut load_cap = 0.0f32;
+            for f in self.driver_fanouts(&pin)? {
+                if !f.input_or_port {
+                    continue;
+                }
+                if f64::from(f.hold_slack) < hm {
+                    for (merged, from) in slacks.iter_mut().zip(&f.slacks) {
+                        merged[MIN] = crate::rebuffer::std_min(merged[MIN], from[MIN]);
+                        merged[MAX] = crate::rebuffer::std_max(merged[MAX], from[MAX]);
+                    }
+                    if f.out_port {
+                        loads_have_out_port = true;
+                    }
+                    load_cap += f.cap;
+                    loads.push(f.pin);
+                }
+            }
+            let _ = loads_have_out_port;
+            if loads.is_empty() {
+                continue;
+            }
+            self.debug("repair_hold", 3, format!(" {} hold_slack={}/{} setup_slack={}/{} fanouts={}", pin, self.ds(slacks[0][MIN]), self.ds(slacks[1][MIN]), self.ds(slacks[0][MAX]), self.ds(slacks[1][MAX]), loads.len()));
+            let cell = self.ctx.libs.link_cell(buffer).ok_or_else(|| Stop::error("RSZ-HOLD", format!("{buffer}: not a liberty cell")))?;
+            let (_, out) = cell.buffer_ports().ok_or_else(|| Stop::error("RSZ-HOLD", format!("{buffer}: not a buffer")))?;
+            let (bd, _) = crate::rebuffer::gate_delays(cell, &out.name, load_cap, self.hctx.tgt_slews);
+            // In `double`: `float` slacks less the `double` margins.
+            let s = |rf: usize, mm: usize| f64::from(slacks[rf][mm]);
+            let fits = self.ha.allow_setup_violations
+                || (s(0, MAX) - sm > -(s(0, MIN) - hm) && s(1, MAX) - sm > -(s(1, MIN) - hm) && (s(0, MAX) - sm) > f64::from(bd[0]) && (s(1, MAX) - sm) > f64::from(bd[1]));
+            if !fits {
+                continue;
+            }
+            let path_load = path.vertices[i + 1].0.clone();
+            let d = self.design.as_design();
+            let (lx, ly) = d.pin_location(&path_load);
+            let (dx, dy) = d.pin_location(&pin);
+            let loc = ((dx + lx) / 2, (dy + ly) / 2);
+            self.design.begin_journal().map_err(|e| Stop::error("RSZ-JOURNAL", e))?;
+            let (setup_before, slew_before) = self.setup_wns_and_slew(&pin)?;
+            let (buffers, resizes) = self.make_hold_delay(&pin, &loads, buffer, loc)?;
+            let (setup_after, slew_after) = self.setup_wns_and_slew(&pin)?;
+            let slew_factor: f32 = if slew_before > 0.0 { slew_after / slew_before } else { 1.0 };
+            if f64::from(slew_factor) > 1.20 || (!self.ha.allow_setup_violations && fuzzy::less(setup_after, setup_before) && f64::from(setup_after) < sm) {
+                // `journalRestore`: undone; the estimates and the timer brought up to date (the
+                // next read updates the timer).
+                // `init()` first: the design area recomputed.
+                self.design_area = self.design.design_area();
+                if self.design.restore_journal().map_err(|e| Stop::error("RSZ-JOURNAL", e))? {
+                    self.design.update_parasitics().map_err(|e| Stop::error("RSZ-EST", e))?;
+                }
+            } else {
+                // `journalEnd`.
+                self.design.update_parasitics().map_err(|e| Stop::error("RSZ-EST", e))?;
+                self.design.commit_journal().map_err(|e| Stop::error("RSZ-JOURNAL", e))?;
+                self.inserted += buffers;
+                self.resized += resizes;
+            }
+        }
+        Ok(())
+    }
+
+    /// `makeHoldDelay`: a buffer before the loads (not dont_touch, in pin-id order) on the
+    /// driver's net, named `hold<n>`; the estimates; a resize to the target slew when its output
+    /// fails `checkMaxSlewCap`. Returns the buffers and resizes made.
+    fn make_hold_delay(&mut self, drvr: &str, loads: &[String], buffer: &str, loc: (i32, i32)) -> Result<(i64, i64), Stop> {
+        let info = self.design.net_info().clone();
+        let mut set: Vec<String> = loads.iter().filter(|l| !self.design.pin_dont_touch(l)).cloned().collect();
+        set.sort_by_key(|p| info.pin_id.get(p).copied().unwrap_or(u64::MAX));
+        set.dedup();
+        if set.is_empty() {
+            return Ok((0, 0));
+        }
+        let d = self.design.as_design();
+        let net = d.netlist().nets.iter().find(|n| n.pins.iter().any(|c| d.netlist().pin_name(c) == drvr)).map(|n| n.name.clone());
+        let r = self.design.insert_buffer_before_loads(net.as_deref(), &set, buffer, loc, "hold", false, "ALWAYS").map_err(|_| Stop::error("RSZ-3009", format!("insert_buffer failed on drvr_pin '{drvr}'.")))?;
+        // `insertBufferPostProcess`: the design area grows by the buffer.
+        let a = self.design.master_area(buffer);
+        self.design_area_incr(a);
+        self.debug("repair_hold", 3, format!(" insert {}", r.inst));
+        self.design.update_parasitics().map_err(|e| Stop::error("RSZ-EST", e))?;
+        let mut resizes = 0;
+        if !self.check_max_slew_cap(&r.output)? {
+            let before = self.design.as_design().netlist().insts.iter().find(|(n, _)| n == &r.inst).map(|(_, c)| c.clone());
+            if resize_to_target_slew(self.ctx, self.design, &r, buffer)? {
+                // `replaceCell`: the old master's area out, the new one's in.
+                let after = self.design.as_design().netlist().insts.iter().find(|(n, _)| n == &r.inst).map(|(_, c)| c.clone());
+                if let (Some(old), Some(new)) = (before, after) {
+                    let (ao, an) = (self.design.master_area(&old), self.design.master_area(&new));
+                    self.design_area_incr(-ao);
+                    self.design_area_incr(an);
+                }
+                self.design.update_parasitics().map_err(|e| Stop::error("RSZ-EST", e))?;
+                resizes = 1;
+            }
+        }
+        Ok((1, resizes))
+    }
+
+    /// `checkMaxSlewCap(drvr)`: the capacitance check, then the slew check, then the loads'
+    /// slews — each `slack / limit` (`float`) at least 0.2, the first two only when a limit exists.
+    fn check_max_slew_cap(&mut self, drvr: &str) -> Result<bool, Stop> {
+        let drvr = drvr.to_string();
+        let ctx = self.ctx;
+        let info = self.design.net_info().clone();
+        let parasitics = vec![self.design.as_design().parasitics(0).clone()];
+        self.query(move |g, _, clocks| {
+            let v = g.vertices.iter().position(|x| x.name == drvr).ok_or_else(|| timer_stop(format!("{drvr}: not in the timing graph")))?;
+            let sc = crate::timing::Scenes::new(std::slice::from_ref(g));
+            const RATIO: f32 = 0.2;
+            let (_, limit, slack, _, corner) = crate::timing::check_capacitance(&sc, v, &parasitics, clocks);
+            if corner.is_some() && slack / limit < RATIO {
+                return Ok(false);
+            }
+            if let Some(c) = crate::timing::check_slew(&sc, v, ctx.limits, clocks) {
+                if c.slack / c.limit < RATIO {
+                    return Ok(false);
+                }
+            }
+            let l = crate::timing::check_load_slews(&sc, &info, v, ctx.limits, clocks, 0.0);
+            Ok(l.slack / l.limit >= RATIO)
+        })
+    }
+}
+
+/// `Resizer::resizeToTargetSlew(buffer output)` under placement parasitics: the new net's
+/// parasitic ensured, its load at the target-slew corner, `findTargetCell`, a swap if it differs.
+/// Returns whether it swapped.
+fn resize_to_target_slew(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, r: &crate::design::Repeater, cell: &str) -> Result<bool, Stop> {
+    design.ensure_wire_parasitic(&r.out_net).map_err(|e| Stop::error("RSZ-EST", e))?;
+    let d = design.as_design();
+    let nl = d.netlist().clone();
+    let k = ctx.sizing.tgt_scene;
+    let par = d.parasitics(k).clone();
+    let graph = crate::repair_design::timer_graph(ctx.libs, k, &nl, ctx.env, ctx.master_pins)?;
+    let v = graph.vertices.iter().position(|x| x.name == r.output).ok_or_else(|| Stop::error("RSZ-INSERT", format!("{}: not in the timing graph", r.output)))?;
+    let load_cap = graph.load_cap(v, &par);
+    if load_cap > 0.0 {
+        let target = ctx.sizing.find_target_cell(cell, load_cap, false)?;
+        if target != cell {
+            design.swap_master(&r.inst, &target).map_err(|e| Stop::error("RSZ-REPLACE", e))?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// `Optimizer::run` for the LEGACY phase: the phase, then the final report.
@@ -1629,24 +2107,8 @@ impl Repair<'_, '_> {
         Ok(Some(MoveResult { kind: Move::SplitLoad, count: 1, insts: vec![rep.inst] }))
     }
 
-    /// `Resizer::resizeToTargetSlew(buffer output)` under placement parasitics: the new net's
-    /// parasitic ensured, its load at the target-slew corner, `findTargetCell`, a swap if it differs.
     fn resize_to_target_slew(&mut self, r: &crate::design::Repeater, cell: &str) -> Result<(), Stop> {
-        self.design.ensure_wire_parasitic(&r.out_net).map_err(|e| Stop::error("RSZ-EST", e))?;
-        let d = self.design.as_design();
-        let nl = d.netlist().clone();
-        let k = self.ctx.sizing.tgt_scene;
-        let par = d.parasitics(k).clone();
-        let graph = crate::repair_design::timer_graph(self.ctx.libs, k, &nl, self.ctx.env, self.ctx.master_pins)?;
-        let v = graph.vertices.iter().position(|x| x.name == r.output).ok_or_else(|| Stop::error("RSZ-INSERT", format!("{}: not in the timing graph", r.output)))?;
-        let load_cap = graph.load_cap(v, &par);
-        if load_cap > 0.0 {
-            let target = self.ctx.sizing.find_target_cell(cell, load_cap, false)?;
-            if target != cell {
-                self.design.swap_master(&r.inst, &target).map_err(|e| Stop::error("RSZ-REPLACE", e))?;
-            }
-        }
-        Ok(())
+        resize_to_target_slew(self.ctx, self.design, r, cell).map(|_| ())
     }
 
     /// BufferGenerator → `BufferCandidate::apply`: `rebufferPin` (the passes in
