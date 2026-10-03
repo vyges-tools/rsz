@@ -46,8 +46,16 @@ impl PinAddr {
     /// terminals in 128-slot pages (odb's dbTable page sizes).
     pub fn parse(text: &str) -> Result<PinAddr, String> {
         let mut seen: HashMap<(bool, u64), Vec<(u64, u64)>> = HashMap::new();
+        // `P I|B page 0x…`: a page base the instrumented reference printed when it allocated it.
+        let mut page_bases: HashMap<(bool, u64), u64> = HashMap::new();
         for l in text.lines() {
             let w: Vec<&str> = l.split_whitespace().collect();
+            if let ["P", kind, page, addr] = w.as_slice() {
+                let page: u64 = page.parse().map_err(|_| format!("pinaddr: bad page {page}"))?;
+                let base = u64::from_str_radix(addr.trim_start_matches("0x"), 16).map_err(|_| format!("pinaddr: bad page address {addr}"))?;
+                page_bases.insert((*kind == "B", page), base);
+                continue;
+            }
             let [kind, id, hex] = w.as_slice() else { continue };
             let port = *kind == "B";
             let id: u64 = id.parse().map_err(|_| format!("pinaddr: bad id {id}"))?;
@@ -65,11 +73,29 @@ impl PinAddr {
                 }
             }
         }
+        // Else from a printed page base and one terminal past its slot 0: a table whose only live
+        // terminals share one page gives no two-slot stride (one block port is common).
+        for ((port, page), slots) in &seen {
+            if let (None, Some(&base)) = (stride.get(port), page_bases.get(&(*port, *page))) {
+                if let Some(&(i, a)) = slots.iter().find(|(i, _)| *i > 0) {
+                    stride.insert(*port, (a.wrapping_sub(base)) / i);
+                }
+            }
+        }
         let mut pages = HashMap::new();
         for ((port, page), slots) in seen {
             let s = stride.get(&port).copied().unwrap_or(1);
             let (i, a) = slots[0];
             pages.insert((port, page), (a - i * s, s));
+        }
+        for ((port, page), base) in page_bases {
+            let s = stride.get(&port).copied().unwrap_or(1);
+            if let Some(&(known, _)) = pages.get(&(port, page)) {
+                if known != base {
+                    return Err(format!("pinaddr: page {page} base {base:#x} disagrees with its terminals' {known:#x}"));
+                }
+            }
+            pages.insert((port, page), (base, s));
         }
         Ok(PinAddr { pages })
     }
@@ -730,5 +756,15 @@ mod tests {
             assert_eq!(s[&2], 1e-11f32, "the load at the junction sees the driver's slew");
             assert_eq!(s[&1], want as f32, "the load down the wire");
         });
+    }
+
+    // Rule (odb dbTable): a page's slots sit at its base plus slot × object size. A page holding
+    // one live terminal gives no two-slot stride; the printed page base does (block port 1 at
+    // base + 0x70 is a 112-byte terminal), and an address off that grid is refused.
+    #[test]
+    fn a_lone_terminal_takes_its_stride_from_the_page_base() {
+        let a = PinAddr::parse("B 1 8060557fe5110000\nP B 0 0x11e57f556010\n").unwrap();
+        assert_eq!(a.addr(2 * 3 + 1), Some(0x11e57f556010 + 3 * 0x70));
+        assert!(PinAddr::parse("I 1 6840b07ee5110000\nI 2 c040b07ee5110000\nP I 0 0x11e57eb04011\n").is_err());
     }
 }

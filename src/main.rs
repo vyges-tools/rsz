@@ -1406,10 +1406,8 @@ fn run(job: &Value) -> Result<Value, String> {
                 let seq = rt::move_sequence(&a, false);
                 let mut lines = rt::preamble(&seq, violating.len(), a.repair_tns_end_percent, a.phases.as_deref());
                 // The moves modelled: SizeUp and Unbuffer, in the LEGACY phase alone.
-                let unmodelled = if let Some(m) = seq.iter().find(|m| !matches!(m, rt::Move::SizeUp | rt::Move::Unbuffer | rt::Move::SwapPins | rt::Move::Buffer | rt::Move::Clone | rt::Move::SplitLoad)) {
-                    Some(format!("repair_timing: {} is not modelled (SizeUpMove, UnbufferMove, SwapPinsMove, BufferMove, CloneMove and SplitLoadMove are)", m.name()))
-                } else if !a.skip_last_gasp && !legacy_only {
-                    Some("repair_timing: the LAST_GASP phase is not modelled (-skip_last_gasp)".into())
+                let unmodelled = if let Some(m) = seq.iter().find(|m| !matches!(m, rt::Move::SizeUp | rt::Move::Unbuffer | rt::Move::SwapPins | rt::Move::Buffer | rt::Move::Clone | rt::Move::SplitLoad | rt::Move::SizeUpMatch | rt::Move::VtSwap)) {
+                    Some(format!("repair_timing: {} is not modelled", m.name()))
                 } else if a.match_cell_footprint {
                     Some("repair_timing -match_cell_footprint: not modelled".into())
                 } else if debug_levels.get(&("RSZ".to_string(), "move_tracker".to_string())).is_some_and(|&l| l > 0) {

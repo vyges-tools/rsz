@@ -833,6 +833,9 @@ struct Repair<'c, 'd> {
     args: &'c Args,
     design: &'d mut dyn SetupDesign,
     timing: Snapshot,
+    /// The phase's label with its marker (`LEGACY*`, `LAST_GASP+`) and its move sequence.
+    phase: &'static str,
+    sequence: Vec<Move>,
     /// The ideal clock network's slews, as first timed ([`snapshot`]).
     clock_slews: ClockSlews,
     committer: Committer,
@@ -929,6 +932,8 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
         args,
         design,
         timing,
+        phase: PHASE,
+        sequence: ctx.sequence.to_vec(),
         clock_slews,
         committer: Committer::default(),
         out: Outcome::default(),
@@ -947,6 +952,11 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
         collector_violating: 0,
     };
     r.iterate()?;
+    // The phases after LEGACY: LAST_GASP unless skipped (or -phases LEGACY), then the implicit
+    // CRIT_VT_SWAP, which finds no VT cells (a VT library is refused) and does nothing.
+    if !args.skip_last_gasp && args.phases.is_none() {
+        r.last_gasp()?;
+    }
     r.finalize_and_report()?;
     r.out.resized = r.committer.committed(Move::SizeUp);
     r.out.removed = r.committer.committed(Move::Unbuffer);
@@ -1178,6 +1188,177 @@ impl Repair<'_, '_> {
         Ok(())
     }
 
+    /// `SetupLastGaspPolicy::iterate`: the sequence narrowed to VtSwap, SizeUpMatch, SizeUp and
+    /// SwapPins; the violating endpoints again; per endpoint up to 10 passes, a pass kept only
+    /// when WNS and TNS both hold (fuzzily), else the journal restored.
+    fn last_gasp(&mut self) -> Result<(), Stop> {
+        self.phase = "LAST_GASP+";
+        let phase = self.phase;
+        // initializeLastGaspRepair.
+        self.sequence.clear();
+        if !self.args.skip_vt_swap {
+            self.sequence.push(Move::VtSwap);
+        }
+        self.sequence.push(Move::SizeUpMatch);
+        self.sequence.push(Move::SizeUp);
+        if !self.args.skip_pin_swap {
+            self.sequence.push(Move::SwapPins);
+        }
+        let violating_ends = collect_violating(&self.timing.ends, self.ctx.margin);
+        self.collector_violating = violating_ends.len();
+        self.num_viols = violating_ends.len() as i64;
+        let curr_tns = self.timing.tns();
+        if !fuzzy::less(curr_tns, 0.0) {
+            self.debug("repair_setup", 1, format!("{phase} Phase: TNS is {}, exiting", self.ds(curr_tns, 1)));
+            return Ok(());
+        }
+        if violating_ends.is_empty() {
+            self.debug("repair_setup", 1, format!("{phase} Phase: No violating endpoints found"));
+            return Ok(());
+        }
+        self.max_end_count = violating_ends.len() as i64;
+        self.end_index = 0;
+        self.prev_tns = curr_tns;
+        let mut prev_worst_slack = violating_ends[0].slack;
+        self.fix_rate_threshold = INC_FIX_RATE_THRESHOLD;
+        self.prev_termination = false;
+        self.two_cons_terminations = false;
+        self.debug("repair_setup", 1, format!("{phase} Phase: {} violating endpoints remain", self.max_end_count));
+        self.print_progress(self.opto_iteration, false)?;
+        // runLastGaspLoop.
+        for end in &violating_ends {
+            if self.last_gasp_should_stop() {
+                break;
+            }
+            // beginLastGaspEndpoint → beginJournaledEndpointSearch.
+            let mut es = EndpointState {
+                end: end.pin.clone(),
+                end_slack: 0.0,
+                worst_slack: 0.0,
+                worst_vertex: None,
+                prev_end_slack: 0.0,
+                prev_worst_slack: 0.0,
+                pass: 1,
+                decreasing_slack_passes: 0,
+                force_single_repair: false,
+                journal_open: false,
+            };
+            self.refresh_endpoint_slacks(&mut es);
+            self.end_index += 1;
+            if self.end_index > self.max_end_count {
+                self.debug("repair_setup", 1, format!("{phase} Phase: Hit maximum endpoint repairs of {}", self.max_end_count));
+                break;
+            }
+            self.begin_journal()?;
+            es.journal_open = true;
+            es.prev_end_slack = es.end_slack;
+            es.prev_worst_slack = es.worst_slack;
+            let line = format!("{phase} Phase: Doing endpoint {} ({}/{}) endpoint slack = {}, WNS = {}", es.end, self.end_index, self.max_end_count, self.ds(es.end_slack, 3), self.ds(es.worst_slack, 3));
+            self.debug("repair_setup", 1, line);
+            self.repair_last_gasp_endpoint(&mut es, &mut prev_worst_slack)?;
+            if self.args.verbose || self.opto_iteration == 1 {
+                self.print_progress(self.opto_iteration, true)?;
+            }
+            if self.last_gasp_should_stop() {
+                self.debug("repair_setup", 1, format!("{phase} Phase: No TNS progress for two opto cycles, exiting"));
+                break;
+            }
+        }
+        let (wns, _) = self.timing.worst();
+        let tns = self.timing.tns();
+        let line = format!("{phase} Phase complete. WNS: {}, TNS: {}", self.ds(wns, 3), self.ds(tns, 1));
+        self.debug("repair_setup", 1, line);
+        Ok(())
+    }
+
+    /// `shouldStopLastGasp`.
+    fn last_gasp_should_stop(&self) -> bool {
+        self.two_cons_terminations || (self.args.max_iterations > 0 && self.opto_iteration >= self.args.max_iterations)
+    }
+
+    /// `repairLastGaspEndpoint` with `advanceLastGaspProgress`.
+    fn repair_last_gasp_endpoint(&mut self, es: &mut EndpointState, prev_worst_slack: &mut f32) -> Result<(), Stop> {
+        let phase = self.phase;
+        let margin = self.ctx.margin;
+        while es.pass <= 10 {
+            self.opto_iteration += 1;
+            if self.terminate_progress() {
+                if self.prev_termination {
+                    self.two_cons_terminations = true;
+                } else {
+                    self.prev_termination = true;
+                }
+                self.accept_endpoint_state(es)?;
+                break;
+            }
+            if self.opto_iteration % OPTO_SMALL_INTERVAL == 0 {
+                self.prev_termination = false;
+            }
+            if self.args.verbose || self.opto_iteration == 1 {
+                self.print_progress(self.opto_iteration, false)?;
+            }
+            if !fuzzy::less(es.end_slack, margin) {
+                self.num_viols -= 1;
+                self.accept_endpoint_state(es)?;
+                break;
+            }
+            let end = es.end.clone();
+            let changed = self.repair_path(&end, es.end_slack, false)?;
+            if !changed {
+                self.finish_endpoint_search(es)?;
+                break;
+            }
+            self.retime(std::slice::from_ref(&es.end))?;
+            self.refresh_endpoint_slacks(es);
+            let curr_tns = self.timing.tns();
+            // advanceLastGaspProgress.
+            let improved = !fuzzy::less(es.worst_slack, *prev_worst_slack) && !fuzzy::less(curr_tns, self.prev_tns);
+            if !improved {
+                let line = format!(
+                    "{phase} Phase: Move rejected for endpoint {} pass {} because WNS worsened {} -> {} and TNS worsened {} -> {}",
+                    self.end_index,
+                    es.pass,
+                    self.ds(*prev_worst_slack, 3),
+                    self.ds(es.worst_slack, 3),
+                    self.ds(self.prev_tns, 1),
+                    self.ds(curr_tns, 1)
+                );
+                self.debug("repair_setup", 2, line);
+                self.restore_endpoint_state(es)?;
+                break;
+            }
+            let line = format!(
+                "{phase} Phase: Move accepted for endpoint {} pass {} because WNS improved {} -> {} and TNS improved {} -> {}",
+                self.end_index,
+                es.pass,
+                self.ds(*prev_worst_slack, 3),
+                self.ds(es.worst_slack, 3),
+                self.ds(self.prev_tns, 1),
+                self.ds(curr_tns, 1)
+            );
+            self.debug("repair_setup", 2, line);
+            *prev_worst_slack = es.worst_slack;
+            self.prev_tns = curr_tns;
+            if !fuzzy::less(es.end_slack, margin) {
+                self.num_viols -= 1;
+                self.accept_endpoint_state(es)?;
+                break;
+            }
+            self.save_improved_checkpoint(es)?;
+            if self.end_index == 1 {
+                if let Some(w) = es.worst_vertex.clone() {
+                    es.end = w;
+                }
+            }
+            es.pass += 1;
+            if self.args.max_iterations > 0 && self.opto_iteration >= self.args.max_iterations {
+                self.accept_endpoint_state(es)?;
+                break;
+            }
+        }
+        self.accept_endpoint_state(es)
+    }
+
     /// `terminateProgress`: every `opto_small_interval_` iterations the incremental fix rate,
     /// which past iteration 1000 must reach a threshold doubled every `opto_large_interval_`.
     fn terminate_progress(&mut self) -> bool {
@@ -1191,7 +1372,8 @@ impl Repair<'_, '_> {
             self.prev_tns = curr_tns;
             if iteration > 1000 && inc_fix_rate < self.fix_rate_threshold {
                 let line = format!(
-                    "{PHASE} Phase: Exiting at iteration {iteration} because incr fix rate {:.2}% is < {:.2}% [endpt {}/{}]",
+                    "{} Phase: Exiting at iteration {iteration} because incr fix rate {:.2}% is < {:.2}% [endpt {}/{}]",
+                    self.phase,
                     inc_fix_rate * 100.0,
                     self.fix_rate_threshold * 100.0,
                     self.end_index,
@@ -1246,8 +1428,8 @@ impl Repair<'_, '_> {
         let st = &view.stages[index];
         let line = format!("{} {} fanout = {} drvr_index = {index}", st.pin, st.cell.as_deref().unwrap_or("none"), st.fanout);
         self.debug("repair_setup", 3, line);
-        for &m in self.ctx.sequence {
-            if !self.is_applicable(m, st) {
+        for m in self.sequence.clone() {
+            if !self.is_applicable(m, st, index) {
                 continue;
             }
             self.debug("repair_setup", 1, format!("Considering {} for {}", m.name(), st.pin));
@@ -1258,6 +1440,10 @@ impl Repair<'_, '_> {
                 Move::Buffer => self.buffer_move(view, index)?,
                 Move::Clone => self.clone_move(view, index)?,
                 Move::SplitLoad => self.split_load_move(view, index)?,
+                Move::SizeUpMatch => self.size_up_match_move(view, index)?,
+                // VtSwapGenerator: a candidate needs two VT categories, and a VT library is
+                // refused before the repair — so it never has one.
+                Move::VtSwap => None,
                 other => return Err(Stop::refused("RSZ-ABSENT", format!("{}: not modelled", other.name()))),
             };
             if let Some(r) = result {
@@ -1271,10 +1457,12 @@ impl Repair<'_, '_> {
     }
 
     /// `MoveGenerator::isApplicable` on a path driver target: SwapPins also needs a path index
-    /// above 0; Buffer a fanout of 2 to 19 on a net it may buffer (`okToBufferNet`).
-    fn is_applicable(&self, m: Move, st: &Stage) -> bool {
+    /// above 0; Buffer a fanout of 2 to 19 on a net it may buffer (`okToBufferNet`); SizeUpMatch a
+    /// path index of 2 or more.
+    fn is_applicable(&self, m: Move, st: &Stage, index: usize) -> bool {
         match m {
             Move::Buffer => st.fanout > 1 && st.fanout < rebuffer::REBUFFER_MAX_FANOUT && self.design.ok_to_buffer_net(&st.pin),
+            Move::SizeUpMatch => index >= 2,
             _ => true,
         }
     }
@@ -1478,6 +1666,58 @@ impl Repair<'_, '_> {
                 Ok(())
             }
         }
+    }
+
+    /// SizeUpMatchGenerator (`resolveDriverTarget`, the previous driver with ONE wire fanout, a
+    /// same-family stronger cell there) → `SizeUpMatchCandidate::apply`: the driver takes the
+    /// previous driver's cell, if no fanin net's max capacitance suffers.
+    fn size_up_match_move(&mut self, view: &PathView, index: usize) -> Result<Option<MoveResult>, Stop> {
+        let st = &view.stages[index];
+        let Some(inst) = &st.inst else {
+            self.debug("size_up_match_move", 2, format!("REJECT SizeUpMatchMove {}: No driver instance", st.pin));
+            return Ok(None);
+        };
+        if self.design.net_info().dont_touch_insts.contains(inst) {
+            self.debug("size_up_match_move", 2, format!("REJECT SizeUpMatchMove {}: {inst} is \"don't touch\"", st.pin));
+            return Ok(None);
+        }
+        let cell = st.cell.clone().unwrap_or_default();
+        if !self.ctx.sizing.masters.get(&cell).is_some_and(|m| m.logic_std) {
+            self.debug("size_up_match_move", 2, format!("REJECT SizeUpMatchMove {}: {inst} isn't logic std cell", st.pin));
+            return Ok(None);
+        }
+        let Some(curr) = self.ctx.libs.link_cell(&cell) else {
+            self.debug("size_up_match_move", 2, format!("REJECT SizeUpMatchMove {}: No liberty cell found for {inst}", st.pin));
+            return Ok(None);
+        };
+        // loadPreviousDriverPin: the path two stages back.
+        let Some(prev) = index.checked_sub(2).map(|k| &view.stages[k]) else {
+            self.debug("size_up_match_move", 2, format!("REJECT SizeUpMatchMove {}: No previous driver pin", st.pin));
+            return Ok(None);
+        };
+        // hasSingleStageFanout: its wire fanout — counted only until it passes 1, so a rejection
+        // always reports 2.
+        if prev.fanout != 1 {
+            let line = if prev.fanout > 1 { format!("REJECT SizeUpMatchMove {}: Previous driver fanout 2 > 1", st.pin) } else { format!("REJECT SizeUpMatchMove {}: No previous driver vertex", st.pin) };
+            self.debug("size_up_match_move", 2, line);
+            return Ok(None);
+        }
+        // selectReplacement: the previous driver's cell when it is the same family (buffer or
+        // inverter) and drives stronger (`bufferDriveResistance`).
+        let Some(prev_cell) = prev.cell.as_deref().filter(|c| *c != cell).and_then(|c| self.ctx.libs.link_cell(c)) else { return Ok(None) };
+        let same_family = (prev_cell.is_buffer() && curr.is_buffer()) || (prev_cell.is_inverter() && curr.is_inverter());
+        let r = |c: &Cell| c.buffer_ports().map_or(0.0, |(_, o)| c.drive_resistance(&o.name));
+        if !same_family || r(prev_cell) >= r(curr) {
+            return Ok(None);
+        }
+        let to = prev_cell.name.clone();
+        if !replacement_preserves_max_cap(self.ctx.libs, &cell, &to, &st.fanin_caps) {
+            self.debug("size_up_match_move", 2, format!("REJECT SizeUpMatchMove {}: Couldn't replace {cell} -> {to}", st.pin));
+            return Ok(None);
+        }
+        self.design.swap_master(inst, &to).map_err(|e| Stop::error("RSZ-REPLACE", e))?;
+        self.debug("size_up_match_move", 1, format!("ACCEPT SizeUpMatchMove {}: Replaced {cell} -> {to}", st.pin));
+        Ok(Some(MoveResult { kind: Move::SizeUpMatch, count: 1, insts: vec![inst.clone()] }))
     }
 
     /// `MoveCommitter::commit` of an accepted candidate: recorded, and kept in the open level.
@@ -1684,12 +1924,12 @@ impl Repair<'_, '_> {
         }
         let starts = collect_violating(&self.timing.starts, self.ctx.margin);
         let (wns, worst) = self.timing.worst();
-        let field = format!("{iteration}*");
+        let field = format!("{iteration}{}", self.phase.chars().last().unwrap_or('*'));
         let row = progress_row(
             &Row {
                 iter: &field,
                 removed: self.committer.total(Move::Unbuffer),
-                resized: self.committer.total(Move::SizeUp),
+                resized: self.committer.total(Move::SizeUp) + self.committer.total(Move::SizeUpMatch),
                 inserted: self.committer.total(Move::Buffer) + self.committer.total(Move::SplitLoad),
                 cloned: self.committer.total(Move::Clone),
                 swaps: self.committer.total(Move::SwapPins),
@@ -1716,7 +1956,7 @@ impl Repair<'_, '_> {
             &Row {
                 iter: "final",
                 removed: self.committer.total(Move::Unbuffer),
-                resized: self.committer.total(Move::SizeUp),
+                resized: self.committer.total(Move::SizeUp) + self.committer.total(Move::SizeUpMatch),
                 inserted: self.committer.total(Move::Buffer) + self.committer.total(Move::SplitLoad),
                 cloned: self.committer.total(Move::Clone),
                 swaps: self.committer.total(Move::SwapPins),
@@ -1743,9 +1983,9 @@ impl Repair<'_, '_> {
                 self.report(format!("[INFO RSZ-0045] Inserted {} buffers, {splits} to split loads.", buffers + splits));
             }
         }
-        let size_up = self.committer.committed(Move::SizeUp);
-        if size_up > 0 {
-            self.report(format!("[INFO RSZ-0051] Resized {size_up} instances: {size_up} up, 0 up match, 0 down, 0 VT"));
+        let (size_up, up_match) = (self.committer.committed(Move::SizeUp), self.committer.committed(Move::SizeUpMatch));
+        if size_up + up_match > 0 {
+            self.report(format!("[INFO RSZ-0051] Resized {} instances: {size_up} up, {up_match} up match, 0 down, 0 VT", size_up + up_match));
         }
         let swaps = self.committer.committed(Move::SwapPins);
         if swaps > 0 {
