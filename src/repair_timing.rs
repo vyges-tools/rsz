@@ -52,7 +52,7 @@ pub struct Args {
 }
 
 /// `MoveType`, by the name `moveName` prints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Move {
     Buffer,
     Unbuffer,
@@ -286,6 +286,29 @@ pub fn delay_as_string(value: f32, digits: usize, time_scale: f32) -> String {
     format!("{:.*}", digits, f64::from(value / time_scale))
 }
 
+/// A float as `fmt`'s `{}` prints it: the shortest digits that read back to the same float, in
+/// fixed notation when the decimal exponent is in [-4, 7) (a float's `digits10 + 1`), else as
+/// `d.ddde±XX` with at least two exponent digits.
+pub fn fmt_float(v: f32) -> String {
+    if v.is_nan() {
+        return "nan".into();
+    }
+    if v.is_infinite() {
+        return if v > 0.0 { "inf".into() } else { "-inf".into() };
+    }
+    if v == 0.0 {
+        return if v.is_sign_negative() { "-0".into() } else { "0".into() };
+    }
+    let sci = format!("{v:e}");
+    let (mantissa, exp) = sci.split_once('e').expect("exponent form");
+    let exp: i32 = exp.parse().expect("an exponent");
+    if (-4..7).contains(&exp) {
+        format!("{v}")
+    } else {
+        format!("{mantissa}e{}{:02}", if exp < 0 { '-' } else { '+' }, exp.abs())
+    }
+}
+
 /// `Search::worstSlack`: over the endpoints in the timer's order, the first strictly worse.
 pub fn worst_slack(endpoints: &[Point]) -> (f32, Option<&Point>) {
     let mut worst = SLACK_INIT;
@@ -453,6 +476,20 @@ mod tests {
         let s = Args::parse(&["-sequence".into(), "size_down_fanout sizeup".into()]).unwrap();
         assert_eq!(move_sequence(&s, false), [Move::SizeDownFanout, Move::SizeUp]);
         assert_eq!(parse_move_sequence("size").unwrap(), [Move::SizeUp, Move::SizeDownFanout]);
+    }
+
+    /// Rule (fmt `{}` on a float): shortest round-trip digits; fixed for exponents -4..6, else
+    /// exponent form with a sign and two digits. Values from the reference's debug lines.
+    #[test]
+    fn floats_print_as_fmt_does() {
+        assert_eq!(fmt_float(1.3929026e-10), "1.3929026e-10");
+        assert_eq!(fmt_float(6.073e-14), "6.073e-14");
+        assert_eq!(fmt_float(10.0), "10");
+        assert_eq!(fmt_float(0.0001), "0.0001");
+        assert_eq!(fmt_float(0.00001), "1e-05");
+        assert_eq!(fmt_float(-2.5e-11), "-2.5e-11");
+        assert_eq!(fmt_float(1.0e7), "1e+07");
+        assert_eq!(fmt_float(0.0), "0");
     }
 
     /// Rule (prepareForPhasePipeline): RSZ-0099 repairs max(int(N × pct), 1) endpoints.

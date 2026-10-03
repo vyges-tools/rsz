@@ -435,12 +435,12 @@ pub fn check_load_slews(sc: &Scenes<'_, '_>, info: &NetInfo, drvr: usize, limits
 /// `Resizer::kDefaultMaxFanout`: the load-pin backstop when nothing constrains fanout.
 pub const DEFAULT_MAX_FANOUT: f32 = 50.0;
 
-/// `Resizer::checkFanout(drvr, max)`: the timer's check (`CheckFanouts::check`) — the fanout
-/// load of the connected non-port loads (`fanout_load`, else the library default, else nothing;
-/// a pin with no liberty port counts 1) against the port's `max_fanout` or, for an output, its
-/// library's `default_max_fanout`; with no limit the timer reports fanout 0, limit and slack
-/// INF, and the backstop applies: the number of load pins (`FindNetDrvrLoads`), against 50.
-pub fn check_fanout(g: &Graph<'_>, info: &NetInfo, drvr: usize, limits: &Limits, clocks: &std::collections::BTreeSet<usize>) -> (f32, f32, f32) {
+/// `Sta::checkFanout(drvr, mode, max)` (`CheckFanouts::check`): the fanout load of the connected
+/// non-port loads (`fanout_load`, else the library default, else nothing; a pin with no liberty
+/// port counts 1) against the port's `max_fanout` or, for an output, its library's
+/// `default_max_fanout`, the design's limit when tighter. No limit (or an ideal clock pin):
+/// fanout 0, limit and slack INF.
+pub fn sta_check_fanout(g: &Graph<'_>, info: &NetInfo, drvr: usize, limits: &Limits, clocks: &std::collections::BTreeSet<usize>) -> (f32, f32, f32) {
     let ideal_clock = clocks.contains(&drvr);
     let mut fanout = 0.0f32;
     for p in connected_pins(g, info, drvr) {
@@ -473,10 +473,14 @@ pub fn check_fanout(g: &Graph<'_>, info: &NetInfo, drvr: usize, limits: &Limits,
             check = (fanout, l, l - fanout);
         }
     }
-    if check.1 < INF {
-        return check;
-    }
-    if ideal_clock {
+    check
+}
+
+/// `Resizer::checkFanout(drvr, max)`: the timer's check ([`sta_check_fanout`]); with no limit
+/// the backstop applies: the number of load pins (`FindNetDrvrLoads`), against 50.
+pub fn check_fanout(g: &Graph<'_>, info: &NetInfo, drvr: usize, limits: &Limits, clocks: &std::collections::BTreeSet<usize>) -> (f32, f32, f32) {
+    let check = sta_check_fanout(g, info, drvr, limits, clocks);
+    if check.1 < INF || clocks.contains(&drvr) {
         return check;
     }
     let loads = connected_pins(g, info, drvr).into_iter().filter(|&p| !g.vertices[p].is_driver).count();

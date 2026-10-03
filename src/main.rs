@@ -304,6 +304,21 @@ struct CliDesign<'a> {
     port_caps: PortCaps,
     /// `set_propagated_clock` in force: a re-estimated clock net is a propagated one.
     propagated: bool,
+    /// Per open journal level (odb's eco), the estimator's state as the level found it: undoing
+    /// the level's edits restores the nets, and re-estimating a restored net gives back its old
+    /// estimate, so the old state is put back whole.
+    journal: Vec<JournalState>,
+    /// The nets an SDC `set_load` names (`Sdc::hasNetWireCap`, keyed by the net object): such a
+    /// net is constrained and is never merged away.
+    sdc_nets: BTreeSet<String>,
+}
+
+/// What a journal level puts back on undo besides the database (the netlist is read from the
+/// database again, as the timer's network reads it live).
+struct JournalState {
+    parasitics: Vec<HashMap<String, NetParasitics>>,
+    invalid: BTreeSet<String>,
+    sdc_nets: BTreeSet<String>,
 }
 
 impl CliDesign<'_> {
@@ -331,6 +346,51 @@ impl CliDesign<'_> {
 
     fn clamp_loc_to_core(&self, loc: (i32, i32), master: &str) -> (i32, i32) {
         clamp_loc_to_core(self.core, (self.db.master_get_width(master) as i32, self.db.master_get_height(master) as i32), loc)
+    }
+
+    /// `insertBufferBeforeLoads(net, loads, …)`: on `net`, else the first load's.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_before_loads(&mut self, net: Option<&str>, loads: &[String], cell: &str, loc: (i32, i32), reason: &str, loads_on_diff_nets: bool, uniquify: &str) -> Result<vyges_rsz::design::Repeater, String> {
+        let original = match net {
+            Some(n) => n.to_string(),
+            None => self.net_of_load(loads.first().ok_or("insertBufferBeforeLoads: no loads specified")?),
+        };
+        let mut iterms = Vec::new();
+        let mut bterms = Vec::new();
+        for l in loads {
+            match l.rsplit_once('/') {
+                Some((inst, pin)) if !self.netlist.ports.iter().any(|p| &p.0 == l) => iterms.push((inst.to_string(), pin.to_string())),
+                _ => bterms.push(l.clone()),
+            }
+        }
+        let inst = self.db.insert_buffer_before_loads(net, &iterms, &bterms, cell, Some(loc), reason, None, uniquify, loads_on_diff_nets).map_err(|e| e.to_string())?;
+        let at = self.clamp_loc_to_core(self.db.inst_location(&inst), cell);
+        self.db.set_inst_location(&inst, at.0, at.1).map_err(|e| e.to_string())?;
+        let c = self.libs.link_cell(cell).ok_or_else(|| format!("{cell}: no liberty cell"))?;
+        let (input, output) = c.buffer_ports().ok_or_else(|| format!("{cell}: not a buffer"))?;
+        let in_net = self.db.net_of(&inst, &input.name);
+        let out_net = self.db.net_of(&inst, &output.name);
+        // A port load names the new net after the port and renames the original: the cache
+        // follows the net, not the name.
+        for map in self.parasitics.iter_mut() {
+            if in_net != original {
+                if let Some(p) = map.remove(&original) {
+                    map.insert(in_net.clone(), p);
+                }
+            }
+            map.remove(&out_net);
+            // `ConcreteParasitics::disconnectPinBefore` on each load moved off the original net:
+            // its pin node in that net's (stale) network becomes a fresh internal subnode — the
+            // resistors handed over, no ground capacitance, no pin. A connected pin adds nothing:
+            // until the net is estimated again, its new input pin has no node.
+            if let Some(p) = map.get_mut(&in_net) {
+                disconnect_pins(p, &in_net, loads);
+            }
+        }
+        self.invalidate(&in_net);
+        self.invalidate(&out_net);
+        self.refresh()?;
+        Ok(vyges_rsz::design::Repeater { input: format!("{inst}/{}", input.name), output: format!("{inst}/{}", output.name), inst, out_net })
     }
 }
 
@@ -392,43 +452,7 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
     /// `net<n>`, always uniquified), then `insertBufferPostProcess` (`setLocation`: clamped to
     /// the core, PLACED). The odb callbacks invalidate the new net and the original one.
     fn insert_repeater(&mut self, loads: &[String], cell: &str, loc: (i32, i32), reason: &str) -> Result<vyges_rsz::design::Repeater, String> {
-        let original = self.net_of_load(loads.first().ok_or("insertBufferBeforeLoads: no loads specified")?);
-        let mut iterms = Vec::new();
-        let mut bterms = Vec::new();
-        for l in loads {
-            match l.rsplit_once('/') {
-                Some((inst, pin)) if !self.netlist.ports.iter().any(|p| &p.0 == l) => iterms.push((inst.to_string(), pin.to_string())),
-                _ => bterms.push(l.clone()),
-            }
-        }
-        let inst = self.db.insert_buffer_before_loads(None, &iterms, &bterms, cell, Some(loc), reason, None, "ALWAYS", false).map_err(|e| e.to_string())?;
-        let at = self.clamp_loc_to_core(self.db.inst_location(&inst), cell);
-        self.db.set_inst_location(&inst, at.0, at.1).map_err(|e| e.to_string())?;
-        let c = self.libs.link_cell(cell).ok_or_else(|| format!("{cell}: no liberty cell"))?;
-        let (input, output) = c.buffer_ports().ok_or_else(|| format!("{cell}: not a buffer"))?;
-        let in_net = self.db.net_of(&inst, &input.name);
-        let out_net = self.db.net_of(&inst, &output.name);
-        // A port load names the new net after the port and renames the original: the cache
-        // follows the net, not the name.
-        for map in self.parasitics.iter_mut() {
-            if in_net != original {
-                if let Some(p) = map.remove(&original) {
-                    map.insert(in_net.clone(), p);
-                }
-            }
-            map.remove(&out_net);
-            // `ConcreteParasitics::disconnectPinBefore` on each load moved off the original net:
-            // its pin node in that net's (stale) network becomes a fresh internal subnode — the
-            // resistors handed over, no ground capacitance, no pin. A connected pin adds nothing:
-            // until the net is estimated again, its new input pin has no node.
-            if let Some(p) = map.get_mut(&in_net) {
-                disconnect_pins(p, &in_net, loads);
-            }
-        }
-        self.invalidate(&in_net);
-        self.invalidate(&out_net);
-        self.refresh()?;
-        Ok(vyges_rsz::design::Repeater { input: format!("{inst}/{}", input.name), output: format!("{inst}/{}", output.name), inst, out_net })
+        self.insert_before_loads(None, loads, cell, loc, reason, false, "ALWAYS")
     }
 
     /// `Resizer::replaceCell` → `dbInst::swapMaster`; the callback invalidates the net on every
@@ -501,6 +525,178 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
 
     fn as_design(&self) -> &dyn vyges_rsz::design::Design {
         self
+    }
+
+    fn begin_journal(&mut self) -> Result<(), String> {
+        self.db.eco_begin().map_err(|e| e.to_string())?;
+        self.journal.push(JournalState { parasitics: self.parasitics.clone(), invalid: self.invalid.clone(), sdc_nets: self.sdc_nets.clone() });
+        Ok(())
+    }
+
+    fn commit_journal(&mut self) -> Result<(), String> {
+        self.db.eco_commit().map_err(|e| e.to_string())?;
+        self.journal.pop();
+        Ok(())
+    }
+
+    fn restore_journal(&mut self) -> Result<bool, String> {
+        let had_changes = !self.db.eco_is_empty().map_err(|e| e.to_string())?;
+        self.db.eco_undo().map_err(|e| e.to_string())?;
+        let s = self.journal.pop().ok_or("undoEco without beginEco")?;
+        self.parasitics = s.parasitics;
+        self.invalid = s.invalid;
+        self.sdc_nets = s.sdc_nets;
+        self.refresh()?;
+        Ok(had_changes)
+    }
+
+    /// `canRemoveBuffer(buffer, true)`'s database checks: the buffer neither dont_touch nor FIXED,
+    /// neither net dont_touch; then the net to go (the input net when the output net has a port,
+    /// else the output net): neither buffer pin a clock's source (`Sdc::isConstrained(pin)`: the
+    /// only pin constraint an accepted SDC can put on an instance pin), the net to go not named by
+    /// `set_load` (`isConstrained(net)`), and that net mergeable into the other
+    /// (`dbNet::canMergeNet`), or absent.
+    fn can_remove_buffer(&self, inst: &str, in_pin: &str, out_pin: &str) -> bool {
+        if self.db.inst_is_do_not_touch(inst) || self.db.inst_is_fixed(inst) {
+            return false;
+        }
+        let in_net = self.db.net_of(inst, in_pin);
+        let out_net = self.db.net_of(inst, out_pin);
+        if [&in_net, &out_net].iter().any(|n| !n.is_empty() && self.db.net_is_do_not_touch(n)) {
+            return false;
+        }
+        let out_net_ports = !out_net.is_empty() && !self.db.net_bterms(&out_net).is_empty();
+        let (survivor, removed) = if out_net_ports { (out_net, in_net) } else { (in_net, out_net) };
+        let pins = [format!("{inst}/{in_pin}"), format!("{inst}/{out_pin}")];
+        if pins.iter().any(|p| self.clock_sources.contains(p)) || self.sdc_nets.contains(&removed) {
+            return false;
+        }
+        if removed.is_empty() {
+            return true;
+        }
+        !survivor.is_empty() && self.db.net_can_merge(&survivor, &removed).unwrap_or(false)
+    }
+
+    /// `swapPins`: the pins' nets, the dont_touch check on each (pin 1's first), then the database
+    /// swap; the callbacks invalidate both nets.
+    fn swap_pins(&mut self, inst: &str, pin1: &str, pin2: &str) -> Result<vyges_rsz::repair_setup::PinSwap, String> {
+        use vyges_rsz::repair_setup::PinSwap;
+        let net1 = self.db.net_of(inst, pin1);
+        let net2 = self.db.net_of(inst, pin2);
+        if net1.is_empty() || net2.is_empty() {
+            return Ok(PinSwap::NoNet);
+        }
+        for n in [&net1, &net2] {
+            if self.db.net_is_do_not_touch(n) {
+                return Ok(PinSwap::DontTouch(n.clone()));
+            }
+        }
+        self.db.swap_pins(inst, pin1, pin2).map_err(|e| e.to_string())?;
+        self.invalidate(&net1);
+        self.invalidate(&net2);
+        self.refresh()
+            .map(|_| PinSwap::Swapped)
+    }
+
+    fn ok_to_buffer_net(&self, drvr_pin: &str) -> bool {
+        let (inst, term) = self.term(drvr_pin);
+        let tristate = inst.is_some_and(|i| self.libs.link_cell(&self.db.inst_master(i)).and_then(|c| c.ports.iter().find(|p| p.name == term)).is_some_and(|p| p.is_any_tristate()));
+        if tristate {
+            return false;
+        }
+        let net = match inst {
+            Some(i) => self.db.net_of(i, term),
+            None => self.db.bterm_net(term),
+        };
+        !net.is_empty() && !self.db.net_is_do_not_touch(&net) && !self.db.net_is_connected_by_abutment(&net) && !self.db.net_is_special(&net)
+    }
+
+    /// `applyClone` on the database: the instance (odb's "clone" name, TIMING source, placed and
+    /// clamped), each liberty INPUT pin of the driver in the master's terminal order connected to
+    /// the same net, the first output on a new "net", the moved loads disconnected and connected
+    /// to it. The callbacks invalidate every net touched.
+    fn clone_instance(&mut self, drvr_inst: &str, cell: &str, loc: (i32, i32), moved_loads: &[String]) -> Result<String, String> {
+        let e = |x: vyges_opendb::Error| x.to_string();
+        let name = self.db.make_new_inst_name("clone", "ALWAYS").map_err(e)?;
+        self.db.create_inst(cell, &name).map_err(e)?;
+        self.db.inst_set_source_type(&name, "TIMING").map_err(e)?;
+        let at = self.clamp_loc_to_core(loc, cell);
+        self.db.set_inst_location(&name, at.0, at.1).map_err(e)?;
+        let master = self.db.inst_master(drvr_inst);
+        let lc = self.libs.link_cell(&master).ok_or_else(|| format!("{master}: no liberty cell"))?.clone();
+        let terms: Vec<String> = self.db.master_mterms(&master).map_err(e)?.into_iter().filter(|(_, t)| t != "POWER" && t != "GROUND").map(|(n, _)| n).collect();
+        let mut touched = Vec::new();
+        for term in &terms {
+            if !lc.port(term).is_some_and(|p| p.direction == vyges_sta::liberty::Direction::Input) {
+                continue;
+            }
+            let net = self.db.net_of(drvr_inst, term);
+            if !net.is_empty() {
+                self.db.connect(&name, term, &net).map_err(e)?;
+                touched.push(net);
+            }
+        }
+        let clone_terms: Vec<String> = self.db.master_mterms(cell).map_err(e)?.into_iter().filter(|(_, t)| t != "POWER" && t != "GROUND").map(|(n, _)| n).collect();
+        let cc = self.libs.link_cell(cell).ok_or_else(|| format!("{cell}: no liberty cell"))?.clone();
+        let out = clone_terms.iter().find(|t| cc.port(t).is_some_and(|p| p.direction == vyges_sta::liberty::Direction::Output)).ok_or("Cannot find output pin of the clone instance")?;
+        let out_net = self.db.make_new_net_name("net", "ALWAYS").map_err(e)?;
+        self.db.create_net(&out_net).map_err(e)?;
+        self.db.connect(&name, out, &out_net).map_err(e)?;
+        touched.push(out_net.clone());
+        for load in moved_loads {
+            let (inst, term) = load.rsplit_once('/').ok_or("a load pin")?;
+            touched.push(self.db.net_of(inst, term));
+            self.db.disconnect(inst, term).map_err(e)?;
+            self.db.connect(inst, term, &out_net).map_err(e)?;
+        }
+        for n in touched {
+            self.invalidate(&n);
+        }
+        self.refresh()?;
+        Ok(name)
+    }
+
+    fn inst_id(&self, inst: &str) -> u32 {
+        self.db.inst_id(inst).unwrap_or(u32::MAX)
+    }
+
+    fn pin_dont_touch(&self, pin: &str) -> bool {
+        let (inst, term) = self.term(pin);
+        let net = match inst {
+            Some(i) => self.db.net_of(i, term),
+            None => self.db.bterm_net(term),
+        };
+        inst.is_some_and(|i| self.db.inst_is_do_not_touch(i)) || (!net.is_empty() && self.db.net_is_do_not_touch(&net))
+    }
+
+    fn insert_buffer_before_loads(&mut self, net: Option<&str>, loads: &[String], cell: &str, loc: (i32, i32), reason: &str, loads_on_diff_nets: bool, uniquify: &str) -> Result<vyges_rsz::design::Repeater, String> {
+        self.insert_before_loads(net, loads, cell, loc, reason, loads_on_diff_nets, uniquify)
+    }
+
+    /// `removeBuffer`: the database edit (`remove_buffer`), then the odb callbacks on the
+    /// estimator — both nets were disconnected and the survivor took the other's pins (invalid),
+    /// the merged-away net destroyed (its parasitics erased). The cache is keyed by name, so both
+    /// old names go and the survivor is estimated afresh under its name now.
+    fn remove_buffer(&mut self, inst: &str, in_pin: &str, out_pin: &str) -> Result<vyges_rsz::repair_setup::RemovedBuffer, String> {
+        let in_net = self.db.net_of(inst, in_pin);
+        let out_net = self.db.net_of(inst, out_pin);
+        if in_net.is_empty() {
+            return Err(format!("The input pin of buffer '{inst}' is undriven. Do not remove the buffer."));
+        }
+        let survivor = self.db.remove_buffer(inst, in_pin, out_pin).map_err(|e| e.to_string())?;
+        for map in self.parasitics.iter_mut() {
+            map.remove(&in_net);
+            map.remove(&out_net);
+        }
+        self.invalid.remove(&in_net);
+        self.invalid.remove(&out_net);
+        self.invalidate(&survivor);
+        // A constrained net only ever survives: its constraint follows it to its name now.
+        if self.sdc_nets.remove(&in_net) | self.sdc_nets.remove(&out_net) {
+            self.sdc_nets.insert(survivor.clone());
+        }
+        self.refresh()?;
+        Ok(vyges_rsz::repair_setup::RemovedBuffer { in_net, out_net, survivor })
     }
 }
 
@@ -1042,7 +1238,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 let core = (db.block_get_core_area_x_min(), db.block_get_core_area_y_min(), db.block_get_core_area_x_max(), db.block_get_core_area_y_max());
                 let core = (core != (0, 0, 0, 0)).then_some(core);
                 let port_caps = port_caps_at(step["sdc"].as_str(), sdc.as_ref(), &libs, &netlist)?;
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new() };
                 let r = buffer_ports::buffer_ports(&mut design, &o, &weakest);
                 let parasitics = std::mem::take(&mut design.parasitics);
                 match r {
@@ -1128,7 +1324,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     std::fs::write(path, lines.join("\n") + "\n").map_err(|e| format!("{path}: {e}"))?;
                 }
                 let port_caps = env.port_pin_cap.clone();
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new() };
                 let inputs = Inputs { libs: &libs, masters: &m, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins };
                 outcome = Some(repair_design::repair_design(&inputs, &mut design, &a, &mut trace));
             }
@@ -1209,9 +1405,9 @@ fn run(job: &Value) -> Result<Value, String> {
                 let violating_starts = rt::collect_violating(&starts, margin);
                 let seq = rt::move_sequence(&a, false);
                 let mut lines = rt::preamble(&seq, violating.len(), a.repair_tns_end_percent, a.phases.as_deref());
-                // The moves modelled: SizeUp alone, in the LEGACY phase alone.
-                let unmodelled = if seq != [rt::Move::SizeUp] {
-                    Some(format!("repair_timing: the {} moves are not modelled (SizeUpMove alone is)", seq.iter().map(|m| m.name()).collect::<Vec<_>>().join(" ")))
+                // The moves modelled: SizeUp and Unbuffer, in the LEGACY phase alone.
+                let unmodelled = if let Some(m) = seq.iter().find(|m| !matches!(m, rt::Move::SizeUp | rt::Move::Unbuffer | rt::Move::SwapPins | rt::Move::Buffer | rt::Move::Clone | rt::Move::SplitLoad)) {
+                    Some(format!("repair_timing: {} is not modelled (SizeUpMove, UnbufferMove, SwapPinsMove, BufferMove, CloneMove and SplitLoadMove are)", m.name()))
                 } else if !a.skip_last_gasp && !legacy_only {
                     Some("repair_timing: the LAST_GASP phase is not modelled (-skip_last_gasp)".into())
                 } else if a.match_cell_footprint {
@@ -1238,6 +1434,55 @@ fn run(job: &Value) -> Result<Value, String> {
                     let buffers = vyges_rsz::preamble::find_buffers(&libs, &m, &dont_use).map_err(|e| format!("{}: {}", e.code(), e.message()))?;
                     let (tgt_slews, tgt_scene, target_loads) = vyges_rsz::preamble::find_target_loads(&libs, &buffers.cells, &dont_use);
                     let sizing = vyges_rsz::sizing::Sizing { libs: &libs, masters: &m, dont_use: &dont_use, equiv: &equiv, target_loads: &target_loads, tgt_slews, tgt_scene };
+                    let limits = Limits {
+                        design_max_transition: s.max_transition.map(|v| user_time_to_sta(v, time_scale)),
+                        design_max_fanout: s.max_fanout.map(|v| v as f32),
+                    };
+                    let wire_rc = {
+                        rc.sort_clk_and_signal_layers();
+                        let v = rc.resolved(&db.tech_get_name(), 0);
+                        vyges_rsz::buffered_net::WireRc { h_res: v[0], v_res: v[1], h_cap: v[2], v_cap: v[3] }
+                    };
+                    let slew_shape_factor = vyges_rsz::preamble::compute_slew_shape_factor(lib0).map_err(|e| format!("{}: {}", e.code(), e.message()))?;
+                    // The reference's pin addresses, when the gate supplies them (debug order only).
+                    let pin_addr = match job["pin_address"].as_str() {
+                        Some(path) => Some(vyges_rsz::unbuffer::PinAddr::parse(&read_text(path)?)?),
+                        None => None,
+                    };
+                    // Rebuffer::init / initOnCorner, when the sequence has BufferMove.
+                    let rb_sizes_store;
+                    let rb_ctx_store;
+                    let rb_ctx = if seq.contains(&rt::Move::Buffer) {
+                        let base = vyges_rsz::rebuffer::Ctx { libs: &libs, sizes: &[], rc: wire_rc, dbu: db.tech_get_db_units_per_micron(), slew_shape_factor, tgt_slews, time_scale, cap_scale: lib0.cap_scale };
+                        let lowest = libs.link_cell(&buffers.lowest).ok_or("no lowest-drive buffer")?;
+                        let r_max = lowest.buffer_ports().map_or(0.0, |(_, o)| lowest.drive_resistance(&o.name));
+                        let slew_limit = |c: &vyges_sta::liberty::Cell, port: &str| {
+                            let lib = libs.link_library(&c.name).unwrap_or(lib0);
+                            let p = c.port(port);
+                            vyges_rsz::timing::find_slew_limit(lib, p.map_or(vyges_sta::liberty::Direction::Output, |p| p.direction), p.and_then(|p| p.max_transition), &limits)
+                        };
+                        let max_input_slew = |c: &vyges_sta::liberty::Cell, port: &str| {
+                            let lib = libs.link_library(&c.name).unwrap_or(lib0);
+                            let p = c.port(port);
+                            vyges_rsz::timing::max_input_slew_at(lib, lib, p.map_or(vyges_sta::liberty::Direction::Input, |p| p.direction), p.and_then(|p| p.max_transition), &limits)
+                        };
+                        // maxLoad: the first output port with a capacitance limit.
+                        let max_load = |c: &vyges_sta::liberty::Cell| c.ports.iter().filter(|p| p.direction == vyges_sta::liberty::Direction::Output).find_map(|p| p.max_capacitance).unwrap_or(0.0);
+                        let ci = vyges_rsz::rebuffer::CharInputs { ctx: &base, r_max, slew_limit: &slew_limit, max_input_slew: &max_input_slew, max_load: &max_load };
+                        rb_sizes_store = match vyges_rsz::rebuffer::characterize(&ci, &buffers.cells) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                lines.extend(rt::row0(&ends, violating.len(), &violating_starts, time_scale));
+                                timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len() }));
+                                timing_stop = Some(format!("{e} (not modelled)"));
+                                break;
+                            }
+                        };
+                        rb_ctx_store = vyges_rsz::rebuffer::Ctx { sizes: &rb_sizes_store, ..base };
+                        Some(&rb_ctx_store)
+                    } else {
+                        None
+                    };
                     let ctx = vyges_rsz::repair_setup::Ctx {
                         libs: &libs,
                         sizing: &sizing,
@@ -1248,6 +1493,15 @@ fn run(job: &Value) -> Result<Value, String> {
                         ideal_clock: !clock_propagated,
                         margin,
                         time_scale,
+                        sequence: &seq,
+                        limits: &limits,
+                        dbu: db.tech_get_db_units_per_micron(),
+                        wire_rc,
+                        slew_shape_factor,
+                        debug: &debug_levels,
+                        rebuffer: rb_ctx,
+                        lowest_buffer: &buffers.lowest,
+                        pin_addr: pin_addr.as_ref(),
                     };
                     drop(search);
                     drop(g);
@@ -1257,7 +1511,8 @@ fn run(job: &Value) -> Result<Value, String> {
                     let core = (db.block_get_core_area_x_min(), db.block_get_core_area_y_min(), db.block_get_core_area_x_max(), db.block_get_core_area_y_max());
                     let core = (core != (0, 0, 0, 0)).then_some(core);
                     let port_caps = env.port_pin_cap.clone();
-                    let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated };
+                    let sdc_nets: BTreeSet<String> = s.env.iter().filter(|e| e.cmd == "set_load" && e.accessor == "get_nets").flat_map(|e| e.objects.iter().cloned()).collect();
+                    let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated, journal: Vec::new(), sdc_nets };
                     let r = vyges_rsz::repair_setup::repair_setup(&ctx, &mut design, &a);
                     carried = Some(std::mem::take(&mut design.parasitics));
                     let o = match r {
@@ -1273,7 +1528,7 @@ fn run(job: &Value) -> Result<Value, String> {
                         std::fs::write(path, o.trace.join("\n") + "\n").map_err(|e| format!("{path}: {e}"))?;
                     }
                     lines.extend(o.lines);
-                    timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len(), "resized": o.resized }));
+                    timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len(), "resized": o.resized, "removed": o.removed, "inserted": o.inserted }));
                 }
                 if a.hold {
                     timing_stop = Some("repair_timing -hold: not modelled".into());
@@ -1289,6 +1544,10 @@ fn run(job: &Value) -> Result<Value, String> {
     // The design as the repair left it.
     if let Some(path) = job["write_def"].as_str() {
         db.write_def(path).map_err(|e| format!("{path}: {e}"))?;
+    }
+    // A diagnostic: the database itself (odb ids preserved), to set against the reference's.
+    if let Some(path) = job["write_db"].as_str() {
+        db.write(path).map_err(|e| format!("{path}: {e}"))?;
     }
     let tags: Vec<&str> = trace.tags.iter().copied().collect();
     let mut report = match outcome {

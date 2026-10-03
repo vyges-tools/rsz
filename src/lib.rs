@@ -8,7 +8,12 @@
 //!   target slews and each cell's target load, the slew shape factor.
 //! - [`repair_design`]: the driver loop, a thin sequencer of the stages in their order.
 //! - [`repair_timing`]: `repair_timing -setup` up to its first progress row.
-//! - [`repair_setup`]: the setup repair's legacy pass loop (SizeUp moves), to its summary.
+//! - [`repair_setup`]: the setup repair's legacy pass loop (SizeUp and Unbuffer moves), to its
+//!   summary.
+//! - [`unbuffer`]: UnbufferMove — the guards and the slack estimate a buffer removal must pass.
+//! - [`swap_pins`]: SwapPinsMove — the symmetric inputs and the fastest of them.
+//! - [`rebuffer`]: BufferMove — the net rebuilt as a buffer tree, by slack then by area.
+//! - [`clone`]: CloneMove — a high-fanout driver duplicated for half its loads.
 //! - [`timing`]: what the repair asks the timer — slew, capacitance and fanout checks per scene, the
 //!   forward pass, the driver order.
 //! - [`driver_slew`]: a driver's own slew violation — the size that fits, else the load cap that
@@ -23,18 +28,22 @@
 
 pub mod buffer_ports;
 pub mod buffered_net;
+pub mod clone;
 pub mod design;
 pub mod driver_slew;
 pub mod fanout;
 pub mod max_wire_length;
 pub mod order;
 pub mod preamble;
+pub mod rebuffer;
 pub mod repair_design;
 pub mod repair_setup;
 pub mod repair_timing;
 pub mod sizing;
+pub mod swap_pins;
 pub mod timing;
 pub mod trace;
+pub mod unbuffer;
 pub mod walk;
 
 /// Why a run stopped short of a result.

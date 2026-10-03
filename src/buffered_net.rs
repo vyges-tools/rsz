@@ -157,7 +157,7 @@ impl BufferedNet {
     }
 
     /// The junction constructor: `ref` and `ref2`'s caps and fanouts summed, the smaller slew limit.
-    fn junction(&mut self, at: (i32, i32), r: usize, r2: usize) -> usize {
+    pub(crate) fn junction(&mut self, at: (i32, i32), r: usize, r2: usize) -> usize {
         let (a, b) = (&self.nodes[r], &self.nodes[r2]);
         let node = BNode { kind: Kind::Junction { r, r2 }, x: at.0, y: at.1, layer: NULL_LAYER, cap: a.cap + b.cap, fanout: a.fanout + b.fanout, max_load_slew: a.max_load_slew.min(b.max_load_slew) };
         self.push(node)
@@ -165,7 +165,7 @@ impl BufferedNet {
 
     /// The wire constructor: at `from`, on no layer; `ref`'s cap plus the wire's (length in meters
     /// times its cap per meter, in double, narrowed); `ref`'s fanout and slew limit.
-    fn wire(&mut self, ctx: &Ctx<'_, '_>, at: (i32, i32), r: usize) -> usize {
+    pub(crate) fn wire(&mut self, ctx: &Ctx<'_, '_>, at: (i32, i32), r: usize) -> usize {
         let (ref_cap, fanout, max_load_slew) = (self.nodes[r].cap, self.nodes[r].fanout, self.nodes[r].max_load_slew);
         let n = self.push(BNode { kind: Kind::Wire { r }, x: at.0, y: at.1, layer: NULL_LAYER, cap: 0.0, fanout, max_load_slew });
         let (_, wire_cap) = self.wire_rc(n, ctx);
