@@ -24,6 +24,14 @@ pub struct Repeater {
     pub out_net: String,
 }
 
+/// What the timer has not yet seen: the database's edit callbacks in order (`Db::edit_log_take`),
+/// and the nets `updateParasitics` estimated since — each gets `delaysInvalidFromFanin`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TimerEdits {
+    pub events: Vec<String>,
+    pub updated_nets: Vec<String>,
+}
+
 /// What the repair asks of the design. The command line implements it over the database.
 pub trait Design {
     /// The netlist as the database holds it now (the timer's vertex order).
@@ -53,4 +61,12 @@ pub trait Design {
     /// hierarchical pins are no loads) in visit order — through the module nets when the pin has
     /// one, else its flat net's instance terminals in the database's order, then its ports.
     fn visit_connected_pins(&self, pin: &str) -> Vec<String>;
+    /// Begin recording the edits for the incremental timer.
+    fn start_timer_edits(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+    /// The edits since the last take (see [`TimerEdits`]).
+    fn take_timer_edits(&mut self) -> TimerEdits {
+        TimerEdits::default()
+    }
 }

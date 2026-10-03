@@ -516,6 +516,8 @@ pub struct Rebuf<'c> {
     pub trace: Vec<(Option<i64>, String)>,
     /// The reference's error, where it stops (RSZ-0501).
     pub failed: Option<String>,
+    /// A step the reference takes that is not modelled (refused by the caller).
+    pub refused: Option<String>,
     /// `pin_`, for the warnings that name it.
     pub pin: String,
 }
@@ -523,7 +525,7 @@ pub struct Rebuf<'c> {
 /// `BufferedNet::to_string`, indented `level` spaces.
 impl Rebuf<'_> {
     pub fn new<'c>(ctx: &'c Ctx<'c>, probe: &'c Probe) -> Rebuf<'c> {
-        Rebuf { ctx, nodes: probe.nodes.clone(), probe, drvr_load_high_water_mark: 0.0, trace: Vec::new(), failed: None, pin: probe.pin.clone() }
+        Rebuf { ctx, nodes: probe.nodes.clone(), probe, drvr_load_high_water_mark: 0.0, trace: Vec::new(), failed: None, refused: None, pin: probe.pin.clone() }
     }
 
     fn debug(&mut self, level: i64, line: String) {
@@ -541,11 +543,18 @@ impl Rebuf<'_> {
         let slack = self.ctx.delay(nd.slack.to_secs());
         let sl = self.ctx.delay(nd.max_load_slew);
         let buffers = self.buffer_count(n);
-        match &nd.kind {
+        let s = match &nd.kind {
             Kind::Load { pin } => format!("load {pin} ({x}, {y}) cap {cap} slack {slack} load sl {sl}"),
             Kind::Wire { .. } => format!("wire ({x}, {y}) cap {cap} slack {slack} buffers {buffers} load sl {sl}"),
             Kind::Buffer { cell, .. } => format!("buffer ({x}, {y}) {cell} cap {cap} slack {slack} buffers {buffers} load sl {sl}"),
             Kind::Junction { .. } => format!("junction ({x}, {y}) cap {cap} slack {slack} buffers {buffers} load sl {sl}"),
+        };
+        // A diagnostic: the raw slack (fs) and load slew bits (`VYG_RAW`), as the instrumented
+        // reference appends them.
+        if std::env::var_os("VYG_RAW").is_some() {
+            format!("{s} RAW {} {:08x}", nd.slack.0, nd.max_load_slew.to_bits())
+        } else {
+            s
         }
     }
 
@@ -1209,11 +1218,22 @@ impl Rebuf<'_> {
 
     /// `pruneCapVsAreaOptions`: by (area, cap) ascending, keep each option whose cap is fuzzily
     /// below every kept one's, then reverse.
-    fn prune_cap_vs_area(&self, opts: &mut Vec<usize>) {
-        opts.sort_by(|&a, &b| {
-            let (x, y) = (&self.nodes[a], &self.nodes[b]);
-            (x.area, x.cap).partial_cmp(&(y.area, y.cap)).unwrap_or(std::cmp::Ordering::Equal)
+    /// `pruneCapVsAreaOptions`. Its sort is `std::ranges::sort` — not stable: options equal in
+    /// (area, cap) keep the order libc++'s introsort leaves them in, and the first survives.
+    // `std::tuple`'s `<` is `a0 < b0 || (!(b0 < a0) && a1 < b1)`: the negation is the reference's
+    // and differs from `>=` on a NaN — kept as written.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    fn prune_cap_vs_area(&mut self, opts: &mut Vec<usize>) {
+        let nodes = &self.nodes;
+        // `std::tuple` `<`: area, then cap.
+        let sorted = crate::order::libcxx_sort_by(opts, |&a, &b| {
+            let (x, y) = (&nodes[a], &nodes[b]);
+            x.area < y.area || (!(y.area < x.area) && x.cap < y.cap)
         });
+        if let Err(h) = sorted {
+            self.refused.get_or_insert(format!("pruneCapVsAreaOptions: {} options reach the sort's heap fallback, which is not modelled", h.len));
+            return;
+        }
         if opts.is_empty() {
             return;
         }

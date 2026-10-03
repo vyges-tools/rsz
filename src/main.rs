@@ -311,6 +311,20 @@ struct CliDesign<'a> {
     /// The nets an SDC `set_load` names (`Sdc::hasNetWireCap`, keyed by the net object): such a
     /// net is constrained and is never merged away.
     sdc_nets: BTreeSet<String>,
+    /// The edits as the incremental timer receives them.
+    timer: TimerLog,
+}
+
+/// The incremental timer's side of the edits: the database's callbacks as read, and the
+/// estimator's invalid set as ITS callbacks keep it (`parasitics_invalid_`) — apart from
+/// [`CliDesign::invalid`], which a journal undo restores whole, where the reference's undo
+/// invalidates every net it touches.
+#[derive(Default)]
+struct TimerLog {
+    on: bool,
+    events: Vec<String>,
+    est_invalid: BTreeSet<String>,
+    updated: Vec<String>,
 }
 
 /// What a journal level puts back on undo besides the database (the netlist is read from the
@@ -327,6 +341,34 @@ impl CliDesign<'_> {
         self.netlist = vyges_grt::timer::netlist(self.db);
         self.info = net_info(self.db, &self.netlist)?;
         Ok(())
+    }
+
+    /// The database's callbacks since the last read, into the timer's log; the estimator's
+    /// callbacks (`est::OdbCallBack`) on its invalid set: a net created, an instance terminal
+    /// connected or disconnected, every net of a swapped instance → invalid; a net destroyed →
+    /// erased.
+    fn pull_edits(&mut self) {
+        if !self.timer.on {
+            return;
+        }
+        for ev in self.db.edit_log_take() {
+            let f: Vec<&str> = ev.split('|').collect();
+            match f.as_slice() {
+                ["net_create", net] | ["iterm_connect" | "iterm_disconnect", _, net, _] if !net.is_empty() => {
+                    self.timer.est_invalid.insert(net.to_string());
+                }
+                ["net_destroy", net, ..] => {
+                    self.timer.est_invalid.remove(*net);
+                }
+                ["swap_after", _, terms] => {
+                    for net in terms.split(';').filter_map(|t| t.split('=').nth(1)).filter(|n| !n.is_empty()) {
+                        self.timer.est_invalid.insert(net.to_string());
+                    }
+                }
+                _ => {}
+            }
+            self.timer.events.push(ev);
+        }
     }
 
     /// `EstimateParasitics::parasiticsInvalid(net)` (the odb callbacks call it).
@@ -409,6 +451,9 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
     /// in force now) only when invalid or with no pi model — no entry, here: every net with a
     /// network has its pi model once `findAllArrivals` has run, and an edited net is invalid.
     fn ensure_wire_parasitic(&mut self, net: &str) -> Result<(), String> {
+        // Estimated now and erased from the invalid set, with no delay invalidation.
+        self.pull_edits();
+        self.timer.est_invalid.remove(net);
         if !self.estimating || !(self.invalid.contains(net) || !self.parasitics[0].contains_key(net)) {
             return Ok(());
         }
@@ -436,6 +481,11 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
     /// `updateParasitics` under placement parasitics: each invalid net estimated again (the order
     /// is the reference's set's; each net's estimate is its own, so it is no value).
     fn update_parasitics(&mut self) -> Result<(), String> {
+        // The estimator's invalid nets: each estimated, then `delaysInvalidFromFanin` each, the
+        // set cleared.
+        self.pull_edits();
+        let updated = std::mem::take(&mut self.timer.est_invalid);
+        self.timer.updated.extend(updated);
         let invalid: Vec<String> = self.invalid.iter().cloned().collect();
         for net in invalid {
             self.ensure_wire_parasitic(&net)?;
@@ -480,6 +530,17 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
             }
             _ => self.db.bterm_first_pin_location(pin).unwrap_or((0, 0)),
         }
+    }
+
+    fn start_timer_edits(&mut self) -> Result<(), String> {
+        self.db.edit_log_start().map_err(|e| e.to_string())?;
+        self.timer = TimerLog { on: true, ..TimerLog::default() };
+        Ok(())
+    }
+
+    fn take_timer_edits(&mut self) -> vyges_rsz::design::TimerEdits {
+        self.pull_edits();
+        vyges_rsz::design::TimerEdits { events: std::mem::take(&mut self.timer.events), updated_nets: std::mem::take(&mut self.timer.updated) }
     }
 
     fn visit_connected_pins(&self, pin: &str) -> Vec<String> {
@@ -1238,7 +1299,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 let core = (db.block_get_core_area_x_min(), db.block_get_core_area_y_min(), db.block_get_core_area_x_max(), db.block_get_core_area_y_max());
                 let core = (core != (0, 0, 0, 0)).then_some(core);
                 let port_caps = port_caps_at(step["sdc"].as_str(), sdc.as_ref(), &libs, &netlist)?;
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new() };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), timer: TimerLog::default() };
                 let r = buffer_ports::buffer_ports(&mut design, &o, &weakest);
                 let parasitics = std::mem::take(&mut design.parasitics);
                 match r {
@@ -1324,7 +1385,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     std::fs::write(path, lines.join("\n") + "\n").map_err(|e| format!("{path}: {e}"))?;
                 }
                 let port_caps = env.port_pin_cap.clone();
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new() };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), timer: TimerLog::default() };
                 let inputs = Inputs { libs: &libs, masters: &m, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins };
                 outcome = Some(repair_design::repair_design(&inputs, &mut design, &a, &mut trace));
             }
@@ -1510,7 +1571,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     let core = (core != (0, 0, 0, 0)).then_some(core);
                     let port_caps = env.port_pin_cap.clone();
                     let sdc_nets: BTreeSet<String> = s.env.iter().filter(|e| e.cmd == "set_load" && e.accessor == "get_nets").flat_map(|e| e.objects.iter().cloned()).collect();
-                    let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated, journal: Vec::new(), sdc_nets };
+                    let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated, journal: Vec::new(), sdc_nets, timer: TimerLog::default() };
                     let r = vyges_rsz::repair_setup::repair_setup(&ctx, &mut design, &a);
                     carried = Some(std::mem::take(&mut design.parasitics));
                     let o = match r {

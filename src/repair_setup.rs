@@ -27,9 +27,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use vyges_sta::fuzzy;
 use vyges_sta::graph::{EdgeKind, Graph, SdcEnv};
 use vyges_sta::liberty::{Cell, Model, Role, MAX};
+use vyges_sta::incr::{EventCtx, IncTimer};
 use vyges_sta::search::Search;
 
-use crate::design::Design;
+use crate::design::{Design, TimerEdits};
 use crate::preamble::Libs;
 use crate::repair_timing::{collect_violating, delay_as_string, progress_header, progress_row, startpoint_tns, timing_points, total_negative_slack, worst_slack, Args, Move, Point, Row};
 use crate::sizing::Sizing;
@@ -186,36 +187,34 @@ fn arc_intrinsic(model: &Model) -> f32 {
     }
 }
 
-/// The timer rebuilt over the design and timed: `updateParasitics` has run, so the parasitics
-/// are the estimator's current ones. `want`: the endpoints whose worst path the repair will read.
-/// An ideal clock network's slews as the reference's incremental timer keeps them, by pin.
-type ClockSlews = Option<HashMap<String, [[f32; 2]; 2]>>;
+/// The timer's state across the repair: the reference's incremental timer, the database's edits
+/// replayed into it at each update — a value it does not recompute stays as it was.
+struct Timer {
+    inc: IncTimer,
+    /// The decision trace's length when the update ran (for `VYGES_RSZ_INC_TRACE`).
+    trace_at: usize,
+}
 
-fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], clock_slews: &mut ClockSlews) -> Result<Snapshot, Stop> {
+impl Timer {
+    fn new(design: &mut dyn SetupDesign) -> Result<Timer, Stop> {
+        design.start_timer_edits().map_err(timer_stop)?;
+        let mut inc = IncTimer::default();
+        inc.track_netlist(design.netlist());
+        Ok(Timer { inc, trace_at: 0 })
+    }
+}
+
+/// The timer over the design and timed: `updateParasitics` has run, so the parasitics are the
+/// estimator's current ones; `edits`, what the timer has not seen. `want`: the endpoints whose
+/// worst path the repair will read.
+fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], timer: &mut Timer, edits: TimerEdits) -> Result<Snapshot, Stop> {
     let netlist = design.netlist();
     let mut g = crate::repair_design::timer_graph(ctx.libs, 0, netlist, ctx.env, ctx.master_pins)?;
     let clocks = crate::timing::clock_pins(&g, ctx.clock_sources);
     if ctx.ideal_clock {
         g.ideal_clock = clocks.iter().copied().collect();
     }
-    g.find_delays(design.parasitics(0), None).map_err(timer_stop)?;
-    // `Sta::replaceCellPinInvalidate`: a cell swap that changes an input pin's capacitance
-    // invalidates delay calculation from that pin's driver — except on an IDEAL clock pin, whose
-    // clock driver is left as it was. Nothing else this repair does touches a clock net (it has
-    // no parasitics to re-estimate), so an ideal clock network keeps the slews of the first
-    // timing; a full re-time here would see a resized register's new clock-pin load.
-    if ctx.ideal_clock {
-        match clock_slews {
-            None => *clock_slews = Some(g.ideal_clock.iter().map(|&v| (g.vertices[v].name.clone(), g.slew[v])).collect()),
-            Some(frozen) => {
-                for &v in &g.ideal_clock {
-                    if let Some(s) = frozen.get(&g.vertices[v].name) {
-                        g.slew[v] = *s;
-                    }
-                }
-            }
-        }
-    }
+    inc_delays(ctx, design, &mut g, &mut timer.inc, &edits)?;
     // A diagnostic: one pin's slews at every snapshot (`VYGES_RSZ_SNAP_PIN=pin:path`).
     if let Some((pin, path)) = std::env::var("VYGES_RSZ_SNAP_PIN").ok().as_deref().and_then(|s| s.split_once(':')).map(|(a, b)| (a.to_string(), b.to_string())) {
         if let Some(v) = g.vertices.iter().position(|x| x.name == pin) {
@@ -228,8 +227,33 @@ fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], clock_slews: &m
         }
     }
     let mut search = Search::in_graph_order(&g, ctx.ssdc);
-    search.find_arrivals().map_err(timer_stop)?;
-    search.find_requireds().map_err(timer_stop)?;
+    let inc = &mut timer.inc;
+    inc.import_paths(&mut search);
+    inc.find_arrivals(&mut search, None).map_err(timer_stop)?;
+    inc.find_requireds(&mut search, None).map_err(timer_stop)?;
+    inc_trace(inc, timer.trace_at);
+    // A diagnostic: every instance pin's max slack per transition after this update, in fs
+    // (`VYGES_RSZ_SLACKS=path`, rewritten each update — the last is the state the repair left).
+    if let Some(path) = std::env::var_os("VYGES_RSZ_SLACKS") {
+        let mut s = String::new();
+        for (v, vx) in g.vertices.iter().enumerate() {
+            if vx.lib.is_none() {
+                continue;
+            }
+            let slack = |rf: usize| {
+                let mut m = INF;
+                for p in search.paths[v].iter().filter(|p| p.tag.mm == MAX && p.tag.rf == rf) {
+                    let x = p.required - p.arrival;
+                    if fuzzy::less(x, m) {
+                        m = x;
+                    }
+                }
+                if m == INF { "INF".to_string() } else { format!("{:.9}", f64::from(m) * 1e15) }
+            };
+            s.push_str(&format!("{} {} {}\n", vx.name, slack(0), slack(1)));
+        }
+        let _ = std::fs::write(path, s);
+    }
     let (ends, starts) = timing_points(&g, &search, ctx.ssdc, ctx.libs, &clocks).map_err(timer_stop)?;
     let ideal = if ctx.ideal_clock { clocks } else { BTreeSet::new() };
     let mut names: Vec<String> = want.to_vec();
@@ -247,6 +271,51 @@ fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], clock_slews: &m
         }
     }
     Ok(Snapshot { ends, starts, paths })
+}
+
+/// The edits replayed into the incremental timer (`dbStaCbk`), the estimator's
+/// `delaysInvalidFromFanin` on each net it estimated — but a skip net, driven by an ideal clock
+/// pin (`isSkipNet`) — then `findDelays()`.
+fn inc_delays(ctx: &Ctx<'_>, design: &dyn Design, g: &mut Graph<'_>, inc: &mut IncTimer, edits: &TimerEdits) -> Result<(), Stop> {
+    let cx = EventCtx { libs: &ctx.libs.libs, ideal_clock_mode: ctx.ideal_clock };
+    for ev in &edits.events {
+        inc.apply_event(&cx, ev).map_err(timer_stop)?;
+    }
+    let netlist = design.netlist();
+    let index = g.pin_index();
+    for net in &edits.updated_nets {
+        let Some(n) = netlist.nets.iter().find(|n| &n.name == net) else { continue };
+        let pins: Vec<String> = n.pins.iter().map(|c| netlist.pin_name(c)).collect();
+        let skip = pins.iter().filter_map(|p| index.get(p)).any(|&v| g.vertices[v].is_driver && g.ideal_clock.contains(&v));
+        if skip {
+            continue;
+        }
+        for p in &pins {
+            inc.delays_invalid_from(p);
+        }
+    }
+    inc.import(g);
+    inc.find_delays(g, design.parasitics(0), None).map_err(timer_stop)?;
+    inc.export(g);
+    Ok(())
+}
+
+/// What the last update visited (`VYGES_RSZ_INC_TRACE=path`), as the instrumented reference
+/// prints it: `DV|pin`, `AV|pin|changed`, `RV|pin|changed`, after a `SNAP|<trace length>` line.
+fn inc_trace(inc: &IncTimer, trace_at: usize) {
+    let Some(path) = std::env::var_os("VYGES_RSZ_INC_TRACE") else { return };
+    use std::io::Write;
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) else { return };
+    let _ = writeln!(f, "SNAP|{trace_at}");
+    for v in &inc.visited {
+        let _ = writeln!(f, "DV|{v}");
+    }
+    for (v, c) in &inc.arrival_visits {
+        let _ = writeln!(f, "AV|{v}|{}", u8::from(*c));
+    }
+    for (v, c) in &inc.required_visits {
+        let _ = writeln!(f, "RV|{v}|{}", u8::from(*c));
+    }
 }
 
 /// `Sta::vertexWorstSlackPath(end, max)`, then `PathExpanded`: the max path with the fuzzily
@@ -836,8 +905,8 @@ struct Repair<'c, 'd> {
     /// The phase's label with its marker (`LEGACY*`, `LAST_GASP+`) and its move sequence.
     phase: &'static str,
     sequence: Vec<Move>,
-    /// The ideal clock network's slews, as first timed ([`snapshot`]).
-    clock_slews: ClockSlews,
+    /// The timer's state across the repair ([`snapshot`]).
+    timer: Timer,
     committer: Committer,
     out: Outcome,
     initial_design_area: f64,
@@ -922,8 +991,8 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
     if args.max_utilization.is_some() {
         return Err(Stop::refused("RSZ-ABSENT", "repair_timing -max_utilization: not modelled".into()));
     }
-    let mut clock_slews: ClockSlews = None;
-    let timing = snapshot(ctx, design.as_design(), &[], &mut clock_slews)?;
+    let mut timer = Timer::new(design)?;
+    let timing = snapshot(ctx, design.as_design(), &[], &mut timer, TimerEdits::default())?;
     // RepairSetupContext: the area and TNS before any move.
     let initial_design_area = design.design_area();
     let initial_tns = timing.tns();
@@ -934,7 +1003,7 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
         timing,
         phase: PHASE,
         sequence: ctx.sequence.to_vec(),
-        clock_slews,
+        timer,
         committer: Committer::default(),
         out: Outcome::default(),
         initial_design_area,
@@ -985,7 +1054,9 @@ impl Repair<'_, '_> {
     /// of `want` ready.
     fn retime(&mut self, want: &[String]) -> Result<(), Stop> {
         self.design.update_parasitics().map_err(timer_stop)?;
-        self.timing = snapshot(self.ctx, self.design.as_design(), want, &mut self.clock_slews)?;
+        let edits = self.design.take_timer_edits();
+        self.timer.trace_at = self.out.trace.len();
+        self.timing = snapshot(self.ctx, self.design.as_design(), want, &mut self.timer, edits)?;
         Ok(())
     }
 
@@ -1399,7 +1470,9 @@ impl Repair<'_, '_> {
     /// `SetupLegacyBase::repairPath`.
     fn repair_path(&mut self, end: &str, path_slack: f32, force_single_repair: bool) -> Result<bool, Stop> {
         if !self.timing.paths.contains_key(end) {
-            self.timing = snapshot(self.ctx, self.design.as_design(), &[end.to_string()], &mut self.clock_slews)?;
+            let edits = self.design.take_timer_edits();
+            self.timer.trace_at = self.out.trace.len();
+            self.timing = snapshot(self.ctx, self.design.as_design(), &[end.to_string()], &mut self.timer, edits)?;
         }
         let Some(view) = self.timing.paths.get(end).cloned() else { return Ok(false) };
         if view.stages.len() <= 1 {
@@ -1612,6 +1685,9 @@ impl Repair<'_, '_> {
                 Some(l) => self.debug("rebuffer", l, line),
                 None => self.report(line),
             }
+        }
+        if let Some(r) = rb.refused.take() {
+            return Err(Stop::refused("RSZ-ORDER", r));
         }
         let chosen = chosen.map_err(|e| Stop::error("RSZ-REBUFFER", e))?;
         let Some(root) = chosen else { return Ok(0) };
