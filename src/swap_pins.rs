@@ -117,12 +117,16 @@ fn simulate(expr: &FuncExpr, port: &dyn Fn(&str) -> Option<bool>) -> Result<bool
 /// ports' order, a port that is an input, not the current input or the driver, and faster than
 /// the best so far becomes the swap. Returns the swap (the current input when none), the base
 /// delay (0 when no arc) and the swap's delay (0 when no arc).
-pub fn find_swap_pin_candidate(cell: &Cell, input_port: &str, drvr_port: &str, equiv_ports: &[String], load_cap: f32, in_slew: &dyn Fn(&str, usize) -> f32) -> (String, f32, f32) {
+pub fn find_swap_pin_candidate(cell: &Cell, scene_cell: &Cell, input_port: &str, drvr_port: &str, equiv_ports: &[String], load_cap: f32, in_slew: &dyn Fn(&str, usize) -> f32) -> (String, f32, f32) {
     let mut port_delays: HashMap<&str, f32> = HashMap::new();
     let mut base_delay = -INF;
     for set in cell.arc_sets.iter().filter(|s| s.to == drvr_port && !s.role.is_timing_check()) {
-        for arc in &set.arcs {
-            let Model::Gate(m) = &arc.model else { continue };
+        // `gateDelay(arc, .., scene)` reads `arc->sceneArc(scene)`'s model: the scene cell's set
+        // of the same key, its arcs paired in order; the link arc when the scene has none.
+        let scene_set = scene_arc_set(set, scene_cell);
+        for (i, arc) in set.arcs.iter().enumerate() {
+            let model = scene_set.map_or(&arc.model, |s| &s.arcs[i].model);
+            let Model::Gate(m) = model else { continue };
             let (gate_delay, _) = m.gate_delay(in_slew(&set.from, arc.from_rf), load_cap);
             let port = set.from.as_str();
             if port == input_port {
@@ -153,14 +157,28 @@ pub fn find_swap_pin_candidate(cell: &Cell, input_port: &str, drvr_port: &str, e
     (swap_port, base_out, swap_out)
 }
 
+/// `LibertyCell::findTimingArcSet(link_set)` on a scene cell (`makeSceneMap`): the set with the
+/// same key — from, to, role, `when`, and arcs pairwise equal in transitions
+/// (`TimingArcSet::equiv`; the sdf conditions are not read, and `when` compares as text).
+pub fn scene_arc_set<'c>(link: &vyges_sta::liberty::ArcSet, scene_cell: &'c Cell) -> Option<&'c vyges_sta::liberty::ArcSet> {
+    scene_cell.arc_sets.iter().find(|s| {
+        s.from == link.from
+            && s.to == link.to
+            && s.role == link.role
+            && s.cond == link.cond
+            && s.arcs.len() == link.arcs.len()
+            && s.arcs.iter().zip(&link.arcs).all(|(a, b)| a.from_rf == b.from_rf && a.to_rf == b.to_rf)
+    })
+}
+
 /// `selectSwapPort`: the equivalent inputs, then the fastest; `None` without an equivalent input
 /// or when the fastest is the current input. Returns (swap port, current delay, swap delay).
-pub fn select_swap_port(cell: &Cell, drvr_port: &str, input_port: &str, load_cap: f32, in_slew: &dyn Fn(&str, usize) -> f32) -> Result<Option<(String, f32, f32)>, String> {
+pub fn select_swap_port(cell: &Cell, scene_cell: &Cell, drvr_port: &str, input_port: &str, load_cap: f32, in_slew: &dyn Fn(&str, usize) -> f32) -> Result<Option<(String, f32, f32)>, String> {
     let equiv_ports = equiv_cell_pins(cell, input_port)?;
     if equiv_ports.is_empty() {
         return Ok(None);
     }
-    let (swap, current, swap_delay) = find_swap_pin_candidate(cell, input_port, drvr_port, &equiv_ports, load_cap, in_slew);
+    let (swap, current, swap_delay) = find_swap_pin_candidate(cell, scene_cell, input_port, drvr_port, &equiv_ports, load_cap, in_slew);
     Ok((swap != input_port).then_some((swap, current, swap_delay)))
 }
 
@@ -213,9 +231,28 @@ mod tests {
             arc("C", 0.1)
         ));
         let slew = |_: &str, _: usize| 0.0;
-        let (swap, cur, sw) = find_swap_pin_candidate(&c, "A", "Z", &["B".into(), "C".into()], 0.0, &slew);
+        let (swap, cur, sw) = find_swap_pin_candidate(&c, &c, "A", "Z", &["B".into(), "C".into()], 0.0, &slew);
         assert_eq!(swap, "B", "C ties B and comes later");
         assert!(cur > sw);
-        assert_eq!(select_swap_port(&c, "Z", "B", 0.0, &slew).unwrap(), None, "nothing beats B");
+        assert_eq!(select_swap_port(&c, &c, "Z", "B", 0.0, &slew).unwrap(), None, "nothing beats B");
+    }
+
+    // Rule (gateDelay at the target's scene → `TimingArc::sceneArc`): the arcs are the link cell's
+    // (their order and ports), each delay the scene cell's arc of the same key.
+    #[test]
+    fn the_delays_are_the_scenes() {
+        let mk = |a: f32, b: f32| {
+            cell(&format!(
+                r#"pin (A) {{ direction : input ; }} pin (B) {{ direction : input ; }}
+                   pin (Z) {{ direction : output ; function : "A*B" ; {} {} }}"#,
+                arc("A", a),
+                arc("B", b)
+            ))
+        };
+        let (link, scene) = (mk(0.3, 0.1), mk(0.1, 0.3));
+        let slew = |_: &str, _: usize| 0.0;
+        assert_eq!(select_swap_port(&link, &link, "Z", "A", 0.0, &slew).unwrap().map(|s| s.0), Some("B".into()), "the link delays swap");
+        assert_eq!(select_swap_port(&link, &scene, "Z", "A", 0.0, &slew).unwrap(), None, "the scene's delays do not");
+        assert!(scene_arc_set(&link.arc_sets[0], &scene).is_some());
     }
 }

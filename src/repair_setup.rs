@@ -2421,7 +2421,10 @@ impl Repair<'_, '_> {
         let Some(input_port) = st.in_port.as_deref().filter(|p| cell.port(p).is_some_and(|q| q.direction != vyges_sta::liberty::Direction::Output)) else { return Ok(None) };
         let tgt = self.ctx.sizing.tgt_slews;
         let in_slew = |port: &str, rf: usize| st.in_slews.iter().find(|(p, _)| p == port).map_or(tgt[rf], |(_, s)| s[rf]);
-        let picked = swap_pins::select_swap_port(cell, drvr_port, input_port, st.load_cap, &in_slew).map_err(|e| Stop::refused("RSZ-ABSENT", e))?;
+        // The target's scene (`activeScene`): the stage's load and input slews are read there
+        // (the path's scene), and each arc's delay model is that scene's.
+        let scene_cell = self.ctx.libs.scene_cell(view.scene, cell_name).unwrap_or(cell);
+        let picked = swap_pins::select_swap_port(cell, scene_cell, drvr_port, input_port, st.load_cap, &in_slew).map_err(|e| Stop::refused("RSZ-ABSENT", e))?;
         let Some((swap_port, current_delay, swap_delay)) = picked else { return Ok(None) };
         // SwapPinsCandidate::estimate: legal when the swap is faster. (Redundant after a strict
         // selection — a different port is only ever strictly faster — so a mutant relaxing it to

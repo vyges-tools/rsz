@@ -1556,11 +1556,11 @@ fn run(job: &Value) -> Result<Value, String> {
                     Some(format!("repair_timing: {} is not modelled", m.name()))
                 } else if a.match_cell_footprint {
                     Some("repair_timing -match_cell_footprint: not modelled".into())
-                } else if libs.scene_count() > 1 && (seq.iter().any(|m| !matches!(m, rt::Move::SizeUp | rt::Move::Unbuffer)) || !(a.skip_last_gasp || a.phases.is_some())) {
-                    // Several corners: SizeUpMove (the path's scene) and UnbufferMove (its slack
-                    // guard at the capacitance guard's scene) in the LEGACY phase are modelled;
-                    // every scene for slacks and max-cap checks.
-                    Some("repair_timing over several corners: moves other than SizeUpMove and UnbufferMove, and LAST_GASP, are not modelled".into())
+                } else if libs.scene_count() > 1 && (seq.iter().any(|m| !matches!(m, rt::Move::SizeUp | rt::Move::Unbuffer | rt::Move::SwapPins)) || !(a.skip_last_gasp || a.phases.is_some())) {
+                    // Several corners: SizeUpMove and SwapPinsMove (the path's scene) and
+                    // UnbufferMove (its slack guard at the capacitance guard's scene) in the
+                    // LEGACY phase are modelled; every scene for slacks and max-cap checks.
+                    Some("repair_timing over several corners: moves other than SizeUpMove, UnbufferMove and SwapPinsMove, and LAST_GASP, are not modelled".into())
                 } else if debug_levels.get(&("RSZ".to_string(), "move_tracker".to_string())).is_some_and(|&l| l > 0) {
                     Some("repair_timing: the move tracker's reports (set_debug_level RSZ move_tracker) are not modelled".into())
                 } else {
