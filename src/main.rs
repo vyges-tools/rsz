@@ -1551,18 +1551,12 @@ fn run(job: &Value) -> Result<Value, String> {
                 let violating_starts = rt::collect_violating(&starts, margin);
                 let seq = rt::move_sequence(&a, false);
                 let mut lines = rt::preamble(&seq, violating.len(), a.repair_tns_end_percent, a.phases.as_deref());
-                // The moves modelled: SizeUp and Unbuffer, in the LEGACY phase alone.
+                // The moves modelled, over one corner or several (each reads the scenes the
+                // reference's does: see the moves), LEGACY and LAST_GASP.
                 let unmodelled = if let Some(m) = seq.iter().find(|m| !matches!(m, rt::Move::SizeUp | rt::Move::Unbuffer | rt::Move::SwapPins | rt::Move::Buffer | rt::Move::Clone | rt::Move::SplitLoad | rt::Move::SizeUpMatch | rt::Move::VtSwap)) {
                     Some(format!("repair_timing: {} is not modelled", m.name()))
                 } else if a.match_cell_footprint {
                     Some("repair_timing -match_cell_footprint: not modelled".into())
-                } else if libs.scene_count() > 1 && (seq.iter().any(|m| !matches!(m, rt::Move::SizeUp | rt::Move::Unbuffer | rt::Move::SwapPins | rt::Move::Buffer | rt::Move::Clone | rt::Move::SplitLoad)) || !(a.skip_last_gasp || a.phases.is_some())) {
-                    // Several corners: SizeUpMove and SwapPinsMove (the path's scene),
-                    // UnbufferMove (its slack guard at the capacitance guard's scene),
-                    // BufferMove (`corner_` = cmdScene, slacks and driver arcs in their paths'
-                    // scenes), CloneMove and SplitLoadMove (slacks over every scene) in the
-                    // LEGACY phase are modelled; every scene for slacks and max-cap checks.
-                    Some("repair_timing over several corners: SizeUpMatchMove, VtSwapMove and LAST_GASP are not modelled".into())
                 } else if debug_levels.get(&("RSZ".to_string(), "move_tracker".to_string())).is_some_and(|&l| l > 0) {
                     Some("repair_timing: the move tracker's reports (set_debug_level RSZ move_tracker) are not modelled".into())
                 } else {
