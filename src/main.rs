@@ -1468,9 +1468,6 @@ fn run(job: &Value) -> Result<Value, String> {
                 if !estimated {
                     return Err("repair_timing without estimate_parasitics -placement: not modelled".into());
                 }
-                if libs.scene_count() != 1 && !a.setup {
-                    return Err("repair_timing -hold over several corners: not modelled".into());
-                }
                 let m = masters(&db)?;
                 if let Some((n, _)) = m.iter().find(|(_, mm)| !mm.implant_obs.is_empty()) {
                     return Err(format!("master {n} has IMPLANT obstructions: VT categories are not modelled"));
@@ -1945,7 +1942,7 @@ const DESCRIBE: &str = r#"{
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "status is one of repaired, up_to_date, vacuous, refused or error. repaired means the design changed (buffers inserted or drivers resized); up_to_date means drivers were checked and none needed a change (nets_checked says how many; for a job with buffer_ports and no repair_design, ports_checked); vacuous means nothing was checked and is NOT a pass. The declared assertion passes on repaired or up_to_date. Exit status is 0 for repaired and up_to_date, 2 for vacuous and for error, 3 for refused.",
     "Modelled: placement parasitics, one or more corners, flat and hierarchical netlists, the default buffer selection, the SDC constraints the usage lists, buffer_ports before the repair (the estimate it leaves carried into it). Refused rather than guessed: global-route parasitics, the early sizing round, footprint matching, rerouting, any other netlist edit between the estimate and the repair, buffer_ports on a hierarchical design, a tristate driver or a bidirect pin on a net, and any other timing-affecting SDC command.",
-    "repair_timing -setup is modelled for every move of the default sequence in the LEGACY phase and LAST_GASP, and repair_timing -hold alone in full (ending with RSZ-0050 / RSZ-0060 as the command does): every progress row, the summary and the design left, for one ideal or propagated clock; -setup with -hold runs the setup part and is refused after it; other -phases, several corners, VT libraries, latches, virtual clocks, clock uncertainty, latency or transition, derates and exceptions are refused before the lines."
+    "repair_timing -setup is modelled for every move of the default sequence in the LEGACY phase and LAST_GASP, and repair_timing -hold alone in full (ending with RSZ-0050 / RSZ-0060 as the command does): every progress row, the summary and the design left, for one ideal or propagated clock, over one corner or several; -setup with -hold runs the setup part and is refused after it; other -phases, VT libraries, latches, virtual clocks, clock uncertainty, latency or transition, derates and exceptions are refused before the lines."
   ],
   "invocation": {
     "args_template": ["repair_design", "{job}"],

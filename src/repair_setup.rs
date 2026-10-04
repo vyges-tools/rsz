@@ -261,9 +261,32 @@ fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], timer: &mut Tim
     })
 }
 
-/// [`timed_all`] over scene 0 alone (the hold repair: one corner).
-fn timed<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits: TimerEdits, read: impl FnOnce(&Graph<'_>, &Search<'_, '_>, &BTreeSet<usize>) -> Result<R, Stop>) -> Result<R, Stop> {
-    timed_all(ctx, design, timer, edits, |gs, ss, cs| read(&gs[0], &ss[0], &cs[0]))
+/// The endpoints' setup points over every scene: each the least over the scenes (`Sta::slack`).
+fn setup_ends(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet<usize>]) -> Result<Vec<Point>, Stop> {
+    let mut per_scene = Vec::with_capacity(gs.len());
+    for k in 0..gs.len() {
+        per_scene.push(timing_points(&gs[k], &ss[k], ctx.ssdc, ctx.libs, &cs[k]).map_err(timer_stop)?.0);
+    }
+    if per_scene.len() == 1 {
+        return Ok(per_scene.pop().expect("one scene"));
+    }
+    crate::repair_timing::least_over_scenes(per_scene.iter().map(|e| e.as_slice()).collect()).map_err(timer_stop)
+}
+
+/// `Sta::slack(vertex[, rf], min_max)` over every scene: the fuzzily least over each scene's
+/// paths, a later scene's after an earlier's. `v` is scene 0's vertex.
+fn slack_over_scenes(gs: &[Graph<'_>], ss: &[Search<'_, '_>], v: usize, mm: usize, rf: Option<usize>) -> f32 {
+    let vx = &gs[0].vertices[v];
+    let mut slack = INF;
+    for (k, (g, s)) in gs.iter().zip(ss).enumerate() {
+        let u = if k == 0 { Some(v) } else { g.vertices.iter().position(|x| x.name == vx.name && x.is_driver == vx.is_driver) };
+        let Some(u) = u else { continue };
+        let x = s.slack_of(u, mm, rf);
+        if fuzzy::less(x, slack) {
+            slack = x;
+        }
+    }
+    slack
 }
 
 /// The incremental timers brought up to date with the design (`edits` replayed, then delays,
@@ -1118,7 +1141,8 @@ pub trait SetupDesign: Design {
 /// it (the reference's lazy reads, measured: one level-limited delay pass per inserted buffer,
 /// with no edit before the full pass that follows it).
 pub fn repair_hold(ctx: &Ctx<'_>, hctx: &crate::repair_hold::HoldCtx<'_>, design: &mut dyn SetupDesign, ha: &crate::repair_hold::HoldArgs) -> Result<crate::repair_hold::HoldOutcome, Stop> {
-    let timer = Timer::new(design, 1)?;
+    // Every scene timed (`Sta::slack`, `worstSlack`, `vertexWorstSlackPath` read them all).
+    let timer = Timer::new(design, ctx.libs.scene_count())?;
     let initial_area = design.design_area();
     // `setMaxUtilization`: the core area times the fraction; 0 (no limit) without one.
     let max_area = ha.max_utilization.map_or(0.0, |u| design.core_area() * u);
@@ -1191,47 +1215,49 @@ impl HoldRepair<'_, '_> {
         delay_as_string(v, 3, self.ctx.time_scale)
     }
 
-    /// A read of the timer: the edits so far replayed, then a full update ([`timed`]).
-    fn query<R>(&mut self, read: impl FnOnce(&Graph<'_>, &Search<'_, '_>, &BTreeSet<usize>) -> Result<R, Stop>) -> Result<R, Stop> {
+    /// A read of the timer over every scene: the edits so far replayed, then a full update
+    /// ([`timed_all`]).
+    fn query_all<R>(&mut self, read: impl FnOnce(&[Graph<'_>], &[Search<'_, '_>], &[BTreeSet<usize>]) -> Result<R, Stop>) -> Result<R, Stop> {
         let edits = self.design.take_timer_edits();
         self.timer.trace_at = self.out.trace.len();
-        timed(self.ctx, self.design.as_design(), &mut self.timer, edits, read)
+        timed_all(self.ctx, self.design.as_design(), &mut self.timer, edits, read)
     }
 
     /// The endpoints in vertex order with their min and max slacks (`findRequireds`, then
-    /// `Sta::slack` of each).
+    /// `Sta::slack` of each — over every scene).
     fn hold_ends(&mut self) -> Result<Vec<crate::repair_hold::HoldEnd>, Stop> {
         let ctx = self.ctx;
-        self.query(|g, s, clocks| {
-            let (ends, _) = timing_points(g, s, ctx.ssdc, ctx.libs, clocks).map_err(timer_stop)?;
+        self.query_all(|gs, ss, cs| {
+            let ends = setup_ends(ctx, gs, ss, cs)?;
+            let (g, clocks) = (&gs[0], &cs[0]);
             Ok(ends
                 .iter()
                 .map(|p| {
                     let v = g.vertices.iter().position(|x| x.name == p.pin).expect("an endpoint vertex");
-                    crate::repair_hold::HoldEnd { pin: p.pin.clone(), hold_slack: s.slack_of(v, MIN, None), setup_slack: p.slack, is_clock: clocks.contains(&v) }
+                    crate::repair_hold::HoldEnd { pin: p.pin.clone(), hold_slack: slack_over_scenes(gs, ss, v, MIN, None), setup_slack: p.slack, is_clock: clocks.contains(&v) }
                 })
                 .collect())
         })
     }
 
-    /// `Sta::worstSlack(max)`.
+    /// `Sta::worstSlack(max)` (over every scene).
     fn setup_wns(&mut self) -> Result<f32, Stop> {
         let ctx = self.ctx;
-        self.query(|g, s, clocks| {
-            let (ends, _) = timing_points(g, s, ctx.ssdc, ctx.libs, clocks).map_err(timer_stop)?;
-            Ok(worst_slack(&ends).0)
-        })
+        self.query_all(|gs, ss, cs| Ok(worst_slack(&setup_ends(ctx, gs, ss, cs)?).0))
     }
 
-    /// `Sta::worstSlack(max)` and `Sta::slew(pin, riseFall, scenes, max)` (the larger of the max
-    /// slews) together.
+    /// `Sta::worstSlack(max)` and `Sta::slew(pin, riseFall, scenes, max)` (the largest max slew
+    /// over every scene) together.
     fn setup_wns_and_slew(&mut self, pin: &str) -> Result<(f32, f32), Stop> {
         let ctx = self.ctx;
         let pin = pin.to_string();
-        self.query(move |g, s, clocks| {
-            let (ends, _) = timing_points(g, s, ctx.ssdc, ctx.libs, clocks).map_err(timer_stop)?;
-            let v = g.vertices.iter().position(|x| x.name == pin).ok_or_else(|| timer_stop(format!("{pin}: not in the timing graph")))?;
-            let slew = crate::rebuffer::std_max(g.slew[v][0][MAX], g.slew[v][1][MAX]);
+        self.query_all(move |gs, ss, cs| {
+            let ends = setup_ends(ctx, gs, ss, cs)?;
+            let mut slew = -INF;
+            for g in gs {
+                let v = g.vertices.iter().position(|x| x.name == pin).ok_or_else(|| timer_stop(format!("{pin}: not in the timing graph")))?;
+                slew = crate::rebuffer::std_max(slew, crate::rebuffer::std_max(g.slew[v][0][MAX], g.slew[v][1][MAX]));
+            }
             Ok((worst_slack(&ends).0, slew))
         })
     }
@@ -1343,18 +1369,24 @@ impl HoldRepair<'_, '_> {
     /// end's setup slack.
     fn worst_hold_path(&mut self, end: &str) -> Result<Option<(HoldPath, f32)>, Stop> {
         let end = end.to_string();
-        self.query(move |g, s, _| {
-            let Some(v) = g.vertices.iter().position(|x| x.name == end) else { return Ok(None) };
+        self.query_all(move |gs, ss, _| {
+            let Some(v0) = gs[0].vertices.iter().position(|x| x.name == end) else { return Ok(None) };
+            // `vertexWorstSlackPath(end, min)` over every scene's paths: the fuzzily least, the
+            // earlier scene on a tie; the path expanded in its own scene.
             let mut worst = None;
             let mut min_slack = INF;
-            for p in s.paths[v].iter().filter(|p| p.tag.mm == MIN) {
-                let slack = p.arrival - p.required;
-                if fuzzy::less(slack, min_slack) {
-                    min_slack = slack;
-                    worst = Some(*p);
+            for (k, (gk, sk)) in gs.iter().zip(ss).enumerate() {
+                let Some(u) = gk.vertices.iter().position(|x| x.name == end) else { continue };
+                for p in sk.paths[u].iter().filter(|p| p.tag.mm == MIN) {
+                    let slack = p.arrival - p.required;
+                    if fuzzy::less(slack, min_slack) {
+                        min_slack = slack;
+                        worst = Some((k, u, *p));
+                    }
                 }
             }
-            let Some(mut p) = worst else { return Ok(None) };
+            let Some((k, v, mut p)) = worst else { return Ok(None) };
+            let (g, s) = (&gs[k], &ss[k]);
             let mut chain = vec![v];
             let mut start_from_end = None;
             let mut i = 0;
@@ -1374,7 +1406,7 @@ impl HoldRepair<'_, '_> {
             let start = n - 1 - start_from_end.unwrap_or(n - 1);
             chain.reverse();
             let vertices = chain[start..].iter().map(|&u| (g.vertices[u].name.clone(), g.vertices[u].is_driver)).collect();
-            Ok(Some((HoldPath { slack: min_slack, len: n, vertices }, s.slack_of(v, MAX, None))))
+            Ok(Some((HoldPath { slack: min_slack, len: n, vertices }, slack_over_scenes(gs, ss, v0, MAX, None))))
         })
     }
 
@@ -1383,7 +1415,8 @@ impl HoldRepair<'_, '_> {
     fn driver_fanouts(&mut self, drvr: &str) -> Result<Vec<HoldFanout>, Stop> {
         let drvr = drvr.to_string();
         let libs = self.ctx.libs;
-        self.query(move |g, s, _| {
+        self.query_all(move |gs, ss, _| {
+            let g = &gs[0];
             let v = g.vertices.iter().position(|x| x.name == drvr).ok_or_else(|| timer_stop(format!("{drvr}: not in the timing graph")))?;
             let mut out = Vec::new();
             for &e in &g.out_edges[v] {
@@ -1396,7 +1429,7 @@ impl HoldRepair<'_, '_> {
                 let mut slacks = [[INF; 2]; 2];
                 for (rf, row) in slacks.iter_mut().enumerate() {
                     for (mm, cell) in row.iter_mut().enumerate() {
-                        *cell = s.slack_of(to, mm, Some(rf));
+                        *cell = slack_over_scenes(gs, ss, to, mm, Some(rf));
                     }
                 }
                 let cell = vx.cell.as_deref().and_then(|c| libs.link_cell(c));
@@ -1407,7 +1440,7 @@ impl HoldRepair<'_, '_> {
                     (Some(c), Some(pn)) => crate::rebuffer::port_cap(c, pn),
                     _ => 0.0,
                 };
-                out.push(HoldFanout { pin: vx.name.clone(), hold_slack: s.slack_of(to, MIN, None), slacks, input_or_port, out_port, cap });
+                out.push(HoldFanout { pin: vx.name.clone(), hold_slack: slack_over_scenes(gs, ss, to, MIN, None), slacks, input_or_port, out_port, cap });
             }
             Ok(out)
         })
@@ -1453,7 +1486,8 @@ impl HoldRepair<'_, '_> {
                 continue;
             }
             self.debug("repair_hold", 3, format!(" {} hold_slack={}/{} setup_slack={}/{} fanouts={}", pin, self.ds(slacks[0][MIN]), self.ds(slacks[1][MIN]), self.ds(slacks[0][MAX]), self.ds(slacks[1][MAX]), loads.len()));
-            let cell = self.ctx.libs.link_cell(buffer).ok_or_else(|| Stop::error("RSZ-HOLD", format!("{buffer}: not a liberty cell")))?;
+            // `bufferDelays(buffer, load, cmdScene(), max)`: the first scene's arcs.
+            let cell = self.ctx.libs.scene_cell(0, buffer).ok_or_else(|| Stop::error("RSZ-HOLD", format!("{buffer}: not a liberty cell")))?;
             let (_, out) = cell.buffer_ports().ok_or_else(|| Stop::error("RSZ-HOLD", format!("{buffer}: not a buffer")))?;
             let (bd, _) = crate::rebuffer::gate_delays(cell, &out.name, load_cap, self.hctx.tgt_slews);
             // In `double`: `float` slacks less the `double` margins.
@@ -1535,10 +1569,13 @@ impl HoldRepair<'_, '_> {
         let drvr = drvr.to_string();
         let ctx = self.ctx;
         let info = self.design.net_info().clone();
-        let parasitics = vec![self.design.as_design().parasitics(0).clone()];
-        self.query(move |g, _, clocks| {
+        let d = self.design.as_design();
+        let parasitics: Vec<HashMap<String, vyges_sta::graph::NetParasitics>> = (0..self.timer.inc.len()).map(|k| d.parasitics(k).clone()).collect();
+        // `checkMaxSlewCap`: `checkCapacitance` / `checkSlew` over `scenes()`, in scene 0's vertices.
+        self.query_all(move |gs, _, cs| {
+            let (g, clocks) = (&gs[0], &cs[0]);
             let v = g.vertices.iter().position(|x| x.name == drvr).ok_or_else(|| timer_stop(format!("{drvr}: not in the timing graph")))?;
-            let sc = crate::timing::Scenes::new(std::slice::from_ref(g));
+            let sc = crate::timing::Scenes::new(gs);
             const RATIO: f32 = 0.2;
             let (_, limit, slack, _, corner) = crate::timing::check_capacitance(&sc, v, &parasitics, clocks);
             if corner.is_some() && slack / limit < RATIO {

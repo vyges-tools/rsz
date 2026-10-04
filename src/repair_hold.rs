@@ -131,13 +131,17 @@ fn filter_hold_buffers<'l>(ctx: &HoldCtx<'l>, out: &mut HoldOutcome) -> Result<V
 }
 
 /// `bufferHoldDelay`: the buffer driving its own input capacitance at the target slews — per
-/// transition the least over scenes (one here) of the largest arc delay; then the smaller of rise
-/// and fall (`std::min`).
+/// transition the least over every scene (`bufferHoldDelays`: the scene port's capacitance, the
+/// scene's arcs) of the largest arc delay; then the smaller of rise and fall (`std::min`).
 fn buffer_hold_delay(ctx: &HoldCtx<'_>, buffer: &Cell) -> f32 {
     let Some((input, output)) = buffer.buffer_ports() else { return INF };
-    let load_cap = port_cap(buffer, &input.name);
-    let (gd, _) = gate_delays(buffer, &output.name, load_cap, ctx.tgt_slews);
-    let delays = [std_min(INF, gd[0]), std_min(INF, gd[1])];
+    let mut delays = [INF; 2];
+    for k in 0..ctx.libs.scene_count() {
+        let sc = ctx.libs.scene_cell(k, &buffer.name).unwrap_or(buffer);
+        let load_cap = port_cap(sc, &input.name);
+        let (gd, _) = gate_delays(sc, &output.name, load_cap, ctx.tgt_slews);
+        delays = [std_min(delays[0], gd[0]), std_min(delays[1], gd[1])];
+    }
     std_min(delays[0], delays[1])
 }
 
