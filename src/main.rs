@@ -721,10 +721,6 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
     /// clamped), each liberty INPUT pin of the driver in the master's terminal order connected to
     /// the same net, the first output on a new "net", the moved loads disconnected and connected
     /// to it. The callbacks invalidate every net touched.
-    fn same_module(&self, a: &str, b: &str) -> bool {
-        self.db.same_owning_module(a, b).unwrap_or(false)
-    }
-
     fn clone_instance(&mut self, drvr_inst: &str, cell: &str, loc: (i32, i32), moved_loads: &[String]) -> Result<String, String> {
         let e = |x: vyges_opendb::Error| x.to_string();
         // `makeInstance(cell, "clone", parent_)`: named and created in the driver's module.
@@ -757,12 +753,23 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
         self.db.create_net(&out_net).map_err(e)?;
         self.db.connect(&name, out, &out_net).map_err(e)?;
         touched.push(out_net.clone());
+        // `moveLoads`: each load off its nets; in the clone's module onto the new net, in another
+        // through the hierarchy (`hierarchicalConnect(clone output, load)`, connection "net").
         for load in moved_loads {
             let (inst, term) = load.rsplit_once('/').ok_or("a load pin")?;
             touched.push(self.db.net_of(inst, term));
             self.db.disconnect(inst, term).map_err(e)?;
-            self.db.connect(inst, term, &out_net).map_err(e)?;
+            if self.db.same_owning_module(inst, drvr_inst).map_err(e)? {
+                // The net itself, by the clone's output (a cross-module load may have renamed it).
+                let cur = self.db.net_of(&name, out);
+                self.db.connect(inst, term, &cur).map_err(e)?;
+            } else {
+                self.db.hierarchical_connect(&name, out, inst, term, "net").map_err(e)?;
+            }
         }
+        // A cross-module connection may rename the clone's flat net (after its highest modnet).
+        let out_net = self.db.net_of(&name, out);
+        touched.push(out_net);
         for n in touched {
             self.invalidate(&n);
         }
