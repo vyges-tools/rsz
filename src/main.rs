@@ -721,10 +721,15 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
     /// clamped), each liberty INPUT pin of the driver in the master's terminal order connected to
     /// the same net, the first output on a new "net", the moved loads disconnected and connected
     /// to it. The callbacks invalidate every net touched.
+    fn same_module(&self, a: &str, b: &str) -> bool {
+        self.db.same_owning_module(a, b).unwrap_or(false)
+    }
+
     fn clone_instance(&mut self, drvr_inst: &str, cell: &str, loc: (i32, i32), moved_loads: &[String]) -> Result<String, String> {
         let e = |x: vyges_opendb::Error| x.to_string();
-        let name = self.db.make_new_inst_name("clone", "ALWAYS").map_err(e)?;
-        self.db.create_inst(cell, &name).map_err(e)?;
+        // `makeInstance(cell, "clone", parent_)`: named and created in the driver's module.
+        let name = self.db.make_new_inst_name_beside(drvr_inst, "clone", "ALWAYS").map_err(e)?;
+        self.db.create_inst_beside(cell, &name, drvr_inst).map_err(e)?;
         self.db.inst_set_source_type(&name, "TIMING").map_err(e)?;
         let at = self.clamp_loc_to_core(loc, cell);
         self.db.set_inst_location(&name, at.0, at.1).map_err(e)?;
@@ -736,16 +741,19 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
             if !lc.port(term).is_some_and(|p| p.direction == vyges_sta::liberty::Direction::Input) {
                 continue;
             }
+            // `connectCloneInputs`: the flat net, then the hierarchical one (`iterm->connect(modnet)`).
             let net = self.db.net_of(drvr_inst, term);
             if !net.is_empty() {
                 self.db.connect(&name, term, &net).map_err(e)?;
                 touched.push(net);
             }
+            self.db.connect_mod_net_of(&name, term, drvr_inst, term).map_err(e)?;
         }
         let clone_terms: Vec<String> = self.db.master_mterms(cell).map_err(e)?.into_iter().filter(|(_, t)| t != "POWER" && t != "GROUND").map(|(n, _)| n).collect();
         let cc = self.libs.link_cell(cell).ok_or_else(|| format!("{cell}: no liberty cell"))?.clone();
         let out = clone_terms.iter().find(|t| cc.port(t).is_some_and(|p| p.direction == vyges_sta::liberty::Direction::Output)).ok_or("Cannot find output pin of the clone instance")?;
-        let out_net = self.db.make_new_net_name("net", "ALWAYS").map_err(e)?;
+        // `makeNet(parent_)`: named in the driver's module.
+        let out_net = self.db.make_new_net_name_beside(drvr_inst, "net", "ALWAYS").map_err(e)?;
         self.db.create_net(&out_net).map_err(e)?;
         self.db.connect(&name, out, &out_net).map_err(e)?;
         touched.push(out_net.clone());

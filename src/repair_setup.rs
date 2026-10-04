@@ -32,7 +32,7 @@ use vyges_sta::search::Search;
 
 use crate::design::{Design, TimerEdits};
 use crate::preamble::Libs;
-use crate::repair_timing::{network_name, strip_parent_prefix, collect_violating, delay_as_string, progress_header, progress_row, startpoint_tns, timing_points, total_negative_slack, worst_slack, Args, Move, Point, Row};
+use crate::repair_timing::{network_name, collect_violating, delay_as_string, progress_header, progress_row, startpoint_tns, timing_points, total_negative_slack, worst_slack, Args, Move, Point, Row};
 use crate::sizing::Sizing;
 use crate::timing::Limits;
 use crate::{clone, rebuffer, swap_pins, unbuffer};
@@ -1126,10 +1126,13 @@ pub trait SetupDesign: Design {
     fn pin_dont_touch(&self, pin: &str) -> bool;
     /// The instance's odb id (the slot its `Instance*` addresses).
     fn inst_id(&self, inst: &str) -> u32;
-    /// `CloneCandidate::applyClone`: `makeInstance(cell, "clone", …, loc)` (odb's name, TIMING
-    /// source, placed and clamped to the core), its inputs on the driver's input nets in pin
-    /// order, its output on a new net (`makeNet`: "net", always uniquified), the moved loads
-    /// onto it. Returns the clone's name.
+    /// `getOwningInstanceParent` of two instances is the same (always, in a flat database).
+    fn same_module(&self, a: &str, b: &str) -> bool;
+    /// `CloneCandidate::applyClone`: `makeInstance(cell, "clone", parent, loc)` in the driver's
+    /// module (odb's name scoped to it, TIMING source, placed and clamped to the core), its
+    /// inputs on the driver's input nets — flat, and hierarchical where the driver's pin has one —
+    /// in pin order, its output on a new net (`makeNet(parent)`: "net", always uniquified), the
+    /// moved loads onto it. Returns the clone's name.
     fn clone_instance(&mut self, drvr_inst: &str, cell: &str, loc: (i32, i32), moved_loads: &[String]) -> Result<String, String>;
     /// `Resizer::insertBufferBeforeLoads(net, loads, cell, loc, base, "net", ALWAYS, diff_nets)`.
     #[allow(clippy::too_many_arguments)]
@@ -2210,12 +2213,11 @@ impl Repair<'_, '_> {
         let clone_cell = clone::choose_clone_cell(cell, &cands, &dont_use).map_err(|e| Stop::refused("RSZ-ABSENT", e))?;
         let d = self.design.as_design();
         let loc = clone::compute_clone_location(d.pin_location(&st.pin), &fanouts, &|p| d.pin_location(p));
-        // `makeInstance(.., parent_ = getOwningInstanceParent(drvr))`: in a hierarchical database a
-        // driver inside a module gets its clone, net and load connections IN that module
-        // (`makeNewInstName(parent_mod_inst)`, `makeNet(parent)`, `hierarchicalConnect`) — not
-        // modelled.
-        if self.ctx.hierarchy && strip_parent_prefix(inst) != inst.as_str() {
-            return Err(Stop::refused("RSZ-HIER", format!("CloneMove of {inst}, inside a module of a hierarchical design: the clone made in that module is not modelled")));
+        // `moveLoads`: a load in another module than the driver's is connected through the
+        // hierarchy (`hierarchicalConnect`: module ports and nets up to the lowest common module)
+        // — not modelled (no witness in the corpus).
+        if let Some(l) = moved.iter().find(|l| !self.design.same_module(inst, l.rsplit_once('/').map_or(l.as_str(), |(i, _)| i))) {
+            return Err(Stop::refused("RSZ-HIER", format!("CloneMove of {inst}: the load {l} is in another module (hierarchicalConnect is not modelled)")));
         }
         let clone_inst = self.design.clone_instance(inst, &clone_cell, loc, &moved).map_err(|e| Stop::error("RSZ-CLONE", e))?;
         self.debug("clone_move", 1, format!("ACCEPT CloneMove {}: ({cell_name}) -> {clone_inst} ({clone_cell})", st.pin));
