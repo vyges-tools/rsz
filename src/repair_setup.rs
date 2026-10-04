@@ -32,7 +32,7 @@ use vyges_sta::search::Search;
 
 use crate::design::{Design, TimerEdits};
 use crate::preamble::Libs;
-use crate::repair_timing::{network_name, collect_violating, delay_as_string, progress_header, progress_row, startpoint_tns, timing_points, total_negative_slack, worst_slack, Args, Move, Point, Row};
+use crate::repair_timing::{network_name, strip_parent_prefix, collect_violating, delay_as_string, progress_header, progress_row, startpoint_tns, timing_points, total_negative_slack, worst_slack, Args, Move, Point, Row};
 use crate::sizing::Sizing;
 use crate::timing::Limits;
 use crate::{clone, rebuffer, swap_pins, unbuffer};
@@ -494,7 +494,7 @@ fn expand(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet
         for (i, (v, _)) in chain.iter().enumerate() {
             let st = &stages[i];
             if i > 0 && st.is_driver && !st.top_port && st.fanout > clone::CLONE_MIN_FANOUT {
-                stages[i].fanout_slacks = Some(fanout_slacks(g, search, *v, stages[i].rf, false));
+                stages[i].fanout_slacks = Some(fanout_slacks(gs, scene, *v, stages[i].rf, false, ss));
             }
         }
     }
@@ -502,7 +502,7 @@ fn expand(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet
         for (i, (v, _)) in chain.iter().enumerate() {
             let st = &stages[i];
             if i > 0 && st.is_driver && !st.top_port && st.fanout > clone::CLONE_MIN_FANOUT {
-                stages[i].split_slacks = Some(fanout_slacks(g, search, *v, stages[i].rf, true));
+                stages[i].split_slacks = Some(fanout_slacks(gs, scene, *v, stages[i].rf, true, ss));
             }
         }
     }
@@ -599,16 +599,23 @@ fn probe_rebuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[
 }
 
 /// `collectFanoutSlacks` (CloneMove) / `collectRankedFanoutSlacks` (SplitLoadMove, `split`): at
-/// the path's transition, each out-edge's vertex's slack (`Sta::slack(vertex, rf, max)`) less the
-/// driver's — at that transition for a clone, over both for a split, which also skips a non-wire
-/// edge — in the reference's order.
-fn fanout_slacks(g: &Graph<'_>, search: &Search<'_, '_>, drvr: usize, rf: usize, split: bool) -> Vec<clone::FanoutSlack> {
+/// the path's transition, each out-edge's vertex's slack (`Sta::slack(vertex, rf, max)`: over
+/// EVERY scene) less the driver's — at that transition for a clone, over both for a split, which
+/// also skips a non-wire edge — in the reference's order. `drvr` is the path scene's vertex.
+fn fanout_slacks(gs: &[Graph<'_>], scene: usize, drvr: usize, rf: usize, split: bool, ss: &[Search<'_, '_>]) -> Vec<clone::FanoutSlack> {
+    let g = &gs[scene];
+    // `Sta::slack(vertex, rf, scenes_, max)`: over the vertex's paths of every scene, the fuzzily
+    // least (`delayLess`); a scene's paths after the earlier scene's, so a tie keeps the earlier.
     let slack_at = |v: usize, rf: Option<usize>| {
+        let vx = &g.vertices[v];
         let mut s = INF;
-        for p in search.paths[v].iter().filter(|p| p.tag.mm == MAX && rf.is_none_or(|r| p.tag.rf == r)) {
-            let x = p.required - p.arrival;
-            if fuzzy::less(x, s) {
-                s = x;
+        for (gk, sk) in gs.iter().zip(ss) {
+            let Some(u) = gk.vertices.iter().position(|x| x.name == vx.name && x.is_driver == vx.is_driver) else { continue };
+            for p in sk.paths[u].iter().filter(|p| p.tag.mm == MAX && rf.is_none_or(|r| p.tag.rf == r)) {
+                let x = p.required - p.arrival;
+                if fuzzy::less(x, s) {
+                    s = x;
+                }
             }
         }
         s
@@ -2166,6 +2173,13 @@ impl Repair<'_, '_> {
         let clone_cell = clone::choose_clone_cell(cell, &cands, &dont_use).map_err(|e| Stop::refused("RSZ-ABSENT", e))?;
         let d = self.design.as_design();
         let loc = clone::compute_clone_location(d.pin_location(&st.pin), &fanouts, &|p| d.pin_location(p));
+        // `makeInstance(.., parent_ = getOwningInstanceParent(drvr))`: in a hierarchical database a
+        // driver inside a module gets its clone, net and load connections IN that module
+        // (`makeNewInstName(parent_mod_inst)`, `makeNet(parent)`, `hierarchicalConnect`) — not
+        // modelled.
+        if self.ctx.hierarchy && strip_parent_prefix(inst) != inst.as_str() {
+            return Err(Stop::refused("RSZ-HIER", format!("CloneMove of {inst}, inside a module of a hierarchical design: the clone made in that module is not modelled")));
+        }
         let clone_inst = self.design.clone_instance(inst, &clone_cell, loc, &moved).map_err(|e| Stop::error("RSZ-CLONE", e))?;
         self.debug("clone_move", 1, format!("ACCEPT CloneMove {}: ({cell_name}) -> {clone_inst} ({clone_cell})", st.pin));
         Ok(Some(MoveResult { kind: Move::Clone, count: 1, insts: vec![clone_inst, inst.clone()] }))

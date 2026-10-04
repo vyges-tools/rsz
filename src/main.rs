@@ -1556,13 +1556,13 @@ fn run(job: &Value) -> Result<Value, String> {
                     Some(format!("repair_timing: {} is not modelled", m.name()))
                 } else if a.match_cell_footprint {
                     Some("repair_timing -match_cell_footprint: not modelled".into())
-                } else if libs.scene_count() > 1 && (seq.iter().any(|m| !matches!(m, rt::Move::SizeUp | rt::Move::Unbuffer | rt::Move::SwapPins | rt::Move::Buffer)) || !(a.skip_last_gasp || a.phases.is_some())) {
+                } else if libs.scene_count() > 1 && (seq.iter().any(|m| !matches!(m, rt::Move::SizeUp | rt::Move::Unbuffer | rt::Move::SwapPins | rt::Move::Buffer | rt::Move::Clone | rt::Move::SplitLoad)) || !(a.skip_last_gasp || a.phases.is_some())) {
                     // Several corners: SizeUpMove and SwapPinsMove (the path's scene),
-                    // UnbufferMove (its slack guard at the capacitance guard's scene) and
+                    // UnbufferMove (its slack guard at the capacitance guard's scene),
                     // BufferMove (`corner_` = cmdScene, slacks and driver arcs in their paths'
-                    // scenes) in the LEGACY phase are modelled; every scene for slacks and
-                    // max-cap checks.
-                    Some("repair_timing over several corners: moves other than SizeUpMove, UnbufferMove, SwapPinsMove and BufferMove, and LAST_GASP, are not modelled".into())
+                    // scenes), CloneMove and SplitLoadMove (slacks over every scene) in the
+                    // LEGACY phase are modelled; every scene for slacks and max-cap checks.
+                    Some("repair_timing over several corners: SizeUpMatchMove, VtSwapMove and LAST_GASP are not modelled".into())
                 } else if debug_levels.get(&("RSZ".to_string(), "move_tracker".to_string())).is_some_and(|&l| l > 0) {
                     Some("repair_timing: the move tracker's reports (set_debug_level RSZ move_tracker) are not modelled".into())
                 } else {
@@ -1747,6 +1747,9 @@ fn run(job: &Value) -> Result<Value, String> {
                     let o = match r {
                         Ok(o) => o,
                         Err(Stop::Refused { msg, .. }) => {
+                            // A step refused during the repair: scored, as a refusal before it is,
+                            // on the preamble and the progress table's header and row 0.
+                            lines.extend(rt::row0(&ends, violating.len(), &violating_starts, time_scale));
                             timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len() }));
                             timing_stop = Some(format!("{msg} (not modelled)"));
                             break;
