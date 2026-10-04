@@ -167,12 +167,30 @@ pub struct Sizing<'a> {
     pub tgt_slews: [f32; 2],
     /// `tgt_slew_corner_`: the scene buffer delays and slews are timed at.
     pub tgt_scene: usize,
+    /// The block's sizing restrictions (`initBlock`).
+    pub limits: SizingLimits,
 }
 
 /// `sizing_area_limit_` and `sizing_leakage_limit_`'s defaults: one sizing move may not grow a
 /// cell's area or its leakage more than fourfold (`initBlock` writes both to the block).
 pub const SIZING_AREA_LIMIT: f64 = 4.0;
 pub const SIZING_LEAKAGE_LIMIT: f64 = 4.0;
+
+/// `Resizer::initBlock`'s sizing restrictions: the block's `limit_sizing_area` /
+/// `limit_sizing_leakage` double properties (`set_opt_config` writes them), else the defaults;
+/// `keep_sizing_site` (a bool property, false when absent).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SizingLimits {
+    pub area: Option<f64>,
+    pub leakage: Option<f64>,
+    pub keep_site: bool,
+}
+
+impl Default for SizingLimits {
+    fn default() -> SizingLimits {
+        SizingLimits { area: Some(SIZING_AREA_LIMIT), leakage: Some(SIZING_LEAKAGE_LIMIT), keep_site: false }
+    }
+}
 
 /// `Resizer::cellLeakage`: `cell_leakage_power`, else the mean of the `leakage_power` groups
 /// (summed in float, divided by their count), else none.
@@ -194,7 +212,7 @@ impl Sizing<'_> {
     /// `Resizer::getSwappableCells(source)`: a non-core master swaps for nothing; a dont_use cell
     /// only for itself; a cell with no class for itself; else its class, in class order, without
     /// dont_use or non-link cells, cells with no master, cells whose LEF area or leakage exceeds
-    /// the source's by more than the limit (4 each); a source with a `user_function_class` keeps
+    /// the source's by more than the block's limits (4 each by default); a source with a `user_function_class` keeps
     /// only cells with the same one. (No site/VT keeping or footprint matching: off by default.)
     pub fn swappable_cells(&self, source: &str) -> Result<Vec<String>, Stop> {
         let Some(master) = self.masters.get(source).filter(|m| m.is_core) else { return Ok(Vec::new()) };
@@ -207,7 +225,8 @@ impl Sizing<'_> {
         let Some(&k) = self.equiv.class_of.get(source) else { return Ok(vec![source.to_string()]) };
         let source_cell = self.libs.link_cell(source).expect("a link cell");
         let source_area = master.area;
-        let source_leakage = cell_leakage(source_cell);
+        // The source's leakage is read only when a leakage limit is in force.
+        let source_leakage = if self.limits.leakage.is_some() { cell_leakage(source_cell) } else { None };
         let mut out = Vec::new();
         for name in &self.equiv.classes[k] {
             // Class members are link cells by construction.
@@ -215,15 +234,19 @@ impl Sizing<'_> {
                 continue;
             }
             let Some(m) = self.masters.get(name) else { continue };
-            if source_area != 0 && m.area as f64 / source_area as f64 > SIZING_AREA_LIMIT {
+            if self.limits.area.is_some_and(|l| source_area != 0 && m.area as f64 / source_area as f64 > l) {
                 continue;
             }
             let cell = self.libs.link_cell(name).expect("a link cell");
             // The ratio is float, compared with the double limit.
-            if let (Some(src), Some(eq)) = (source_leakage, cell_leakage(cell)) {
-                if f64::from(eq / src) > SIZING_LEAKAGE_LIMIT {
+            if let (Some(limit), Some(src), Some(eq)) = (self.limits.leakage, source_leakage, cell_leakage(cell)) {
+                if f64::from(eq / src) > limit {
                     continue;
                 }
+            }
+            // `sizing_keep_site_`: the source's site only.
+            if self.limits.keep_site && m.site != master.site {
+                continue;
             }
             if !source_cell.user_function_class.is_empty() && source_cell.user_function_class != cell.user_function_class {
                 continue;
@@ -365,7 +388,7 @@ mod tests {
         let masters: BTreeMap<String, Master> = ["B1", "B2", "B4"].iter().map(|n| (n.to_string(), Master { site: "s".into(), area: 1, is_core: true, logic_std: true, implant_obs: vec![] })).collect();
         let equiv = make_equiv_cells(&l);
         let (dont_use, loads) = (BTreeSet::new(), BTreeMap::new());
-        let s = Sizing { libs: &l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0 };
+        let s = Sizing { libs: &l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: SizingLimits::default() };
         assert_eq!(s.swappable_cells("B1").unwrap(), vec!["B1".to_string(), "B2".into()], "B4 leaks 4.1x B1");
     }
 

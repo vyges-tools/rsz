@@ -49,6 +49,8 @@ pub struct Inputs<'a> {
     pub wire_rc: Vec<WireRc>,
     /// The SDC loads and input slews the timer reads (net loads keyed by their driver pins).
     pub sdc: SdcEnv,
+    /// The block's sizing restrictions.
+    pub sizing_limits: crate::sizing::SizingLimits,
     /// Each master's signal terminals (the database's): the timer's pins are these.
     pub master_pins: HashMap<String, Vec<String>>,
 }
@@ -191,7 +193,7 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
     // Fix violations from outputs to inputs: the drivers, levelized ONCE, from the LAST.
     let drivers: Vec<String> = timing::levelized_drvr_vertices(g0, &level).into_iter().map(|d| g0.vertices[d].name.clone()).collect();
     drop(graphs);
-    let sizing = Sizing { libs: inputs.libs, masters: inputs.masters, dont_use: inputs.dont_use, equiv: &equiv, target_loads: &target_loads, tgt_slews, tgt_scene };
+    let sizing = Sizing { libs: inputs.libs, masters: inputs.masters, dont_use: inputs.dont_use, equiv: &equiv, target_loads: &target_loads, tgt_slews, tgt_scene, limits: inputs.sizing_limits };
     let mut ctx = NetCtx {
         inputs,
         args,

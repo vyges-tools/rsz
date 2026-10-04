@@ -141,6 +141,8 @@ enum RebufProbe {
 struct PathView {
     stages: Vec<Stage>,
     start: usize,
+    /// The scene of the path (`Path::scene`): its delays, loads and library cells.
+    scene: usize,
 }
 
 /// The timer over the design as it is now: every endpoint's and startpoint's slack, and the worst
@@ -190,17 +192,18 @@ fn arc_intrinsic(model: &Model) -> f32 {
 /// The timer's state across the repair: the reference's incremental timer, the database's edits
 /// replayed into it at each update — a value it does not recompute stays as it was.
 struct Timer {
-    inc: IncTimer,
+    /// One per scene: every scene is timed on its own libraries and parasitics.
+    inc: Vec<IncTimer>,
     /// The decision trace's length when the update ran (for `VYGES_RSZ_INC_TRACE`).
     trace_at: usize,
 }
 
 impl Timer {
-    fn new(design: &mut dyn SetupDesign) -> Result<Timer, Stop> {
+    fn new(design: &mut dyn SetupDesign, scenes: usize) -> Result<Timer, Stop> {
         design.start_timer_edits().map_err(timer_stop)?;
         let mut inc = IncTimer::default();
         inc.track_netlist(design.netlist());
-        Ok(Timer { inc, trace_at: 0 })
+        Ok(Timer { inc: vec![inc; scenes], trace_at: 0 })
     }
 }
 
@@ -208,9 +211,20 @@ impl Timer {
 /// estimator's current ones; `edits`, what the timer has not seen. `want`: the endpoints whose
 /// worst path the repair will read.
 fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], timer: &mut Timer, edits: TimerEdits) -> Result<Snapshot, Stop> {
-    timed(ctx, design, timer, edits, |g, search, clocks| {
-        let (ends, starts) = timing_points(g, search, ctx.ssdc, ctx.libs, clocks).map_err(timer_stop)?;
-        let ideal = if ctx.ideal_clock { clocks.clone() } else { BTreeSet::new() };
+    timed_all(ctx, design, timer, edits, |gs, ss, cs| {
+        // Each point's slack: the least over the scenes (`Sta::slack` over every path).
+        let mut per_scene = Vec::with_capacity(gs.len());
+        for k in 0..gs.len() {
+            per_scene.push(timing_points(&gs[k], &ss[k], ctx.ssdc, ctx.libs, &cs[k]).map_err(timer_stop)?);
+        }
+        let (ends, starts) = if gs.len() == 1 {
+            per_scene.pop().expect("one scene")
+        } else {
+            (
+                crate::repair_timing::least_over_scenes(per_scene.iter().map(|(e, _)| e.as_slice()).collect()).map_err(timer_stop)?,
+                crate::repair_timing::least_over_scenes(per_scene.iter().map(|(_, s)| s.as_slice()).collect()).map_err(timer_stop)?,
+            )
+        };
         let mut names: Vec<String> = want.to_vec();
         if let (_, Some(w)) = worst_slack(&ends) {
             names.push(w.pin.clone());
@@ -220,8 +234,24 @@ fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], timer: &mut Tim
             if paths.contains_key(&n) {
                 continue;
             }
-            let Some(v) = g.vertices.iter().position(|x| x.name == n) else { continue };
-            if let Some(view) = expand(ctx, g, search, design, v, &ideal)? {
+            // `vertexWorstSlackPath(end, max)` over every scene's paths: the fuzzily least slack,
+            // the earlier scene on a tie; the path is expanded in its own scene.
+            let mut best: Option<(usize, usize, f32)> = None;
+            for k in 0..gs.len() {
+                let Some(v) = gs[k].vertices.iter().position(|x| x.name == n) else { continue };
+                let worst = ss[k].paths[v].iter().filter(|p| p.tag.mm == MAX).map(|p| p.required - p.arrival).fold(None, |m: Option<f32>, s| match m {
+                    Some(m) if !fuzzy::less(s, m) => Some(m),
+                    _ => Some(s),
+                });
+                if let Some(s) = worst {
+                    if best.is_none_or(|(_, _, b)| fuzzy::less(s, b)) {
+                        best = Some((k, v, s));
+                    }
+                }
+            }
+            let Some((k, v, _)) = best else { continue };
+            let ideal = if ctx.ideal_clock { cs[k].clone() } else { BTreeSet::new() };
+            if let Some(view) = expand(ctx, gs, ss, design, k, v, &ideal)? {
                 paths.insert(n, view);
             }
         }
@@ -229,17 +259,29 @@ fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], timer: &mut Tim
     })
 }
 
-/// The incremental timer brought up to date with the design (`edits` replayed, then delays,
-/// arrivals and requireds in full — the reference's `findRequireds`), and `read` run over the
-/// graph, the search and the clock network's pins.
+/// [`timed_all`] over scene 0 alone (the hold repair: one corner).
 fn timed<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits: TimerEdits, read: impl FnOnce(&Graph<'_>, &Search<'_, '_>, &BTreeSet<usize>) -> Result<R, Stop>) -> Result<R, Stop> {
+    timed_all(ctx, design, timer, edits, |gs, ss, cs| read(&gs[0], &ss[0], &cs[0]))
+}
+
+/// The incremental timers brought up to date with the design (`edits` replayed, then delays,
+/// arrivals and requireds in full — the reference's `findRequireds`), every scene on its own
+/// libraries and parasitics; `read` run over the scenes' graphs, searches and clock pins.
+fn timed_all<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits: TimerEdits, read: impl FnOnce(&[Graph<'_>], &[Search<'_, '_>], &[BTreeSet<usize>]) -> Result<R, Stop>) -> Result<R, Stop> {
     let netlist = design.netlist();
-    let mut g = crate::repair_design::timer_graph(ctx.libs, 0, netlist, ctx.env, ctx.master_pins)?;
-    let clocks = crate::timing::clock_pins(&g, ctx.clock_sources);
-    if ctx.ideal_clock {
-        g.ideal_clock = clocks.iter().copied().collect();
+    let mut graphs = Vec::with_capacity(timer.inc.len());
+    let mut all_clocks = Vec::with_capacity(timer.inc.len());
+    for k in 0..timer.inc.len() {
+        let mut gk = crate::repair_design::timer_graph(ctx.libs, k, netlist, ctx.env, ctx.master_pins)?;
+        let ck = crate::timing::clock_pins(&gk, ctx.clock_sources);
+        if ctx.ideal_clock {
+            gk.ideal_clock = ck.iter().copied().collect();
+        }
+        inc_delays(ctx, design, &mut gk, &mut timer.inc[k], &edits, k)?;
+        graphs.push(gk);
+        all_clocks.push(ck);
     }
-    inc_delays(ctx, design, &mut g, &mut timer.inc, &edits)?;
+    let g = &graphs[0];
     // A diagnostic: one pin's slews at every snapshot (`VYGES_RSZ_SNAP_PIN=pin:path`).
     if let Some((pin, path)) = std::env::var("VYGES_RSZ_SNAP_PIN").ok().as_deref().and_then(|s| s.split_once(':')).map(|(a, b)| (a.to_string(), b.to_string())) {
         if let Some(v) = g.vertices.iter().position(|x| x.name == pin) {
@@ -251,12 +293,14 @@ fn timed<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits: TimerE
             }
         }
     }
-    let mut search = Search::in_graph_order(&g, ctx.ssdc);
-    let inc = &mut timer.inc;
-    inc.import_paths(&mut search);
-    inc.find_arrivals(&mut search, None).map_err(timer_stop)?;
-    inc.find_requireds(&mut search, None).map_err(timer_stop)?;
-    inc_trace(inc, timer.trace_at);
+    let mut searches: Vec<Search<'_, '_>> = graphs.iter().map(|gk| Search::in_graph_order(gk, ctx.ssdc)).collect();
+    for (inc, search) in timer.inc.iter_mut().zip(searches.iter_mut()) {
+        inc.import_paths(search);
+        inc.find_arrivals(search, None).map_err(timer_stop)?;
+        inc.find_requireds(search, None).map_err(timer_stop)?;
+    }
+    inc_trace(&timer.inc[0], timer.trace_at);
+    let search = &searches[0];
     // A diagnostic: every instance pin's max slack per transition after this update, in fs
     // (`VYGES_RSZ_SLACKS=path`, rewritten each update — the last is the state the repair left).
     if let Some(path) = std::env::var_os("VYGES_RSZ_SLACKS") {
@@ -279,13 +323,13 @@ fn timed<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits: TimerE
         }
         let _ = std::fs::write(path, s);
     }
-    read(&g, &search, &clocks)
+    read(&graphs, &searches, &all_clocks)
 }
 
 /// The edits replayed into the incremental timer (`dbStaCbk`), the estimator's
 /// `delaysInvalidFromFanin` on each net it estimated — but a skip net, driven by an ideal clock
 /// pin (`isSkipNet`) — then `findDelays()`.
-fn inc_delays(ctx: &Ctx<'_>, design: &dyn Design, g: &mut Graph<'_>, inc: &mut IncTimer, edits: &TimerEdits) -> Result<(), Stop> {
+fn inc_delays(ctx: &Ctx<'_>, design: &dyn Design, g: &mut Graph<'_>, inc: &mut IncTimer, edits: &TimerEdits, scene: usize) -> Result<(), Stop> {
     let cx = EventCtx { libs: &ctx.libs.libs, ideal_clock_mode: ctx.ideal_clock };
     for ev in &edits.events {
         inc.apply_event(&cx, ev).map_err(timer_stop)?;
@@ -304,7 +348,7 @@ fn inc_delays(ctx: &Ctx<'_>, design: &dyn Design, g: &mut Graph<'_>, inc: &mut I
         }
     }
     inc.import(g);
-    inc.find_delays(g, design.parasitics(0), None).map_err(timer_stop)?;
+    inc.find_delays(g, design.parasitics(scene), None).map_err(timer_stop)?;
     inc.export(g);
     Ok(())
 }
@@ -330,7 +374,8 @@ fn inc_trace(inc: &IncTimer, trace_at: usize) {
 /// `Sta::vertexWorstSlackPath(end, max)`, then `PathExpanded`: the max path with the fuzzily
 /// least slack (the first, in tag order), walked back through its prev paths to the root.
 /// `startIndex`: the pin reached by the clock-to-output arc nearest the end, else the root.
-fn expand(ctx: &Ctx<'_>, g: &Graph<'_>, search: &Search<'_, '_>, design: &dyn Design, end: usize, ideal: &BTreeSet<usize>) -> Result<Option<PathView>, Stop> {
+fn expand(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], design: &dyn Design, scene: usize, end: usize, ideal: &BTreeSet<usize>) -> Result<Option<PathView>, Stop> {
+    let (g, search) = (&gs[scene], &ss[scene]);
     let mut worst = None;
     let mut min_slack = INF;
     for p in search.paths[end].iter().filter(|p| p.tag.mm == MAX) {
@@ -362,8 +407,17 @@ fn expand(ctx: &Ctx<'_>, g: &Graph<'_>, search: &Search<'_, '_>, design: &dyn De
     let n = chain.len();
     let start = n - 1 - start_from_end.unwrap_or(n - 1);
     chain.reverse();
-    let sc = crate::timing::Scenes::new(std::slice::from_ref(g));
-    let parasitics = std::slice::from_ref(design.parasitics(0));
+    // `checkMaxCapOK` (`checkCapacitance` over every scene), in scene 0's vertices.
+    let sc = crate::timing::Scenes::new(gs);
+    let all_parasitics: Vec<HashMap<String, vyges_sta::graph::NetParasitics>>;
+    let parasitics: &[HashMap<String, vyges_sta::graph::NetParasitics>] = if gs.len() == 1 {
+        std::slice::from_ref(design.parasitics(0))
+    } else {
+        all_parasitics = (0..gs.len()).map(|k| design.parasitics(k).clone()).collect();
+        &all_parasitics
+    };
+    let ideal0: BTreeSet<usize> = if scene == 0 { ideal.clone() } else { ideal.iter().filter_map(|&u| gs[0].vertices.iter().position(|x| x.name == g.vertices[u].name && x.is_driver == g.vertices[u].is_driver)).collect() };
+    let to_scene0 = |u: usize| if scene == 0 { Some(u) } else { gs[0].vertices.iter().position(|x| x.name == g.vertices[u].name && x.is_driver == g.vertices[u].is_driver) };
     let mut stages = Vec::with_capacity(n);
     for (i, (v, p)) in chain.iter().enumerate() {
         let vx = &g.vertices[*v];
@@ -398,7 +452,7 @@ fn expand(ctx: &Ctx<'_>, g: &Graph<'_>, search: &Search<'_, '_>, design: &dyn De
             }
         }
         if i > 0 && vx.is_driver && !top_port {
-            st.load_cap = g.load_cap(*v, design.parasitics(0));
+            st.load_cap = g.load_cap(*v, design.parasitics(scene));
             // Each input pin of the instance, its net's drivers' capacitance checks.
             for (u, ux) in g.vertices.iter().enumerate() {
                 let same = matches!(&ux.conn, vyges_sta::netlist::Conn::Inst(k, _) if Some(*k) == inst_index);
@@ -407,8 +461,9 @@ fn expand(ctx: &Ctx<'_>, g: &Graph<'_>, search: &Search<'_, '_>, design: &dyn De
                 }
                 let checks = crate::timing::net_drivers(g, u)
                     .into_iter()
+                    .filter_map(to_scene0)
                     .map(|d| {
-                        let (cap, max_cap, slack, limited, _) = crate::timing::check_capacitance(&sc, d, parasitics, ideal);
+                        let (cap, max_cap, slack, limited, _) = crate::timing::check_capacitance(&sc, d, parasitics, &ideal0);
                         CapCheck { cap, max_cap, slack, limited }
                     })
                     .collect();
@@ -449,7 +504,7 @@ fn expand(ctx: &Ctx<'_>, g: &Graph<'_>, search: &Search<'_, '_>, design: &dyn De
             }
         }
     }
-    Ok(Some(PathView { stages, start }))
+    Ok(Some(PathView { stages, start, scene }))
 }
 
 /// `rebufferPin` up to its buffering: the driver's checks, `makeBufferedNet`, `annotateLoadSlacks`
@@ -688,29 +743,30 @@ fn gate_delay(sizing: &Sizing<'_>, cell: &Cell, port: &str, load_cap: f32) -> f3
         for arc in &set.arcs {
             if let Model::Gate(m) = &arc.model {
                 let (delay, _) = m.gate_delay(sizing.tgt_slews[arc.from_rf], load_cap);
-                delays[arc.to_rf] = delays[arc.to_rf].max(delay);
+                delays[arc.to_rf] = crate::rebuffer::std_max(delays[arc.to_rf], delay);
             }
         }
     }
-    delays[0].max(delays[1])
+    crate::rebuffer::std_max(delays[0], delays[1])
 }
 
-/// `MoveGenerator::weakerCellFirst`: cells with the driver port first, by (drive resistance,
-/// intrinsic delay) LARGER first; cells without it by name. (The reference's sort is not stable;
-/// equal keys keep their order here.)
-fn weaker_cell_first(libs: &Libs, a: &str, b: &str, port: &str) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    let (ca, cb) = (libs.link_cell(a), libs.link_cell(b));
+/// `MoveGenerator::weakerCellFirst(lhs, rhs, port, lib_ap)` as a strict "lhs first": the cells
+/// with the driver port at the scene (`scenePort`) first; among those, `std::tie(drive
+/// resistance, intrinsic delay)` of lhs GREATER than rhs's; cells without it by name.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
+fn weaker_cell_first(libs: &Libs, scene: usize, a: &str, b: &str, port: &str) -> bool {
+    let (ca, cb) = (libs.scene_cell(scene, a), libs.scene_cell(scene, b));
     let pa = ca.filter(|c| c.port(port).is_some());
     let pb = cb.filter(|c| c.port(port).is_some());
     match (pa, pb) {
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => a.cmp(b),
+        (Some(_), None) => true,
+        (None, Some(_)) => false,
+        (None, None) => a < b,
         (Some(x), Some(y)) => {
-            let kx = (x.drive_resistance(port), port_intrinsic_delay(x, port));
-            let ky = (y.drive_resistance(port), port_intrinsic_delay(y, port));
-            ky.partial_cmp(&kx).unwrap_or(Ordering::Equal)
+            let (xr, xi) = (x.drive_resistance(port), port_intrinsic_delay(x, port));
+            let (yr, yi) = (y.drive_resistance(port), port_intrinsic_delay(y, port));
+            // `std::tie(...) > std::tie(...)`: lexicographic, each `<` on `float`.
+            yr < xr || (!(xr < yr) && yi < xi)
         }
     }
 }
@@ -718,19 +774,20 @@ fn weaker_cell_first(libs: &Libs, a: &str, b: &str, port: &str) -> std::cmp::Ord
 /// `SizeUpGenerator::upsizeCell`: the swappable cells weaker first; the first whose port drives no
 /// worse and whose stage delay — `gateDelay` at the load plus the previous driver's resistance
 /// times its input capacitance — is smaller than the current cell's.
-fn upsize_cell(sizing: &Sizing<'_>, in_port: &str, cell: &str, drvr_port: &str, load_cap: f32, prev_drive: f32) -> Result<Option<String>, Stop> {
+fn upsize_cell(sizing: &Sizing<'_>, scene: usize, in_port: &str, cell: &str, drvr_port: &str, load_cap: f32, prev_drive: f32) -> Result<Option<String>, Stop> {
     let libs = sizing.libs;
     let mut swappable = sizing.swappable_cells(cell)?;
     if swappable.is_empty() {
         return Ok(None);
     }
-    swappable.sort_by(|a, b| weaker_cell_first(libs, a, b, drvr_port));
-    let Some(c) = libs.link_cell(cell) else { return Ok(None) };
+    crate::order::libcxx_sort_by(&mut swappable, |a, b| weaker_cell_first(libs, scene, a, b, drvr_port)).map_err(|h| Stop::refused("RSZ-ORDER", format!("{} swappable cells reach the sort's heap fallback, which is not modelled", h.len)))?;
+    // The current cell's ports at the scene (`scenePort`); the gate delay of its arcs there.
+    let Some(c) = libs.scene_cell(scene, cell) else { return Ok(None) };
     let (Some(_), Some(in_cap)) = (c.port(drvr_port), port_capacitance(c, in_port)) else { return Ok(None) };
     let drive_r = c.drive_resistance(drvr_port);
     let delay = gate_delay(sizing, c, drvr_port, load_cap) + prev_drive * in_cap;
     for name in swappable {
-        let Some(s) = libs.link_cell(&name) else { continue };
+        let Some(s) = libs.scene_cell(scene, &name) else { continue };
         let (Some(_), Some(s_in_cap)) = (s.port(drvr_port), port_capacitance(s, in_port)) else { continue };
         let s_drive_r = s.drive_resistance(drvr_port);
         let s_delay = gate_delay(sizing, s, drvr_port, load_cap) + prev_drive * s_in_cap;
@@ -787,7 +844,7 @@ fn size_up(ctx: &Ctx<'_>, design: &dyn Design, view: &PathView, index: usize) ->
         Some(Stage { cell: Some(c), port: Some(p), .. }) => ctx.libs.link_cell(c).map_or(0.0, |c| c.drive_resistance(p)),
         _ => 0.0,
     };
-    let Some(to) = upsize_cell(ctx.sizing, in_port, cell, port, st.load_cap, prev_drive)? else { return Ok(None) };
+    let Some(to) = upsize_cell(ctx.sizing, view.scene, in_port, cell, port, st.load_cap, prev_drive)? else { return Ok(None) };
     if !replacement_preserves_max_cap(ctx.libs, cell, &to, &st.fanin_caps) {
         return Ok(None);
     }
@@ -1005,7 +1062,7 @@ pub trait SetupDesign: Design {
 /// it (the reference's lazy reads, measured: one level-limited delay pass per inserted buffer,
 /// with no edit before the full pass that follows it).
 pub fn repair_hold(ctx: &Ctx<'_>, hctx: &crate::repair_hold::HoldCtx<'_>, design: &mut dyn SetupDesign, ha: &crate::repair_hold::HoldArgs) -> Result<crate::repair_hold::HoldOutcome, Stop> {
-    let timer = Timer::new(design)?;
+    let timer = Timer::new(design, 1)?;
     let initial_area = design.design_area();
     // `setMaxUtilization`: the core area times the fraction; 0 (no limit) without one.
     let max_area = ha.max_utilization.map_or(0.0, |u| design.core_area() * u);
@@ -1469,7 +1526,7 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
     if args.max_utilization.is_some() {
         return Err(Stop::refused("RSZ-ABSENT", "repair_timing -max_utilization: not modelled".into()));
     }
-    let mut timer = Timer::new(design)?;
+    let mut timer = Timer::new(design, ctx.libs.scene_count())?;
     let timing = snapshot(ctx, design.as_design(), &[], &mut timer, TimerEdits::default())?;
     // RepairSetupContext: the area and TNS before any move.
     let initial_design_area = design.design_area();
@@ -2586,6 +2643,7 @@ mod tests {
                 stage("u2/Z", true, false, 2.0),
             ],
             start: 2,
+            scene: 0,
         };
         assert_eq!(rank_path_drivers(&view), vec![(4, 5.0), (6, 2.0), (2, 2.0)]);
     }
@@ -2619,7 +2677,7 @@ mod tests {
         let masters: BTreeMap<String, Master> = l.libs[0].cells.keys().map(|n| (n.clone(), Master { site: "s".into(), area: 1, is_core: true, logic_std: true, implant_obs: vec![] })).collect();
         let equiv = crate::sizing::make_equiv_cells(l);
         let (dont_use, loads) = (BTreeSet::new(), BTreeMap::new());
-        f(&Sizing { libs: l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0 })
+        f(&Sizing { libs: l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: Default::default() })
     }
 
     // Rule (weakerCellFirst): cells with the driver port first, the LARGER drive resistance
@@ -2628,7 +2686,7 @@ mod tests {
     fn swappable_cells_are_tried_weakest_first() {
         let l = libs(&[buf("B4", 0.01, 0.1, 0.2, 1.0), buf("B1", 0.01, 0.1, 0.5, 4.0), buf("B2", 0.01, 0.1, 0.3, 2.0)]);
         let mut cells = vec!["B4".to_string(), "B2".into(), "NOPE".into(), "B1".into()];
-        cells.sort_by(|a, b| weaker_cell_first(&l, a, b, "Z"));
+        crate::order::libcxx_sort_by(&mut cells, |a, b| weaker_cell_first(&l, 0, a, b, "Z")).unwrap();
         assert_eq!(cells, vec!["B1", "B2", "B4", "NOPE"]);
     }
 
@@ -2641,12 +2699,12 @@ mod tests {
         let unit = l.libs[0].cells["B1"].port("A").unwrap().capacitance[0][MAX] / 0.01;
         with_sizing(&l, |s| {
             // No previous driver: B2 is faster at half the unit load.
-            assert_eq!(upsize_cell(s, "A", "B1", "Z", 0.5 * unit, 0.0).unwrap().as_deref(), Some("B2"));
+            assert_eq!(upsize_cell(s, 0, "A", "B1", "Z", 0.5 * unit, 0.0).unwrap().as_deref(), Some("B2"));
             // A previous driver of 1 (time per unit cap) pays for B2's input cap: B4 wins.
             let r = l.libs[0].cells["B1"].drive_resistance("Z") / 4.0;
-            assert_eq!(upsize_cell(s, "A", "B1", "Z", 0.5 * unit, r).unwrap().as_deref(), Some("B4"));
+            assert_eq!(upsize_cell(s, 0, "A", "B1", "Z", 0.5 * unit, r).unwrap().as_deref(), Some("B4"));
             // The strongest cell has nothing stronger.
-            assert_eq!(upsize_cell(s, "A", "B4", "Z", 0.5 * unit, 0.0).unwrap(), None);
+            assert_eq!(upsize_cell(s, 0, "A", "B4", "Z", 0.5 * unit, 0.0).unwrap(), None);
         });
     }
 

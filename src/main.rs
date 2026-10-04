@@ -281,6 +281,27 @@ fn disconnect_pins(p: &mut NetParasitics, net: &str, pins: &[String]) {
     }
 }
 
+/// `Resizer::initBlock`'s sizing restrictions from the block's properties (`set_opt_config`
+/// writes them before the repair): a limit absent is the default; `keep_sizing_site` absent is
+/// off. `keep_sizing_vt` is moot: a VT library is refused.
+fn sizing_limits(db: &Db) -> Result<vyges_rsz::sizing::SizingLimits, String> {
+    let d = vyges_rsz::sizing::SizingLimits::default();
+    Ok(vyges_rsz::sizing::SizingLimits {
+        area: db.block_double_property("limit_sizing_area").map_err(|e| e.to_string())?.or(d.area),
+        leakage: db.block_double_property("limit_sizing_leakage").map_err(|e| e.to_string())?.or(d.leakage),
+        keep_site: db.block_bool_property("keep_sizing_site").map_err(|e| e.to_string())?.unwrap_or(false),
+    })
+}
+
+/// The checks of repair_design / buffer_ports read the LINK library through scene 0: a first
+/// library read for another corner is refused there.
+fn link_corner_is_first(libs: &Libs) -> Result<(), String> {
+    if libs.link_scene.is_some_and(|k| k != 0) {
+        return Err("the first liberty library read is not for the first corner: the link library's corner is not modelled".into());
+    }
+    Ok(())
+}
+
 /// `Resizer::computeDesignArea`: over the block's instances in order, each master's
 /// `width × height` in m² (`dbuToMeters` each side) — 0 for a master that is not core
 /// autoplaceable (`isCoreAutoPlaceable`) — fillers (`CORE SPACER`) left out.
@@ -1195,9 +1216,8 @@ fn run(job: &Value) -> Result<Value, String> {
                 }
                 let lib = Library::read(&group).map_err(|e| format!("{path}: {e} (not modelled)"))?;
                 if !libs.scene_libs.is_empty() {
-                    // Scene 0 is the timer's LINK view: the first library read must serve it.
-                    if libs.libs.is_empty() && scene.is_some_and(|k| k != 0) {
-                        return Err("the first liberty library read is not for the first corner: the link library's corner is not modelled".into());
+                    if libs.libs.is_empty() {
+                        libs.link_scene = scene;
                     }
                     for (k, sl) in libs.scene_libs.iter_mut().enumerate() {
                         if scene.is_none_or(|c| c == k) {
@@ -1299,6 +1319,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 if sdc_propagated {
                     return Err("set_propagated_clock: not modelled for buffer_ports".into());
                 }
+                link_corner_is_first(&libs)?;
                 let o = buffer_ports::Options::parse(&args)?;
                 let mut dont_use = set_dont_use.clone();
                 for lib in &libs.libs {
@@ -1361,6 +1382,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 if outcome.is_some() {
                     return Err("a second repair_design: not modelled".into());
                 }
+                link_corner_is_first(&libs)?;
                 if sdc_propagated {
                     return Err("set_propagated_clock: not modelled for repair_design".into());
                 }
@@ -1427,8 +1449,9 @@ fn run(job: &Value) -> Result<Value, String> {
                     std::fs::write(path, lines.join("\n") + "\n").map_err(|e| format!("{path}: {e}"))?;
                 }
                 let port_caps = env.port_pin_cap.clone();
+                let limits_of_block = sizing_limits(&db)?;
                 let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), timer: TimerLog::default() };
-                let inputs = Inputs { libs: &libs, masters: &m, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins };
+                let inputs = Inputs { libs: &libs, masters: &m, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins, sizing_limits: limits_of_block };
                 outcome = Some(repair_design::repair_design(&inputs, &mut design, &a, &mut trace));
             }
             "repair_timing" => {
@@ -1445,8 +1468,8 @@ fn run(job: &Value) -> Result<Value, String> {
                 if !estimated {
                     return Err("repair_timing without estimate_parasitics -placement: not modelled".into());
                 }
-                if libs.scene_count() != 1 {
-                    return Err("repair_timing over several corners: not modelled".into());
+                if libs.scene_count() != 1 && !a.setup {
+                    return Err("repair_timing -hold over several corners: not modelled".into());
                 }
                 let m = masters(&db)?;
                 if let Some((n, _)) = m.iter().find(|(_, mm)| !mm.implant_obs.is_empty()) {
@@ -1500,6 +1523,26 @@ fn run(job: &Value) -> Result<Value, String> {
                     std::fs::write(&path, out).map_err(|e| format!("{path}: {e}"))?;
                 }
                 let (ends, starts) = rt::timing_points(&g, &search, &ssdc, &libs, &clocks)?;
+                // Several corners: every scene timed on its own libraries and parasitics, each
+                // point's slack the least over the scenes (`Sta::slack` over every path).
+                let (ends, starts) = if libs.scene_count() > 1 {
+                    let mut per_scene = Vec::new();
+                    for (k, par) in parasitics.iter().enumerate().take(libs.scene_count()) {
+                        let mut gk = repair_design::timer_graph(&libs, k, &netlist, &env, &mpins).map_err(|e| e.message().to_string())?;
+                        let ck = vyges_rsz::timing::clock_pins(&gk, &clock_sources);
+                        if !clock_propagated {
+                            gk.ideal_clock = ck.iter().copied().collect();
+                        }
+                        gk.find_delays(par, None)?;
+                        let mut sk = vyges_sta::search::Search::in_graph_order(&gk, &ssdc);
+                        sk.find_arrivals()?;
+                        sk.find_requireds()?;
+                        per_scene.push(rt::timing_points(&gk, &sk, &ssdc, &libs, &ck)?);
+                    }
+                    (rt::least_over_scenes(per_scene.iter().map(|(e, _)| e.as_slice()).collect())?, rt::least_over_scenes(per_scene.iter().map(|(_, s)| s.as_slice()).collect())?)
+                } else {
+                    (ends, starts)
+                };
                 // `-hold` alone: `Resizer::repairHold` (its preamble with clock buffers allowed),
                 // over the endpoints' min and max slacks.
                 let hold_only = !a.setup;
@@ -1513,6 +1556,10 @@ fn run(job: &Value) -> Result<Value, String> {
                     Some(format!("repair_timing: {} is not modelled", m.name()))
                 } else if a.match_cell_footprint {
                     Some("repair_timing -match_cell_footprint: not modelled".into())
+                } else if libs.scene_count() > 1 && (seq.iter().any(|m| *m != rt::Move::SizeUp) || !(a.skip_last_gasp || a.phases.is_some())) {
+                    // Several corners: SizeUpMove in the LEGACY phase is modelled (the path's
+                    // scene for its delays and cells, every scene for slacks and max-cap checks).
+                    Some("repair_timing over several corners: moves other than SizeUpMove, and LAST_GASP, are not modelled".into())
                 } else if debug_levels.get(&("RSZ".to_string(), "move_tracker".to_string())).is_some_and(|&l| l > 0) {
                     Some("repair_timing: the move tracker's reports (set_debug_level RSZ move_tracker) are not modelled".into())
                 } else {
@@ -1536,7 +1583,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     let db_dbu = db.tech_get_db_units_per_micron();
                     let buffers = vyges_rsz::preamble::find_buffers(&libs, &m, &dont_use, !hold_only).map_err(|e| format!("{}: {}", e.code(), e.message()))?;
                     let (tgt_slews, tgt_scene, target_loads) = vyges_rsz::preamble::find_target_loads(&libs, &buffers.cells, &dont_use);
-                    let sizing = vyges_rsz::sizing::Sizing { libs: &libs, masters: &m, dont_use: &dont_use, equiv: &equiv, target_loads: &target_loads, tgt_slews, tgt_scene };
+                    let sizing = vyges_rsz::sizing::Sizing { libs: &libs, masters: &m, dont_use: &dont_use, equiv: &equiv, target_loads: &target_loads, tgt_slews, tgt_scene, limits: sizing_limits(&db)? };
                     let limits = Limits {
                         design_max_transition: s.max_transition.map(|v| user_time_to_sta(v, time_scale)),
                         design_max_fanout: s.max_fanout.map(|v| v as f32),

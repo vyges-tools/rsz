@@ -26,6 +26,9 @@ pub struct Libs {
     /// With corners: each scene's libraries (a `read_liberty -corner`'s, in read order) — the
     /// libraries its `sceneCell` / `scenePort` come from. Empty with one scene: it is `libs`.
     pub scene_libs: Vec<Vec<Library>>,
+    /// With corners: the corner of the first library read (`read_liberty -corner`), the LINK
+    /// library's — not always the first corner (`define_corners fast slow` read slow first).
+    pub link_scene: Option<usize>,
 }
 
 impl Libs {
@@ -428,7 +431,7 @@ mod tests {
     // an equal one does not take it.
     #[test]
     fn the_target_slew_corner_is_the_slowest_scene() {
-        let scenes = |a: f32, b: f32| Libs { libs: vec![corner_lib(a), corner_lib(b)], scenes: vec!["c0".into(), "c1".into()], scene_libs: vec![vec![corner_lib(a)], vec![corner_lib(b)]] };
+        let scenes = |a: f32, b: f32| Libs { libs: vec![corner_lib(a), corner_lib(b)], scenes: vec!["c0".into(), "c1".into()], scene_libs: vec![vec![corner_lib(a)], vec![corner_lib(b)]], link_scene: Some(0) };
         let bufs = ["B".to_string()];
         let (slow_second, k) = find_buffer_target_slews(&scenes(1.0, 2.0), &bufs);
         assert_eq!(k, 1);

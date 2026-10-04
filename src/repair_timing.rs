@@ -266,6 +266,26 @@ pub struct Point {
     pub slack: f32,
 }
 
+/// Several scenes' points merged: in scene 0's order, each point's slack the fuzzily least over
+/// the scenes, the earlier scene kept on a tie (`Sta::slack` over every path, in tag order).
+pub fn least_over_scenes(scenes: Vec<&[Point]>) -> Result<Vec<Point>, String> {
+    let Some((first, rest)) = scenes.split_first() else { return Ok(Vec::new()) };
+    let mut out: Vec<Point> = first.to_vec();
+    for other in rest {
+        let by_pin: std::collections::HashMap<&str, f32> = other.iter().map(|p| (p.pin.as_str(), p.slack)).collect();
+        if by_pin.len() != out.len() {
+            return Err("the scenes' timing points differ: not modelled".into());
+        }
+        for p in out.iter_mut() {
+            let s = *by_pin.get(p.pin.as_str()).ok_or_else(|| format!("{}: a timing point in one scene only (not modelled)", p.pin))?;
+            if fuzzy::less(s, p.slack) {
+                p.slack = s;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// `collectViolatingEndpoints` / `collectViolatingStartpoints`: every point whose slack is fuzzily
 /// below the margin, stable-sorted by slack — equal slacks keep the timer's order.
 pub fn collect_violating(points: &[Point], margin: f32) -> Vec<Point> {
@@ -497,6 +517,15 @@ mod tests {
 
     /// Rules (proc repair_timing, buildMainMoveSequence): neither flag means both; the default
     /// sequence drops what a -skip names; an explicit -sequence keeps its own order.
+    /// Rule (Sta::slack over every scene's paths): the least, the earlier scene on a tie.
+    #[test]
+    fn a_points_slack_is_the_least_over_scenes() {
+        let fast = vec![p("a", -1.0), p("b", 2.0)];
+        let slow = vec![p("b", -3.0), p("a", -2.0)];
+        let m = least_over_scenes(vec![&fast, &slow]).unwrap();
+        assert_eq!(m, vec![p("a", -2.0), p("b", -3.0)]);
+    }
+
     #[test]
     fn the_move_sequence_follows_the_flags() {
         let a = Args::parse(&["-setup".into(), "-skip_pin_swap".into(), "-skip_gate_cloning".into()]).unwrap();
