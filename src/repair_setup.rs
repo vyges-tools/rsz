@@ -279,9 +279,15 @@ fn timed_all<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits: Ti
         if ctx.ideal_clock {
             gk.ideal_clock = ck.iter().copied().collect();
         }
-        inc_delays(ctx, design, &mut gk, &mut timer.inc[k], &edits, k)?;
+        inc_prepare(ctx, design, &mut gk, &mut timer.inc[k], &edits)?;
         graphs.push(gk);
         all_clocks.push(ck);
+    }
+    // `findDelays()`: one queue over every scene (the reference's one graph).
+    let pars: Vec<&HashMap<String, vyges_sta::graph::NetParasitics>> = (0..graphs.len()).map(|k| design.parasitics(k)).collect();
+    vyges_sta::incr::find_delays_scenes(&mut timer.inc, &mut graphs, &pars, None).map_err(timer_stop)?;
+    for (inc, gk) in timer.inc.iter_mut().zip(&graphs) {
+        inc.export(gk);
     }
     let g = &graphs[0];
     // A diagnostic: one pin's slews at every snapshot (`VYGES_RSZ_SNAP_PIN=pin:path`).
@@ -298,9 +304,11 @@ fn timed_all<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits: Ti
     let mut searches: Vec<Search<'_, '_>> = graphs.iter().map(|gk| Search::in_graph_order(gk, ctx.ssdc)).collect();
     for (inc, search) in timer.inc.iter_mut().zip(searches.iter_mut()) {
         inc.import_paths(search);
-        inc.find_arrivals(search, None).map_err(timer_stop)?;
-        inc.find_requireds(search, None).map_err(timer_stop)?;
     }
+    // One queue over every scene for arrivals, then for requireds (a vertex's tag group holds
+    // every scene's paths).
+    vyges_sta::incr::find_arrivals_scenes(&mut timer.inc, &mut searches, None).map_err(timer_stop)?;
+    vyges_sta::incr::find_requireds_scenes(&mut timer.inc, &mut searches, None).map_err(timer_stop)?;
     inc_trace(&timer.inc[0], timer.trace_at);
     let search = &searches[0];
     // A diagnostic: every instance pin's max slack per transition after this update, in fs
@@ -328,10 +336,11 @@ fn timed_all<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits: Ti
     read(&graphs, &searches, &all_clocks)
 }
 
-/// The edits replayed into the incremental timer (`dbStaCbk`), the estimator's
+/// The edits replayed into one scene's incremental timer (`dbStaCbk`), the estimator's
 /// `delaysInvalidFromFanin` on each net it estimated — but a skip net, driven by an ideal clock
-/// pin (`isSkipNet`) — then `findDelays()`.
-fn inc_delays(ctx: &Ctx<'_>, design: &dyn Design, g: &mut Graph<'_>, inc: &mut IncTimer, edits: &TimerEdits, scene: usize) -> Result<(), Stop> {
+/// pin (`isSkipNet`) — and the stored state imported into the scene's graph; `findDelays()`
+/// follows over every scene at once.
+fn inc_prepare(ctx: &Ctx<'_>, design: &dyn Design, g: &mut Graph<'_>, inc: &mut IncTimer, edits: &TimerEdits) -> Result<(), Stop> {
     let cx = EventCtx { libs: &ctx.libs.libs, ideal_clock_mode: ctx.ideal_clock };
     for ev in &edits.events {
         inc.apply_event(&cx, ev).map_err(timer_stop)?;
@@ -350,8 +359,6 @@ fn inc_delays(ctx: &Ctx<'_>, design: &dyn Design, g: &mut Graph<'_>, inc: &mut I
         }
     }
     inc.import(g);
-    inc.find_delays(g, design.parasitics(scene), None).map_err(timer_stop)?;
-    inc.export(g);
     Ok(())
 }
 
@@ -503,7 +510,7 @@ fn expand(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet
         for (i, (v, _)) in chain.iter().enumerate() {
             let st = &stages[i];
             if i > 0 && st.is_driver && !st.top_port && st.fanout > 1 && st.fanout < rebuffer::REBUFFER_MAX_FANOUT {
-                stages[i].rebuffer = Some(probe_rebuffer(ctx, g, search, design, ideal, *v));
+                stages[i].rebuffer = Some(probe_rebuffer(ctx, gs, ss, cs, design, &g.vertices[*v].name));
             }
         }
     }
@@ -513,7 +520,13 @@ fn expand(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet
 /// `rebufferPin` up to its buffering: the driver's checks, `makeBufferedNet`, `annotateLoadSlacks`
 /// (each load's worst max path walked back to the driver: its slack, its transition, and the
 /// first such path per transition as `arrival_paths_`), `drvrPinTiming`'s arcs and `setPin`.
-fn probe_rebuffer(ctx: &Ctx<'_>, g: &Graph<'_>, search: &Search<'_, '_>, design: &dyn Design, ideal: &BTreeSet<usize>, drvr: usize) -> RebufProbe {
+/// `corner_` is `cmdScene()` (scene 0): the buffered net and `setPin`'s limits are read there;
+/// each load's path is its worst over EVERY scene (`vertexWorstSlackPath`), and a transition's
+/// driver arc is timed in its arrival path's scene.
+fn probe_rebuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet<usize>], design: &dyn Design, drvr_name: &str) -> RebufProbe {
+    let g = &gs[0];
+    let ideal: BTreeSet<usize> = if ctx.ideal_clock { cs[0].clone() } else { BTreeSet::new() };
+    let Some(drvr) = g.vertices.iter().position(|x| x.name == drvr_name && x.is_driver) else { return RebufProbe::Skip };
     let vx = &g.vertices[drvr];
     if vx.lib.is_none() {
         return RebufProbe::Warn(format!("[WARNING RSZ-2020] rebuffering does not support top port as the driver pin: {}", vx.name));
@@ -541,36 +554,41 @@ fn probe_rebuffer(ctx: &Ctx<'_>, g: &Graph<'_>, search: &Search<'_, '_>, design:
         };
         nodes.push(rebuffer::Node { kind, x: n.x, y: n.y, cap: n.cap, fanout: n.fanout, max_load_slew: n.max_load_slew, area: 0.0, slack_rf: None, slack: rebuffer::FixedDelay::ZERO, delay: rebuffer::FixedDelay::ZERO, arrival: rebuffer::FixedDelay::ZERO });
     }
-    let mut arrival_paths: [Option<vyges_sta::search::Path>; 2] = [None, None];
+    let mut arrival_paths: [Option<(usize, vyges_sta::search::Path)>; 2] = [None, None];
     let mut warnings = Vec::new();
-    annotate_load_slacks(g, search, &bn, root, drvr, &mut nodes, &mut arrival_paths, &mut warnings);
+    annotate_load_slacks(gs, ss, &bn, root, &vx.name, &mut nodes, &mut arrival_paths, &mut warnings);
     let mut arcs: [Option<Option<rebuffer::DriverArc>>; 2] = [None, None];
+    let mut arc_scenes = [0usize; 2];
     for rf in 0..2 {
-        let Some(ap) = arrival_paths[rf] else { continue };
+        let Some((k, ap)) = arrival_paths[rf] else { continue };
+        arc_scenes[rf] = k;
+        let (gk, sk) = (&gs[k], &ss[k]);
         arcs[rf] = Some(ap.prev.and_then(|prev| {
-            let dp = search.paths[prev.vertex].iter().find(|q| q.tag == prev.tag)?;
-            let set = edge_arc_set(g, prev.edge)?;
+            let dp = sk.paths[prev.vertex].iter().find(|q| q.tag == prev.tag)?;
+            let set = edge_arc_set(gk, prev.edge)?;
             let arc = &set.arcs[prev.arc];
             // edgeFromSlew: an ideal clock pin's clock-to-output edge reads the ideal slew, 0.
-            let ideal_clk = set.role == Role::RegClkToQ && g.ideal_clock.contains(&prev.vertex);
-            let from_slew = if ideal_clk { 0.0 } else { g.slew[prev.vertex][arc.from_rf][MAX] };
+            let ideal_clk = set.role == Role::RegClkToQ && gk.ideal_clock.contains(&prev.vertex);
+            let from_slew = if ideal_clk { 0.0 } else { gk.slew[prev.vertex][arc.from_rf][MAX] };
             // clkPathArrival for a clock path: the ideal clock's edge, else its arrival.
             let prev_arrival = if dp.tag.is_clock && !ctx.ssdc.clock.propagated { ctx.ssdc.clock.edge_time(dp.tag.clk_edge.unwrap_or(dp.tag.rf)) } else { dp.arrival };
             Some(rebuffer::DriverArc { model: arc.model.clone(), from_slew, prev_arrival, arrival: ap.arrival })
         }));
     }
     let link = ctx.libs.link_cell(cell_name).unwrap_or(cell);
-    let lib = ctx.libs.link_library(cell_name).unwrap_or(&g.libs[vx.lib.expect("an instance pin")]);
-    // setPin: the fanout limit (the resizer's check, with its backstop), the driver's slew limit.
-    let (_, max_fanout, _) = crate::timing::check_fanout(g, design.net_info(), drvr, ctx.limits, ideal);
+    // setPin: the fanout limit (the resizer's check, with its backstop); the driver's slew limit
+    // at `corner_` (`findSlewLimit(drvr_port_, corner_)`: the scene port and its library).
+    let (_, max_fanout, _) = crate::timing::check_fanout(g, design.net_info(), drvr, ctx.limits, &ideal);
     let fanout_limit = if max_fanout > 0.0 { max_fanout } else { INF };
-    let p = link.port(port);
+    let lib = ctx.libs.scene_library(0, cell_name).unwrap_or(&g.libs[vx.lib.expect("an instance pin")]);
+    let p = ctx.libs.scene_cell(0, cell_name).unwrap_or(link).port(port);
     let (max_slew, exists) = crate::timing::find_slew_limit(lib, p.map_or(vyges_sta::liberty::Direction::Output, |p| p.direction), p.and_then(|p| p.max_transition), ctx.limits);
     let drvr_pin_max_slew = if exists { (f64::from(max_slew) * (1.0 - 20.0 / 100.0)) as f32 } else { INF };
     RebufProbe::Ready(Box::new(rebuffer::Probe {
         nodes,
         root,
         arcs,
+        arc_scenes,
         drvr_port_cap: port_capacitance(link, port).unwrap_or(0.0),
         drvr_resistance: link.drive_resistance(port),
         fanout_limit,
@@ -607,47 +625,55 @@ fn fanout_slacks(g: &Graph<'_>, search: &Search<'_, '_>, drvr: usize, rf: usize,
     clone::collect_fanout_slacks(fanouts)
 }
 
-/// `annotateLoadSlacks` over the buffered net: per load, `vertexWorstSlackPath(max)` walked back
-/// along its previous paths to the driver; its slack `required − arrival(at the driver)` and
-/// transition, or INF with none when the walk does not reach the driver.
+/// `annotateLoadSlacks` over the buffered net: per load, `vertexWorstSlackPath(max)` — the
+/// fuzzily least slack over every scene's paths, the earlier scene on a tie — walked back along
+/// its previous paths (in its scene) to the driver; its slack `required − arrival(at the driver)`
+/// and transition, or INF with none when the walk does not reach the driver.
 #[allow(clippy::too_many_arguments)]
-fn annotate_load_slacks(g: &Graph<'_>, search: &Search<'_, '_>, bn: &crate::buffered_net::BufferedNet, n: usize, drvr: usize, nodes: &mut [rebuffer::Node], arrival_paths: &mut [Option<vyges_sta::search::Path>; 2], warnings: &mut Vec<String>) {
+fn annotate_load_slacks(gs: &[Graph<'_>], ss: &[Search<'_, '_>], bn: &crate::buffered_net::BufferedNet, n: usize, drvr: &str, nodes: &mut [rebuffer::Node], arrival_paths: &mut [Option<(usize, vyges_sta::search::Path)>; 2], warnings: &mut Vec<String>) {
     match bn.nodes[n].kind {
-        crate::buffered_net::Kind::Wire { r } => annotate_load_slacks(g, search, bn, r, drvr, nodes, arrival_paths, warnings),
+        crate::buffered_net::Kind::Wire { r } => annotate_load_slacks(gs, ss, bn, r, drvr, nodes, arrival_paths, warnings),
         crate::buffered_net::Kind::Junction { r, r2 } => {
-            annotate_load_slacks(g, search, bn, r, drvr, nodes, arrival_paths, warnings);
-            annotate_load_slacks(g, search, bn, r2, drvr, nodes, arrival_paths, warnings);
+            annotate_load_slacks(gs, ss, bn, r, drvr, nodes, arrival_paths, warnings);
+            annotate_load_slacks(gs, ss, bn, r2, drvr, nodes, arrival_paths, warnings);
         }
         crate::buffered_net::Kind::Load { pin } => {
-            let mut req: Option<vyges_sta::search::Path> = None;
+            let name = gs[0].vertices[pin].name.as_str();
+            let mut req: Option<(usize, usize, vyges_sta::search::Path)> = None;
             let mut min_slack = INF;
-            for p in search.paths[pin].iter().filter(|p| p.tag.mm == MAX) {
-                let s = p.required - p.arrival;
-                if fuzzy::less(s, min_slack) {
-                    min_slack = s;
-                    req = Some(*p);
+            for (k, (g, search)) in gs.iter().zip(ss).enumerate() {
+                let Some(v) = g.vertices.iter().position(|x| x.name == name && !x.is_driver) else { continue };
+                for p in search.paths[v].iter().filter(|p| p.tag.mm == MAX) {
+                    let s = p.required - p.arrival;
+                    if fuzzy::less(s, min_slack) {
+                        min_slack = s;
+                        req = Some((k, v, *p));
+                    }
                 }
             }
-            let mut arrival = req;
-            let mut at = pin;
-            while let (Some(_), Some(a)) = (req, arrival) {
-                if at == drvr {
-                    break;
-                }
-                arrival = a.prev.and_then(|pv| {
-                    at = pv.vertex;
-                    search.paths[pv.vertex].iter().find(|q| q.tag == pv.tag).copied()
-                });
-                if arrival.is_none() {
-                    warnings.push(format!("[WARNING RSZ-2006] failed to trace timing path for load {} when buffering {}", g.vertices[pin].name, g.vertices[drvr].name));
+            let mut arrival = req.map(|(_, _, p)| p);
+            if let Some((k, v, _)) = req {
+                let (g, search) = (&gs[k], &ss[k]);
+                let mut at = v;
+                while let Some(a) = arrival {
+                    if g.vertices[at].name == drvr && g.vertices[at].is_driver {
+                        break;
+                    }
+                    arrival = a.prev.and_then(|pv| {
+                        at = pv.vertex;
+                        search.paths[pv.vertex].iter().find(|q| q.tag == pv.tag).copied()
+                    });
+                    if arrival.is_none() {
+                        warnings.push(format!("[WARNING RSZ-2006] failed to trace timing path for load {} when buffering {}", name, drvr));
+                    }
                 }
             }
             match (req, arrival) {
-                (Some(r), Some(a)) => {
+                (Some((k, _, r)), Some(a)) => {
                     nodes[n].slack_rf = Some(rebuffer::Rfs::of(r.tag.rf));
                     nodes[n].slack = rebuffer::FixedDelay::from_secs(r.required - a.arrival);
                     if arrival_paths[r.tag.rf].is_none() {
-                        arrival_paths[r.tag.rf] = Some(a);
+                        arrival_paths[r.tag.rf] = Some((k, a));
                     }
                 }
                 _ => {
@@ -714,6 +740,11 @@ fn rank_path_drivers(view: &PathView) -> Vec<(usize, f32)> {
     let mut load_delays = Vec::new();
     for (i, st) in view.stages.iter().enumerate().skip(view.start) {
         if i > 0 && st.is_driver && !st.top_port {
+            // A diagnostic: the key's raw bits (`VYG_RANK`), as the instrumented reference
+            // prints them (`VYGC|rankld`).
+            if std::env::var_os("VYG_RANK").is_some() {
+                eprintln!("VYGR|rankld|{}|{:08x}", st.pin, st.load_delay.unwrap_or(0.0).to_bits());
+            }
             load_delays.push((i, st.load_delay.unwrap_or(0.0)));
         }
     }

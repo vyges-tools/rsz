@@ -1556,11 +1556,13 @@ fn run(job: &Value) -> Result<Value, String> {
                     Some(format!("repair_timing: {} is not modelled", m.name()))
                 } else if a.match_cell_footprint {
                     Some("repair_timing -match_cell_footprint: not modelled".into())
-                } else if libs.scene_count() > 1 && (seq.iter().any(|m| !matches!(m, rt::Move::SizeUp | rt::Move::Unbuffer | rt::Move::SwapPins)) || !(a.skip_last_gasp || a.phases.is_some())) {
-                    // Several corners: SizeUpMove and SwapPinsMove (the path's scene) and
-                    // UnbufferMove (its slack guard at the capacitance guard's scene) in the
-                    // LEGACY phase are modelled; every scene for slacks and max-cap checks.
-                    Some("repair_timing over several corners: moves other than SizeUpMove, UnbufferMove and SwapPinsMove, and LAST_GASP, are not modelled".into())
+                } else if libs.scene_count() > 1 && (seq.iter().any(|m| !matches!(m, rt::Move::SizeUp | rt::Move::Unbuffer | rt::Move::SwapPins | rt::Move::Buffer)) || !(a.skip_last_gasp || a.phases.is_some())) {
+                    // Several corners: SizeUpMove and SwapPinsMove (the path's scene),
+                    // UnbufferMove (its slack guard at the capacitance guard's scene) and
+                    // BufferMove (`corner_` = cmdScene, slacks and driver arcs in their paths'
+                    // scenes) in the LEGACY phase are modelled; every scene for slacks and
+                    // max-cap checks.
+                    Some("repair_timing over several corners: moves other than SizeUpMove, UnbufferMove, SwapPinsMove and BufferMove, and LAST_GASP, are not modelled".into())
                 } else if debug_levels.get(&("RSZ".to_string(), "move_tracker".to_string())).is_some_and(|&l| l > 0) {
                     Some("repair_timing: the move tracker's reports (set_debug_level RSZ move_tracker) are not modelled".into())
                 } else {
@@ -1605,18 +1607,22 @@ fn run(job: &Value) -> Result<Value, String> {
                     let rb_sizes_store;
                     let rb_ctx_store;
                     let rb_ctx = if !hold_only && seq.contains(&rt::Move::Buffer) {
-                        let base = vyges_rsz::rebuffer::Ctx { libs: &libs, sizes: &[], rc: wire_rc, dbu: db.tech_get_db_units_per_micron(), slew_shape_factor, tgt_slews, time_scale, cap_scale: lib0.cap_scale };
+                        // `corner_` is `cmdScene()`, the first corner: scene 0.
+                        let base = vyges_rsz::rebuffer::Ctx { libs: &libs, sizes: &[], rc: wire_rc, dbu: db.tech_get_db_units_per_micron(), slew_shape_factor, tgt_slews, time_scale, cap_scale: lib0.cap_scale, cmd: 0, tgt: tgt_scene };
                         let lowest = libs.link_cell(&buffers.lowest).ok_or("no lowest-drive buffer")?;
                         let r_max = lowest.buffer_ports().map_or(0.0, |(_, o)| lowest.drive_resistance(&o.name));
+                        // `findSlewLimit(port, corner_)` / `maxInputSlew(port, corner_)`: the scene
+                        // port and its library (the library default for an input is the link's).
                         let slew_limit = |c: &vyges_sta::liberty::Cell, port: &str| {
-                            let lib = libs.link_library(&c.name).unwrap_or(lib0);
-                            let p = c.port(port);
+                            let lib = libs.scene_library(0, &c.name).unwrap_or(lib0);
+                            let p = libs.scene_cell(0, &c.name).unwrap_or(c).port(port);
                             vyges_rsz::timing::find_slew_limit(lib, p.map_or(vyges_sta::liberty::Direction::Output, |p| p.direction), p.and_then(|p| p.max_transition), &limits)
                         };
                         let max_input_slew = |c: &vyges_sta::liberty::Cell, port: &str| {
-                            let lib = libs.link_library(&c.name).unwrap_or(lib0);
-                            let p = c.port(port);
-                            vyges_rsz::timing::max_input_slew_at(lib, lib, p.map_or(vyges_sta::liberty::Direction::Input, |p| p.direction), p.and_then(|p| p.max_transition), &limits)
+                            let link_lib = libs.link_library(&c.name).unwrap_or(lib0);
+                            let lib = libs.scene_library(0, &c.name).unwrap_or(lib0);
+                            let p = libs.scene_cell(0, &c.name).unwrap_or(c).port(port);
+                            vyges_rsz::timing::max_input_slew_at(link_lib, lib, p.map_or(vyges_sta::liberty::Direction::Input, |p| p.direction), p.and_then(|p| p.max_transition), &limits)
                         };
                         // maxLoad: the first output port with a capacitance limit.
                         let max_load = |c: &vyges_sta::liberty::Cell| c.ports.iter().filter(|p| p.direction == vyges_sta::liberty::Direction::Output).find_map(|p| p.max_capacitance).unwrap_or(0.0);
@@ -1670,7 +1676,7 @@ fn run(job: &Value) -> Result<Value, String> {
                         let mut trace_head = Vec::new();
                         if debug_levels.get(&("RSZ".to_string(), "resizer".to_string())).is_some_and(|&l| l >= 1) {
                             // `findFastBuffers`' list (`pre-selected buffers`).
-                            let base = vyges_rsz::rebuffer::Ctx { libs: &libs, sizes: &[], rc: wire_rc, dbu: db_dbu, slew_shape_factor, tgt_slews, time_scale, cap_scale: lib0.cap_scale };
+                            let base = vyges_rsz::rebuffer::Ctx { libs: &libs, sizes: &[], rc: wire_rc, dbu: db_dbu, slew_shape_factor, tgt_slews, time_scale, cap_scale: lib0.cap_scale, cmd: 0, tgt: tgt_scene };
                             let lowest = libs.link_cell(&buffers.lowest).ok_or("no lowest-drive buffer")?;
                             let r_max = lowest.buffer_ports().map_or(0.0, |(_, o)| lowest.drive_resistance(&o.name));
                             let slew_limit = |c: &vyges_sta::liberty::Cell, port: &str| {

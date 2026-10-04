@@ -160,6 +160,8 @@ pub struct BufferSize {
     /// The input port's capacitance (`capacitance()`, the largest value), fanout load and max
     /// input slew; the output port's name; the cell's area.
     pub in_cap: f32,
+    /// `portCapacitance(input, corner_)` (`scenePort`): the buffer node's cap, the asymptotics'.
+    pub in_cap_cmd: f32,
     pub in_fanout: f32,
     pub in_max_slew: f32,
     pub out_port: String,
@@ -184,6 +186,11 @@ pub struct Ctx<'a> {
     pub tgt_slews: [f32; 2],
     pub time_scale: f32,
     pub cap_scale: f32,
+    /// `corner_` (`initOnCorner(cmdScene())`): the scene of the buffered net, the characterization
+    /// and `setPin`'s limits.
+    pub cmd: usize,
+    /// `tgt_slew_corner_`: the scene of `findFastBuffers`' delays.
+    pub tgt: usize,
 }
 
 impl Ctx<'_> {
@@ -200,6 +207,10 @@ impl Ctx<'_> {
     }
     fn cell(&self, name: &str) -> &Cell {
         self.libs.link_cell(name).expect("a buffer cell")
+    }
+    /// The scene's cell (`gateDelay(.., scene)` reads its arcs' `sceneArc` models; `scenePort`).
+    fn scene_cell(&self, k: usize, name: &str) -> &Cell {
+        self.libs.scene_cell(k, name).expect("a buffer cell")
     }
     /// `Unit::asString(float, digits)`.
     fn unit(v: f32, scale: f32, digits: usize) -> String {
@@ -299,6 +310,7 @@ pub fn characterize(ci: &CharInputs<'_>, buffer_cells: &[String]) -> Result<Vec<
             driver_resistance: c.drive_resistance(&out.name),
             asym: None,
             in_cap: port_cap(c, &inp.name),
+            in_cap_cmd: port_cap(ctx.scene_cell(ctx.cmd, name), &inp.name),
             in_fanout: 0.0,
             in_max_slew: (ci.max_input_slew)(c, &inp.name),
             out_port: out.name.clone(),
@@ -378,8 +390,9 @@ fn buffer_size_outmatched(ci: &CharInputs<'_>, worse: &str, better: &str) -> boo
     points.dedup();
     for p in points {
         if (wlimit == 0.0 || p <= wlimit) && p < bc.min(wc) * 20.0 {
-            let bd = buffer_delay_max(ctx, b, p);
-            let wd = buffer_delay_max(ctx, w, p);
+            // `bufferDelay(.., tgt_slew_corner_)`.
+            let bd = buffer_delay_max(ctx, ctx.scene_cell(ctx.tgt, better), p);
+            let wd = buffer_delay_max(ctx, ctx.scene_cell(ctx.tgt, worse), p);
             if bd + penalty > wd {
                 return false;
             }
@@ -411,9 +424,12 @@ fn find_buffer_load_limit_implied_by_driver_slew(ci: &CharInputs<'_>, c: &Cell) 
     let (limit, _) = (ci.slew_limit)(c, &outp.name);
     let max_slew = max_slew_margined(limit);
     let in_slew = max_slew_margined((ci.max_input_slew)(c, &inp.name));
+    // `gateDelay(arc, .., corner_)`: the scene's arcs (a max over all of them: the scene cell's own
+    // sets are the link sets' scene arcs).
+    let sc = ci.ctx.scene_cell(ci.ctx.cmd, &c.name);
     let objective = |load: f32| -> f32 {
         let mut slew = -INF;
-        for set in c.arc_sets.iter().filter(|s| !s.role.is_timing_check()) {
+        for set in sc.arc_sets.iter().filter(|s| !s.role.is_timing_check()) {
             for arc in &set.arcs {
                 if let Model::Gate(m) = &arc.model {
                     slew = slew.max(m.gate_delay(in_slew, load).1);
@@ -456,12 +472,13 @@ fn find_long_wire_asymptotics(ctx: &Ctx<'_>, s: &BufferSize) -> Option<Asymptoti
     if wire_res <= 0.0 || wire_cap <= 0.0 {
         return None;
     }
-    let c = ctx.cell(&s.cell);
+    // `characterizationDelay`: `gateDelays` at `corner_`; the input cap its `scenePort`'s.
+    let c = ctx.scene_cell(ctx.cmd, &s.cell);
     let char_delay = |load: f32| buffer_delay_max(ctx, c, load);
     let mut length = 0.0f32;
     let mut buffer_delay = 0.0f32;
     for _ in 0..3 {
-        let buffer_load = (wire_cap * f64::from(length) + f64::from(s.in_cap)) as f32;
+        let buffer_load = (wire_cap * f64::from(length) + f64::from(s.in_cap_cmd)) as f32;
         let eps = 0.01f32;
         buffer_delay = char_delay(buffer_load);
         let slope = (f64::from((char_delay(buffer_load * (1.0 + eps)) - buffer_delay) / (buffer_load * eps)) * wire_cap) as f32;
@@ -470,7 +487,7 @@ fn find_long_wire_asymptotics(ctx: &Ctx<'_>, s: &BufferSize) -> Option<Asymptoti
     }
     let wire_delay = (wire_res * wire_cap / 2.0 * f64::from(length) * f64::from(length)) as f32;
     let delay_per_meter = (buffer_delay + wire_delay) / length;
-    Some(Asymptotics { buffer_spacing: length, delay_per_meter, delay_per_farad: (f64::from(delay_per_meter) / wire_cap) as f32, input_cap: s.in_cap })
+    Some(Asymptotics { buffer_spacing: length, delay_per_meter, delay_per_farad: (f64::from(delay_per_meter) / wire_cap) as f32, input_cap: s.in_cap_cmd })
 }
 
 /// The driver's arc into the net for one transition (`drvrPinTiming`'s inputs): the arc's gate
@@ -494,6 +511,8 @@ pub struct Probe {
     /// Per transition, the arrival path at the driver (`arrival_paths_`): its arc, or `None` for a
     /// path with no previous path; absent when no load's path took that transition.
     pub arcs: [Option<Option<DriverArc>>; 2],
+    /// Per transition, the scene of that arrival path (`bufferDelay` reads its delays there).
+    pub arc_scenes: [usize; 2],
     /// `drvr_port_->capacitance()`, `driveResistance()`.
     pub drvr_port_cap: f32,
     pub drvr_resistance: f32,
@@ -625,7 +644,7 @@ impl Rebuf<'_> {
             kind: Kind::Buffer { cell: s.cell.clone(), r },
             x: at.0,
             y: at.1,
-            cap: s.in_cap,
+            cap: s.in_cap_cmd,
             fanout: s.in_fanout,
             max_load_slew: s.in_max_slew,
             area: self.nodes[r].area + s.area,
@@ -665,8 +684,9 @@ impl Rebuf<'_> {
         let mut delay = FixedDelay::ZERO;
         if let Some(rf) = rf {
             let s = &self.ctx.sizes[size];
-            let (d, _) = gate_delays(self.ctx.cell(&s.cell), &s.out_port, load, self.ctx.tgt_slews);
+            // Each transition at its arrival path's scene.
             for &k in rf.range() {
+                let (d, _) = gate_delays(self.ctx.scene_cell(self.probe.arc_scenes[k], &s.cell), &s.out_port, load, self.ctx.tgt_slews);
                 delay = delay.max(FixedDelay::from_secs(d[k]));
             }
         }
