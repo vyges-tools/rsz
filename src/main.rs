@@ -1556,10 +1556,11 @@ fn run(job: &Value) -> Result<Value, String> {
                     Some(format!("repair_timing: {} is not modelled", m.name()))
                 } else if a.match_cell_footprint {
                     Some("repair_timing -match_cell_footprint: not modelled".into())
-                } else if libs.scene_count() > 1 && (seq.iter().any(|m| *m != rt::Move::SizeUp) || !(a.skip_last_gasp || a.phases.is_some())) {
-                    // Several corners: SizeUpMove in the LEGACY phase is modelled (the path's
-                    // scene for its delays and cells, every scene for slacks and max-cap checks).
-                    Some("repair_timing over several corners: moves other than SizeUpMove, and LAST_GASP, are not modelled".into())
+                } else if libs.scene_count() > 1 && (seq.iter().any(|m| !matches!(m, rt::Move::SizeUp | rt::Move::Unbuffer)) || !(a.skip_last_gasp || a.phases.is_some())) {
+                    // Several corners: SizeUpMove (the path's scene) and UnbufferMove (its slack
+                    // guard at the capacitance guard's scene) in the LEGACY phase are modelled;
+                    // every scene for slacks and max-cap checks.
+                    Some("repair_timing over several corners: moves other than SizeUpMove and UnbufferMove, and LAST_GASP, are not modelled".into())
                 } else if debug_levels.get(&("RSZ".to_string(), "move_tracker".to_string())).is_some_and(|&l| l > 0) {
                     Some("repair_timing: the move tracker's reports (set_debug_level RSZ move_tracker) are not modelled".into())
                 } else {
@@ -1579,6 +1580,7 @@ fn run(job: &Value) -> Result<Value, String> {
                         dont_use.extend(lib.cells.values().filter(|c| c.dont_use).map(|c| c.name.clone()));
                     }
                     let equiv = vyges_rsz::sizing::make_equiv_cells(&libs);
+                    let db_hierarchy = db.has_hierarchy();
                     let site_heights: BTreeMap<String, i32> = m.values().map(|mm| mm.site.clone()).filter(|s| !s.is_empty()).map(|s| (s.clone(), db.site_get_height(&s))).collect();
                     let db_dbu = db.tech_get_db_units_per_micron();
                     let buffers = vyges_rsz::preamble::find_buffers(&libs, &m, &dont_use, !hold_only).map_err(|e| format!("{}: {}", e.code(), e.message()))?;
@@ -1652,6 +1654,7 @@ fn run(job: &Value) -> Result<Value, String> {
                         rebuffer: rb_ctx,
                         lowest_buffer: &buffers.lowest,
                         pin_addr: pin_addr.as_ref(),
+                        hierarchy: db_hierarchy,
                     };
                     drop(search);
                     drop(g);

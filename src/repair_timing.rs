@@ -319,6 +319,26 @@ pub fn preamble(seq: &[Move], violating: usize, repair_tns_end_percent: f64, pha
     lines
 }
 
+/// `dbNetwork::stripParentPrefix`: the name after the last `/` that is not escaped (`\\/` inside a
+/// Verilog escaped identifier), else the whole name.
+pub fn strip_parent_prefix(name: &str) -> &str {
+    let b = name.as_bytes();
+    let mut pos = b.len();
+    while let Some(k) = name[..pos].rfind('/') {
+        if k > 0 && b[k - 1] == b'\\' {
+            pos = k - 1;
+            continue;
+        }
+        return &name[k + 1..];
+    }
+    name
+}
+
+/// `dbNetwork::name(instance | net)`: under `hasHierarchy`, without the parent prefix.
+pub fn network_name(name: &str, hierarchy: bool) -> &str {
+    if hierarchy { strip_parent_prefix(name) } else { name }
+}
+
 /// `Unit::asString(float value, digits)`: `INF` / `-INF` when `|value| ≥ INF × .1` (`float`
 /// against a `double` product, compared in `double`); else `value / scale` in `float`, an
 /// absolute value under 1e-6 printed as 0 (no `-0.000`), `%.<digits>f`.
@@ -537,6 +557,15 @@ mod tests {
         let s = Args::parse(&["-sequence".into(), "size_down_fanout sizeup".into()]).unwrap();
         assert_eq!(move_sequence(&s, false), [Move::SizeDownFanout, Move::SizeUp]);
         assert_eq!(parse_move_sequence("size").unwrap(), [Move::SizeUp, Move::SizeDownFanout]);
+    }
+
+    /// Rule (dbNetwork::stripParentPrefix): the last unescaped `/` splits; an escaped one does not.
+    #[test]
+    fn the_parent_prefix_strips_at_the_last_unescaped_slash() {
+        assert_eq!(strip_parent_prefix("u1/u16"), "u16");
+        assert_eq!(strip_parent_prefix("u16"), "u16");
+        assert_eq!(strip_parent_prefix("a/b\\/c"), "b\\/c");
+        assert_eq!(network_name("u1/u16", false), "u1/u16");
     }
 
     /// Rule (Unit::asString): INF past 1e29, and a value under 1e-6 in the unit prints as 0 —

@@ -32,7 +32,7 @@ use vyges_sta::search::Search;
 
 use crate::design::{Design, TimerEdits};
 use crate::preamble::Libs;
-use crate::repair_timing::{collect_violating, delay_as_string, progress_header, progress_row, startpoint_tns, timing_points, total_negative_slack, worst_slack, Args, Move, Point, Row};
+use crate::repair_timing::{network_name, collect_violating, delay_as_string, progress_header, progress_row, startpoint_tns, timing_points, total_negative_slack, worst_slack, Args, Move, Point, Row};
 use crate::sizing::Sizing;
 use crate::timing::Limits;
 use crate::{clone, rebuffer, swap_pins, unbuffer};
@@ -79,6 +79,8 @@ pub struct Ctx<'a> {
     pub lowest_buffer: &'a str,
     /// The reference's pin addresses, when the gate supplies them ([`unbuffer::PinAddr`]).
     pub pin_addr: Option<&'a unbuffer::PinAddr>,
+    /// `dbNetwork::hasHierarchy`: instance and net names print without their parent prefix.
+    pub hierarchy: bool,
 }
 
 /// A driver's `checkCapacitance`: its load, limit and slack, and whether it has a limit at all.
@@ -251,7 +253,7 @@ fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], timer: &mut Tim
             }
             let Some((k, v, _)) = best else { continue };
             let ideal = if ctx.ideal_clock { cs[k].clone() } else { BTreeSet::new() };
-            if let Some(view) = expand(ctx, gs, ss, design, k, v, &ideal)? {
+            if let Some(view) = expand(ctx, gs, ss, cs, design, k, v, &ideal)? {
                 paths.insert(n, view);
             }
         }
@@ -374,7 +376,8 @@ fn inc_trace(inc: &IncTimer, trace_at: usize) {
 /// `Sta::vertexWorstSlackPath(end, max)`, then `PathExpanded`: the max path with the fuzzily
 /// least slack (the first, in tag order), walked back through its prev paths to the root.
 /// `startIndex`: the pin reached by the clock-to-output arc nearest the end, else the root.
-fn expand(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], design: &dyn Design, scene: usize, end: usize, ideal: &BTreeSet<usize>) -> Result<Option<PathView>, Stop> {
+#[allow(clippy::too_many_arguments)]
+fn expand(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet<usize>], design: &dyn Design, scene: usize, end: usize, ideal: &BTreeSet<usize>) -> Result<Option<PathView>, Stop> {
     let (g, search) = (&gs[scene], &ss[scene]);
     let mut worst = None;
     let mut min_slack = INF;
@@ -478,7 +481,7 @@ fn expand(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], design: &dyn D
         stages.push(st);
     }
     if ctx.sequence.contains(&Move::Unbuffer) {
-        probe_unbuffer(ctx, g, search, design, ideal, &chain, &mut stages);
+        probe_unbuffer(ctx, gs, ss, cs, design, scene, ideal, &chain, &mut stages);
     }
     if ctx.sequence.contains(&Move::Clone) {
         for (i, (v, _)) in chain.iter().enumerate() {
@@ -658,10 +661,24 @@ fn annotate_load_slacks(g: &Graph<'_>, search: &Search<'_, '_>, bn: &crate::buff
 
 /// UnbufferMove's timer verdict on each driver of the path that may be ranked
 /// ([`unbuffer::probe`]), taken while the timer is at hand.
-fn probe_unbuffer(ctx: &Ctx<'_>, g: &Graph<'_>, search: &Search<'_, '_>, design: &dyn Design, ideal: &BTreeSet<usize>, chain: &[(usize, vyges_sta::search::Path)], stages: &mut [Stage]) {
+#[allow(clippy::too_many_arguments)]
+fn probe_unbuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet<usize>], design: &dyn Design, scene: usize, ideal: &BTreeSet<usize>, chain: &[(usize, vyges_sta::search::Path)], stages: &mut [Stage]) {
+    let (g, search) = (&gs[scene], &ss[scene]);
     let index: HashMap<String, usize> = g.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect();
     let steiner = |net: &str, drvr: &str| design.steiner(net, drvr);
-    let t = unbuffer::Timer { g, search, parasitics: design.parasitics(0), ideal, info: design.net_info(), index: &index, steiner: &steiner };
+    // Several corners: every scene's timer, for the reads made over all of them.
+    let several = gs.len() > 1;
+    let all_parasitics: Vec<HashMap<String, vyges_sta::graph::NetParasitics>> =
+        if several { (0..gs.len()).map(|k| design.parasitics(k).clone()).collect() } else { Vec::new() };
+    let ideals: Vec<BTreeSet<usize>> =
+        if several { cs.iter().map(|c| if ctx.ideal_clock { c.clone() } else { BTreeSet::new() }).collect() } else { Vec::new() };
+    let indices: Vec<HashMap<String, usize>> = if several {
+        gs.iter().map(|gk| gk.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect()).collect()
+    } else {
+        Vec::new()
+    };
+    let multi = unbuffer::Multi { graphs: gs, searches: ss, parasitics: &all_parasitics, ideals: &ideals, indices: &indices };
+    let t = unbuffer::Timer { g, search, parasitics: design.parasitics(scene), ideal, info: design.net_info(), index: &index, steiner: &steiner, multi: several.then_some(&multi) };
     let uctx = unbuffer::Ctx {
         libs: ctx.libs,
         limits: ctx.limits,
@@ -673,6 +690,7 @@ fn probe_unbuffer(ctx: &Ctx<'_>, g: &Graph<'_>, search: &Search<'_, '_>, design:
         margin: ctx.margin,
         master_pins: ctx.master_pins,
         pin_addr: ctx.pin_addr,
+        hierarchy: ctx.hierarchy,
     };
     let path: Vec<unbuffer::PathStage<'_>> = chain
         .iter()
@@ -2346,13 +2364,13 @@ impl Repair<'_, '_> {
             }
             Some(unbuffer::Verdict::NoPathContext) => {
                 let inst = st.inst.clone().unwrap_or_default();
-                self.debug("unbuffer_move", 4, format!("buffer {inst} is not removed because path context did not resolve"));
+                self.debug("unbuffer_move", 4, format!("buffer {} is not removed because path context did not resolve", network_name(&inst, self.ctx.hierarchy)));
                 return Ok(None);
             }
             Some(unbuffer::Verdict::Resolved(r)) => r.clone(),
         };
         if let Some(why) = self.committer.blocking_buffer_removal(self.design.inst_id(&r.inst)) {
-            self.debug("unbuffer_move", 4, format!("buffer {} is not removed because {why}", r.inst));
+            self.debug("unbuffer_move", 4, format!("buffer {} is not removed because {why}", network_name(&r.inst, self.ctx.hierarchy)));
             return Ok(None);
         }
         // passesFanoutGuard, then passesCapGuard.
@@ -2364,17 +2382,19 @@ impl Repair<'_, '_> {
             self.debug("remove_buffer", 1, l.clone());
         }
         if !r.slack_ok {
-            self.debug("unbuffer_move", 4, format!("buffer {} is not removed because estimated slack is not OK", r.inst));
+            self.debug("unbuffer_move", 4, format!("buffer {} is not removed because estimated slack is not OK", network_name(&r.inst, self.ctx.hierarchy)));
             return Ok(None);
         }
         if !self.can_remove_buffer(&r) {
-            self.debug("unbuffer_move", 4, format!("buffer {} is not removed because canRemoveBuffer rejected it", r.inst));
+            self.debug("unbuffer_move", 4, format!("buffer {} is not removed because canRemoveBuffer rejected it", network_name(&r.inst, self.ctx.hierarchy)));
             return Ok(None);
         }
         // removeBuffer.
         self.debug("repair_setup", 3, format!("remove_buffer {} ({})", r.inst, r.cell));
         let removed = self.design.remove_buffer(&r.inst, &r.in_port, &r.out_port).map_err(|e| Stop::error("RSZ-0168", e))?;
-        self.debug("remove_buffer", 1, format!("remove_buffer {} (input net) - {} ({}) - {} (output net)", removed.in_net, r.inst, r.cell, removed.out_net));
+        // `name(net)`, `pathName(buffer)`, `name(net)`.
+        let h = self.ctx.hierarchy;
+        self.debug("remove_buffer", 1, format!("remove_buffer {} (input net) - {} ({}) - {} (output net)", network_name(&removed.in_net, h), r.inst, r.cell, network_name(&removed.out_net, h)));
         Ok(Some(MoveResult { kind: Move::Unbuffer, count: 1, insts: vec![r.inst] }))
     }
 

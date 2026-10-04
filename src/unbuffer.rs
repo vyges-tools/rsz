@@ -24,7 +24,7 @@ use vyges_sta::liberty::{Cell, Model, MAX};
 use vyges_sta::search::Search;
 
 use crate::buffered_net::{self, BufferedNet, Kind};
-use crate::repair_timing::fmt_float;
+use crate::repair_timing::{fmt_float, network_name};
 use crate::timing::{self, Limits, NetInfo, INF};
 
 /// `kBufferRemovalMaxFanout`.
@@ -127,6 +127,8 @@ pub struct Ctx<'a> {
     /// The reference's pin addresses, when the gate supplies them: a `map<const Pin*>` loop then
     /// runs in their order (debug order only — the verdict is every load's).
     pub pin_addr: Option<&'a PinAddr>,
+    /// `dbNetwork::hasHierarchy`: the buffer prints by `name()`, without its parent prefix.
+    pub hierarchy: bool,
 }
 
 /// The timer the probe reads: the graph, its search, the parasitics, the ideal clock pins.
@@ -140,6 +142,60 @@ pub struct Timer<'t, 'g> {
     pub index: &'t HashMap<String, usize>,
     /// `est::makeSteinerTree(drvr_pin)` for a net and its driver.
     pub steiner: &'t dyn Fn(&str, &str) -> Option<buffered_net::Tree>,
+    /// Several corners: every scene's timer (`g` … `index` are the path's scene).
+    pub multi: Option<&'t Multi<'t, 'g>>,
+}
+
+/// Every scene's timer, for what the reference reads over all scenes (`Sta::slack(vertex, max)`,
+/// `checkCapacitance(pin, scenes())`), and to time the slack guard at its own corner.
+pub struct Multi<'t, 'g> {
+    pub graphs: &'t [Graph<'g>],
+    pub searches: &'t [Search<'t, 'g>],
+    pub parasitics: &'t [HashMap<String, NetParasitics>],
+    pub ideals: &'t [BTreeSet<usize>],
+    /// Each scene's vertex by pin name.
+    pub indices: &'t [HashMap<String, usize>],
+}
+
+impl<'t, 'g> Timer<'t, 'g> {
+    /// The same timer at scene `k` (several corners).
+    fn at_scene(&self, k: usize) -> Timer<'t, 'g> {
+        let m = self.multi.expect("several scenes");
+        Timer { g: &m.graphs[k], search: &m.searches[k], parasitics: &m.parasitics[k], ideal: &m.ideals[k], info: self.info, index: &m.indices[k], steiner: self.steiner, multi: self.multi }
+    }
+}
+
+/// `Sta::slack(vertex, max)`: over every scene's paths, the fuzzily least (the earlier scene on a
+/// tie); one scene, that scene's.
+fn slack_all(t: &Timer<'_, '_>, v: usize) -> f32 {
+    let Some(m) = t.multi else { return t.search.vertex_slack(v) };
+    let name = &t.g.vertices[v].name;
+    let mut best: Option<f32> = None;
+    for (k, search) in m.searches.iter().enumerate() {
+        if let Some(&u) = m.indices[k].get(name) {
+            let s = search.vertex_slack(u);
+            if best.is_none_or(|b| fuzzy::less(s, b)) {
+                best = Some(s);
+            }
+        }
+    }
+    best.unwrap_or(INF)
+}
+
+/// `Sta::checkCapacitance(pin, scenes(), max)`: over every scene (in scene 0's vertices), or the
+/// one scene. `(cap, limit, slack, limited, scene)`.
+fn check_capacitance_all(t: &Timer<'_, '_>, v: usize) -> (f32, f32, f32, bool, Option<usize>) {
+    match t.multi {
+        None => {
+            let sc = timing::Scenes::new(std::slice::from_ref(t.g));
+            timing::check_capacitance(&sc, v, std::slice::from_ref(t.parasitics), t.ideal)
+        }
+        Some(m) => {
+            let sc = timing::Scenes::new(m.graphs);
+            let Some(&v0) = m.indices[0].get(&t.g.vertices[v].name) else { return (0.0, 0.0, 0.0, false, None) };
+            timing::check_capacitance(&sc, v0, m.parasitics, &m.ideals[0])
+        }
+    }
 }
 
 /// What `isEligible` found from the timer, in its order.
@@ -207,10 +263,25 @@ pub fn probe(ctx: &Ctx<'_>, t: &Timer<'_, '_>, stages: &[PathStage<'_>], index: 
     let buffer_in = t.index.get(&format!("{inst}/{in_port}")).copied();
     let Some(buffer_in) = buffer_in else { return Some(Verdict::NoPathContext) };
     r.fanout_reject = passes_fanout_guard(ctx, t, inst, prev.vertex, fanout);
-    let (cap_reject, slack_scene) = passes_cap_guard(t, cell, inst, prev.vertex, st.vertex);
+    let (cap_reject, slack_scene) = passes_cap_guard(ctx, t, cell, cell_name, inst, prev.vertex, st.vertex);
     r.cap_reject = cap_reject;
     let p = SlackParams { driver: st.vertex, driver_rf: st.rf, prev: prev.vertex, prev_rf: prev.rf, driver_input: buffer_in, inst, cell };
-    let (ok, lines) = estimated_slack_ok(ctx, t, &p, slack_scene);
+    let (ok, lines) = match (t.multi, slack_scene) {
+        // Several corners: the slack guard times everything at the capacitance guard's scene
+        // (`passesCapGuard` sets `slack_scene`), the buffer's ports there (`scenePort`).
+        (Some(_), Some(k)) => {
+            let tk = t.at_scene(k);
+            let at = |v: usize| tk.index.get(&t.g.vertices[v].name).copied();
+            match (at(p.driver), at(p.prev), at(p.driver_input), ctx.libs.scene_cell(k, cell_name)) {
+                (Some(driver), Some(prev_k), Some(driver_input), Some(scene_cell)) => {
+                    let pk = SlackParams { driver, prev: prev_k, driver_input, cell: scene_cell, ..p };
+                    estimated_slack_ok(ctx, &tk, &pk, slack_scene)
+                }
+                _ => (false, Vec::new()),
+            }
+        }
+        _ => estimated_slack_ok(ctx, t, &p, slack_scene),
+    };
     r.slack_ok = ok;
     r.slack_lines = lines;
     Some(Verdict::Resolved(r))
@@ -224,8 +295,8 @@ fn passes_fanout_guard(ctx: &Ctx<'_>, t: &Timer<'_, '_>, inst: &str, prev: usize
     let prev_name = &t.g.vertices[prev].name;
     match fanout_rejects(fanout, limit, target_fanout) {
         None => None,
-        Some(FanoutLimit::Timer(l)) => Some(format!("buffer {inst} is not removed because of max fanout limit of {} at {prev_name}", fmt_float(l))),
-        Some(FanoutLimit::Default) => Some(format!("buffer {inst} is not removed because of default fanout limit of {} at {prev_name}", BUFFER_REMOVAL_MAX_FANOUT as i32)),
+        Some(FanoutLimit::Timer(l)) => Some(format!("buffer {} is not removed because of max fanout limit of {} at {prev_name}", network_name(inst, ctx.hierarchy), fmt_float(l))),
+        Some(FanoutLimit::Default) => Some(format!("buffer {} is not removed because of default fanout limit of {} at {prev_name}", network_name(inst, ctx.hierarchy), BUFFER_REMOVAL_MAX_FANOUT as i32)),
     }
 }
 
@@ -249,19 +320,26 @@ fn fanout_rejects(fanout: f32, limit: f32, target_fanout: usize) -> Option<Fanou
 /// `passesCapGuard`: the previous driver's load plus the buffer's, less the buffer's input, within
 /// the previous driver's max capacitance. Also returns the scene the check found
 /// (`slack_scene`): none when the driver has no limit — and then the slack guard refuses.
-fn passes_cap_guard(t: &Timer<'_, '_>, cell: &Cell, inst: &str, prev: usize, drvr: usize) -> (Option<String>, Option<usize>) {
-    let sc = timing::Scenes::new(std::slice::from_ref(t.g));
-    let (cap, max_cap, _, _, scene) = timing::check_capacitance(&sc, prev, std::slice::from_ref(t.parasitics), t.ideal);
+fn passes_cap_guard(ctx: &Ctx<'_>, t: &Timer<'_, '_>, cell: &Cell, cell_name: &str, inst: &str, prev: usize, drvr: usize) -> (Option<String>, Option<usize>) {
+    let (cap, max_cap, _, _, scene) = check_capacitance_all(t, prev);
     if max_cap <= 0.0 || scene.is_none() {
         return (None, scene);
     }
-    let drvr_cap = t.g.load_cap(drvr, t.parasitics);
     let (input, _) = cell.buffer_ports().expect("a buffer");
-    let new_cap = cap + drvr_cap - port_capacitance(cell, &input.name);
+    // `loadCap(drvr, corner)` and `portCapacitance(buffer input, corner)`: at the check's scene.
+    let (drvr_cap, in_cap) = match (t.multi, scene) {
+        (Some(_), Some(k)) => {
+            let tk = t.at_scene(k);
+            let d = tk.index.get(&t.g.vertices[drvr].name).map_or(0.0, |&u| tk.g.load_cap(u, tk.parasitics));
+            (d, ctx.libs.scene_cell(k, cell_name).map_or(0.0, |c| port_capacitance(c, &input.name)))
+        }
+        _ => (t.g.load_cap(drvr, t.parasitics), port_capacitance(cell, &input.name)),
+    };
+    let new_cap = cap + drvr_cap - in_cap;
     if new_cap <= max_cap {
         return (None, scene);
     }
-    let line = format!("buffer {inst} is not removed because of max cap limit of {} at {}", fmt_float(max_cap), t.g.vertices[prev].name);
+    let line = format!("buffer {} is not removed because of max cap limit of {} at {}", network_name(inst, ctx.hierarchy), fmt_float(max_cap), t.g.vertices[prev].name);
     (Some(line), scene)
 }
 
@@ -357,8 +435,7 @@ fn compute_new_delays_slews(ctx: &Ctx<'_>, t: &Timer<'_, '_>, p: &SlackParams<'_
 /// `Resizer::checkMaxCapOK(drvr, cap_delta)`: with a limit, a driver already over it may not
 /// grow, else it must stay within it.
 fn check_max_cap_ok(t: &Timer<'_, '_>, drvr: usize, cap_delta: f32) -> bool {
-    let sc = timing::Scenes::new(std::slice::from_ref(t.g));
-    let (cap, max_cap, slack, _, scene) = timing::check_capacitance(&sc, drvr, std::slice::from_ref(t.parasitics), t.ideal);
+    let (cap, max_cap, slack, _, scene) = check_capacitance_all(t, drvr);
     if max_cap > 0.0 && scene.is_some() {
         let new_cap = cap + cap_delta;
         return if slack < 0.0 { new_cap <= cap } else { new_cap <= max_cap };
@@ -381,7 +458,7 @@ fn estimated_slack_ok(ctx: &Ctx<'_>, t: &Timer<'_, '_>, p: &SlackParams<'_>, sce
     let g = t.g;
     let Some((old_delay, new_delay, old_drvr_slew, new_drvr_slew, old_cap, new_cap)) = compute_new_delays_slews(ctx, t, p) else { return (false, lines) };
     if !check_max_cap_ok(t, p.prev, new_cap - old_cap) {
-        lines.push(format!("buffer {} is not removed because of max cap violation", p.inst));
+        lines.push(format!("buffer {} is not removed because of max cap violation", network_name(p.inst, ctx.hierarchy)));
         return (false, lines);
     }
     let delay_degrad = new_delay[p.prev_rf] - old_delay[p.prev_rf];
@@ -429,14 +506,14 @@ fn estimated_slack_ok(ctx: &Ctx<'_>, t: &Timer<'_, '_>, p: &SlackParams<'_>, sce
         if side == p.prev || side == p.driver_input {
             continue;
         }
-        let old_slack = t.search.vertex_slack(side);
+        let old_slack = slack_all(t, side);
         let new_slack = old_slack - delay_degrad - ctx.margin;
         if new_slack < 0.0 {
             let slack_degrad = old_slack - new_slack;
             if old_slack >= 0.0 || (old_slack < 0.0 && slack_degrad > SLACK_DEGRAD_RATIO_LIMIT * old_slack.abs()) {
                 lines.push(format!(
                     "buffer {} is not removed because side input pin {name} will have a violating slack of {}: old slack={}, slack margin={}, delay_degrad={}",
-                    p.inst,
+                    network_name(p.inst, ctx.hierarchy),
                     fmt_float(new_slack),
                     fmt_float(old_slack),
                     fmt_float(ctx.margin),
@@ -449,7 +526,7 @@ fn estimated_slack_ok(ctx: &Ctx<'_>, t: &Timer<'_, '_>, p: &SlackParams<'_>, sce
             return (false, lines);
         }
     }
-    lines.push(format!("buffer {} can be removed because direct fanouts and side fanouts can absorb delay/slew degradation", p.inst));
+    lines.push(format!("buffer {} can be removed because direct fanouts and side fanouts can absorb delay/slew degradation", network_name(p.inst, ctx.hierarchy)));
     (true, lines)
 }
 
@@ -467,7 +544,7 @@ fn estimate_input_slew_impact(ctx: &Ctx<'_>, t: &Timer<'_, '_>, load: usize, old
         for (port, _) in &g.netlist.ports {
             let Some(&u) = t.index.get(port) else { continue };
             if !g.vertices[u].is_driver {
-                lines.push(format!("buffer {inst} is not removed because pin {port} has no liberty port"));
+                lines.push(format!("buffer {} is not removed because pin {port} has no liberty port", network_name(inst, ctx.hierarchy)));
                 return false;
             }
         }
@@ -487,7 +564,7 @@ fn estimate_input_slew_impact(ctx: &Ctx<'_>, t: &Timer<'_, '_>, load: usize, old
         let (old_delay, _) = gate_delays(cell, pin, load_cap, &|_, rf| old_in[rf]);
         let (new_delay, _) = gate_delays(cell, pin, load_cap, &|_, rf| new_in[rf]);
         let delay_diff = (new_delay[0] - old_delay[0]).max(new_delay[1] - old_delay[1]);
-        let old_slack = t.search.vertex_slack(u) - ctx.margin;
+        let old_slack = slack_all(t, u) - ctx.margin;
         let new_slack = old_slack - delay_diff - delay_adjust - ctx.margin;
         // A diagnostic: every input of this slack as raw float bits (set against the reference's
         // `VYGU|` lines from its instrumented build).
@@ -503,7 +580,7 @@ fn estimate_input_slew_impact(ctx: &Ctx<'_>, t: &Timer<'_, '_>, load: usize, old
             }
         }
         if (accept_if_slack_improves && fuzzy::greater(old_slack, new_slack)) || (!accept_if_slack_improves && new_slack < 0.0) {
-            lines.push(format!("buffer {inst} is not removed because pin {name} will have a violating or worse slack of {}", fmt_float(new_slack)));
+            lines.push(format!("buffer {} is not removed because pin {name} will have a violating or worse slack of {}", network_name(inst, ctx.hierarchy), fmt_float(new_slack)));
             return false;
         }
     }
