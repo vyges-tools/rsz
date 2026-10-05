@@ -1074,19 +1074,24 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
 /// ⚠️ The parsed SDC keeps an I/O delay's value and ports but not its flags, so the delays are read
 /// from the text: `-max` / `-rise` / `-fall` place the value; a `-min`-only delay bounds hold paths
 /// and is not a setup input; any other flag is refused.
-fn search_sdc(s: &vyges_loom::sdc::Sdc, text: &str, time_scale: f32, propagated: bool) -> Result<vyges_sta::sdc::Sdc, String> {
+fn search_sdc(s: &vyges_loom::sdc::Sdc, text: &str, time_scale: f32, propagated: bool, hold_repair: bool) -> Result<vyges_sta::sdc::Sdc, String> {
     use vyges_sta::sdc::{Clock, PortDelay};
-    let real: Vec<&vyges_loom::sdc::SdcClock> = s.clocks.iter().filter(|c| !c.is_virtual()).collect();
-    let [clock] = real.as_slice() else {
-        return Err(format!("repair_timing with {} clocks: one is modelled", real.len()));
+    // One clock: on one source port, or virtual (no source — its edges launch the input delays and
+    // close the output delays; nothing is clocked on the design). A mixture is refused.
+    let [clock] = s.clocks.as_slice() else {
+        let real = s.clocks.iter().filter(|c| !c.is_virtual()).count();
+        return Err(format!("repair_timing with {real} clocks and {} virtual: not modelled (one clock is)", s.clocks.len() - real));
     };
-    let [source] = clock.sources.as_slice() else {
-        return Err(format!("clock {} on {} sources: one is modelled", clock.name, clock.sources.len()));
+    let source: &str = if clock.is_virtual() {
+        ""
+    } else {
+        let [source] = clock.sources.as_slice() else {
+            return Err(format!("clock {} on {} sources: not modelled (one is)", clock.name, clock.sources.len()));
+        };
+        source
     };
-    if real.len() != s.clocks.len() {
-        return Err("a virtual clock: not modelled".into());
-    }
-    if s.setup_uncertainty != 0.0 || s.hold_uncertainty != 0.0 {
+    // A hold uncertainty moves only hold checks: read by a hold repair alone.
+    if s.setup_uncertainty != 0.0 || (s.hold_uncertainty != 0.0 && hold_repair) {
         return Err("set_clock_uncertainty: not modelled".into());
     }
     if s.clock_latency != 0.0 || s.late_derate.is_some() || s.early_derate.is_some() || !s.exceptions.is_empty() || !s.async_groups.is_empty() {
@@ -1551,7 +1556,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     g.ideal_clock = clocks.iter().copied().collect();
                 }
                 g.find_delays(&parasitics[0], None)?;
-                let ssdc = search_sdc(s, &text, time_scale, clock_propagated)?;
+                let ssdc = search_sdc(s, &text, time_scale, clock_propagated, a.hold)?;
                 let mut search = vyges_sta::search::Search::in_graph_order(&g, &ssdc);
                 search.find_arrivals()?;
                 search.find_requireds()?;

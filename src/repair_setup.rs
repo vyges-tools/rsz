@@ -3865,11 +3865,31 @@ impl Repair<'_, '_> {
         }
         // removeBuffer.
         self.debug("repair_setup", 3, format!("remove_buffer {} ({})", r.inst, r.cell));
+        // `name(net)` of each side, as the nets stand before the removal.
+        let (in_name, out_name) = (self.net_display_name(&r.inst, &r.in_port), self.net_display_name(&r.inst, &r.out_port));
         let removed = self.design.remove_buffer(&r.inst, &r.in_port, &r.out_port).map_err(|e| Stop::error("RSZ-0168", e))?;
         // `name(net)`, `pathName(buffer)`, `name(net)`.
         let h = self.ctx.hierarchy;
-        self.debug("remove_buffer", 1, format!("remove_buffer {} (input net) - {} ({}) - {} (output net)", network_name(&removed.in_net, h), r.inst, r.cell, network_name(&removed.out_net, h)));
+        let in_name = in_name.unwrap_or_else(|| network_name(&removed.in_net, h).to_string());
+        let out_name = out_name.unwrap_or_else(|| network_name(&removed.out_net, h).to_string());
+        self.debug("remove_buffer", 1, format!("remove_buffer {in_name} (input net) - {} ({}) - {out_name} (output net)", r.inst, r.cell));
         Ok(Some(MoveResult { kind: Move::Unbuffer, count: 1, insts: vec![r.inst] }))
+    }
+
+    /// `dbNetwork::name(Net*)` of the flat net on `inst/port`: its first output iterm (net pin
+    /// order) decides the module prefix removed (`db_net_name`).
+    fn net_display_name(&self, inst: &str, port: &str) -> Option<String> {
+        let nl = self.design.netlist();
+        let k = nl.insts.iter().position(|(n, _)| n == inst)?;
+        let net = nl.nets.iter().find(|n| n.pins.iter().any(|c| matches!(c, vyges_sta::netlist::Conn::Inst(i, p) if *i == k && p == port)))?;
+        let first_output = net.pins.iter().find_map(|c| match c {
+            vyges_sta::netlist::Conn::Inst(i, p) => {
+                let cell = self.ctx.libs.link_cell(&nl.insts[*i].1)?;
+                (cell.port(p)?.direction == vyges_sta::liberty::Direction::Output).then(|| nl.pin_name(c))
+            }
+            vyges_sta::netlist::Conn::Port(_) => None,
+        });
+        Some(crate::repair_timing::db_net_name(&net.name, first_output.as_deref(), self.ctx.hierarchy))
     }
 
     /// `SwapPinsGenerator::generate` (`resolveDriverContext`: a liberty driver port of a cell that

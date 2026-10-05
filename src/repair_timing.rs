@@ -392,6 +392,27 @@ pub fn network_name(name: &str, hierarchy: bool) -> &str {
     if hierarchy { strip_parent_prefix(name) } else { name }
 }
 
+/// `dbNetwork::name(Net*)` for a flat net (no modnet): with hierarchy, a name with a `/` loses
+/// the prefix naming the module its first OUTPUT iterm's instance sits in — that pin's path
+/// without its last two components — wherever the prefix is found; kept whole with no such
+/// driver, or a driver at the top.
+pub fn db_net_name(name: &str, first_output_pin: Option<&str>, hierarchy: bool) -> String {
+    let mut name = name.to_string();
+    if !hierarchy || !name.contains('/') {
+        return name;
+    }
+    let Some(pin) = first_output_pin else { return name };
+    let Some(i) = pin.rfind('/') else { return name };
+    let related = &pin[..i];
+    let Some(j) = related.rfind('/') else { return name };
+    let header = &related[..j];
+    if let Some(pos) = name.find(header) {
+        let end = (pos + header.len() + 1).min(name.len());
+        name.replace_range(pos..end, "");
+    }
+    name
+}
+
 /// `Unit::asString(float value, digits)`: `INF` / `-INF` when `|value| ≥ INF × .1` (`float`
 /// against a `double` product, compared in `double`); else `value / scale` in `float`, an
 /// absolute value under 1e-6 printed as 0 (no `-0.000`), `%.<digits>f`.
@@ -706,5 +727,17 @@ mod tests {
         assert!(phases_modelled("TNS"));
         assert!(phases_modelled("ENDPOINT_FANIN STARTPOINT_FANOUT"));
         assert!(!phases_modelled("WNS_CONE"));
+    }
+
+    /// Rule (`dbNetwork::name(Net*)`): the module prefix of the net's first output driver is
+    /// removed; a driver at the top, or none, leaves the hierarchical name whole (the reference's
+    /// `u_mid2/l3_out` driven from the top).
+    #[test]
+    fn db_net_names() {
+        assert_eq!(db_net_name("u_mid2/l3_out", Some("u_mid2/buf0/Z"), true), "l3_out");
+        assert_eq!(db_net_name("u_mid2/l3_out", Some("l3/Z"), true), "u_mid2/l3_out");
+        assert_eq!(db_net_name("u_mid2/l3_out", None, true), "u_mid2/l3_out");
+        assert_eq!(db_net_name("n1", Some("u_mid2/buf1/Z"), true), "n1");
+        assert_eq!(db_net_name("u_mid2/l3_out", Some("u_mid2/buf0/Z"), false), "u_mid2/l3_out");
     }
 }
