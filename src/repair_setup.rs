@@ -35,7 +35,7 @@ use crate::preamble::Libs;
 use crate::repair_timing::{network_name, collect_violating, delay_as_string, progress_header, progress_row, startpoint_tns, timing_points, total_negative_slack, worst_slack, Args, Move, Point, Row};
 use crate::sizing::Sizing;
 use crate::timing::Limits;
-use crate::{clone, rebuffer, swap_pins, unbuffer};
+use crate::{clone, move_tracker, rebuffer, swap_pins, unbuffer};
 use crate::Stop;
 
 /// `decreasing_slack_max_passes_`, `print_interval_`, `opto_small_interval_`,
@@ -1034,6 +1034,9 @@ struct EndpointState {
 pub struct Outcome {
     pub lines: Vec<String>,
     pub trace: Vec<String>,
+    /// Lines the reference prints in the preamble, right after RSZ-0099 (the move tracker's
+    /// capture): the caller splices them there.
+    pub preamble: Vec<String>,
     /// SizeUp moves kept.
     pub resized: i64,
     /// Buffers removed (UnbufferMove).
@@ -1070,6 +1073,8 @@ struct Repair<'c, 'd> {
     max_viol: f32,
     /// The collector's violating endpoint count as its last `init` found it (the Viol column).
     collector_violating: usize,
+    /// `MoveTracker`'s capture, with `RSZ move_tracker` at level 1.
+    tracker: Option<move_tracker::Initial>,
 }
 
 /// What `Resizer::swapPins` did.
@@ -1649,12 +1654,20 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
         min_viol: 0.0,
         max_viol: 0.0,
         collector_violating: 0,
+        tracker: None,
     };
+    // `SetupLegacyBase::start`: with the move tracker on, `captureInitialSlackDistribution` (and
+    // `captureOriginalEndpointSlack`, read only by the level-2 profiles) after RSZ-0099.
+    if r.tracker_level() >= 1 {
+        r.capture_initial_slack_distribution()?;
+    }
     r.iterate()?;
     // The phases after LEGACY: LAST_GASP unless skipped (or -phases LEGACY), then the implicit
-    // CRIT_VT_SWAP, which finds no VT cells (a VT library is refused) and does nothing.
+    // CRIT_VT_SWAP, which finds no VT cells (a VT library is refused) and does nothing — its
+    // `printTrackerPhaseSummary` asks for no endpoint profile, and no move was tracked.
     if !args.skip_last_gasp && args.phases.is_none() {
         r.last_gasp()?;
+        r.print_tracker_phase_summary("LAST_GASP Phase Endpoint Profiler");
     }
     r.finalize_and_report()?;
     r.out.resized = r.committer.committed(Move::SizeUp);
@@ -1696,7 +1709,127 @@ impl Repair<'_, '_> {
         if !violating_ends.is_empty() {
             self.run_main_repair_loop(&violating_ends)?;
         }
+        self.print_tracker_phase_summary("LEGACY Phase Endpoint Profiler");
         Ok(())
+    }
+
+    /// `RSZ move_tracker`'s debug level (0: off).
+    fn tracker_level(&self) -> i64 {
+        self.ctx.debug.get(&("RSZ".to_string(), move_tracker::GROUP.to_string())).copied().unwrap_or(0)
+    }
+
+    /// A line the tracker logs: the command's output, and the trace.
+    fn tracker_line(&mut self, line: String) {
+        self.report(line);
+    }
+
+    /// `MoveCommitter::printTrackerPhaseSummary(title, profiler, true)` at level 1: no move was
+    /// tracked (`printMoveSummary` prints nothing), no endpoint profile collected.
+    fn print_tracker_phase_summary(&mut self, profiler_title: &str) {
+        if self.tracker.is_some() {
+            self.tracker_line(move_tracker::endpoint_summary(profiler_title));
+        }
+    }
+
+    /// `MoveTracker::captureInitialSlackDistribution`: its two lines go to the preamble.
+    fn capture_initial_slack_distribution(&mut self) -> Result<(), Stop> {
+        let view = self.tracker_view()?;
+        let initial = move_tracker::capture(&view.pins, &view.ends);
+        self.out.preamble.extend(move_tracker::capture_lines(&initial));
+        self.tracker = Some(initial);
+        Ok(())
+    }
+
+    /// `MoveCommitter::printTrackerFinalReports` at level 1: `trackCriticalPins`, then the
+    /// reports. With a violating endpoint or a critical pin left, the reports enumerate each
+    /// endpoint's k worst paths — refused.
+    fn print_tracker_final_reports(&mut self) -> Result<(), Stop> {
+        let Some(initial) = self.tracker.clone() else { return Ok(()) };
+        let view = self.tracker_view()?;
+        // `trackCriticalPins`: a non-clock driver pin whose RISE slack in ps (`float × 1e12` in
+        // `double`, narrowed) is below 0. `printTopBinEndpoints`: an endpoint whose slack is.
+        let critical = view.pins.iter().filter(|p| p.driver && !p.clock && ((f64::from(p.rise_slack) * 1e12) as f32) < 0.0).count();
+        let violating = view.ends.iter().filter(|&&(_, s)| s < 0.0).count();
+        if critical > 0 || violating > 0 {
+            return Err(Stop::refused(
+                "RSZ-ABSENT",
+                format!("repair_timing: the move tracker's reports with {violating} violating endpoints and {critical} critical pins left (each endpoint's k worst paths) are not modelled"),
+            ));
+        }
+        let live = |id: u64| view.slacks.contains_key(&id);
+        let (pins, pins_destroyed) = move_tracker::split(&initial.pins, live);
+        let (ends, ends_destroyed) = move_tracker::split(&initial.endpoint_slacks, live);
+        let pins: Vec<(f32, f32)> = pins.iter().map(|&(id, s)| (s, view.slacks[&id][0])).collect();
+        let ends: Vec<(f32, Option<f32>)> = ends.iter().map(|&(id, s)| (s, Some(view.slacks[&id][1]))).collect();
+        let distribution = move_tracker::slack_distribution("Pin Slack Distribution", &pins, pins_destroyed, &ends, ends_destroyed);
+        for l in move_tracker::final_reports_all_met(distribution) {
+            self.tracker_line(l);
+        }
+        Ok(())
+    }
+
+    /// The design's pins as `MoveTracker` reads them now (the timer brought up to date first).
+    fn tracker_view(&mut self) -> Result<move_tracker::View, Stop> {
+        self.design.update_parasitics().map_err(timer_stop)?;
+        let edits = self.design.take_timer_edits();
+        let ctx = self.ctx;
+        let design = self.design.as_design();
+        timed_all(ctx, design, &mut self.timer, edits, |gs, ss, cs| {
+            let netlist = design.netlist();
+            let ids = &design.net_info().pin_id;
+            // Each scene's vertices by pin name (a bidirect pin has two).
+            let index: Vec<HashMap<&str, Vec<usize>>> = gs
+                .iter()
+                .map(|g| {
+                    let mut m: HashMap<&str, Vec<usize>> = HashMap::new();
+                    for (v, x) in g.vertices.iter().enumerate() {
+                        m.entry(x.name.as_str()).or_default().push(v);
+                    }
+                    m
+                })
+                .collect();
+            // `Sta::slack(pin, rf, scenes, max)`: the fuzzily least over every scene and each of
+            // the pin's vertices (`rf` None: both transitions).
+            let slack = |name: &str, rf: Option<usize>| {
+                let mut s = INF;
+                for (k, idx) in index.iter().enumerate() {
+                    for &u in idx.get(name).map_or(&[][..], |v| v.as_slice()) {
+                        let x = ss[k].slack_of(u, MAX, rf);
+                        if fuzzy::less(x, s) {
+                            s = x;
+                        }
+                    }
+                }
+                s
+            };
+            let mut pins = Vec::new();
+            for (i, (_, cell)) in netlist.insts.iter().enumerate() {
+                let lib_cell = ctx.libs.link_cell(cell);
+                for port in ctx.master_pins.get(cell).map_or(&[][..], |v| v.as_slice()) {
+                    let name = netlist.pin_name(&vyges_sta::netlist::Conn::Inst(i, port.clone()));
+                    // `Network::isDriver`: an output, tristate or bidirect port.
+                    let driver = lib_cell.and_then(|c| c.port(port)).is_some_and(|p| {
+                        matches!(p.direction, vyges_sta::liberty::Direction::Output | vyges_sta::liberty::Direction::Tristate | vyges_sta::liberty::Direction::Bidirect)
+                    });
+                    let clock = index[0].get(name.as_str()).is_some_and(|vs| vs.iter().any(|v| cs[0].contains(v)));
+                    // A pin on no net has no id, and no path: never kept.
+                    let id = ids.get(&name).copied().unwrap_or(u64::MAX);
+                    // RISE only (`RiseFall::rise()->asRiseFallBoth()`). ⚠️ No run yet tells it from
+                    // both transitions (the mutant survives: report_move_tracker's violators' worst
+                    // paths rise); Category 2's per-pin slacks will.
+                    let rise_slack = slack(&name, Some(vyges_sta::liberty::RISE));
+                    pins.push(move_tracker::DriverPin { id, driver, clock, rise_slack });
+                }
+            }
+            // `search->endpoints()`: each endpoint's slack, both transitions over every scene.
+            let ends: Vec<(u64, f32)> = setup_ends(ctx, gs, ss, cs)?.iter().map(|p| (ids.get(&p.pin).copied().unwrap_or(u64::MAX), p.slack)).collect();
+            // Every terminal on a net, by id: its RISE slack (a pin's, `Sta::slack(pin, rise)`) and
+            // its slack over both transitions (an endpoint's, `Sta::slack(pinLoadVertex, max)`;
+            // a bidirect pin is not told apart). ⚠️ A terminal on no net has no id here: a slot
+            // reused by an unconnected terminal reads as destroyed.
+            let slacks = ids.iter().map(|(n, &id)| (id, [slack(n, Some(vyges_sta::liberty::RISE)), slack(n, None)])).collect();
+            Ok(move_tracker::View { pins, ends, slacks })
+        })
     }
 
     /// `initializeMainRepair`: the violating endpoints, row 0, and the violation range.
@@ -2666,6 +2799,7 @@ impl Repair<'_, '_> {
         );
         self.report(row);
         self.report("-".repeat(126));
+        self.print_tracker_final_reports()?;
         let unbuffer = self.committer.committed(Move::Unbuffer);
         if unbuffer > 0 {
             self.report(format!("[INFO RSZ-0059] Removed {unbuffer} buffers."));

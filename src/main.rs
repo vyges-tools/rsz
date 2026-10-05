@@ -1569,8 +1569,9 @@ fn run(job: &Value) -> Result<Value, String> {
                     Some(format!("repair_timing: {} is not modelled", m.name()))
                 } else if a.match_cell_footprint {
                     Some("repair_timing -match_cell_footprint: not modelled".into())
-                } else if debug_levels.get(&("RSZ".to_string(), "move_tracker".to_string())).is_some_and(|&l| l > 0) {
-                    Some("repair_timing: the move tracker's reports (set_debug_level RSZ move_tracker) are not modelled".into())
+                } else if debug_levels.get(&("RSZ".to_string(), "move_tracker".to_string())).is_some_and(|&l| l > 1) {
+                    // Level 1's reports are modelled (`move_tracker`); level 2 tracks every move.
+                    Some("repair_timing: the move tracker's level-2 reports (set_debug_level RSZ move_tracker 2) are not modelled".into())
                 } else {
                     None
                 };
@@ -1764,6 +1765,11 @@ fn run(job: &Value) -> Result<Value, String> {
                     };
                     if let Some(path) = job["timing_trace"].as_str() {
                         std::fs::write(path, o.trace.join("\n") + "\n").map_err(|e| format!("{path}: {e}"))?;
+                    }
+                    // The preamble's own lines from the repair (the move tracker's capture) print
+                    // right after RSZ-0099, before RSZ-0221.
+                    if let Some(k) = lines.iter().position(|l| l.starts_with("[INFO RSZ-0099]")) {
+                        lines.splice(k + 1..k + 1, o.preamble);
                     }
                     lines.extend(o.lines);
                     timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len(), "resized": o.resized, "removed": o.removed, "inserted": o.inserted }));

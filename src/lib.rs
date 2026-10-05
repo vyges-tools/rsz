@@ -33,6 +33,7 @@ pub mod design;
 pub mod driver_slew;
 pub mod fanout;
 pub mod max_wire_length;
+pub mod move_tracker;
 pub mod order;
 pub mod preamble;
 pub mod rebuffer;
