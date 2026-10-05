@@ -264,28 +264,220 @@ pub fn endpoint_summary(title: &str) -> String {
     debug(&format!("{title}: No endpoint statistics collected"))
 }
 
-/// `MoveCommitter::printTrackerFinalReports` with no violating endpoint and no critical pin left:
-/// the distributions, then every report's empty branch. `distribution` is
-/// [`slack_distribution`]'s lines.
-pub fn final_reports_all_met(distribution: Vec<String>) -> Vec<String> {
+/// A slack (s) in ps as the reports print it: the `float` times the `double` 1e12, narrowed.
+pub fn ps(v: f32) -> f32 {
+    (f64::from(v) * 1e12) as f32
+}
+
+/// `name.substr(0, keep) + "..."` when longer than `width` (ASCII names).
+fn trunc_tail(name: &str, width: usize) -> String {
+    if name.len() > width {
+        format!("{}...", &name[..width - 3])
+    } else {
+        name.to_string()
+    }
+}
+
+/// One violating endpoint as `printTopBinEndpoints` reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopEnd {
+    pub name: String,
+    /// `Sta::slack(vertex, max)` (s).
+    pub slack: f32,
+    /// The first sequential cell's output on the worst path (from its start), else its first pin.
+    pub startpoint: Option<String>,
+    /// `PathExpanded::size()`: every pin of the worst path, its clock path included.
+    pub levels: usize,
+    /// The pin with the largest arrival step along the worst path: `"pin (cell)"`, the step (s)
+    /// and its load vertex's wire fanout.
+    pub worst: Option<(String, f32, usize)>,
+    /// The slack of each path end the enumerator returned for the endpoint (s), in order.
+    pub path_slacks: Vec<f32>,
+}
+
+/// `printTopBinEndpoints(title, 20)`: `ends` sorted already (most negative first).
+pub fn top_bin_endpoints(title: &str, ends: &[TopEnd]) -> Vec<String> {
+    const MAX_ENDPOINTS: usize = 20;
+    let mut out = vec![debug(&format!("{title}:"))];
+    if ends.is_empty() {
+        out.push(debug("No violating endpoints after optimization (all meet timing!)"));
+        return out;
+    }
+    out.push(debug(&format!("Found {} violating endpoints after optimization", ends.len())));
+    out.push(debug(&format!("Analyzing top {} most critical endpoints:", MAX_ENDPOINTS.min(ends.len()))));
+    out.push(debug(""));
+    out.push(debug(&format!(
+        "{:<40} | {:<40} | {:>10} | {:>10} | {:>7} | {:>6} | {:<40} | {:>8} | {:>8} | {:>8} | {:>6}",
+        "Endpoint", "Startpoint", "Slack(ns)", "EpTNS(ns)", "NegPath", "Levels", "Worst Delay Pin (Gate)", "Arc(ps)", "Load(ps)", "Intr(ps)", "Fanout"
+    )));
+    for end in ends.iter().take(MAX_ENDPOINTS) {
+        // The worst pin's step: 40% intrinsic, 60% load (the reference's heuristic).
+        let (worst_name, worst_delay, load_ps, intr_ps, fanout) = match &end.worst {
+            Some((name, delay, fanout)) => {
+                let total = ps(*delay);
+                let name = if name.len() > 40 { format!("...{}", &name[name.len() - 37..]) } else { name.clone() };
+                (name, *delay, total * 0.6, total * 0.4, *fanout)
+            }
+            None => ("none".to_string(), 0.0, 0.0, 0.0, 0),
+        };
+        // The negative paths: their count and their slacks summed in order (`float`).
+        let mut neg = 0usize;
+        let mut local_tns = 0.0f32;
+        for &s in &end.path_slacks {
+            if s < 0.0 {
+                neg += 1;
+                local_tns += s;
+            }
+        }
+        if neg == 0 {
+            neg = 1;
+            local_tns = end.slack;
+        }
+        out.push(debug(&format!(
+            "{:<40} | {:<40} | {:>10.3} | {:>10.3} | {:>7} | {:>6} | {:<40} | {:>8.1} | {:>8.1} | {:>8.1} | {:>6}",
+            trunc_tail(&end.name, 40),
+            end.startpoint.as_deref().map_or("unknown".to_string(), |s| trunc_tail(s, 40)),
+            f64::from(ns(end.slack)),
+            f64::from(ns(local_tns)),
+            neg,
+            end.levels,
+            worst_name,
+            f64::from(ps(worst_delay)),
+            f64::from(load_ps),
+            f64::from(intr_ps),
+            fanout
+        )));
+    }
+    if ends.len() > MAX_ENDPOINTS {
+        out.push(debug(&format!("... ({} more violating endpoints not shown)", ends.len() - MAX_ENDPOINTS)));
+    }
+    let mut tns = 0.0f32;
+    for e in ends {
+        tns += e.slack;
+    }
+    out.push(debug(""));
+    out.push(debug(&format!(
+        "Post-Optimization Summary: WNS = {:.3} ns, TNS = {:.3} ns, {} violating endpoints",
+        f64::from(ns(ends[0].slack)),
+        f64::from(ns(tns)),
+        ends.len()
+    )));
+    out
+}
+
+/// `drawHistogram`.
+fn draw_histogram(out: &mut Vec<String>, title: &str, labels: &[String], counts: &[usize], count_label: &str) {
+    let gates_per_hash = per_hash(counts.iter().copied().max().unwrap_or(0));
+    out.push(debug(""));
+    out.push(debug(title));
+    out.push(debug(&format!("{:<18} | {:>6} | {}", "Slack (ns)", count_label, "Distribution")));
+    for (label, &count) in labels.iter().zip(counts) {
+        out.push(debug(&format!("{label:<18} | {count:>6} |{}", bar(count, gates_per_hash))));
+    }
+}
+
+/// `printCriticalEndpointPathHistogram`: the three worst of `ends` (sorted already), their path
+/// slacks on common bins — 10 edges from the least slack to the greatest capped at 0, in `float`.
+pub fn critical_endpoint_path_histogram(title: &str, ends: &[TopEnd]) -> Vec<String> {
+    const NUM_BINS: usize = 10;
+    let mut out = vec![debug(""), debug(&format!("=== {title} ==="))];
+    if ends.is_empty() {
+        out.push(debug("No violating endpoints found."));
+        return out;
+    }
+    let shown = &ends[..ends.len().min(3)];
+    let all: Vec<Vec<f32>> = shown.iter().map(|e| e.path_slacks.iter().map(|&s| ns(s)).collect()).collect();
+    let mut min = 1e30f32;
+    let mut max = -1e30f32;
+    for &s in all.iter().flatten() {
+        min = std_min(s, min);
+        max = std_max(s, max);
+    }
+    // `std::min<double>(max, 0.0)`, back into the float.
+    max = f64::from(max).min(0.0) as f32;
+    let width = (max - min) / (NUM_BINS - 1) as f32;
+    let edges: Vec<f32> = (0..NUM_BINS).map(|i| min + i as f32 * width).collect();
+    let mut labels = vec![format!("< {}", fixed3(edges[0]))];
+    for w in edges.windows(2) {
+        labels.push(format!("[{},{})", fixed3(w[0]), fixed3(w[1])));
+    }
+    labels.push(format!(">= {}", fixed3(edges[NUM_BINS - 1])));
+    for (k, (end, slacks)) in shown.iter().zip(&all).enumerate() {
+        out.push(debug(""));
+        out.push(debug(&format!("Endpoint #{}: {} (slack = {:.3} ns)", k + 1, end.name, f64::from(ns(end.slack)))));
+        if slacks.is_empty() {
+            out.push(debug("No paths found to endpoint."));
+            continue;
+        }
+        out.push(debug(&format!("Found {} paths to this endpoint", slacks.len())));
+        let mut counts = vec![0usize; NUM_BINS + 1];
+        for &s in slacks {
+            counts[bin_of(&edges, s)] += 1;
+        }
+        draw_histogram(&mut out, &format!("Path Slack Distribution for Endpoint #{}", k + 1), &labels, &counts, "Paths");
+    }
+    out
+}
+
+/// One critical pin never visited, as Category 2 prints it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CriticalPin {
+    pub name: String,
+    pub cell: Option<String>,
+    /// RISE slack over every scene (s).
+    pub slack: f32,
+    /// The effort delays (s): `None` with no gate arc in.
+    pub effort: Option<(f32, f32)>,
+    pub fanout: usize,
+}
+
+/// `printMissedOpportunitiesReport` at level 1 (nothing visited): Category 2 over `critical`, in
+/// the report's order already.
+pub fn missed_opportunities(title: &str, critical: &[CriticalPin]) -> Vec<String> {
+    const MAX_PINS: usize = 20;
+    let mut out = vec![
+        debug(&format!("{title}:")),
+        debug("Category 1: All visited pins with negative slack had moves attempted (good!)"),
+    ];
+    if critical.is_empty() {
+        out.push(debug("Category 2: All critical pins were visited (good!)"));
+    } else {
+        out.push(debug(&format!("Category 2: {} critical pins NEVER visited", critical.len())));
+        out.push(debug("  (These pins are on critical paths but were never considered for optimization)"));
+        out.push(debug(&format!("  {:<38} | {:<30} | {:>10} | {:>9} | {:>9} | {:>6}", "Pin", "Gate Type", "PinSlk(ps)", "Load(ps)", "Intr(ps)", "Fanout")));
+        for c in critical.iter().take(MAX_PINS) {
+            let (load, intr) = c.effort.map_or((0.0, 0.0), |(l, i)| (ps(l), ps(i)));
+            out.push(debug(&format!(
+                "  {:<38} | {:<30} | {:>10.2} | {:>9.2} | {:>9.2} | {:>6}",
+                trunc_tail(&c.name, 38),
+                c.cell.as_deref().map_or("unknown".to_string(), |s| trunc_tail(s, 30)),
+                f64::from(ps(c.slack)),
+                f64::from(load),
+                f64::from(intr),
+                c.fanout
+            )));
+        }
+        if critical.len() > MAX_PINS {
+            out.push(debug(&format!("    ... ({} more pins not shown)", critical.len() - MAX_PINS)));
+        }
+    }
+    out.push(debug(&format!("Summary: {} critical pins identified, 0 visited, 0 had moves attempted", critical.len())));
+    out.push(debug(&format!("  Missed opportunities: 0 visited but no moves, {} never visited", critical.len())));
+    out
+}
+
+/// `MoveCommitter::printTrackerFinalReports` at level 1: `distribution` is
+/// [`slack_distribution`]'s lines; `ends` the violating endpoints sorted; `critical` the critical
+/// pins in the report's order. No move event at level 1: the success and failure reports are
+/// empty.
+pub fn final_reports(distribution: Vec<String>, ends: &[TopEnd], critical: &[CriticalPin]) -> Vec<String> {
     let mut out = vec!["[INFO RSZ-0211] ".to_string(), "[INFO RSZ-0212] === Optimization Analysis Reports ===".to_string()];
     out.extend(distribution);
-    // printTopBinEndpoints
-    out.push(debug("Most Critical Endpoints After Optimization:"));
-    out.push(debug("No violating endpoints after optimization (all meet timing!)"));
-    // printCriticalEndpointPathHistogram
-    out.push(debug(""));
-    out.push(debug("=== Critical Endpoint Path Distribution ==="));
-    out.push(debug("No violating endpoints found."));
-    // printSuccessReport / printFailureReport: no move event at level 1.
+    out.extend(top_bin_endpoints("Most Critical Endpoints After Optimization", ends));
+    out.extend(critical_endpoint_path_histogram("Critical Endpoint Path Distribution", ends));
     out.push(debug("Successful Optimizations Report: No successful optimizations"));
     out.push(debug("Unsuccessful Optimizations Report: No rejected optimizations"));
-    // printMissedOpportunitiesReport: nothing visited, no critical pin.
-    out.push(debug("Missed Opportunities Report:"));
-    out.push(debug("Category 1: All visited pins with negative slack had moves attempted (good!)"));
-    out.push(debug("Category 2: All critical pins were visited (good!)"));
-    out.push(debug("Summary: 0 critical pins identified, 0 visited, 0 had moves attempted"));
-    out.push(debug("  Missed opportunities: 0 visited but no moves, 0 never visited"));
+    out.extend(missed_opportunities("Missed Opportunities Report", critical));
     out.push("[INFO RSZ-0213] ".to_string());
     out
 }
@@ -368,5 +560,46 @@ mod tests {
         assert_eq!(per_hash(51), 2);
         assert_eq!(bar(3, 2), " #");
         assert_eq!(bar(1, 2), "");
+    }
+
+    /// Rule (`printTopBinEndpoints`): EpTNS sums the negative path slacks in order, NegPath counts
+    /// them; the worst pin's step is split 60% load, 40% intrinsic. Values: the reference's
+    /// `report_move_tracker` under `-sequence sizeup` (r2/D, 2 paths, clock-to-Q 148.4 ps, 14
+    /// pins with the clock path).
+    #[test]
+    fn top_bin_row() {
+        let e = TopEnd {
+            name: "r2/D".into(),
+            slack: -91.6e-12,
+            startpoint: Some("r1/Q".into()),
+            levels: 14,
+            worst: Some(("r1/Q (DFF_X2)".into(), 148.4e-12, 11)),
+            path_slacks: vec![-91.6e-12, -75.4e-12, 3e-12],
+        };
+        let l = top_bin_endpoints("Most Critical Endpoints After Optimization", &[e]);
+        assert_eq!(
+            l[5],
+            debug(&format!("{:<40} | {:<40} | {:>10} | {:>10} | {:>7} | {:>6} | {:<40} | {:>8} | {:>8} | {:>8} | {:>6}", "r2/D", "r1/Q", "-0.092", "-0.167", 2, 14, "r1/Q (DFF_X2)", "148.4", "89.0", "59.4", 11))
+        );
+        assert_eq!(l[7], debug("Post-Optimization Summary: WNS = -0.092 ns, TNS = -0.092 ns, 1 violating endpoints"));
+    }
+
+    /// Rule (`printCriticalEndpointPathHistogram`): 10 edges from the least path slack to the
+    /// greatest (capped at 0), 11 bins; the last label is the last edge.
+    #[test]
+    fn path_histogram_edges() {
+        let e = TopEnd { name: "r2/D".into(), slack: -0.092e-9, startpoint: None, levels: 1, worst: None, path_slacks: vec![-0.092e-9, -0.075e-9] };
+        let l = critical_endpoint_path_histogram("Critical Endpoint Path Distribution", &[e]);
+        assert!(l.contains(&debug("Found 2 paths to this endpoint")));
+        assert!(l.contains(&debug(&format!("{:<18} | {:>6} | #", "[-0.092,-0.090)", 1))));
+        assert!(l.contains(&debug(&format!("{:<18} | {:>6} | #", ">= -0.075", 1))));
+    }
+
+    /// Rule (Category 2): a long pin name keeps 35 characters and "...".
+    #[test]
+    fn category2_truncates() {
+        let c = CriticalPin { name: "a".repeat(40), cell: Some("BUF_X4".into()), slack: -91.6e-12, effort: Some((21.38e-12, 12.58e-12)), fanout: 1 };
+        let l = missed_opportunities("Missed Opportunities Report", &[c]);
+        assert_eq!(l[5], debug(&format!("  {:<38} | {:<30} | {:>10} | {:>9} | {:>9} | {:>6}", format!("{}...", "a".repeat(35)), "BUF_X4", "-91.60", "21.38", "12.58", 1)));
     }
 }

@@ -191,6 +191,40 @@ fn arc_intrinsic(model: &Model) -> f32 {
     }
 }
 
+/// `printMissedOpportunitiesReport`'s effort delays at a driver vertex (cmd scene, max): over its
+/// in-edges (newest first) from a non-output pin, each transition's arc INTO it — `arcTo(rf)`, the
+/// LAST arc of the set to that transition — the one whose from-pin slack at the arc's from
+/// transition is least, a tie to the larger load delay; `(arc delay − intrinsic, intrinsic)`.
+fn effort_delays(g: &Graph<'_>, s: &Search<'_, '_>, drvr: usize) -> Option<(f32, f32)> {
+    let mut selected: Option<(f32, f32)> = None;
+    let mut worst_slack = INF;
+    for &e in g.in_edges[drvr].iter().rev() {
+        let from = g.edges[e].from;
+        let fx = &g.vertices[from];
+        let from_output = match (&fx.cell, &fx.port) {
+            (Some(c), Some(p)) => g.libs[fx.lib.unwrap_or(0)].cells.get(c.as_str()).and_then(|c| c.port(p)).is_some_and(|p| matches!(p.direction, vyges_sta::liberty::Direction::Output)),
+            _ => false,
+        };
+        if from_output {
+            continue;
+        }
+        let Some(set) = edge_arc_set(g, e) else { continue };
+        for rf in [vyges_sta::liberty::RISE, vyges_sta::liberty::FALL] {
+            // ⚠️ `arcTo` keeps the LAST arc added to that transition (read: `to_arc_[rf] = arc` on
+            // every add); no run tells it from the first yet (its mutant `crit_arcto` survives).
+            let Some((k, arc)) = set.arcs.iter().enumerate().rev().find(|(_, a)| a.to_rf == rf) else { continue };
+            let from_slack = s.slack_of(from, MAX, Some(arc.from_rf));
+            let intrinsic = arc_intrinsic(&arc.model);
+            let load = g.delay[e][k][MAX] - intrinsic;
+            if from_slack < worst_slack || (from_slack == worst_slack && selected.is_none_or(|(l, _)| load > l)) {
+                worst_slack = from_slack;
+                selected = Some((load, intrinsic));
+            }
+        }
+    }
+    selected
+}
+
 /// The timer's state across the repair: the reference's incremental timer, the database's edits
 /// replayed into it at each update — a value it does not recompute stays as it was.
 struct Timer {
@@ -1740,32 +1774,149 @@ impl Repair<'_, '_> {
         Ok(())
     }
 
-    /// `MoveCommitter::printTrackerFinalReports` at level 1: `trackCriticalPins`, then the
-    /// reports. With a violating endpoint or a critical pin left, the reports enumerate each
-    /// endpoint's k worst paths — refused.
+    /// `MoveCommitter::printTrackerFinalReports` at level 1: `trackCriticalPins`, the
+    /// distributions, then the reports over the violating endpoints and the critical pins.
     fn print_tracker_final_reports(&mut self) -> Result<(), Stop> {
         let Some(initial) = self.tracker.clone() else { return Ok(()) };
         let view = self.tracker_view()?;
-        // `trackCriticalPins`: a non-clock driver pin whose RISE slack in ps (`float × 1e12` in
-        // `double`, narrowed) is below 0. `printTopBinEndpoints`: an endpoint whose slack is.
-        let critical = view.pins.iter().filter(|p| p.driver && !p.clock && ((f64::from(p.rise_slack) * 1e12) as f32) < 0.0).count();
-        let violating = view.ends.iter().filter(|&&(_, s)| s < 0.0).count();
-        if critical > 0 || violating > 0 {
-            return Err(Stop::refused(
-                "RSZ-ABSENT",
-                format!("repair_timing: the move tracker's reports with {violating} violating endpoints and {critical} critical pins left (each endpoint's k worst paths) are not modelled"),
-            ));
-        }
         let live = |id: u64| view.slacks.contains_key(&id);
         let (pins, pins_destroyed) = move_tracker::split(&initial.pins, live);
         let (ends, ends_destroyed) = move_tracker::split(&initial.endpoint_slacks, live);
         let pins: Vec<(f32, f32)> = pins.iter().map(|&(id, s)| (s, view.slacks[&id][0])).collect();
         let ends: Vec<(f32, Option<f32>)> = ends.iter().map(|&(id, s)| (s, Some(view.slacks[&id][1]))).collect();
         let distribution = move_tracker::slack_distribution("Pin Slack Distribution", &pins, pins_destroyed, &ends, ends_destroyed);
-        for l in move_tracker::final_reports_all_met(distribution) {
+        let (top, critical) = self.tracker_reports()?;
+        for l in move_tracker::final_reports(distribution, &top, &critical) {
             self.tracker_line(l);
         }
         Ok(())
+    }
+
+    /// What the final reports read: the violating endpoints (`slack < 0`, `search->endpoints()` in
+    /// vertex order, then sorted by slack), each with its worst path expanded and its k worst path
+    /// ends; and `trackCriticalPins`' pins (a non-clock driver whose RISE slack in ps is below 0)
+    /// in Category 2's order — the set's (pin address) order, sorted by slack.
+    fn tracker_reports(&mut self) -> Result<(Vec<move_tracker::TopEnd>, Vec<move_tracker::CriticalPin>), Stop> {
+        if self.ctx.libs.scene_count() > 1 || self.ctx.ssdc.clock.propagated {
+            let ends = collect_violating(&self.timing.ends, 0.0).len();
+            if ends > 0 {
+                return Err(Stop::refused("RSZ-ABSENT", "repair_timing: the move tracker's path enumeration over several scenes or a propagated clock is not modelled".into()));
+            }
+        }
+        self.design.update_parasitics().map_err(timer_stop)?;
+        let edits = self.design.take_timer_edits();
+        let ctx = self.ctx;
+        let design = self.design.as_design();
+        timed_all(ctx, design, &mut self.timer, edits, |gs, ss, cs| {
+            let (g, s) = (&gs[0], &ss[0]);
+            let netlist = design.netlist();
+            let ids = &design.net_info().pin_id;
+            let mut index: HashMap<&str, Vec<usize>> = HashMap::new();
+            for (v, x) in g.vertices.iter().enumerate() {
+                index.entry(x.name.as_str()).or_default().push(v);
+            }
+            let vertices = |name: &str| index.get(name).map_or(&[][..], |v| v.as_slice());
+            // `pinLoadVertex` / `pinDrvrVertex`: a pin's one vertex, or of a bidirect's two the load's
+            // / the driver's.
+            let load_vertex = |name: &str| vertices(name).iter().copied().find(|&v| !g.vertices[v].is_driver).or_else(|| vertices(name).first().copied());
+            let drvr_vertex = |name: &str| vertices(name).iter().copied().find(|&v| g.vertices[v].is_driver);
+            let wire_fanout = |v: usize| g.out_edges[v].iter().filter(|&&e| matches!(g.edges[e].kind, EdgeKind::Wire)).count();
+            let cell_of = |v: usize| g.vertices[v].cell.clone();
+            let mut viol: Vec<(String, f32)> = setup_ends(ctx, gs, ss, cs)?.into_iter().filter(|p| p.slack < 0.0).map(|p| (p.pin, p.slack)).collect();
+            crate::order::libcxx_sort_by(&mut viol, |a, b| a.1 < b.1).map_err(|e| Stop::refused("RSZ-ABSENT", format!("the move tracker's endpoint sort over {} endpoints falls back to heap sort: not modelled", e.len)))?;
+            let mut top = Vec::with_capacity(viol.len());
+            for (name, slack) in viol {
+                let Some(v) = load_vertex(&name) else { continue };
+                // `vertexWorstSlackPath(vertex, max)`: the fuzzily least slack, the first of equals.
+                let mut worst: Option<&vyges_sta::search::Path> = None;
+                for p in s.paths[v].iter().filter(|p| p.tag.mm == MAX) {
+                    if worst.is_none_or(|w| fuzzy::less(p.required - p.arrival, w.required - w.arrival)) {
+                        worst = Some(p);
+                    }
+                }
+                let Some(worst) = worst else { continue };
+                // `PathExpanded`: from the start (the clock source, for a register's path).
+                let mut expanded = vyges_sta::path_enum::chain(s, v, worst);
+                expanded.reverse();
+                let startpoint = expanded
+                    .iter()
+                    .find(|n| {
+                        let x = &g.vertices[n.vertex];
+                        let lc = x.cell.as_deref().and_then(|c| ctx.libs.link_cell(c));
+                        lc.is_some_and(|c| (!c.sequentials.is_empty() || c.has_seq_bank) && x.port.as_deref().and_then(|p| c.port(p)).is_some_and(|p| p.direction == vyges_sta::liberty::Direction::Output))
+                    })
+                    .or(expanded.first())
+                    .map(|n| g.vertices[n.vertex].name.clone());
+                // The largest arrival step (from 0: a step must be positive).
+                let mut step: Option<(usize, f32)> = None;
+                let mut worst_delay = 0.0f32;
+                for i in 1..expanded.len() {
+                    let d = expanded[i].arrival - expanded[i - 1].arrival;
+                    if d > worst_delay {
+                        worst_delay = d;
+                        step = Some((i, d));
+                    }
+                }
+                let worst_pin = step.map(|(i, d)| {
+                    let pin = &g.vertices[expanded[i].vertex].name;
+                    let label = match cell_of(expanded[i].vertex) {
+                        Some(c) => format!("{pin} ({c})"),
+                        None => pin.clone(),
+                    };
+                    (label, d, load_vertex(pin).map_or(0, wire_fanout))
+                });
+                let path_slacks: Vec<f32> = s.endpoint_path_ends(v, 100, 100).iter().map(|pe| pe.slack).collect();
+                if let Ok(path) = std::env::var("VYGES_RSZ_ENUM_DUMP") {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                        for (k, pe) in s.endpoint_path_ends(v, 100, 100).iter().enumerate() {
+                            let _ = writeln!(f, "next path {} {} {} delay {:.3} slack {:.3}", k + 1, name, if pe.nodes[0].tag.rf == 0 { "^" } else { "v" }, f64::from(pe.arrival()) * 1e9, f64::from(pe.slack) * 1e9);
+                            for n in &pe.nodes {
+                                let _ = writeln!(f, "  {} {} {:.3}", g.vertices[n.vertex].name, if n.tag.rf == 0 { "^" } else { "v" }, f64::from(n.arrival) * 1e9);
+                            }
+                        }
+                    }
+                }
+                top.push(move_tracker::TopEnd { name, slack, startpoint, levels: expanded.len(), worst: worst_pin, path_slacks });
+            }
+            // `trackCriticalPins`, in the set's order: the pins' addresses when the gate supplies
+            // them, else the terminal table's order.
+            let mut critical: Vec<(u64, String, usize, f32)> = Vec::new();
+            for (i, (_, cell)) in netlist.insts.iter().enumerate() {
+                let lib_cell = ctx.libs.link_cell(cell);
+                for port in ctx.master_pins.get(cell).map_or(&[][..], |v| v.as_slice()) {
+                    let name = netlist.pin_name(&vyges_sta::netlist::Conn::Inst(i, port.clone()));
+                    let driver = lib_cell.and_then(|c| c.port(port)).is_some_and(|p| {
+                        matches!(p.direction, vyges_sta::liberty::Direction::Output | vyges_sta::liberty::Direction::Tristate | vyges_sta::liberty::Direction::Bidirect)
+                    });
+                    let Some(dv) = drvr_vertex(&name).filter(|_| driver) else { continue };
+                    if vertices(&name).iter().any(|u| cs[0].contains(u)) {
+                        continue;
+                    }
+                    let mut slack = INF;
+                    for &u in vertices(&name) {
+                        let x = s.slack_of(u, MAX, Some(vyges_sta::liberty::RISE));
+                        if fuzzy::less(x, slack) {
+                            slack = x;
+                        }
+                    }
+                    if move_tracker::ps(slack) < 0.0 {
+                        let id = ids.get(&name).copied().unwrap_or(u64::MAX);
+                        critical.push((id, name, dv, slack));
+                    }
+                }
+            }
+            match ctx.pin_addr.filter(|pa| critical.iter().all(|c| pa.addr(c.0).is_some())) {
+                Some(pa) => critical.sort_by_key(|c| pa.addr(c.0)),
+                None => critical.sort_by_key(|c| c.0),
+            }
+            crate::order::libcxx_sort_by(&mut critical, |a, b| a.3 < b.3).map_err(|e| Stop::refused("RSZ-ABSENT", format!("the move tracker's critical pin sort over {} pins falls back to heap sort: not modelled", e.len)))?;
+            let critical = critical
+                .into_iter()
+                .map(|(_, name, dv, slack)| move_tracker::CriticalPin { cell: cell_of(dv), effort: effort_delays(g, s, dv), fanout: wire_fanout(dv), name, slack })
+                .collect();
+            Ok((top, critical))
+        })
     }
 
     /// The design's pins as `MoveTracker` reads them now (the timer brought up to date first).
@@ -1814,9 +1965,9 @@ impl Repair<'_, '_> {
                     let clock = index[0].get(name.as_str()).is_some_and(|vs| vs.iter().any(|v| cs[0].contains(v)));
                     // A pin on no net has no id, and no path: never kept.
                     let id = ids.get(&name).copied().unwrap_or(u64::MAX);
-                    // RISE only (`RiseFall::rise()->asRiseFallBoth()`). ⚠️ No run yet tells it from
-                    // both transitions (the mutant survives: report_move_tracker's violators' worst
-                    // paths rise); Category 2's per-pin slacks will.
+                    // RISE only (`RiseFall::rise()->asRiseFallBoth()`). The capture's use survives its
+                    // mutant (report_move_tracker's violators' worst paths rise); the same rule in
+                    // Category 2 (`tracker_reports`) is witnessed — its mutant `crit_rise` is killed.
                     let rise_slack = slack(&name, Some(vyges_sta::liberty::RISE));
                     pins.push(move_tracker::DriverPin { id, driver, clock, rise_slack });
                 }
