@@ -1475,10 +1475,17 @@ fn run(job: &Value) -> Result<Value, String> {
                 if a.recover_power {
                     return Err("repair_timing -recover_power: not modelled".into());
                 }
-                // A phase list of LEGACY alone is the default pipeline without LAST_GASP.
-                let legacy_only = a.phases.as_deref().is_some_and(|p| p.split_whitespace().eq(["LEGACY"]));
-                if a.phases.is_some() && !legacy_only {
-                    return Err("repair_timing -phases: not modelled".into());
+                // `-phases`: LEGACY alone is the default pipeline without LAST_GASP; another policy
+                // after the shared preamble is refused there; an empty list or an unknown first
+                // phase is the reference's error, before any line.
+                let plan = a.phases.as_deref().map(rt::phase_plan);
+                match &plan {
+                    Some(rt::PhasePlan::Error { code, line }) if a.setup => {
+                        timing_runs.push(json!({ "lines": [line], "endpoints": 0, "violating_endpoints": 0, "resized": 0, "removed": 0, "inserted": 0, "error": code }));
+                        break;
+                    }
+                    Some(rt::PhasePlan::Other) => return Err("repair_timing -phases: GLOBAL_SIZING, MT1 and MEASURED_VT_SWAP are not modelled".into()),
+                    _ => {}
                 }
                 if !estimated {
                     return Err("repair_timing without estimate_parasitics -placement: not modelled".into());
@@ -1565,7 +1572,10 @@ fn run(job: &Value) -> Result<Value, String> {
                 let mut lines = rt::preamble(&seq, violating.len(), a.repair_tns_end_percent, a.phases.as_deref());
                 // The moves modelled, over one corner or several (each reads the scenes the
                 // reference's does: see the moves), LEGACY and LAST_GASP.
-                let unmodelled = if let Some(m) = seq.iter().find(|m| !matches!(m, rt::Move::SizeUp | rt::Move::Unbuffer | rt::Move::SwapPins | rt::Move::Buffer | rt::Move::Clone | rt::Move::SplitLoad | rt::Move::SizeUpMatch | rt::Move::VtSwap)) {
+                let startpoint_rows = matches!(plan, Some(rt::PhasePlan::LegacyPreamble { startpoints: true }));
+                let unmodelled = if matches!(plan, Some(rt::PhasePlan::LegacyPreamble { .. })) {
+                    Some(format!("repair_timing -phases {}: not modelled", a.phases.as_deref().unwrap_or_default()))
+                } else if let Some(m) = seq.iter().find(|m| !matches!(m, rt::Move::SizeUp | rt::Move::Unbuffer | rt::Move::SwapPins | rt::Move::Buffer | rt::Move::Clone | rt::Move::SplitLoad | rt::Move::SizeUpMatch | rt::Move::VtSwap)) {
                     Some(format!("repair_timing: {} is not modelled", m.name()))
                 } else if a.match_cell_footprint {
                     Some("repair_timing -match_cell_footprint: not modelled".into())
@@ -1578,7 +1588,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 if !hold_only && violating.is_empty() {
                     timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": 0 }));
                 } else if let Some(why) = unmodelled.filter(|_| !hold_only) {
-                    lines.extend(rt::row0(&ends, violating.len(), &violating_starts, time_scale));
+                    lines.extend(rt::row0_with(&ends, violating.len(), &violating_starts, time_scale, startpoint_rows));
                     timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len() }));
                     timing_stop = Some(why);
                     break;
@@ -1914,8 +1924,10 @@ REPAIR_TIMING:
   ends it with RSZ-0050 / RSZ-0060 (status error).
   status repaired (the design changed), unrepaired (violations, nothing kept), up_to_date or
   error. One clock, ideal or propagated, with its I/O delays. -setup and -hold together (or
-  neither): the setup repair, then refused. Refused before the lines: -phases other than
-  LEGACY, -recover_power, several corners, VT libraries, a latch, a virtual clock, clock
+  neither): the setup repair, then refused. -phases other than LEGACY: refused after the
+  preamble and row 0 (an empty list or an unknown first phase is the command's own error;
+  GLOBAL_SIZING, MT1, MEASURED_VT_SWAP refused before the lines). Refused before the lines:
+  -recover_power, several corners, VT libraries, a latch, a virtual clock, clock
   uncertainty / latency / transition, derates, path exceptions; refused during the repair:
   -setup with -max_utilization, more than one repair per pass.
 
@@ -1963,7 +1975,7 @@ const DESCRIBE: &str = r#"{
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "status is one of repaired, up_to_date, vacuous, refused or error. repaired means the design changed (buffers inserted or drivers resized); up_to_date means drivers were checked and none needed a change (nets_checked says how many; for a job with buffer_ports and no repair_design, ports_checked); vacuous means nothing was checked and is NOT a pass. The declared assertion passes on repaired or up_to_date. Exit status is 0 for repaired and up_to_date, 2 for vacuous and for error, 3 for refused.",
     "Modelled: placement parasitics, one or more corners, flat and hierarchical netlists, the default buffer selection, the SDC constraints the usage lists, buffer_ports before the repair (the estimate it leaves carried into it). Refused rather than guessed: global-route parasitics, the early sizing round, footprint matching, rerouting, any other netlist edit between the estimate and the repair, buffer_ports on a hierarchical design, a tristate driver or a bidirect pin on a net, and any other timing-affecting SDC command.",
-    "repair_timing -setup is modelled for every move of the default sequence in the LEGACY phase and LAST_GASP, and repair_timing -hold alone in full (ending with RSZ-0050 / RSZ-0060 as the command does): every progress row, the summary and the design left, for one ideal or propagated clock, over one corner or several; -setup with -hold runs the setup part and is refused after it; other -phases, VT libraries, latches, virtual clocks, clock uncertainty, latency or transition, derates and exceptions are refused before the lines."
+    "repair_timing -setup is modelled for every move of the default sequence in the LEGACY phase and LAST_GASP, and repair_timing -hold alone in full (ending with RSZ-0050 / RSZ-0060 as the command does): every progress row, the summary and the design left, for one ideal or propagated clock, over one corner or several; -setup with -hold runs the setup part and is refused after it; other -phases are refused after the preamble (an empty list or an unknown first phase is the command's error), VT libraries, latches, virtual clocks, clock uncertainty, latency or transition, derates and exceptions are refused before the lines."
   ],
   "invocation": {
     "args_template": ["repair_design", "{job}"],

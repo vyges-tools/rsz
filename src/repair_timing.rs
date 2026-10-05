@@ -319,6 +319,42 @@ pub fn preamble(seq: &[Move], violating: usize, repair_tns_end_percent: f64, pha
     lines
 }
 
+/// The phase names `Optimizer::makePolicyForPhase` knows, as its errors list them (LEGACY_MT,
+/// MT1 and MEASURED_VT_SWAP are accepted but not listed).
+const VALID_PHASES: &str = "LEGACY, WNS, WNS_PATH, WNS_CONE, TNS, ENDPOINT_FANIN, STARTPOINT_FANOUT, LAST_GASP, CRIT_VT_SWAP, REROUTE, GLOBAL_SIZING";
+
+/// What `Optimizer::run` does with a `-phases` / `-policy` list, as far as it is modelled.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PhasePlan {
+    /// The command errors before printing anything: RSZ-0223 (no phase) or RSZ-0217 (the FIRST
+    /// phase unknown — a later one is only made, and fails, after the phases before it ran).
+    Error { code: &'static str, line: String },
+    /// `LEGACY` alone: the default pipeline without LAST_GASP (modelled).
+    Legacy,
+    /// The first phase starts with `SetupLegacyBase::start` — the shared preamble and row 0 —
+    /// then runs a policy that is not modelled. `startpoints`: STARTPOINT_FANOUT, whose rows
+    /// name the worst STARTPOINT (`printProgress(.., use_startpoint_metrics)`).
+    LegacyPreamble { startpoints: bool },
+    /// The first phase is GLOBAL_SIZING, MT1 or MEASURED_VT_SWAP: another preamble, not modelled.
+    Other,
+}
+
+/// `sta::parseTokens(phases)` (space and tab delimited), then the first phase's policy.
+pub fn phase_plan(phases: &str) -> PhasePlan {
+    let names: Vec<&str> = phases.split([' ', '\t']).filter(|s| !s.is_empty()).collect();
+    let Some(&first) = names.first() else {
+        return PhasePlan::Error { code: "RSZ-0223", line: format!("[ERROR RSZ-0223] No phase names specified. Valid phase names are: {VALID_PHASES}") };
+    };
+    if names == ["LEGACY"] {
+        return PhasePlan::Legacy;
+    }
+    match first {
+        "LEGACY" | "LEGACY_MT" | "WNS" | "WNS_PATH" | "WNS_CONE" | "TNS" | "ENDPOINT_FANIN" | "STARTPOINT_FANOUT" | "LAST_GASP" | "CRIT_VT_SWAP" | "REROUTE" => PhasePlan::LegacyPreamble { startpoints: first == "STARTPOINT_FANOUT" },
+        "MT1" | "MEASURED_VT_SWAP" | "GLOBAL_SIZING" => PhasePlan::Other,
+        _ => PhasePlan::Error { code: "RSZ-0217", line: format!("[ERROR RSZ-0217] Unknown phase name '{first}'. Valid phase names are: {VALID_PHASES}") },
+    }
+}
+
 /// `dbNetwork::stripParentPrefix`: the name after the last `/` that is not escaped (`\\/` inside a
 /// Verilog escaped identifier), else the whole name.
 pub fn strip_parent_prefix(name: &str) -> &str {
@@ -463,7 +499,14 @@ pub fn progress_row(r: &Row<'_>, time_scale: f32) -> String {
 
 /// The progress header and row 0 (`printProgress(0, …, '*')`): nothing moved yet, area unchanged.
 pub fn row0(endpoints: &[Point], violating_endpoints: usize, violating_startpoints: &[Point], time_scale: f32) -> Vec<String> {
-    let (wns, worst) = worst_slack(endpoints);
+    row0_with(endpoints, violating_endpoints, violating_startpoints, time_scale, false)
+}
+
+/// [`row0`]; with `use_startpoints`, the Worst column is `getWorstPin(true)`: the first violating
+/// startpoint of least slack (they are stable-sorted by slack; a strict `<` keeps the first).
+pub fn row0_with(endpoints: &[Point], violating_endpoints: usize, violating_startpoints: &[Point], time_scale: f32, use_startpoints: bool) -> Vec<String> {
+    let (wns, worst_end) = worst_slack(endpoints);
+    let worst = if use_startpoints { violating_startpoints.first() } else { worst_end };
     let mut lines = progress_header();
     lines.push(progress_row(
         &Row {
@@ -616,5 +659,21 @@ mod tests {
         assert_eq!(v.iter().map(|x| x.pin.as_str()).collect::<Vec<_>>(), ["b/D", "c/D", "a/D"]);
         let row = row0(&ends, 3, &[], 1e-9);
         assert_eq!(row[3], "       0* |       0 |       0 |        0 |      0 |     0 |    +0.0% |   -0.300 |        0.0 |       -0.7 |      3 | b/D");
+    }
+
+    /// Rules (`Optimizer::run`): an empty list errors with RSZ-0223; an unknown FIRST phase with
+    /// RSZ-0217 (text from the reference's repair_setup_invalid_phase.ok); tokens split on space
+    /// and tab only.
+    #[test]
+    fn phase_plans() {
+        assert!(matches!(phase_plan(" "), PhasePlan::Error { code: "RSZ-0223", .. }));
+        let PhasePlan::Error { line, .. } = phase_plan("BAD_PHASE WNS") else { panic!() };
+        assert_eq!(line, "[ERROR RSZ-0217] Unknown phase name 'BAD_PHASE'. Valid phase names are: LEGACY, WNS, WNS_PATH, WNS_CONE, TNS, ENDPOINT_FANIN, STARTPOINT_FANOUT, LAST_GASP, CRIT_VT_SWAP, REROUTE, GLOBAL_SIZING");
+        assert_eq!(phase_plan("WNS_PATH BAD_PHASE LAST_GASP"), PhasePlan::LegacyPreamble { startpoints: false });
+        assert_eq!(phase_plan("LEGACY"), PhasePlan::Legacy);
+        assert_eq!(phase_plan("\tLEGACY "), PhasePlan::Legacy);
+        assert_eq!(phase_plan("GLOBAL_SIZING"), PhasePlan::Other);
+        assert_eq!(phase_plan("WNS LEGACY LAST_GASP"), PhasePlan::LegacyPreamble { startpoints: false });
+        assert_eq!(phase_plan("STARTPOINT_FANOUT"), PhasePlan::LegacyPreamble { startpoints: true });
     }
 }
