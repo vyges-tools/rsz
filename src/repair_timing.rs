@@ -339,6 +339,23 @@ pub enum PhasePlan {
     Other,
 }
 
+/// `Optimizer::run`'s phase list: `-phases` split as `sta::parseTokens` does (space and tab),
+/// else `LEGACY LAST_GASP`; then `appendImplicitCritVtSwapForLegacyPhases` — a CRIT_VT_SWAP
+/// after a list with a legacy-compatible phase and none of its own.
+pub fn phase_names(phases: Option<&str>) -> Vec<String> {
+    let mut names: Vec<String> = phases.unwrap_or("LEGACY LAST_GASP").split([' ', '\t']).filter(|s| !s.is_empty()).map(String::from).collect();
+    let legacy_compatible = |n: &str| matches!(n, "LEGACY" | "LEGACY_MT" | "WNS" | "WNS_PATH" | "WNS_CONE" | "TNS" | "ENDPOINT_FANIN" | "STARTPOINT_FANOUT" | "LAST_GASP");
+    if names.iter().any(|n| legacy_compatible(n)) && !names.iter().any(|n| n == "CRIT_VT_SWAP") {
+        names.push("CRIT_VT_SWAP".into());
+    }
+    names
+}
+
+/// Whether every phase of the list is modelled.
+pub fn phases_modelled(phases: &str) -> bool {
+    phase_names(Some(phases)).iter().all(|n| matches!(n.as_str(), "LEGACY" | "WNS" | "WNS_PATH" | "TNS" | "ENDPOINT_FANIN" | "STARTPOINT_FANOUT" | "LAST_GASP" | "CRIT_VT_SWAP"))
+}
+
 /// `sta::parseTokens(phases)` (space and tab delimited), then the first phase's policy.
 pub fn phase_plan(phases: &str) -> PhasePlan {
     let names: Vec<&str> = phases.split([' ', '\t']).filter(|s| !s.is_empty()).collect();
@@ -675,5 +692,19 @@ mod tests {
         assert_eq!(phase_plan("GLOBAL_SIZING"), PhasePlan::Other);
         assert_eq!(phase_plan("WNS LEGACY LAST_GASP"), PhasePlan::LegacyPreamble { startpoints: false });
         assert_eq!(phase_plan("STARTPOINT_FANOUT"), PhasePlan::LegacyPreamble { startpoints: true });
+    }
+
+    /// Rule (`appendImplicitCritVtSwapForLegacyPhases`): the default list, and any list with a
+    /// legacy-compatible phase, ends with CRIT_VT_SWAP unless it names one.
+    #[test]
+    fn phase_lists() {
+        assert_eq!(phase_names(None), vec!["LEGACY", "LAST_GASP", "CRIT_VT_SWAP"]);
+        assert_eq!(phase_names(Some("WNS LEGACY LAST_GASP")), vec!["WNS", "LEGACY", "LAST_GASP", "CRIT_VT_SWAP"]);
+        assert_eq!(phase_names(Some("CRIT_VT_SWAP WNS")), vec!["CRIT_VT_SWAP", "WNS"]);
+        assert_eq!(phase_names(Some("GLOBAL_SIZING")), vec!["GLOBAL_SIZING"]);
+        assert!(phases_modelled("WNS LEGACY LAST_GASP"));
+        assert!(phases_modelled("TNS"));
+        assert!(phases_modelled("ENDPOINT_FANIN STARTPOINT_FANOUT"));
+        assert!(!phases_modelled("WNS_CONE"));
     }
 }

@@ -48,7 +48,9 @@ const INC_FIX_RATE_THRESHOLD: f32 = 0.0001;
 /// `MinMax::min()->initValue()`.
 const INF: f32 = 1e30;
 /// The LEGACY phase is phase 0: its marker is the first of `"*+^&@!-="`.
-const PHASE: &str = "LEGACY*";
+/// `phaseMarkerForIndex`: the marker each phase's rows and debug lines carry, by its index in
+/// the phase list.
+const PHASE_MARKERS: [char; 8] = ['*', '+', '^', '&', '@', '!', '-', '='];
 
 /// What the repair reads besides the design.
 pub struct Ctx<'a> {
@@ -1085,7 +1087,7 @@ struct Repair<'c, 'd> {
     design: &'d mut dyn SetupDesign,
     timing: Snapshot,
     /// The phase's label with its marker (`LEGACY*`, `LAST_GASP+`) and its move sequence.
-    phase: &'static str,
+    phase: String,
     sequence: Vec<Move>,
     /// The timer's state across the repair ([`snapshot`]).
     timer: Timer,
@@ -1109,6 +1111,19 @@ struct Repair<'c, 'd> {
     collector_violating: usize,
     /// `MoveTracker`'s capture, with `RSZ move_tracker` at level 1.
     tracker: Option<move_tracker::Initial>,
+    /// The collector's `wns_visited_endpoints_` (it is shared by every phase): a TNS phase skips
+    /// what a WNS phase worked on.
+    wns_visited: BTreeSet<String>,
+    /// The collector's `violating_endpoints_` (pin, slack) as `collectViolatingEndpoints` last
+    /// found them — `repairsPerPass` reads the first and last.
+    collector_ends: Vec<(String, f32)>,
+    /// The collector's `violating_startpoints_` as a printed row last collected them (StTNS of a
+    /// directional pass reads them with their slacks now).
+    collector_starts: Vec<String>,
+    /// The collector's `current_endpoint_` (`useWorstEndpoint`, `setToEndpoint`).
+    current_endpoint: Option<String>,
+    /// Rows name the worst startpoint (`printProgress(.., use_startpoint_metrics)`).
+    startpoint_rows: bool,
 }
 
 /// What `Resizer::swapPins` did.
@@ -1670,7 +1685,7 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
         args,
         design,
         timing,
-        phase: PHASE,
+        phase: format!("LEGACY{}", PHASE_MARKERS[0]),
         sequence: ctx.sequence.to_vec(),
         timer,
         committer: Committer::default(),
@@ -1689,19 +1704,50 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
         max_viol: 0.0,
         collector_violating: 0,
         tracker: None,
+        wns_visited: BTreeSet::new(),
+        collector_ends: Vec::new(),
+        collector_starts: Vec::new(),
+        current_endpoint: None,
+        startpoint_rows: false,
     };
     // `SetupLegacyBase::start`: with the move tracker on, `captureInitialSlackDistribution` (and
     // `captureOriginalEndpointSlack`, read only by the level-2 profiles) after RSZ-0099.
     if r.tracker_level() >= 1 {
         r.capture_initial_slack_distribution()?;
     }
-    r.iterate()?;
-    // The phases after LEGACY: LAST_GASP unless skipped (or -phases LEGACY), then the implicit
-    // CRIT_VT_SWAP, which finds no VT cells (a VT library is refused) and does nothing — its
-    // `printTrackerPhaseSummary` asks for no endpoint profile, and no move was tracked.
-    if !args.skip_last_gasp && args.phases.is_none() {
-        r.last_gasp()?;
-        r.print_tracker_phase_summary("LAST_GASP Phase Endpoint Profiler");
+    // `prepareForPhasePipeline`: the collector's violating endpoints (the Viol column until a
+    // phase collects again) and the endpoints a phase may repair.
+    let preamble_ends = collect_violating(&r.timing.ends, ctx.margin);
+    r.collector_violating = preamble_ends.len();
+    r.collector_ends = preamble_ends.iter().map(|p| (p.pin.clone(), p.slack)).collect();
+    // `RepairTargetCollector::init` → `setToEndpoint(0)`: the worst violating endpoint.
+    r.current_endpoint = preamble_ends.first().map(|p| p.pin.clone());
+    r.max_end_count = ((r.collector_violating as f64 * args.repair_tns_end_percent) as i64).max(1);
+    // `Optimizer::run`: each phase in turn, its rows and debug lines marked by its index.
+    for (i, name) in crate::repair_timing::phase_names(args.phases.as_deref()).iter().enumerate() {
+        let Some(&marker) = PHASE_MARKERS.get(i) else {
+            return Err(Stop::refused("RSZ-ABSENT", "more than 8 phases: not modelled".into()));
+        };
+        match name.as_str() {
+            "LEGACY" => {
+                r.phase = format!("LEGACY{marker}");
+                r.sequence = ctx.sequence.to_vec();
+                r.iterate()?;
+            }
+            "WNS" | "WNS_PATH" => r.wns_phase(marker)?,
+            "TNS" => r.tns_phase(marker)?,
+            "ENDPOINT_FANIN" => r.directional_phase(marker, false)?,
+            "STARTPOINT_FANOUT" => r.directional_phase(marker, true)?,
+            "LAST_GASP" => {
+                if !args.skip_last_gasp {
+                    r.last_gasp(marker)?;
+                    r.print_tracker_phase_summary("LAST_GASP Phase Endpoint Profiler");
+                }
+            }
+            // No VT cells (a VT library is refused): nothing to swap, no endpoint profile asked.
+            "CRIT_VT_SWAP" => {}
+            other => return Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -phases: {other} is not modelled"))),
+        }
     }
     r.finalize_and_report()?;
     r.out.resized = r.committer.committed(Move::SizeUp);
@@ -1727,6 +1773,16 @@ impl Repair<'_, '_> {
         delay_as_string(v, digits, self.ctx.time_scale)
     }
 
+    /// The timer brought up to date with the edits, the parasitics left as estimated (between two
+    /// moves of one pass). Witness: re-estimating here moves a removed buffer's estimated slew by
+    /// one ulp on the directional phases' second pass.
+    fn retime_without_estimate(&mut self) -> Result<(), Stop> {
+        let edits = self.design.take_timer_edits();
+        self.timer.trace_at = self.out.trace.len();
+        self.timing = snapshot(self.ctx, self.design.as_design(), &[], &mut self.timer, edits)?;
+        Ok(())
+    }
+
     /// The timer again over the design (`updateParasitics`, `findRequireds`), with the worst path
     /// of `want` ready.
     fn retime(&mut self, want: &[String]) -> Result<(), Stop> {
@@ -1745,6 +1801,740 @@ impl Repair<'_, '_> {
         }
         self.print_tracker_phase_summary("LEGACY Phase Endpoint Profiler");
         Ok(())
+    }
+
+    /// `SetupWnsPolicy::iterate` (WNS / WNS_PATH): the move sequence rebuilt, `repairSetupWns`
+    /// over the worst path with its violators sorted by load delay, the phase's tracker summary.
+    fn wns_phase(&mut self, marker: char) -> Result<(), Stop> {
+        if self.ctx.libs.scene_count() > 1 {
+            return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases WNS over several corners: not modelled".into()));
+        }
+        self.phase = format!("WNS{marker}");
+        self.sequence = self.ctx.sequence.to_vec();
+        self.repair_setup_wns()?;
+        self.print_tracker_phase_summary("WNS_PATH Phase Endpoint Profiler");
+        Ok(())
+    }
+
+    /// `SetupWnsPolicy::repairSetupWns`: follow the design's worst endpoint, one pass at a time —
+    /// a pass collects the worst path's violators and repairs the first it can; a pass that is not
+    /// better (WNS, else endpoint slack or TNS) is kept within the endpoint's decreasing-slack limit
+    /// (6, grown by 5 to 25 while passes succeed), then the journal is restored and the moves it
+    /// made are rejected for the endpoint. Each endpoint is repaired at most `-max_passes` times.
+    fn repair_setup_wns(&mut self) -> Result<(), Stop> {
+        const MAX_NO_PROGRESS: i64 = 4;
+        const INITIAL_DECREASING_SLACK_MAX_PASSES: i64 = 6;
+        const PASS_LIMIT_INCREMENT: i64 = 5;
+        const MAX_ADAPTIVE_LIMIT: i64 = 25;
+        let phase = self.phase.clone();
+        let margin = self.ctx.margin;
+        let mut overall_no_progress = 0i64;
+        let mut rejected: HashMap<String, Vec<Move>> = HashMap::new();
+        let mut pass_counts: HashMap<String, i64> = HashMap::new();
+        let mut visited_this_round: BTreeSet<String> = BTreeSet::new();
+        let mut decreasing_endpoints: BTreeSet<String> = BTreeSet::new();
+        let mut decreasing_counts: HashMap<String, i64> = HashMap::new();
+        let mut pass_limits: HashMap<String, i64> = HashMap::new();
+        let mut any_improvement = false;
+        let mut total_decreasing = 0i64;
+        let mut fix_rate_threshold = INC_FIX_RATE_THRESHOLD;
+        let (mut target_end_slack, mut target_worst_slack, mut target_tns) = (0.0f32, 0.0f32, 0.0f32);
+        let (_, worst) = self.timing.worst();
+        let Some(mut current) = worst else {
+            self.debug("repair_setup", 1, format!("{phase} Phase: No worst endpoint found"));
+            return Ok(());
+        };
+        self.debug("repair_setup", 1, format!("{phase} Phase: Focusing on worst slack path..."));
+        self.print_progress(self.opto_iteration, false)?;
+        self.wns_visited.insert(current.clone());
+        self.current_endpoint = Some(current.clone());
+        pass_limits.insert(current.clone(), INITIAL_DECREASING_SLACK_MAX_PASSES);
+        decreasing_counts.insert(current.clone(), 0);
+        loop {
+            let (worst_slack, worst) = self.timing.worst();
+            let Some(worst_pin) = worst else { break };
+            if visited_this_round.contains(&worst_pin) {
+                if !any_improvement {
+                    break;
+                }
+                visited_this_round.clear();
+                any_improvement = false;
+                continue;
+            }
+            let mut should_switch = false;
+            if visited_this_round.contains(&current) {
+                should_switch = true;
+            } else if current != worst_pin {
+                let limit = pass_limits.entry(current.clone()).or_insert(0);
+                if *limit == 0 {
+                    *limit = INITIAL_DECREASING_SLACK_MAX_PASSES;
+                }
+                let limit = *limit;
+                if *decreasing_counts.entry(current.clone()).or_insert(0) >= limit {
+                    should_switch = true;
+                }
+            }
+            if should_switch && current != worst_pin {
+                current = worst_pin.clone();
+                self.current_endpoint = Some(current.clone());
+                self.wns_visited.insert(worst_pin.clone());
+                rejected.clear();
+                pass_limits.entry(worst_pin.clone()).or_insert(INITIAL_DECREASING_SLACK_MAX_PASSES);
+                decreasing_counts.entry(worst_pin.clone()).or_insert(0);
+            }
+            let end = current.clone();
+            pass_counts.entry(end.clone()).or_insert(0);
+            if pass_counts.len() as i64 > self.max_end_count {
+                self.debug("repair_setup", 1, format!("{phase} Phase: Hit maximum endpoint repairs of {}", self.max_end_count));
+                break;
+            }
+            if pass_counts[&end] >= self.args.max_passes {
+                self.debug("repair_setup", 1, format!("{phase} Phase: WNS endpoint {end} exceeded pass limit {}, exiting", self.args.max_passes));
+                break;
+            }
+            // `fuzzyGreaterEqual`: not fuzzily less. (No run has WNS fuzzily equal to the margin:
+            // its mutant to a strict `>` survives.)
+            if !fuzzy::less(worst_slack, margin) {
+                let line = format!("{phase} Phase: WNS {} meets slack margin {}, done", self.ds(worst_slack, 3), self.ds(margin, 3));
+                self.debug("repair_setup", 1, line);
+                self.print_progress(self.opto_iteration, true)?;
+                break;
+            }
+            let label = format!("WNS_PATH{}", phase.chars().last().unwrap_or('*'));
+            if self.terminate_progress_with(&label, &mut fix_rate_threshold, 0, 1) {
+                overall_no_progress += 1;
+                if overall_no_progress >= MAX_NO_PROGRESS {
+                    self.debug("repair_setup", 1, format!("{phase} Phase: No TNS progress for {overall_no_progress} cycles, exiting"));
+                    break;
+                }
+            }
+            if self.opto_iteration % OPTO_SMALL_INTERVAL == 0 {
+                overall_no_progress = 0;
+            }
+            let (prev_end_slack, prev_worst_slack, prev_tns) = if total_decreasing == 0 {
+                let p = (self.timing.slack(&current), worst_slack, self.timing.tns());
+                self.begin_journal()?;
+                p
+            } else {
+                (target_end_slack, target_worst_slack, target_tns)
+            };
+            self.opto_iteration += 1;
+            if self.args.verbose || self.opto_iteration % PRINT_INTERVAL == 0 {
+                self.print_progress(self.opto_iteration, false)?;
+            }
+            let Some(view) = self.focus_view(&current)? else { break };
+            let pins = self.collect_violators(&current, &view)?;
+            let (changed, chosen) = self.repair_pins(Some(&view), &pins, &rejected, self.args.max_repairs_per_pass, total_decreasing > 0)?;
+            if !changed {
+                if total_decreasing > 0 {
+                    total_decreasing = 0;
+                    for d in &decreasing_endpoints {
+                        decreasing_counts.insert(d.clone(), 0);
+                    }
+                    decreasing_endpoints.clear();
+                    self.restore_journal(std::slice::from_ref(&current))?;
+                } else {
+                    self.commit_journal()?;
+                }
+                *pass_counts.get_mut(&end).expect("inserted") += 1;
+                visited_this_round.insert(end);
+                continue;
+            }
+            // `updateParasitics`, `findRequireds`.
+            self.retime(std::slice::from_ref(&current))?;
+            let end_slack = self.timing.slack(&current);
+            let (new_wns, _) = self.timing.worst();
+            let new_tns = self.timing.tns();
+            let better = fuzzy::greater(new_wns, prev_worst_slack) || (fuzzy::equal(new_wns, prev_worst_slack) && (fuzzy::greater(end_slack, prev_end_slack) || fuzzy::greater(new_tns, prev_tns)));
+            *pass_counts.get_mut(&end).expect("inserted") += 1;
+            if better {
+                any_improvement = true;
+                total_decreasing = 0;
+                for d in &decreasing_endpoints {
+                    decreasing_counts.insert(d.clone(), 0);
+                }
+                decreasing_endpoints.clear();
+                let successful = pass_counts[&end] - *decreasing_counts.entry(end.clone()).or_insert(0);
+                let mut limit = *pass_limits.entry(end.clone()).or_insert(0);
+                if limit == 0 {
+                    limit = INITIAL_DECREASING_SLACK_MAX_PASSES;
+                }
+                if pass_counts[&end] >= limit && successful > limit / 2 && limit < MAX_ADAPTIVE_LIMIT {
+                    *pass_limits.get_mut(&end).expect("inserted") += PASS_LIMIT_INCREMENT;
+                }
+                self.commit_journal()?;
+            } else {
+                if total_decreasing == 0 {
+                    (target_end_slack, target_worst_slack, target_tns) = (prev_end_slack, prev_worst_slack, prev_tns);
+                }
+                total_decreasing += 1;
+                decreasing_endpoints.insert(end.clone());
+                *decreasing_counts.entry(end.clone()).or_insert(0) += 1;
+                let limit = pass_limits.entry(end.clone()).or_insert(0);
+                if *limit == 0 {
+                    *limit = INITIAL_DECREASING_SLACK_MAX_PASSES;
+                }
+                let limit = *limit;
+                if decreasing_counts[&end] > limit {
+                    total_decreasing = 0;
+                    for d in &decreasing_endpoints {
+                        decreasing_counts.insert(d.clone(), 0);
+                    }
+                    decreasing_endpoints.clear();
+                    visited_this_round.insert(end.clone());
+                    self.restore_journal(std::slice::from_ref(&current))?;
+                    for (pin, kind) in chosen {
+                        let r = rejected.entry(pin).or_default();
+                        if !r.contains(&kind) {
+                            r.push(kind);
+                        }
+                    }
+                }
+            }
+        }
+        self.print_progress(self.opto_iteration, true)?;
+        let (wns, _) = self.timing.worst();
+        let tns = self.timing.tns();
+        let line = format!("{phase} Phase complete. WNS: {}, TNS: {}", self.ds(wns, 3), self.ds(tns, 1));
+        self.debug("repair_setup", 1, line);
+        Ok(())
+    }
+
+    /// `SetupTnsPolicy::iterate`: the move sequence rebuilt, `repairSetupTns` over every
+    /// violating endpoint but the worst, the phase's tracker summary.
+    fn tns_phase(&mut self, marker: char) -> Result<(), Stop> {
+        if self.ctx.libs.scene_count() > 1 {
+            return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases TNS over several corners: not modelled".into()));
+        }
+        self.phase = format!("TNS{marker}");
+        self.sequence = self.ctx.sequence.to_vec();
+        self.repair_setup_tns()?;
+        self.print_tracker_phase_summary("TNS Phase Endpoint Profiler");
+        Ok(())
+    }
+
+    /// `SetupTnsPolicy::repairSetupTns`: the violating endpoints in the collector's order from the
+    /// SECOND (the worst is WNS's), each not yet met and not worked on by a WNS phase, for up to
+    /// `-max_passes` passes under its own journal — a better pass (WNS, else the endpoint's slack)
+    /// is committed and a new journal opened; past the decreasing-slack limit the journal is
+    /// restored and the pass's moves rejected for the endpoint. A row after each endpoint when
+    /// verbose, after the first, and every tenth.
+    fn repair_setup_tns(&mut self) -> Result<(), Stop> {
+        const INITIAL_DECREASING_SLACK_MAX_PASSES: i64 = 6;
+        const PASS_LIMIT_INCREMENT: i64 = 5;
+        const MAX_ADAPTIVE_LIMIT: i64 = 25;
+        let phase = self.phase.clone();
+        let margin = self.ctx.margin;
+        self.debug("repair_setup", 1, format!("{phase} Phase: Focusing on all violating endpoints..."));
+        self.print_progress(self.opto_iteration, false)?;
+        let (mut prev_global_wns, _) = self.timing.worst();
+        // `collectViolatingEndpoints`.
+        let violating_ends = collect_violating(&self.timing.ends, margin);
+        self.collector_violating = violating_ends.len();
+        self.collector_ends = violating_ends.iter().map(|p| (p.pin.clone(), p.slack)).collect();
+        if violating_ends.is_empty() {
+            self.debug("repair_setup", 1, format!("{phase} Phase: No violating endpoints, exiting"));
+            return Ok(());
+        }
+        self.debug("repair_setup", 1, format!("{phase} Phase: Processing {} violating endpoints (skipping worst endpoint)", violating_ends.len()));
+        let mut pass_limits: HashMap<String, i64> = HashMap::new();
+        for (endpoint_index, ve) in violating_ends.iter().enumerate().skip(1) {
+            if endpoint_index as i64 >= self.max_end_count {
+                self.debug("repair_setup", 1, format!("{phase} Phase: Hit maximum endpoint repairs of {}", self.max_end_count));
+                break;
+            }
+            let end = ve.pin.clone();
+            // `setToEndpoint`.
+            self.current_endpoint = Some(end.clone());
+            let mut endpoint_slack = self.timing.slack(&end);
+            if !fuzzy::less(endpoint_slack, margin) || self.wns_visited.contains(&end) {
+                continue;
+            }
+            let line = format!("{phase} Phase: Working on endpoint {end} (index {endpoint_index}), slack = {}", self.ds(endpoint_slack, 3));
+            self.debug("repair_setup", 1, line);
+            let mut rejected: HashMap<String, Vec<Move>> = HashMap::new();
+            let mut current_limit = *pass_limits.entry(end.clone()).or_insert(INITIAL_DECREASING_SLACK_MAX_PASSES);
+            let mut pass = 1i64;
+            let mut decreasing = 0i64;
+            let mut successful = 0i64;
+            let mut force_single = false;
+            let mut prev_endpoint_slack = endpoint_slack;
+            self.begin_journal()?;
+            let mut journal_open = true;
+            while pass <= self.args.max_passes {
+                let Some(view) = self.focus_view(&end)? else { break };
+                let pins = self.collect_violators(&end, &view)?;
+                let (changed, chosen) = self.repair_pins(Some(&view), &pins, &rejected, self.args.max_repairs_per_pass, force_single)?;
+                if !changed {
+                    if decreasing > current_limit {
+                        self.restore_journal(std::slice::from_ref(&end))?;
+                    } else {
+                        self.commit_journal()?;
+                    }
+                    journal_open = false;
+                    break;
+                }
+                self.retime(std::slice::from_ref(&end))?;
+                endpoint_slack = self.timing.slack(&end);
+                let (global_wns, _) = self.timing.worst();
+                let better = fuzzy::greater(global_wns, prev_global_wns) || (fuzzy::equal(global_wns, prev_global_wns) && fuzzy::greater(endpoint_slack, prev_endpoint_slack));
+                if better {
+                    prev_global_wns = global_wns;
+                    if !fuzzy::less(endpoint_slack, margin) {
+                        self.commit_journal()?;
+                        journal_open = false;
+                        break;
+                    }
+                    prev_endpoint_slack = endpoint_slack;
+                    decreasing = 0;
+                    force_single = false;
+                    successful += 1;
+                    if pass >= current_limit && successful > current_limit / 2 && current_limit < MAX_ADAPTIVE_LIMIT {
+                        let l = pass_limits.get_mut(&end).expect("inserted");
+                        *l += PASS_LIMIT_INCREMENT;
+                        current_limit = *l;
+                    }
+                    self.commit_journal()?;
+                    self.begin_journal()?;
+                } else {
+                    force_single = true;
+                    decreasing += 1;
+                    if decreasing > current_limit {
+                        self.restore_journal(std::slice::from_ref(&end))?;
+                        journal_open = false;
+                        for (pin, kind) in chosen {
+                            let r = rejected.entry(pin).or_default();
+                            if !r.contains(&kind) {
+                                r.push(kind);
+                            }
+                        }
+                        break;
+                    }
+                }
+                pass += 1;
+            }
+            if journal_open {
+                self.commit_journal()?;
+            }
+            self.opto_iteration += 1;
+            if self.args.verbose || endpoint_index == 1 || self.opto_iteration % PRINT_INTERVAL == 0 {
+                self.print_progress(self.opto_iteration, false)?;
+            }
+        }
+        self.print_progress(self.opto_iteration, true)?;
+        let (wns, _) = self.timing.worst();
+        let tns = self.timing.tns();
+        let line = format!("{phase} Phase complete. WNS: {}, TNS: {}", self.ds(wns, 3), self.ds(tns, 1));
+        self.debug("repair_setup", 1, line);
+        Ok(())
+    }
+
+    /// `SetupDirectionalPolicy::iterate` (ENDPOINT_FANIN, or STARTPOINT_FANOUT with
+    /// `use_starts`): the move sequence rebuilt, `repairSetupDirectional`, the phase's tracker
+    /// summary.
+    fn directional_phase(&mut self, marker: char, use_starts: bool) -> Result<(), Stop> {
+        if self.ctx.libs.scene_count() > 1 {
+            return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases ENDPOINT_FANIN / STARTPOINT_FANOUT over several corners: not modelled".into()));
+        }
+        let name = if use_starts { "STARTPOINT_FANOUT" } else { "ENDPOINT_FANIN" };
+        self.phase = format!("{name}{marker}");
+        self.sequence = self.ctx.sequence.to_vec();
+        self.startpoint_rows = use_starts;
+        let r = self.repair_setup_directional(use_starts);
+        self.startpoint_rows = false;
+        r?;
+        self.print_tracker_phase_summary(if use_starts { "STARTPOINT_FANOUT Phase Startpoint Profiler" } else { "ENDPOINT_FANIN Phase Endpoint Profiler" });
+        Ok(())
+    }
+
+    /// `SetupDirectionalPolicy::repairSetupDirectional`: each violating point (endpoints, or
+    /// startpoints) in the collector's order, refined over three thresholds — the point's slack
+    /// plus 20%, 50%, 100% of its magnitude — each pass under a journal: the cone's pins worse than
+    /// the threshold (fanin of an endpoint, fanout of a startpoint) sorted by load delay, repaired
+    /// up to their count per pass; kept when better (WNS, else the point's slack or the focused
+    /// TNS with neither TNS worse), else restored and its moves rejected for the point.
+    fn repair_setup_directional(&mut self, use_starts: bool) -> Result<(), Stop> {
+        const MARGIN_PERCENTAGES: [f32; 3] = [0.20, 0.50, 1.00];
+        const DIMINISHING_RETURNS: f32 = 1e-11;
+        let phase = self.phase.clone();
+        let margin = self.ctx.margin;
+        let (point_type, point_cap) = if use_starts { ("startpoint", "Startpoint") } else { ("endpoint", "Endpoint") };
+        self.debug("repair_setup", 1, format!("{phase} Phase: Iterative threshold refinement..."));
+        // `collectViolatingPoints`.
+        let points: Vec<String> = if use_starts {
+            let starts = collect_violating(&self.timing.starts, margin);
+            self.collector_starts = starts.iter().map(|p| p.pin.clone()).collect();
+            self.collector_starts.clone()
+        } else {
+            let ends = collect_violating(&self.timing.ends, margin);
+            self.collector_violating = ends.len();
+            self.collector_ends = ends.iter().map(|p| (p.pin.clone(), p.slack)).collect();
+            ends.iter().map(|p| p.pin.clone()).collect()
+        };
+        self.print_progress(self.opto_iteration, false)?;
+        if points.is_empty() {
+            self.debug("repair_setup", 1, format!("{phase} Phase: No violating {point_type}s, exiting"));
+            return Ok(());
+        }
+        self.debug("repair_setup", 1, format!("{phase} Phase: Processing {} violating {point_type}s", points.len()));
+        let mut processed = 0i64;
+        for (point_index, point) in points.iter().enumerate() {
+            if point_index as i64 >= self.max_end_count {
+                self.debug("repair_setup", 1, format!("{phase} Phase: Hit maximum point repairs of {}", self.max_end_count));
+                break;
+            }
+            if !use_starts {
+                self.current_endpoint = Some(point.clone());
+            }
+            let mut point_slack = self.point_slack(point, use_starts);
+            if !fuzzy::less(point_slack, margin) {
+                self.debug("repair_setup", 2, format!("{phase} Phase: {point_cap} {point} (index {point_index}) already meets timing, skipping"));
+                continue;
+            }
+            let line = format!("{phase} Phase: Processing {point_type} {point} (index {point_index}), slack = {}", self.ds(point_slack, 3));
+            self.debug("repair_setup", 1, line);
+            let mut rejected: HashMap<String, Vec<Move>> = HashMap::new();
+            let mut pass_count = 0i64;
+            let mut prev_point_slack = point_slack;
+            for pct in MARGIN_PERCENTAGES {
+                if pass_count >= self.args.max_passes {
+                    self.debug("repair_setup", 1, format!("{phase} Phase: {point_cap} {point} reached pass limit {}, moving to next {point_type}", self.args.max_passes));
+                    break;
+                }
+                point_slack = self.point_slack(point, use_starts);
+                if !fuzzy::less(point_slack, margin) {
+                    self.debug("repair_setup", 1, format!("{phase} Phase: {point_cap} {point} now meets timing, moving to next {point_type}"));
+                    break;
+                }
+                let threshold = point_slack + point_slack.abs() * pct;
+                let (prev_wns, _) = self.timing.worst();
+                let prev_end_tns = self.timing.tns();
+                let prev_start_tns = self.collector_start_tns();
+                self.begin_journal()?;
+                pass_count += 1;
+                self.opto_iteration += 1;
+                if self.args.verbose || self.opto_iteration % PRINT_INTERVAL == 0 {
+                    self.print_progress(self.opto_iteration, false)?;
+                }
+                let pins = self.directional_violators(use_starts, point, threshold)?;
+                let n = pins.len() as i64;
+                let (changed, chosen) = self.repair_pins(None, &pins, &rejected, n, false)?;
+                if !changed {
+                    self.commit_journal()?;
+                    continue;
+                }
+                self.retime(&[])?;
+                let new_point_slack = self.point_slack(point, use_starts);
+                let (new_wns, _) = self.timing.worst();
+                let new_end_tns = self.timing.tns();
+                let new_start_tns = self.collector_start_tns();
+                let end_tns_improved = fuzzy::greater(new_end_tns, prev_end_tns);
+                let start_tns_improved = fuzzy::greater(new_start_tns, prev_start_tns);
+                let both_ok = (end_tns_improved || fuzzy::equal(new_end_tns, prev_end_tns)) && (start_tns_improved || fuzzy::equal(new_start_tns, prev_start_tns));
+                let focused = if use_starts { start_tns_improved } else { end_tns_improved };
+                let better = fuzzy::greater(new_wns, prev_wns) || (fuzzy::equal(new_wns, prev_wns) && (fuzzy::greater(new_point_slack, prev_point_slack) || focused) && both_ok);
+                let improvement = new_point_slack - prev_point_slack;
+                let line = format!(
+                    "{phase} Phase: Threshold {pass_count}/3: {point_type} slack {} -> {} (imp: {}), WNS {} -> {}, EnTNS {} -> {}, StTNS {} -> {}{}",
+                    self.ds(prev_point_slack, 3),
+                    self.ds(new_point_slack, 3),
+                    self.ds(improvement, 3),
+                    self.ds(prev_wns, 3),
+                    self.ds(new_wns, 3),
+                    self.ds(prev_end_tns, 1),
+                    self.ds(new_end_tns, 1),
+                    self.ds(prev_start_tns, 1),
+                    self.ds(new_start_tns, 1),
+                    if better { " [ACCEPT]" } else { " [REJECT]" }
+                );
+                self.debug("repair_setup", 1, line);
+                if better {
+                    self.commit_journal()?;
+                    prev_point_slack = new_point_slack;
+                    if improvement < DIMINISHING_RETURNS {
+                        let line = format!("{phase} Phase: Improvement {} < {} (diminishing returns), moving to next {point_type}", self.ds(improvement, 3), self.ds(DIMINISHING_RETURNS, 3));
+                        self.debug("repair_setup", 1, line);
+                        break;
+                    }
+                } else {
+                    self.restore_journal(&[])?;
+                    for (pin, kind) in chosen {
+                        let r = rejected.entry(pin).or_default();
+                        if !r.contains(&kind) {
+                            r.push(kind);
+                        }
+                    }
+                }
+            }
+            processed += 1;
+        }
+        self.print_progress(self.opto_iteration, true)?;
+        let (wns, _) = self.timing.worst();
+        let tns = self.timing.tns();
+        let line = format!("{phase} Phase complete. {point_cap}s processed: {processed}, WNS: {}, TNS: {}", self.ds(wns, 3), self.ds(tns, 1));
+        self.debug("repair_setup", 1, line);
+        Ok(())
+    }
+
+    /// `Sta::slack(point vertex, max)`: an endpoint's, or a startpoint's (its load vertex).
+    fn point_slack(&self, point: &str, use_starts: bool) -> f32 {
+        if use_starts {
+            self.timing.starts.iter().find(|p| p.pin == point).map_or(INF, |p| p.slack)
+        } else {
+            self.timing.slack(point)
+        }
+    }
+
+    /// `getOverallStartpointTns(false)`: over the collector's startpoints as last collected,
+    /// their slacks now, the negative ones summed in `float`.
+    fn collector_start_tns(&self) -> f32 {
+        let mut tns = 0.0f32;
+        for pin in &self.collector_starts {
+            let s = self.point_slack(pin, true);
+            if s < 0.0 {
+                tns += s;
+            }
+        }
+        tns
+    }
+
+    /// `collectViolatorsByDirectionalTraversal`: an endpoint's fanin cone (`traverseFaninCone`
+    /// from its vertex, in-edges newest first, breadth first: each driver pin not on a clock
+    /// network nor a top port, kept when its RISE slack is under the threshold — the cone not
+    /// followed past a register or a pin at or above it), or a startpoint's fanout cone
+    /// (`collectViolatorsByFanoutTraversal`: the startpoint itself, then each instance reached by
+    /// an input pin, its output pins under the threshold); then by load delay.
+    fn directional_violators(&mut self, use_starts: bool, point: &str, threshold: f32) -> Result<Vec<String>, Stop> {
+        self.design.update_parasitics().map_err(timer_stop)?;
+        let edits = self.design.take_timer_edits();
+        let ctx = self.ctx;
+        let design = self.design.as_design();
+        let pins: Vec<String> = timed_all(ctx, design, &mut self.timer, edits, |gs, ss, cs| {
+            let (g, s, clocks) = (&gs[0], &ss[0], &cs[0]);
+            let vx = |v: usize| &g.vertices[v];
+            let port_dir = |v: usize| {
+                let x = vx(v);
+                match (&x.cell, &x.port) {
+                    (Some(c), Some(p)) => g.libs[x.lib.unwrap_or(0)].cells.get(c.as_str()).and_then(|c| c.port(p)).map(|p| p.direction),
+                    _ => None,
+                }
+            };
+            let is_output = |v: usize| matches!(port_dir(v), Some(vyges_sta::liberty::Direction::Output));
+            let is_input = |v: usize| matches!(port_dir(v), Some(vyges_sta::liberty::Direction::Input));
+            let top_port = |v: usize| vx(v).lib.is_none();
+            let rise_slack = |v: usize| s.slack_of(v, MAX, Some(vyges_sta::liberty::RISE));
+            let is_register = |v: usize| vx(v).cell.as_deref().and_then(|c| ctx.libs.link_cell(c)).is_some_and(|c| !c.sequentials.is_empty() || c.has_seq_bank);
+            // The instance's pins (its master's signal terminals, in order) as vertices.
+            let inst_pins = |v: usize| -> Vec<usize> {
+                let vyges_sta::netlist::Conn::Inst(k, _) = &vx(v).conn else { return Vec::new() };
+                let inst = &g.netlist.insts[*k];
+                ctx.master_pins.get(&inst.1).map_or(Vec::new(), |ports| {
+                    ports.iter().filter_map(|p| {
+                        let name = g.netlist.pin_name(&vyges_sta::netlist::Conn::Inst(*k, p.clone()));
+                        g.vertices.iter().position(|x| x.name == name && (x.is_driver || !g.vertices.iter().any(|y| y.name == name && y.is_driver)))
+                    }).collect()
+                })
+            };
+            let Some(pv) = g.vertices.iter().position(|x| x.name == point && (use_starts == x.is_driver || g.vertices.iter().filter(|y| y.name == point).count() == 1)) else {
+                return Ok(Vec::new());
+            };
+            let mut found: Vec<usize> = Vec::new();
+            let mut visited: BTreeSet<usize> = BTreeSet::new();
+            let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+            queue.push_back(pv);
+            visited.insert(pv);
+            if use_starts {
+                if rise_slack(pv) < threshold {
+                    found.push(pv);
+                }
+                while let Some(v) = queue.pop_front() {
+                    for &e in g.out_edges[v].iter().rev() {
+                        let to = g.edges[e].to;
+                        if visited.contains(&to) {
+                            continue;
+                        }
+                        visited.insert(to);
+                        if top_port(to) && !vx(to).is_driver {
+                            continue;
+                        }
+                        if is_input(to) {
+                            for out in inst_pins(to).into_iter().filter(|&p| is_output(p)) {
+                                if rise_slack(out) < threshold && !found.contains(&out) {
+                                    found.push(out);
+                                }
+                                if !visited.contains(&out) {
+                                    queue.push_back(out);
+                                    visited.insert(out);
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                while let Some(v) = queue.pop_front() {
+                    for &e in g.in_edges[v].iter().rev() {
+                        let from = g.edges[e].from;
+                        if visited.contains(&from) || clocks.contains(&from) {
+                            continue;
+                        }
+                        visited.insert(from);
+                        if top_port(from) || !is_output(from) {
+                            continue;
+                        }
+                        if rise_slack(from) >= threshold {
+                            continue;
+                        }
+                        found.push(from);
+                        if is_register(from) {
+                            continue;
+                        }
+                        for inp in inst_pins(from).into_iter().filter(|&p| is_input(p)) {
+                            if !visited.contains(&inp) {
+                                queue.push_back(inp);
+                                visited.insert(inp);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(found.into_iter().map(|v| vx(v).name.clone()).collect())
+        })?;
+        let mut data = self.violator_data(&pins)?;
+        crate::order::libcxx_sort_by(&mut data, |a, b| a.1 > b.1 || (a.1 == b.1 && a.2 < b.2) || (a.1 == b.1 && a.2 == b.2 && a.0 < b.0))
+            .map_err(|e| Stop::refused("RSZ-ABSENT", format!("the violator sort over {} pins falls back to heap sort: not modelled", e.len)))?;
+        Ok(data.into_iter().map(|d| d.0).collect())
+    }
+
+    /// `vertexWorstSlackPath(current endpoint)`, timed now.
+    fn focus_view(&mut self, end: &str) -> Result<Option<PathView>, Stop> {
+        if !self.timing.paths.contains_key(end) {
+            let edits = self.design.take_timer_edits();
+            self.timer.trace_at = self.out.trace.len();
+            self.timing = snapshot(self.ctx, self.design.as_design(), &[end.to_string()], &mut self.timer, edits)?;
+        }
+        Ok(self.timing.paths.get(end).cloned())
+    }
+
+    /// `RepairTargetCollector::collectViolators(1, -1, SORT_BY_LOAD_DELAY)` with the current
+    /// endpoint set: the worst path's output pins from its start (no top-level port, no clock
+    /// pin) — none when the path's slack is positive — sorted by load delay (greater first), then
+    /// local TNS (smaller first), then name.
+    fn collect_violators(&mut self, end: &str, view: &PathView) -> Result<Vec<String>, Stop> {
+        if self.timing.slack(end) > 0.0 {
+            return Ok(Vec::new());
+        }
+        // From the path's start: the pins before it are its clock path (`isClock`). ⚠️ No run has
+        // a driver on its clock path (each clock port drives the registers directly): the mutant
+        // scanning from 0 survives.
+        let pins: Vec<String> = view.stages.iter().skip(view.start).filter(|s| s.is_driver && !s.top_port).map(|s| s.pin.clone()).collect::<BTreeSet<_>>().into_iter().collect();
+        let mut data = self.violator_data(&pins)?;
+        crate::order::libcxx_sort_by(&mut data, |a, b| a.1 > b.1 || (a.1 == b.1 && a.2 < b.2) || (a.1 == b.1 && a.2 == b.2 && a.0 < b.0))
+            .map_err(|e| Stop::refused("RSZ-ABSENT", format!("the violator sort over {} pins falls back to heap sort: not modelled", e.len)))?;
+        Ok(data.into_iter().map(|d| d.0).collect())
+    }
+
+    /// `updatePinData` for each pin: `(pin, load delay, local TNS)` — the effort delays'
+    /// (`getEffortDelays`, `-INF` with no arc) and `getLocalPinTns` (the fanout loads' negative
+    /// slacks summed in `float`, out-edges newest first, output pins skipped).
+    fn violator_data(&mut self, pins: &[String]) -> Result<Vec<(String, f32, f32)>, Stop> {
+        self.design.update_parasitics().map_err(timer_stop)?;
+        let edits = self.design.take_timer_edits();
+        let ctx = self.ctx;
+        let design = self.design.as_design();
+        timed_all(ctx, design, &mut self.timer, edits, |gs, ss, _| {
+            let (g, s) = (&gs[0], &ss[0]);
+            let mut out = Vec::with_capacity(pins.len());
+            for pin in pins {
+                let Some(dv) = g.vertices.iter().position(|x| x.name == *pin && x.is_driver) else { continue };
+                let load = effort_delays(g, s, dv).map_or(-INF, |(l, _)| l);
+                let mut tns = 0.0f32;
+                for &e in g.out_edges[dv].iter().rev() {
+                    let to = g.edges[e].to;
+                    let tx = &g.vertices[to];
+                    let output = match (&tx.cell, &tx.port) {
+                        (Some(c), Some(p)) => g.libs[tx.lib.unwrap_or(0)].cells.get(c.as_str()).and_then(|c| c.port(p)).is_some_and(|p| matches!(p.direction, vyges_sta::liberty::Direction::Output)),
+                        // A top-level output port.
+                        _ => !tx.is_driver,
+                    };
+                    if output {
+                        continue;
+                    }
+                    let slack = s.slack_of(to, MAX, None);
+                    if slack < 0.0 {
+                        tns += slack;
+                    }
+                }
+                out.push((pin.clone(), load, tns));
+            }
+            Ok(out)
+        })
+    }
+
+    /// `SetupLegacyBase::repairPins(pins, focus_path, rejected, chosen, force_single_repair)`: each
+    /// pin's target on the focus path (a driver from its start, not a top-level port), its rejected
+    /// moves skipped, until a repair; the moves accepted.
+    fn repair_pins(&mut self, focus: Option<&PathView>, pins: &[String], rejected: &HashMap<String, Vec<Move>>, max_repairs_per_pass: i64, force_single: bool) -> Result<(bool, Vec<(String, Move)>), Stop> {
+        let mut chosen = Vec::new();
+        if pins.is_empty() {
+            return Ok((false, chosen));
+        }
+        let repairs_per_pass = if force_single { 1 } else { self.repairs_per_pass(max_repairs_per_pass) };
+        // On a focus path the reference keeps reading the path it found before the first move.
+        if repairs_per_pass > 1 && focus.is_some() {
+            return Err(Stop::refused("RSZ-ABSENT", format!("{repairs_per_pass} repairs in one pass on a focus path: not modelled")));
+        }
+        let mut changed = 0i64;
+        let mut moved = false;
+        for pin in pins {
+            if changed >= repairs_per_pass {
+                break;
+            }
+            // A target after a move in the same pass reads the timer the move changed — with the
+            // parasitics as they were: the reference re-estimates only after the pass
+            // (`updateParasitics` follows `repairPins`).
+            if moved {
+                self.retime_without_estimate()?;
+                moved = false;
+            }
+            // `makePinTargetOnPath` on the focus path, else on the pin's own worst path
+            // (`makePinTarget`: `vertexWorstSlackPath` at its driver vertex).
+            let own;
+            let view = match focus {
+                Some(v) => v,
+                None => {
+                    let Some(v) = self.focus_view(pin)? else { continue };
+                    own = v;
+                    &own
+                }
+            };
+            let Some(index) = (view.start..view.stages.len()).find(|&i| view.stages[i].pin == *pin && view.stages[i].is_driver) else { continue };
+            if view.stages[index].top_port {
+                continue;
+            }
+            let rej = rejected.get(pin).cloned().unwrap_or_default();
+            if let Some(kind) = self.try_repair_target(view, index, &mut changed, repairs_per_pass, &rej)? {
+                chosen.push((pin.clone(), kind));
+                moved = true;
+            }
+        }
+        Ok((changed > 0, chosen))
+    }
+
+    /// `RepairTargetCollector::repairsPerPass(max)`: one, plus `max − 1` scaled by where the
+    /// current endpoint's slack sits between the collector's least and worst violation (rounded).
+    fn repairs_per_pass(&self, max_repairs_per_pass: i64) -> i64 {
+        let (mut min_viol, mut max_viol) = (-INF, 0.0f32);
+        if let (Some(first), Some(last)) = (self.collector_ends.first(), self.collector_ends.last()) {
+            min_viol = -last.1;
+            max_viol = -first.1;
+        }
+        let path_slack = self.current_endpoint.as_deref().map_or(0.0, |e| self.timing.slack(e));
+        let mut repairs = 1i64;
+        if max_viol - min_viol != 0.0 {
+            // `std::round` of the float expression (an int times a float), added to an int.
+            repairs += ((max_repairs_per_pass - 1) as f32 * (-path_slack - min_viol) / (max_viol - min_viol)).round() as i64;
+        }
+        repairs
     }
 
     /// `RSZ move_tracker`'s debug level (0: off).
@@ -1985,18 +2775,22 @@ impl Repair<'_, '_> {
 
     /// `initializeMainRepair`: the violating endpoints, row 0, and the violation range.
     fn initialize_main_repair(&mut self) -> Result<Vec<Point>, Stop> {
+        let phase = self.phase.clone();
         let violating_ends = collect_violating(&self.timing.ends, self.ctx.margin);
         self.collector_violating = violating_ends.len();
+        self.collector_ends = violating_ends.iter().map(|p| (p.pin.clone(), p.slack)).collect();
+        // `RepairTargetCollector::init` → `setToEndpoint(0)`: the worst violating endpoint.
+        self.current_endpoint = violating_ends.first().map(|p| p.pin.clone());
         // A diagnostic: the endpoints in the order the loop visits them, each slack's bits.
         if let Ok(path) = std::env::var("VYGES_RSZ_ENDS_DUMP") {
             let text: String = violating_ends.iter().map(|p| format!("{} {:e}\n", p.pin, p.slack)).collect();
             let _ = std::fs::write(path, text);
         }
         if violating_ends.is_empty() {
-            self.debug("repair_setup", 1, format!("{PHASE} Phase: No violating endpoints, exiting"));
+            self.debug("repair_setup", 1, format!("{phase} Phase: No violating endpoints, exiting"));
             return Ok(violating_ends);
         }
-        self.debug("repair_setup", 1, format!("{PHASE} Phase: {} violating endpoints found", violating_ends.len()));
+        self.debug("repair_setup", 1, format!("{phase} Phase: {} violating endpoints found", violating_ends.len()));
         self.max_end_count = ((violating_ends.len() as f64 * self.args.repair_tns_end_percent) as i64).max(1);
         self.initial_tns = self.timing.tns();
         self.prev_tns = self.initial_tns;
@@ -2010,6 +2804,7 @@ impl Repair<'_, '_> {
 
     /// `runMainRepairLoop`.
     fn run_main_repair_loop(&mut self, violating_ends: &[Point]) -> Result<(), Stop> {
+        let phase = self.phase.clone();
         for end in violating_ends {
             if self.args.max_iterations > 0 && self.opto_iteration >= self.args.max_iterations {
                 break;
@@ -2020,20 +2815,23 @@ impl Repair<'_, '_> {
                 self.print_progress(self.opto_iteration, true)?;
             }
             if self.two_cons_terminations {
-                self.debug("repair_setup", 1, format!("{PHASE} Phase: Exiting due to no TNS progress for two opto cycles"));
+                self.debug("repair_setup", 1, format!("{phase} Phase: Exiting due to no TNS progress for two opto cycles"));
                 break;
             }
         }
         self.print_progress(self.opto_iteration, true)?;
         let (wns, _) = self.timing.worst();
         let tns = self.timing.tns();
-        let line = format!("{PHASE} Phase complete. WNS: {}, TNS: {}", self.ds(wns, 3), self.ds(tns, 1));
+        let line = format!("{phase} Phase complete. WNS: {}, TNS: {}", self.ds(wns, 3), self.ds(tns, 1));
         self.debug("repair_setup", 1, line);
         Ok(())
     }
 
     /// `beginEndpointRepair` → `beginJournaledEndpointSearch`.
     fn begin_endpoint_repair(&mut self, end: &str) -> Result<Option<EndpointState>, Stop> {
+        let phase = self.phase.clone();
+        // `useWorstEndpoint`.
+        self.current_endpoint = Some(end.to_string());
         let mut es = EndpointState {
             end: end.to_string(),
             end_slack: 0.0,
@@ -2054,7 +2852,7 @@ impl Repair<'_, '_> {
         self.begin_journal()?;
         es.journal_open = true;
         let line = format!(
-            "{PHASE} Phase: Doing endpoint {} ({}/{}) WNS = {}, endpoint slack = {}, TNS = {}",
+            "{phase} Phase: Doing endpoint {} ({}/{}) WNS = {}, endpoint slack = {}, TNS = {}",
             es.end,
             self.end_index,
             self.max_end_count,
@@ -2078,6 +2876,7 @@ impl Repair<'_, '_> {
 
     /// `SetupLegacyPolicy::repairEndpoint`: the pass loop.
     fn repair_endpoint(&mut self, es: &mut EndpointState) -> Result<(), Stop> {
+        let phase = self.phase.clone();
         let margin = self.ctx.margin;
         while es.pass <= self.args.max_passes {
             self.opto_iteration += 1;
@@ -2090,7 +2889,7 @@ impl Repair<'_, '_> {
                 } else {
                     self.prev_termination = true;
                 }
-                let line = format!("{PHASE} Phase: Restoring best slack; endpoint slack = {}, WNS = {}", self.ds(es.prev_end_slack, 3), self.ds(es.prev_worst_slack, 3));
+                let line = format!("{phase} Phase: Restoring best slack; endpoint slack = {}, WNS = {}", self.ds(es.prev_end_slack, 3), self.ds(es.prev_worst_slack, 3));
                 self.debug("repair_setup", 2, line);
                 self.restore_endpoint_state(es)?;
                 break;
@@ -2101,7 +2900,7 @@ impl Repair<'_, '_> {
             // fuzzyGreaterEqual.
             if !fuzzy::less(es.end_slack, margin) {
                 self.num_viols -= 1;
-                let line = format!("{PHASE} Phase: Endpoint slack {} meets slack margin {}, done", self.ds(es.worst_slack, 3), self.ds(margin, 3));
+                let line = format!("{phase} Phase: Endpoint slack {} meets slack margin {}, done", self.ds(es.worst_slack, 3), self.ds(margin, 3));
                 self.debug("repair_setup", 1, line);
                 self.finish_endpoint_search(es)?;
                 break;
@@ -2111,11 +2910,11 @@ impl Repair<'_, '_> {
             let changed = self.repair_path(&end, es.end_slack, es.force_single_repair)?;
             if !changed {
                 if es.pass != 1 {
-                    self.debug("repair_setup", 2, format!("{PHASE} Phase: No change after {} decreasing slack passes.", es.decreasing_slack_passes));
-                    let line = format!("{PHASE} Phase: Restoring best slack; endpoint slack = {}, WNS = {}", self.ds(es.prev_end_slack, 3), self.ds(es.prev_worst_slack, 3));
+                    self.debug("repair_setup", 2, format!("{phase} Phase: No change after {} decreasing slack passes.", es.decreasing_slack_passes));
+                    let line = format!("{phase} Phase: Restoring best slack; endpoint slack = {}, WNS = {}", self.ds(es.prev_end_slack, 3), self.ds(es.prev_worst_slack, 3));
                     self.debug("repair_setup", 2, line);
                 }
-                self.debug("repair_setup", 1, format!("{PHASE} Phase: No change possible for endpoint {} ", es.end));
+                self.debug("repair_setup", 1, format!("{phase} Phase: No change possible for endpoint {} ", es.end));
                 self.finish_endpoint_search(es)?;
                 break;
             }
@@ -2126,7 +2925,7 @@ impl Repair<'_, '_> {
             let better = path_improved(es.end_slack, es.worst_slack, es.prev_end_slack, es.prev_worst_slack);
             let new_tns = self.timing.tns();
             let line = format!(
-                "{PHASE} Phase: {} after changes: WNS ({} -> {}) TNS ({} -> {}) Endpoint slack ({} -> {})",
+                "{phase} Phase: {} after changes: WNS ({} -> {}) TNS ({} -> {}) Endpoint slack ({} -> {})",
                 if better { "Improved" } else { "Worsened" },
                 self.ds(es.prev_worst_slack, 3),
                 self.ds(es.worst_slack, 3),
@@ -2148,14 +2947,14 @@ impl Repair<'_, '_> {
                 es.force_single_repair = true;
                 es.decreasing_slack_passes += 1;
                 if es.decreasing_slack_passes > DECREASING_SLACK_MAX_PASSES {
-                    let line = format!("{PHASE} Phase: Endpoint {} stuck after {} non-improving passes (limit {DECREASING_SLACK_MAX_PASSES})", es.end, es.decreasing_slack_passes);
+                    let line = format!("{phase} Phase: Endpoint {} stuck after {} non-improving passes (limit {DECREASING_SLACK_MAX_PASSES})", es.end, es.decreasing_slack_passes);
                     self.debug("repair_setup", 2, line);
-                    let line = format!("{PHASE} Phase: Restoring best slack; endpoint slack = {}, WNS = {}", self.ds(es.prev_end_slack, 3), self.ds(es.prev_worst_slack, 3));
+                    let line = format!("{phase} Phase: Restoring best slack; endpoint slack = {}, WNS = {}", self.ds(es.prev_end_slack, 3), self.ds(es.prev_worst_slack, 3));
                     self.debug("repair_setup", 2, line);
                     self.restore_endpoint_state(es)?;
                     break;
                 }
-                self.debug("repair_setup", 3, format!("{PHASE} Phase: Allowing decreasing slack for {}/{DECREASING_SLACK_MAX_PASSES} passes", es.decreasing_slack_passes));
+                self.debug("repair_setup", 3, format!("{phase} Phase: Allowing decreasing slack for {}/{DECREASING_SLACK_MAX_PASSES} passes", es.decreasing_slack_passes));
             }
             // overMaxArea: -max_utilization is refused, so never.
             if self.end_index == 1 {
@@ -2176,9 +2975,9 @@ impl Repair<'_, '_> {
     /// `SetupLastGaspPolicy::iterate`: the sequence narrowed to VtSwap, SizeUpMatch, SizeUp and
     /// SwapPins; the violating endpoints again; per endpoint up to 10 passes, a pass kept only
     /// when WNS and TNS both hold (fuzzily), else the journal restored.
-    fn last_gasp(&mut self) -> Result<(), Stop> {
-        self.phase = "LAST_GASP+";
-        let phase = self.phase;
+    fn last_gasp(&mut self, marker: char) -> Result<(), Stop> {
+        self.phase = format!("LAST_GASP{marker}");
+        let phase = self.phase.clone();
         // initializeLastGaspRepair.
         self.sequence.clear();
         if !self.args.skip_vt_swap {
@@ -2191,6 +2990,9 @@ impl Repair<'_, '_> {
         }
         let violating_ends = collect_violating(&self.timing.ends, self.ctx.margin);
         self.collector_violating = violating_ends.len();
+        self.collector_ends = violating_ends.iter().map(|p| (p.pin.clone(), p.slack)).collect();
+        // `RepairTargetCollector::init` → `setToEndpoint(0)`: the worst violating endpoint.
+        self.current_endpoint = violating_ends.first().map(|p| p.pin.clone());
         self.num_viols = violating_ends.len() as i64;
         let curr_tns = self.timing.tns();
         if !fuzzy::less(curr_tns, 0.0) {
@@ -2263,7 +3065,7 @@ impl Repair<'_, '_> {
 
     /// `repairLastGaspEndpoint` with `advanceLastGaspProgress`.
     fn repair_last_gasp_endpoint(&mut self, es: &mut EndpointState, prev_worst_slack: &mut f32) -> Result<(), Stop> {
-        let phase = self.phase;
+        let phase = self.phase.clone();
         let margin = self.ctx.margin;
         while es.pass <= 10 {
             self.opto_iteration += 1;
@@ -2347,23 +3149,25 @@ impl Repair<'_, '_> {
     /// `terminateProgress`: every `opto_small_interval_` iterations the incremental fix rate,
     /// which past iteration 1000 must reach a threshold doubled every `opto_large_interval_`.
     fn terminate_progress(&mut self) -> bool {
+        let (label, mut threshold) = (self.phase.clone(), self.fix_rate_threshold);
+        let stop = self.terminate_progress_with(&label, &mut threshold, self.end_index, self.max_end_count);
+        self.fix_rate_threshold = threshold;
+        stop
+    }
+
+    /// `terminateProgress(iteration, initial_tns, prev_tns, fix_rate_threshold, endpt_index,
+    /// num_endpts, phase_name, marker)`: `label` is the phase name with its marker.
+    fn terminate_progress_with(&mut self, label: &str, fix_rate_threshold: &mut f32, endpt_index: i64, num_endpts: i64) -> bool {
         let iteration = self.opto_iteration;
         if iteration % OPTO_LARGE_INTERVAL == 0 {
-            self.fix_rate_threshold *= 2.0;
+            *fix_rate_threshold *= 2.0;
         }
         if iteration % OPTO_SMALL_INTERVAL == 0 {
             let curr_tns = self.timing.tns();
             let inc_fix_rate = (self.prev_tns - curr_tns) / self.initial_tns;
             self.prev_tns = curr_tns;
-            if iteration > 1000 && inc_fix_rate < self.fix_rate_threshold {
-                let line = format!(
-                    "{} Phase: Exiting at iteration {iteration} because incr fix rate {:.2}% is < {:.2}% [endpt {}/{}]",
-                    self.phase,
-                    inc_fix_rate * 100.0,
-                    self.fix_rate_threshold * 100.0,
-                    self.end_index,
-                    self.max_end_count
-                );
+            if iteration > 1000 && inc_fix_rate < *fix_rate_threshold {
+                let line = format!("{label} Phase: Exiting at iteration {iteration} because incr fix rate {:.2}% is < {:.2}% [endpt {endpt_index}/{num_endpts}]", inc_fix_rate * 100.0, *fix_rate_threshold * 100.0);
                 self.debug("repair_setup", 1, line);
                 return true;
             }
@@ -2412,11 +3216,17 @@ impl Repair<'_, '_> {
     /// `tryRepairPathTarget` → `logRepairTarget`, then `tryRepairTarget`: each generator of the
     /// move sequence in order, until one's candidate is committed (`tryCandidateSequence`).
     fn try_repair_path_target(&mut self, view: &PathView, index: usize, changed: &mut i64, repairs_per_pass: i64) -> Result<bool, Stop> {
+        Ok(self.try_repair_target(view, index, changed, repairs_per_pass, &[])?.is_some())
+    }
+
+    /// `tryRepairTarget`: the move types in `rejected` skipped (before `isApplicable`); the
+    /// accepted move's type.
+    fn try_repair_target(&mut self, view: &PathView, index: usize, changed: &mut i64, repairs_per_pass: i64, rejected: &[Move]) -> Result<Option<Move>, Stop> {
         let st = &view.stages[index];
         let line = format!("{} {} fanout = {} drvr_index = {index}", st.pin, st.cell.as_deref().unwrap_or("none"), st.fanout);
         self.debug("repair_setup", 3, line);
         for m in self.sequence.clone() {
-            if !self.is_applicable(m, st, index) {
+            if rejected.contains(&m) || !self.is_applicable(m, st, index) {
                 continue;
             }
             self.debug("repair_setup", 1, format!("Considering {} for {}", m.name(), st.pin));
@@ -2436,11 +3246,12 @@ impl Repair<'_, '_> {
             if let Some(r) = result {
                 // repairProgressIncrement: an unbuffer spends the pass's whole budget.
                 *changed += if r.kind == Move::Unbuffer { repairs_per_pass } else { 1 };
+                let kind = r.kind;
                 self.commit(r);
-                return Ok(true);
+                return Ok(Some(kind));
             }
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// `MoveGenerator::isApplicable` on a path driver target: SwapPins also needs a path index
@@ -2901,8 +3712,12 @@ impl Repair<'_, '_> {
         if iteration % PRINT_INTERVAL != 0 && !force {
             return Ok(());
         }
+        // `collectViolatingStartpoints`, only when a row prints.
         let starts = collect_violating(&self.timing.starts, self.ctx.margin);
-        let (wns, worst) = self.timing.worst();
+        self.collector_starts = starts.iter().map(|p| p.pin.clone()).collect();
+        let (wns, worst_end) = self.timing.worst();
+        // `getWorstPin(use_startpoints)`: the first violating startpoint of least slack.
+        let worst = if self.startpoint_rows { starts.first().map(|p| p.pin.clone()) } else { worst_end };
         let field = format!("{iteration}{}", self.phase.chars().last().unwrap_or('*'));
         let row = progress_row(
             &Row {
