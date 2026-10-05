@@ -79,6 +79,8 @@ pub struct Ctx<'a> {
     pub rebuffer: Option<&'a rebuffer::Ctx<'a>>,
     /// `buffer_lowest_drive_` (SplitLoadMove's buffer).
     pub lowest_buffer: &'a str,
+    /// `buffer_fast_sizes_` (`findFastBuffers`): SizeDownFanout's sizes for a buffer load.
+    pub fast_buffers: &'a [String],
     /// The reference's pin addresses, when the gate supplies them ([`unbuffer::PinAddr`]).
     pub pin_addr: Option<&'a unbuffer::PinAddr>,
     /// `dbNetwork::hasHierarchy`: instance and net names print without their parent prefix.
@@ -138,6 +140,47 @@ enum RebufProbe {
     Warn(String),
     /// The annotated net and the driver's timing.
     Ready(Box<rebuffer::Probe>),
+}
+
+/// A load of a driver's net as SizeDownFanout reads it.
+#[derive(Debug, Clone)]
+struct SdfLoad {
+    pin: String,
+    inst: Option<String>,
+    cell: Option<String>,
+    port: Option<String>,
+    /// `Sta::slack(vertex, max)`.
+    slack: f32,
+    /// Over the instance's input pins (`std::min` from INF).
+    worst_input_slack: f32,
+    /// Over its output pins.
+    worst_output_slack: f32,
+    outputs: Vec<SdfOutput>,
+}
+
+/// One output of a load instance (`buildOutputProfile`).
+#[derive(Debug, Clone)]
+struct SdfOutput {
+    pin: String,
+    port: String,
+    /// `GraphDelayCalc::loadCap`.
+    cap: f32,
+    /// `Sta::slew` over both transitions (max).
+    slew: f32,
+    /// `computeElmoreSlewFactor`: `slew / (drive resistance × load)`, 0 without either.
+    slew_factor: f32,
+}
+
+/// `getWorstIntrinsicDelay(input_port)`: over the arc sets from the port, the largest arc
+/// intrinsic delay; 0 with none.
+fn worst_intrinsic_delay(cell: &Cell, port: &str) -> f32 {
+    let mut max = -INF;
+    for set in cell.arc_sets.iter().filter(|s| s.from == port) {
+        for arc in &set.arcs {
+            max = crate::rebuffer::std_max(max, arc_intrinsic(&arc.model));
+        }
+    }
+    if max == -INF { 0.0 } else { max }
 }
 
 /// `PathExpanded`: the path from its root, and `startIndex`.
@@ -1124,6 +1167,8 @@ struct Repair<'c, 'd> {
     current_endpoint: Option<String>,
     /// Rows name the worst startpoint (`printProgress(.., use_startpoint_metrics)`).
     startpoint_rows: bool,
+    /// The slack of the target being repaired (`Target::slack`: the path's, or the focus slack).
+    target_slack: f32,
 }
 
 /// What `Resizer::swapPins` did.
@@ -1709,6 +1754,7 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
         collector_starts: Vec::new(),
         current_endpoint: None,
         startpoint_rows: false,
+        target_slack: 0.0,
     };
     // `SetupLegacyBase::start`: with the move tracker on, `captureInitialSlackDistribution` (and
     // `captureOriginalEndpointSlack`, read only by the level-2 profiles) after RSZ-0099.
@@ -1750,7 +1796,7 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
         }
     }
     r.finalize_and_report()?;
-    r.out.resized = r.committer.committed(Move::SizeUp);
+    r.out.resized = r.committer.committed(Move::SizeUp) + r.committer.committed(Move::SizeDownFanout);
     r.out.removed = r.committer.committed(Move::Unbuffer);
     r.out.inserted = r.committer.committed(Move::Buffer);
     Ok(r.out)
@@ -2154,6 +2200,7 @@ impl Repair<'_, '_> {
     /// up to their count per pass; kept when better (WNS, else the point's slack or the focused
     /// TNS with neither TNS worse), else restored and its moves rejected for the point.
     fn repair_setup_directional(&mut self, use_starts: bool) -> Result<(), Stop> {
+        // (The first threshold's mutant to 50% survives: both collect the same cone pins here.)
         const MARGIN_PERCENTAGES: [f32; 3] = [0.20, 0.50, 1.00];
         const DIMINISHING_RETURNS: f32 = 1e-11;
         let phase = self.phase.clone();
@@ -2485,6 +2532,8 @@ impl Repair<'_, '_> {
         }
         let mut changed = 0i64;
         let mut moved = false;
+        // `focus_slack`: the collector's current endpoint's.
+        self.target_slack = self.current_endpoint.as_deref().map_or(0.0, |e| self.timing.slack(e));
         for pin in pins {
             if changed >= repairs_per_pass {
                 break;
@@ -3201,6 +3250,7 @@ impl Repair<'_, '_> {
             return Err(Stop::refused("RSZ-ABSENT", format!("{repairs_per_pass} repairs in one pass: a target after the first move would read a timer the move changed, which is not modelled")));
         }
         let ranked = rank_path_drivers(&view);
+        self.target_slack = path_slack;
         let line = format!("Path slack: {}, repairs: {repairs_per_pass}, ranked_targets: {}", self.ds(path_slack, 3), ranked.len());
         self.debug("repair_setup", 3, line);
         let mut changed = 0i64;
@@ -3230,6 +3280,21 @@ impl Repair<'_, '_> {
                 continue;
             }
             self.debug("repair_setup", 1, format!("Considering {} for {}", m.name(), st.pin));
+            // `allowsBatchRepair`: SizeDownFanout repeats on the target until nothing is accepted
+            // (`trySizeDownFanoutBatch`), each round on the timer the last move changed.
+            if m == Move::SizeDownFanout {
+                let mut accepted = false;
+                while let Some(r) = self.size_down_fanout_move(view, index)? {
+                    *changed += 1;
+                    self.commit(r);
+                    accepted = true;
+                    self.retime_without_estimate()?;
+                }
+                if accepted {
+                    return Ok(Some(Move::SizeDownFanout));
+                }
+                continue;
+            }
             let result = match m {
                 Move::SizeUp => self.size_up_move(view, index)?,
                 Move::Unbuffer => self.unbuffer_move(view, index)?,
@@ -3523,6 +3588,243 @@ impl Repair<'_, '_> {
         Ok(Some(MoveResult { kind: Move::SizeUp, count: 1, insts: vec![m.inst] }))
     }
 
+    /// `SizeDownFanoutGenerator::generate` → the first candidate → `SizeDownFanoutCandidate::apply`
+    /// (`replaceCell`): the driver's wire fanouts not yet sized down, by slack (greatest first, then
+    /// name); each load a logic standard cell, not dont_touch, stepped down ONE size — the largest
+    /// input capacitance below its own, no larger area (equal caps: the last ranked) — within its
+    /// outputs' cap and slew limits and its delay budget (a register: its worst output slack; else
+    /// the lesser of its own and its worst input's).
+    fn size_down_fanout_move(&mut self, view: &PathView, index: usize) -> Result<Option<MoveResult>, Stop> {
+        let st = view.stages[index].clone();
+        let (Some(drvr_cell), Some(drvr_port)) = (st.cell.clone(), st.port.clone()) else { return Ok(None) };
+        let ctx = self.ctx;
+        let Some(dc) = ctx.libs.link_cell(&drvr_cell) else { return Ok(None) };
+        let drvr_res = dc.drive_resistance(&drvr_port);
+        self.debug("size_down_fanout_move", 2, format!("sizing down for crit fanout {}", st.pin));
+        let fanouts = self.size_down_fanout_loads(&st.pin)?;
+        // Fanouts already sized down (`hasMoves`), then by slack, greater first, then by name.
+        let mut fanouts: Vec<SdfLoad> = fanouts.into_iter().filter(|f| f.inst.as_deref().is_none_or(|i| !self.committer.has_moves(Move::SizeDownFanout, self.design.inst_id(i)))).collect();
+        crate::order::libcxx_sort_by(&mut fanouts, |a, b| a.slack > b.slack || (a.slack == b.slack && a.pin < b.pin))
+            .map_err(|e| Stop::refused("RSZ-ABSENT", format!("the fanout sort over {} loads falls back to heap sort: not modelled", e.len)))?;
+        for f in &fanouts {
+            let line = format!(" fanout {} slack: {} drvr slack: {}", f.pin, self.ds(f.slack, 3), self.ds(self.target_slack, 3));
+            self.debug("size_down_fanout_move", 2, line);
+        }
+        let mut candidates: Vec<(SdfLoad, String)> = Vec::new();
+        for f in fanouts {
+            // `resolveLoadContext`.
+            let (Some(_), Some(cell_name), Some(port)) = (f.inst.clone(), f.cell.clone(), f.port.clone()) else { continue };
+            let Some(cell) = ctx.libs.link_cell(&cell_name) else { continue };
+            // ⚠️ `dontTouch(load_inst)` is the instance's alone; this also reads the pin's net.
+            if self.design.pin_dont_touch(&f.pin) || !ctx.sizing.masters.get(&cell_name).is_some_and(|m| m.logic_std) {
+                continue;
+            }
+            let scene_cell = ctx.libs.scene_cell(0, &cell_name).unwrap_or(cell);
+            let Some(input_cap) = port_capacitance(scene_cell, &port) else { continue };
+            // `computeDelayBudget`.
+            let sequential = !cell.sequentials.is_empty() || cell.has_seq_bank;
+            let budget = if sequential {
+                self.debug("size_down_fanout_move", 4, format!(" Sequential element: using worst output slack: {} (pin slack: {})", self.ds(f.worst_output_slack, 3), self.ds(f.slack, 3)));
+                f.worst_output_slack
+            } else {
+                let b = crate::rebuffer::std_min(f.slack, f.worst_input_slack);
+                self.debug("size_down_fanout_move", 4, format!(" Combinational gate: using worst input slack: {} (pin slack: {}, worst input: {})", self.ds(b, 3), self.ds(f.slack, 3), self.ds(f.worst_input_slack, 3)));
+                b
+            };
+            // `rankSwappableCells`.
+            let mut swaps: Vec<String> = if cell.is_buffer() {
+                if ctx.fast_buffers.contains(&cell_name) {
+                    let mut v: Vec<String> = ctx.fast_buffers.to_vec();
+                    // `getFastBufferSizes`: by area, then cell id (⚠️ name here: no tie in the corpus).
+                    v.sort_by(|a, b| {
+                        let (ca, cb) = (ctx.libs.link_cell(a).map_or(0.0, |c| c.area), ctx.libs.link_cell(b).map_or(0.0, |c| c.area));
+                        ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.cmp(b))
+                    });
+                    v
+                } else {
+                    Vec::new()
+                }
+            } else {
+                ctx.sizing.swappable_cells(&cell_name)?
+            };
+            if swaps.len() > 1 {
+                let key = |n: &str| -> Option<(f32, f32)> {
+                    let c = ctx.libs.scene_cell(0, n).or_else(|| ctx.libs.link_cell(n))?;
+                    Some((port_capacitance(c, &port)?, worst_intrinsic_delay(c, &port)))
+                };
+                crate::order::libcxx_sort_by(&mut swaps, |a, b| match (key(a), key(b)) {
+                    (Some((c1, i1)), Some((c2, i2))) => (c1, i2) < (c2, i1),
+                    (x, _) => x.is_some(),
+                })
+                .map_err(|e| Stop::refused("RSZ-ABSENT", format!("the swappable cell sort over {} cells falls back to heap sort: not modelled", e.len)))?;
+            }
+            let names: Vec<String> = swaps.iter().map(|s| if *s == cell_name { format!("*{s}*") } else { s.clone() }).collect();
+            self.debug("size_down_fanout_move", 3, format!("size_down_fanout fanout {} swaps={}", f.pin, names.join(" ")));
+            for o in &f.outputs {
+                let delay = gate_delay(ctx.sizing, scene_cell, &o.port, o.cap);
+                let line = format!(" current {}->{} gate={cell_name} delay={} cap={} slew={} slack={}", f.pin, o.pin, self.ds(delay, 3), crate::repair_timing::fmt_float(o.cap), self.ds(o.slew, 3), self.ds(f.slack, 3));
+                self.debug("size_down_fanout_move", 4, line);
+            }
+            // `selectReplacementCell`: one step down.
+            let cap_of = |n: &str| ctx.libs.scene_cell(0, n).or_else(|| ctx.libs.link_cell(n)).and_then(|c| port_capacitance(c, &port)).unwrap_or(INF);
+            let mut step: Option<String> = None;
+            let mut step_cap = -1.0f32;
+            for s in &swaps {
+                if *s == cell_name {
+                    continue;
+                }
+                let c = cap_of(s);
+                let area = ctx.libs.link_cell(s).map_or(INF, |c| c.area);
+                if c < input_cap && c >= step_cap && area <= cell.area {
+                    step_cap = c;
+                    step = Some(s.clone());
+                }
+            }
+            let replacement = match step {
+                Some(s) if !self.sdf_violates_output_limits(&s, &f) && self.sdf_fits_budget(&s, &f, &cell_name, &port, input_cap, drvr_res, budget, sequential) => Some(s),
+                _ => None,
+            };
+            match replacement {
+                Some(r) => candidates.push((f, r)),
+                None => {
+                    let line = format!("REJECT SizeDownFanoutMove {} -> {}: ({cell_name} -> none) slack={}", st.pin, f.pin, self.ds(f.slack, 3));
+                    self.debug("size_down_fanout_move", 3, line);
+                }
+            }
+        }
+        if candidates.is_empty() {
+            self.debug("size_down_fanout_move", 2, format!("REJECT SizeDownFanoutMove {}: Couldn't size down any gates", st.pin));
+            return Ok(None);
+        }
+        // `tryCandidateSequence`: the first candidate (every estimate is legal).
+        let (f, to) = candidates.swap_remove(0);
+        let inst = f.inst.clone().expect("a load instance");
+        let from = f.cell.clone().expect("a load cell");
+        self.design.swap_master(&inst, &to).map_err(|e| Stop::error("RSZ-REPLACE", e))?;
+        let line = format!("ACCEPT SizeDownFanoutMove {} -> {}: ({from} -> {to}) slack={}", st.pin, f.pin, self.ds(f.slack, 3));
+        self.debug("size_down_fanout_move", 3, line);
+        Ok(Some(MoveResult { kind: Move::SizeDownFanout, count: 1, insts: vec![inst] }))
+    }
+
+    /// `violatesOutputLimits`: the replacement's output port missing, over its cap limit at the
+    /// output's load, or over its slew limit at the Elmore-scaled slew.
+    fn sdf_violates_output_limits(&mut self, cell: &str, f: &SdfLoad) -> bool {
+        let ctx = self.ctx;
+        let Some(c) = ctx.libs.link_cell(cell) else { return true };
+        for o in &f.outputs {
+            let Some(p) = c.port(&o.port) else { return true };
+            if let Some(max_cap) = p.max_capacitance.filter(|&m| m > 0.0 && o.cap > m) {
+                self.debug("opt_moves", 2, format!("  skip based on max cap {} gate={cell} cap={} max_cap={}", o.pin, crate::repair_timing::fmt_float(o.cap), crate::repair_timing::fmt_float(max_cap)));
+                return true;
+            }
+            let new_slew = o.slew_factor * c.drive_resistance(&o.port) * o.cap;
+            let lib = ctx.libs.scene_library(0, cell).or_else(|| ctx.libs.default_library());
+            if let Some(lib) = lib {
+                let (max_slew, exists) = crate::timing::find_slew_limit(lib, p.direction, p.max_transition, ctx.limits);
+                {
+                    if exists && new_slew > max_slew {
+                        self.debug("opt_moves", 2, format!("  skip based on max slew {} gate={cell} slew={} max_slew={}", o.pin, crate::repair_timing::fmt_float(new_slew), crate::repair_timing::fmt_float(max_slew)));
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// `fitsDelayBudget`: the worst output's delay change (with the driver's change from the
+    /// smaller load, but for a register) against the budget — over a positive budget, or any
+    /// increase against a negative one.
+    #[allow(clippy::too_many_arguments)]
+    fn sdf_fits_budget(&mut self, cell: &str, f: &SdfLoad, cur: &str, port: &str, input_cap: f32, drvr_res: f32, budget: f32, sequential: bool) -> bool {
+        let ctx = self.ctx;
+        let Some(c) = ctx.libs.scene_cell(0, cell).or_else(|| ctx.libs.link_cell(cell)) else { return false };
+        let new_cap = port_capacitance(c, port).unwrap_or(INF);
+        let drvr_delta = -drvr_res * (input_cap - new_cap);
+        let cur_cell = ctx.libs.scene_cell(0, cur).or_else(|| ctx.libs.link_cell(cur));
+        let mut worst_change = -INF;
+        let mut first_new = 0.0f32;
+        for (k, o) in f.outputs.iter().enumerate() {
+            let new_delay = gate_delay(ctx.sizing, c, &o.port, o.cap);
+            let old_delay = cur_cell.map_or(0.0, |cc| gate_delay(ctx.sizing, cc, &o.port, o.cap));
+            if k == 0 {
+                first_new = new_delay;
+            }
+            let change = if sequential { new_delay - old_delay } else { new_delay + drvr_delta - old_delay };
+            worst_change = crate::rebuffer::std_max(worst_change, change);
+        }
+        let first_old = f.outputs.first().and_then(|o| cur_cell.map(|cc| gate_delay(ctx.sizing, cc, &o.port, o.cap))).unwrap_or(0.0);
+        let first_pin = f.outputs.first().map_or(String::new(), |o| o.pin.clone());
+        let body = format!(
+            "{}->{first_pin} gate={cell} drvr_delta {} + new_delay {} - old_delay {} < slack {} ({} < {})",
+            f.pin,
+            self.ds(drvr_delta, 3),
+            self.ds(first_new, 3),
+            self.ds(first_old, 3),
+            self.ds(budget, 3),
+            self.ds(worst_change, 3),
+            self.ds(budget, 3)
+        );
+        self.debug("size_down_fanout_move", 4, format!(" new delay {body}"));
+        let violates = (budget > 0.0 && worst_change > budget) || (budget < 0.0 && worst_change > 0.0);
+        if violates {
+            self.debug("size_down_fanout_move", 4, format!(" skip based on delay {body}"));
+        }
+        !violates
+    }
+
+    /// The driver's wire fanouts as SizeDownFanout reads them: the timer brought up to date with
+    /// the edits, the parasitics NOT estimated again (the generator reads the timer as it stands).
+    fn size_down_fanout_loads(&mut self, drvr: &str) -> Result<Vec<SdfLoad>, Stop> {
+        let edits = self.design.take_timer_edits();
+        let ctx = self.ctx;
+        let design = self.design.as_design();
+        timed_all(ctx, design, &mut self.timer, edits, |gs, ss, _| {
+            let (g, s) = (&gs[0], &ss[0]);
+            let par = design.parasitics(0);
+            let Some(dv) = g.vertices.iter().position(|x| x.name == drvr && x.is_driver) else { return Ok(Vec::new()) };
+            let vertex_of = |name: &str, drv: bool| g.vertices.iter().position(|x| x.name == name && x.is_driver == drv).or_else(|| g.vertices.iter().position(|x| x.name == name));
+            let mut out = Vec::new();
+            for &e in g.out_edges[dv].iter().rev() {
+                if !matches!(g.edges[e].kind, EdgeKind::Wire) {
+                    continue;
+                }
+                let fv = g.edges[e].to;
+                let x = &g.vertices[fv];
+                let (inst, k) = match &x.conn {
+                    vyges_sta::netlist::Conn::Inst(k, _) => (Some(g.netlist.insts[*k].0.clone()), Some(*k)),
+                    vyges_sta::netlist::Conn::Port(_) => (None, None),
+                };
+                let mut load = SdfLoad { pin: x.name.clone(), inst, cell: x.cell.clone(), port: x.port.clone(), slack: s.slack_of(fv, MAX, None), worst_input_slack: INF, worst_output_slack: INF, outputs: Vec::new() };
+                if let (Some(k), Some(cell)) = (k, x.cell.as_deref().and_then(|c| ctx.libs.link_cell(c))) {
+                    for p in ctx.master_pins.get(&g.netlist.insts[k].1).map_or(&[][..], |v| v.as_slice()) {
+                        let Some(port) = cell.port(p) else { continue };
+                        let name = g.netlist.pin_name(&vyges_sta::netlist::Conn::Inst(k, p.clone()));
+                        match port.direction {
+                            vyges_sta::liberty::Direction::Input => {
+                                if let Some(v) = vertex_of(&name, true) {
+                                    load.worst_input_slack = crate::rebuffer::std_min(load.worst_input_slack, s.slack_of(v, MAX, None));
+                                }
+                            }
+                            vyges_sta::liberty::Direction::Output => {
+                                let Some(v) = vertex_of(&name, false) else { continue };
+                                load.worst_output_slack = crate::rebuffer::std_min(load.worst_output_slack, s.slack_of(v, MAX, None));
+                                let cap = g.load_cap(v, par);
+                                let slew = g.slew[v][0][MAX].max(g.slew[v][1][MAX]);
+                                let res = cell.drive_resistance(p);
+                                let slew_factor = if res <= 0.0 || cap <= 0.0 { 0.0 } else { slew / (res * cap) };
+                                load.outputs.push(SdfOutput { pin: name, port: p.clone(), cap, slew, slew_factor });
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                out.push(load);
+            }
+            Ok(out)
+        })
+    }
+
     /// `UnbufferGenerator::generate` (`isEligible`, its guards in order) → `UnbufferCandidate::apply`
     /// (`Resizer::removeBuffer`).
     fn unbuffer_move(&mut self, view: &PathView, index: usize) -> Result<Option<MoveResult>, Stop> {
@@ -3723,7 +4025,8 @@ impl Repair<'_, '_> {
             &Row {
                 iter: &field,
                 removed: self.committer.total(Move::Unbuffer),
-                resized: self.committer.total(Move::SizeUp) + self.committer.total(Move::SizeUpMatch),
+                // SizeUp, SizeDownFanout, SizeUpMatch and VtSwap (none: no VT library).
+                resized: self.committer.total(Move::SizeUp) + self.committer.total(Move::SizeDownFanout) + self.committer.total(Move::SizeUpMatch),
                 inserted: self.committer.total(Move::Buffer) + self.committer.total(Move::SplitLoad),
                 cloned: self.committer.total(Move::Clone),
                 swaps: self.committer.total(Move::SwapPins),
@@ -3750,7 +4053,8 @@ impl Repair<'_, '_> {
             &Row {
                 iter: "final",
                 removed: self.committer.total(Move::Unbuffer),
-                resized: self.committer.total(Move::SizeUp) + self.committer.total(Move::SizeUpMatch),
+                // SizeUp, SizeDownFanout, SizeUpMatch and VtSwap (none: no VT library).
+                resized: self.committer.total(Move::SizeUp) + self.committer.total(Move::SizeDownFanout) + self.committer.total(Move::SizeUpMatch),
                 inserted: self.committer.total(Move::Buffer) + self.committer.total(Move::SplitLoad),
                 cloned: self.committer.total(Move::Clone),
                 swaps: self.committer.total(Move::SwapPins),
@@ -3778,9 +4082,9 @@ impl Repair<'_, '_> {
                 self.report(format!("[INFO RSZ-0045] Inserted {} buffers, {splits} to split loads.", buffers + splits));
             }
         }
-        let (size_up, up_match) = (self.committer.committed(Move::SizeUp), self.committer.committed(Move::SizeUpMatch));
-        if size_up + up_match > 0 {
-            self.report(format!("[INFO RSZ-0051] Resized {} instances: {size_up} up, {up_match} up match, 0 down, 0 VT", size_up + up_match));
+        let (size_up, up_match, down) = (self.committer.committed(Move::SizeUp), self.committer.committed(Move::SizeUpMatch), self.committer.committed(Move::SizeDownFanout));
+        if size_up + up_match + down > 0 {
+            self.report(format!("[INFO RSZ-0051] Resized {} instances: {size_up} up, {up_match} up match, {down} down, 0 VT", size_up + up_match + down));
         }
         let swaps = self.committer.committed(Move::SwapPins);
         if swaps > 0 {

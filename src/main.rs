@@ -565,6 +565,31 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
         for n in nets {
             self.invalidate(&n);
         }
+        // `Sta::replace(Equiv)CellAfter` → `loadPinCapacitanceChanged` on each input pin: the
+        // reduced models of its net's drivers are deleted — a placement estimate IS one, so the
+        // net has no parasitic until `updateParasitics` estimates it again (it is invalid).
+        // Witness: SizeDownFanout's next round in the same batch reads the driver timed on its
+        // pin caps alone.
+        let lib_cell = self.libs.link_cell(cell);
+        let input_nets: Vec<String> = self
+            .netlist
+            .nets
+            .iter()
+            .filter(|n| {
+                n.pins.iter().any(|c| {
+                    matches!(c, vyges_sta::netlist::Conn::Inst(i, port) if self.netlist.insts[*i].0 == inst
+                        && lib_cell.and_then(|lc| lc.port(port)).is_some_and(|p| matches!(p.direction, vyges_sta::liberty::Direction::Input | vyges_sta::liberty::Direction::Bidirect)))
+                })
+            })
+            .map(|n| n.name.clone())
+            .collect();
+        if self.estimating {
+            for n in input_nets {
+                for k in 0..self.parasitics.len() {
+                    self.parasitics[k].remove(&n);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1575,7 +1600,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 let startpoint_rows = matches!(plan, Some(rt::PhasePlan::LegacyPreamble { startpoints: true }));
                 let unmodelled = if matches!(plan, Some(rt::PhasePlan::LegacyPreamble { .. })) && !a.phases.as_deref().is_some_and(rt::phases_modelled) {
                     Some(format!("repair_timing -phases {}: not modelled", a.phases.as_deref().unwrap_or_default()))
-                } else if let Some(m) = seq.iter().find(|m| !matches!(m, rt::Move::SizeUp | rt::Move::Unbuffer | rt::Move::SwapPins | rt::Move::Buffer | rt::Move::Clone | rt::Move::SplitLoad | rt::Move::SizeUpMatch | rt::Move::VtSwap)) {
+                } else if let Some(m) = seq.iter().find(|m| !matches!(m, rt::Move::SizeUp | rt::Move::SizeDownFanout | rt::Move::Unbuffer | rt::Move::SwapPins | rt::Move::Buffer | rt::Move::Clone | rt::Move::SplitLoad | rt::Move::SizeUpMatch | rt::Move::VtSwap)) {
                     Some(format!("repair_timing: {} is not modelled", m.name()))
                 } else if a.match_cell_footprint {
                     Some("repair_timing -match_cell_footprint: not modelled".into())
@@ -1620,10 +1645,12 @@ fn run(job: &Value) -> Result<Value, String> {
                         Some(path) => Some(vyges_rsz::unbuffer::PinAddr::parse(&read_text(path)?)?),
                         None => None,
                     };
-                    // Rebuffer::init / initOnCorner, when the sequence has BufferMove.
+                    // Rebuffer::init / initOnCorner, when the sequence has BufferMove; the fast
+                    // buffers (`resizePreamble` → `findFastBuffers`) SizeDownFanout reads.
                     let rb_sizes_store;
                     let rb_ctx_store;
-                    let rb_ctx = if !hold_only && seq.contains(&rt::Move::Buffer) {
+                    let mut fast_buffers: Vec<String> = Vec::new();
+                    let rb_ctx = if !hold_only && (seq.contains(&rt::Move::Buffer) || seq.contains(&rt::Move::SizeDownFanout)) {
                         // `corner_` is `cmdScene()`, the first corner: scene 0.
                         let base = vyges_rsz::rebuffer::Ctx { libs: &libs, sizes: &[], rc: wire_rc, dbu: db.tech_get_db_units_per_micron(), slew_shape_factor, tgt_slews, time_scale, cap_scale: lib0.cap_scale, cmd: 0, tgt: tgt_scene };
                         let lowest = libs.link_cell(&buffers.lowest).ok_or("no lowest-drive buffer")?;
@@ -1644,17 +1671,24 @@ fn run(job: &Value) -> Result<Value, String> {
                         // maxLoad: the first output port with a capacitance limit.
                         let max_load = |c: &vyges_sta::liberty::Cell| c.ports.iter().filter(|p| p.direction == vyges_sta::liberty::Direction::Output).find_map(|p| p.max_capacitance).unwrap_or(0.0);
                         let ci = vyges_rsz::rebuffer::CharInputs { ctx: &base, r_max, slew_limit: &slew_limit, max_input_slew: &max_input_slew, max_load: &max_load };
-                        rb_sizes_store = match vyges_rsz::rebuffer::characterize(&ci, &buffers.cells) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                lines.extend(rt::row0(&ends, violating.len(), &violating_starts, time_scale));
-                                timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len() }));
-                                timing_stop = Some(format!("{e} (not modelled)"));
-                                break;
-                            }
-                        };
-                        rb_ctx_store = vyges_rsz::rebuffer::Ctx { sizes: &rb_sizes_store, ..base };
-                        Some(&rb_ctx_store)
+                        if seq.contains(&rt::Move::SizeDownFanout) {
+                            fast_buffers = vyges_rsz::rebuffer::find_fast_buffers(&ci, &buffers.cells);
+                        }
+                        if seq.contains(&rt::Move::Buffer) {
+                            rb_sizes_store = match vyges_rsz::rebuffer::characterize(&ci, &buffers.cells) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    lines.extend(rt::row0(&ends, violating.len(), &violating_starts, time_scale));
+                                    timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len() }));
+                                    timing_stop = Some(format!("{e} (not modelled)"));
+                                    break;
+                                }
+                            };
+                            rb_ctx_store = vyges_rsz::rebuffer::Ctx { sizes: &rb_sizes_store, ..base };
+                            Some(&rb_ctx_store)
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     };
@@ -1676,6 +1710,7 @@ fn run(job: &Value) -> Result<Value, String> {
                         debug: &debug_levels,
                         rebuffer: rb_ctx,
                         lowest_buffer: &buffers.lowest,
+                        fast_buffers: &fast_buffers,
                         pin_addr: pin_addr.as_ref(),
                         hierarchy: db_hierarchy,
                     };
