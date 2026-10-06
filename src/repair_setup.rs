@@ -192,6 +192,9 @@ struct PathView {
     start: usize,
     /// The scene of the path (`Path::scene`): its delays, loads and library cells.
     scene: usize,
+    /// `visitLatchFaninSegments`: for a path through a latch D -> Q, the latch D path expanded on
+    /// its own, then ITS latch D path, … (each latch D once).
+    latch_segments: Vec<PathView>,
 }
 
 /// The timer over the design as it is now: every endpoint's and startpoint's slack, and the worst
@@ -492,7 +495,7 @@ fn inc_trace(inc: &IncTimer, trace_at: usize) {
 /// `startIndex`: the pin reached by the clock-to-output arc nearest the end, else the root.
 #[allow(clippy::too_many_arguments)]
 fn expand(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet<usize>], design: &dyn Design, scene: usize, end: usize, ideal: &BTreeSet<usize>) -> Result<Option<PathView>, Stop> {
-    let (g, search) = (&gs[scene], &ss[scene]);
+    let search = &ss[scene];
     let mut worst = None;
     let mut min_slack = INF;
     for p in search.paths[end].iter().filter(|p| p.tag.mm == MAX) {
@@ -502,7 +505,28 @@ fn expand(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet
             worst = Some(*p);
         }
     }
-    let Some(mut p) = worst else { return Ok(None) };
+    let Some(p) = worst else { return Ok(None) };
+    let (mut view, mut latch_d) = expand_path(ctx, gs, ss, cs, design, scene, end, p, ideal)?;
+    // `visitLatchFaninSegments`: each latch D path (`PathExpanded::latchPaths`) expanded in turn;
+    // a latch D already followed ends it.
+    let mut visited = BTreeSet::new();
+    while let Some((d_v, d_p)) = latch_d {
+        if !visited.insert(d_v) {
+            break;
+        }
+        let (seg, next) = expand_path(ctx, gs, ss, cs, design, scene, d_v, d_p, ideal)?;
+        view.latch_segments.push(seg);
+        latch_d = next;
+    }
+    Ok(Some(view))
+}
+
+/// `PathExpanded` of path `p` at vertex `end`, and its latch D path when it passes a latch D -> Q.
+#[allow(clippy::too_many_arguments)]
+fn expand_path(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet<usize>], design: &dyn Design, scene: usize, end: usize, p: vyges_sta::search::Path, ideal: &BTreeSet<usize>) -> Result<(PathView, Option<(usize, vyges_sta::search::Path)>), Stop> {
+    let _ = cs;
+    let (g, search) = (&gs[scene], &ss[scene]);
+    let mut p = p;
     // From the end back to the root.
     let mut chain = vec![(end, p)];
     while let Some(prev) = p.prev {
@@ -510,6 +534,7 @@ fn expand(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet
         chain.push((prev.vertex, p));
     }
     let mut start_from_end = None;
+    let mut latch_d = None;
     for (i, (_, p)) in chain.iter().enumerate() {
         let Some(prev) = p.prev else { continue };
         match edge_arc_set(g, prev.edge).map(|s| s.role) {
@@ -517,10 +542,20 @@ fn expand(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet
                 start_from_end = Some(i);
                 break;
             }
-            Some(Role::LatchDtoQ) => return Err(Stop::refused("RSZ-LATCH", "a path through a latch D->Q arc: not modelled".into())),
+            // An enabled latch's D -> Q: the path starts at the Q, keeps the latch D path, and
+            // stops there ("this breaks latch loop paths").
+            Some(Role::LatchDtoQ) => {
+                start_from_end = Some(i);
+                latch_d = Some(i + 1);
+                break;
+            }
             _ => {}
         }
     }
+    if let Some(k) = latch_d {
+        chain.truncate(k + 1);
+    }
+    let latch_d_path = latch_d.map(|k| chain[k]);
     let n = chain.len();
     let start = n - 1 - start_from_end.unwrap_or(n - 1);
     chain.reverse();
@@ -621,7 +656,7 @@ fn expand(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet
             }
         }
     }
-    Ok(Some(PathView { stages, start, scene }))
+    Ok((PathView { stages, start, scene, latch_segments: Vec::new() }, latch_d_path))
 }
 
 /// `rebufferPin` up to its buffering: the driver's checks, `makeBufferedNet`, `annotateLoadSlacks`
@@ -3284,16 +3319,23 @@ impl Repair<'_, '_> {
         if repairs_per_pass > 1 {
             return Err(Stop::refused("RSZ-ABSENT", format!("{repairs_per_pass} repairs in one pass: a target after the first move would read a timer the move changed, which is not modelled")));
         }
-        let ranked = rank_path_drivers(&view);
+        // `visitPathSegments`: the drivers of the main path, then of each latch D fanin path, each
+        // segment ranked on its own, merged by a stable sort on the load delay.
+        let segments: Vec<&PathView> = std::iter::once(&view).chain(view.latch_segments.iter()).collect();
+        let mut ranked: Vec<(usize, usize, f32)> = Vec::new();
+        for (k, seg) in segments.iter().enumerate() {
+            ranked.extend(rank_path_drivers(seg).into_iter().map(|(i, d)| (k, i, d)));
+        }
+        ranked.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
         self.target_slack = path_slack;
         let line = format!("Path slack: {}, repairs: {repairs_per_pass}, ranked_targets: {}", self.ds(path_slack, 3), ranked.len());
         self.debug("repair_setup", 3, line);
         let mut changed = 0i64;
-        for (index, _) in ranked {
+        for (k, index, _) in ranked {
             if changed >= repairs_per_pass {
                 break;
             }
-            self.try_repair_path_target(&view, index, &mut changed, repairs_per_pass)?;
+            self.try_repair_path_target(segments[k], index, &mut changed, repairs_per_pass)?;
         }
         Ok(changed > 0)
     }
@@ -4222,6 +4264,7 @@ mod tests {
             ],
             start: 2,
             scene: 0,
+            latch_segments: Vec::new(),
         };
         assert_eq!(rank_path_drivers(&view), vec![(4, 5.0), (6, 2.0), (2, 2.0)]);
     }
