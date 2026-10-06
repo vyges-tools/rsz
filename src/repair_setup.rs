@@ -296,7 +296,7 @@ fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], timer: &mut Tim
         // Each point's slack: the least over the scenes (`Sta::slack` over every path).
         let mut per_scene = Vec::with_capacity(gs.len());
         for k in 0..gs.len() {
-            per_scene.push(timing_points(&gs[k], &ss[k], ctx.ssdc, ctx.libs, &cs[k]).map_err(timer_stop)?);
+            per_scene.push(timing_points(&gs[k], &ss[k], ctx.libs, &cs[k]).map_err(timer_stop)?);
         }
         let (ends, starts) = if gs.len() == 1 {
             per_scene.pop().expect("one scene")
@@ -344,7 +344,7 @@ fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], timer: &mut Tim
 fn setup_ends(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet<usize>]) -> Result<Vec<Point>, Stop> {
     let mut per_scene = Vec::with_capacity(gs.len());
     for k in 0..gs.len() {
-        per_scene.push(timing_points(&gs[k], &ss[k], ctx.ssdc, ctx.libs, &cs[k]).map_err(timer_stop)?.0);
+        per_scene.push(timing_points(&gs[k], &ss[k], ctx.libs, &cs[k]).map_err(timer_stop)?.0);
     }
     if per_scene.len() == 1 {
         return Ok(per_scene.pop().expect("one scene"));
@@ -673,7 +673,10 @@ fn probe_rebuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[
             let ideal_clk = set.role == Role::RegClkToQ && gk.ideal_clock.contains(&prev.vertex);
             let from_slew = if ideal_clk { 0.0 } else { gk.slew[prev.vertex][arc.from_rf][MAX] };
             // clkPathArrival for a clock path: the ideal clock's edge, else its arrival.
-            let prev_arrival = if dp.tag.is_clock && !ctx.ssdc.clock.propagated { ctx.ssdc.clock.edge_time(dp.tag.clk_edge.unwrap_or(dp.tag.rf)) } else { dp.arrival };
+            let prev_arrival = match ctx.ssdc.clock.as_ref() {
+                Some(c) if dp.tag.is_clock && !c.propagated => c.edge_time(dp.tag.clk_edge.unwrap_or(dp.tag.rf)),
+                _ => dp.arrival,
+            };
             Some(rebuffer::DriverArc { model: arc.model.clone(), from_slew, prev_arrival, arrival: ap.arrival })
         }));
     }
@@ -2636,7 +2639,7 @@ impl Repair<'_, '_> {
     /// ends; and `trackCriticalPins`' pins (a non-clock driver whose RISE slack in ps is below 0)
     /// in Category 2's order — the set's (pin address) order, sorted by slack.
     fn tracker_reports(&mut self) -> Result<(Vec<move_tracker::TopEnd>, Vec<move_tracker::CriticalPin>), Stop> {
-        if self.ctx.libs.scene_count() > 1 || self.ctx.ssdc.clock.propagated {
+        if self.ctx.libs.scene_count() > 1 || self.ctx.ssdc.clock.as_ref().is_some_and(|c| c.propagated) {
             let ends = collect_violating(&self.timing.ends, 0.0).len();
             if ends > 0 {
                 return Err(Stop::refused("RSZ-ABSENT", "repair_timing: the move tracker's path enumeration over several scenes or a propagated clock is not modelled".into()));

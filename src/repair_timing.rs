@@ -572,27 +572,15 @@ pub fn row0_with(endpoints: &[Point], violating_endpoints: usize, violating_star
 /// An endpoint (`Search::isEndpoint`): a vertex with fanin that has timing checks, carries an
 /// output delay, or has no fanout. ⚠️ One WITH fanout times its slack through the path ends
 /// downstream (`wnsSlacks`), which is not modelled: refused.
-pub fn timing_points(g: &vyges_sta::graph::Graph<'_>, search: &vyges_sta::search::Search<'_, '_>, ssdc: &vyges_sta::sdc::Sdc, libs: &crate::preamble::Libs, clocks: &std::collections::BTreeSet<usize>) -> Result<(Vec<Point>, Vec<Point>), String> {
-    use vyges_sta::graph::EdgeKind;
-    use vyges_sta::liberty::Role;
-    let role = |e: usize| match g.edges[e].kind {
-        EdgeKind::Gate { set } => {
-            let vx = &g.vertices[g.edges[e].to];
-            Some(g.libs[vx.lib.expect("an instance pin")].cells[vx.cell.as_deref().expect("its cell")].arc_sets[set].role)
-        }
-        EdgeKind::Wire => None,
-    };
-    let is_check = |e: usize| matches!(role(e), Some(Role::Setup | Role::Hold | Role::Recovery | Role::Removal));
+pub fn timing_points(g: &vyges_sta::graph::Graph<'_>, search: &vyges_sta::search::Search<'_, '_>, libs: &crate::preamble::Libs, clocks: &std::collections::BTreeSet<usize>) -> Result<(Vec<Point>, Vec<Point>), String> {
     let mut ends = Vec::new();
     let mut starts = Vec::new();
     for (v, vx) in g.vertices.iter().enumerate() {
-        let fanin = g.in_edges[v].iter().any(|&e| !is_check(e));
-        let fanout = g.out_edges[v].iter().any(|&e| !is_check(e));
-        let checks = g.in_edges[v].iter().any(|&e| is_check(e));
         let port = vx.lib.is_none();
-        let constrained = port && ssdc.output_delays.iter().any(|d| d.port == vx.name);
-        if fanin && (checks || constrained || !fanout) {
-            if fanout {
+        // `Search::isEndpoint` (a path delay's internal pins included); an end whose fanout the
+        // search still walks is refused — a path delay's internal `-to` pin breaks it.
+        if search.is_endpoint(v) {
+            if search.has_fanout(v) && !search.is_path_delay_internal_to_break(v) {
                 return Err(format!("endpoint {} has fanout: its slack through the path ends downstream is not modelled", vx.name));
             }
             ends.push(Point { pin: vx.name.clone(), slack: search.vertex_slack(v) });

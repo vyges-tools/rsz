@@ -1078,17 +1078,24 @@ fn search_sdc(s: &vyges_loom::sdc::Sdc, text: &str, time_scale: f32, propagated:
     use vyges_sta::sdc::{Clock, PortDelay};
     // One clock: on one source port, or virtual (no source — its edges launch the input delays and
     // close the output delays; nothing is clocked on the design). A mixture is refused.
-    let [clock] = s.clocks.as_slice() else {
-        let real = s.clocks.iter().filter(|c| !c.is_virtual()).count();
-        return Err(format!("repair_timing with {real} clocks and {} virtual: not modelled (one clock is)", s.clocks.len() - real));
+    // None: nothing clocked — every path unclocked (the timer's own refusals apply).
+    let clock = match s.clocks.as_slice() {
+        [] => None,
+        [clock] => Some(clock),
+        _ => {
+            let real = s.clocks.iter().filter(|c| !c.is_virtual()).count();
+            return Err(format!("repair_timing with {real} clocks and {} virtual: not modelled (one clock or none is)", s.clocks.len() - real));
+        }
     };
-    let source: &str = if clock.is_virtual() {
-        ""
-    } else {
-        let [source] = clock.sources.as_slice() else {
-            return Err(format!("clock {} on {} sources: not modelled (one is)", clock.name, clock.sources.len()));
-        };
-        source
+    let source: &str = match clock {
+        None => "",
+        Some(clock) if clock.is_virtual() => "",
+        Some(clock) => {
+            let [source] = clock.sources.as_slice() else {
+                return Err(format!("clock {} on {} sources: not modelled (one is)", clock.name, clock.sources.len()));
+            };
+            source
+        }
     };
     // A hold uncertainty moves only hold checks: read by a hold repair alone.
     if s.setup_uncertainty != 0.0 || (s.hold_uncertainty != 0.0 && hold_repair) {
@@ -1115,7 +1122,7 @@ fn search_sdc(s: &vyges_loom::sdc::Sdc, text: &str, time_scale: f32, propagated:
             }
         }
         let clock_name = line.split("[get_clocks {").nth(1).and_then(|r| r.split('}').next()).ok_or_else(|| format!("{line}: a delay without -clock is not modelled"))?;
-        if clock_name != clock.name {
+        if clock.is_none_or(|c| clock_name != c.name) {
             return Err(format!("{line}: a delay on another clock is not modelled"));
         }
         let ports = line.split("[get_ports {").nth(1).and_then(|r| r.split('}').next()).ok_or_else(|| format!("{line}: ports not read"))?;
@@ -1174,10 +1181,10 @@ fn search_sdc(s: &vyges_loom::sdc::Sdc, text: &str, time_scale: f32, propagated:
             .collect()
     };
     Ok(vyges_sta::sdc::Sdc {
-        clock: Clock::new(&clock.name, vyges_sta::sdc::user_to_sta(clock.period, time_scale), source, propagated),
+        clock: clock.map(|c| Clock::new(&c.name, vyges_sta::sdc::user_to_sta(c.period, time_scale), source, propagated)),
         input_delays: inputs(&delays[0])?,
         output_delays: outputs(&delays[1])?,
-        path_delays: path_delays(text, &clock.name, time_scale)?,
+        path_delays: path_delays(text, clock.map(|c| c.name.as_str()), time_scale)?,
     })
 }
 
@@ -1186,7 +1193,7 @@ fn search_sdc(s: &vyges_loom::sdc::Sdc, text: &str, time_scale: f32, propagated:
 /// <delay>`, objects `[get_pins {..}]` or `[get_clocks {..}]`. Any other flag is refused; so is
 /// more than one (an exception's id is the order it was MADE in, which the file may not keep).
 /// Which forms the timer models is the search's to say (`Search::path_delays_modelled`).
-fn path_delays(text: &str, clock: &str, time_scale: f32) -> Result<Vec<vyges_sta::sdc::PathDelay>, String> {
+fn path_delays(text: &str, clock: Option<&str>, time_scale: f32) -> Result<Vec<vyges_sta::sdc::PathDelay>, String> {
     use vyges_sta::liberty::{MAX, MIN};
     let joined = text.replace("\\\n", " ");
     let mut out = Vec::new();
@@ -1200,7 +1207,7 @@ fn path_delays(text: &str, clock: &str, time_scale: f32) -> Result<Vec<vyges_sta
             let names: Vec<String> = inner.split('{').nth(1).and_then(|r| r.split('}').next()).unwrap_or("").split_whitespace().map(String::from).collect();
             if inner.starts_with("get_pins ") {
                 Ok((names, false))
-            } else if inner.starts_with("get_clocks ") && names == [clock] {
+            } else if inner.starts_with("get_clocks ") && clock.is_some_and(|c| names == [c]) {
                 Ok((Vec::new(), true))
             } else {
                 Err(format!("{line}: {flag} [{inner}]: not modelled (pins or the clock are)"))
@@ -1620,7 +1627,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 g.find_delays(&parasitics[0], None)?;
                 let ssdc = search_sdc(s, &text, time_scale, clock_propagated, a.hold)?;
                 let mut search = vyges_sta::search::Search::in_graph_order(&g, &ssdc);
-                search.path_delays_modelled()?;
+                search.constraints_modelled()?;
                 search.find_arrivals()?;
                 search.find_requireds()?;
                 // A diagnostic: every vertex's max-path arrivals, requireds and slews (seconds),
@@ -1634,7 +1641,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     }
                     std::fs::write(&path, out).map_err(|e| format!("{path}: {e}"))?;
                 }
-                let (ends, starts) = rt::timing_points(&g, &search, &ssdc, &libs, &clocks)?;
+                let (ends, starts) = rt::timing_points(&g, &search, &libs, &clocks)?;
                 // Several corners: every scene timed on its own libraries and parasitics, each
                 // point's slack the least over the scenes (`Sta::slack` over every path).
                 let (ends, starts) = if libs.scene_count() > 1 {
@@ -1649,7 +1656,7 @@ fn run(job: &Value) -> Result<Value, String> {
                         let mut sk = vyges_sta::search::Search::in_graph_order(&gk, &ssdc);
                         sk.find_arrivals()?;
                         sk.find_requireds()?;
-                        per_scene.push(rt::timing_points(&gk, &sk, &ssdc, &libs, &ck)?);
+                        per_scene.push(rt::timing_points(&gk, &sk, &libs, &ck)?);
                     }
                     (rt::least_over_scenes(per_scene.iter().map(|(e, _)| e.as_slice()).collect())?, rt::least_over_scenes(per_scene.iter().map(|(_, s)| s.as_slice()).collect())?)
                 } else {
