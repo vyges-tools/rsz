@@ -184,12 +184,23 @@ pub struct SizingLimits {
     pub area: Option<f64>,
     pub leakage: Option<f64>,
     pub keep_site: bool,
+    /// `sizing_keep_vt_` (`keep_sizing_vt`): the source's VT category only.
+    pub keep_vt: bool,
 }
 
 impl Default for SizingLimits {
     fn default() -> SizingLimits {
-        SizingLimits { area: Some(SIZING_AREA_LIMIT), leakage: Some(SIZING_LEAKAGE_LIMIT), keep_site: false }
+        SizingLimits { area: Some(SIZING_AREA_LIMIT), leakage: Some(SIZING_LEAKAGE_LIMIT), keep_site: false, keep_vt: false }
     }
+}
+
+/// A master's IMPLANT obstruction layers as a set — what `cellVTType` hashes, so two masters share
+/// a VT index exactly when their sets are equal, whatever order the categories were numbered in.
+fn implant_set(m: &Master) -> Vec<String> {
+    let mut l = m.implant_obs.clone();
+    l.sort();
+    l.dedup();
+    l
 }
 
 /// `Resizer::cellLeakage`: `cell_leakage_power`, else the mean of the `leakage_power` groups
@@ -248,12 +259,64 @@ impl Sizing<'_> {
             if self.limits.keep_site && m.site != master.site {
                 continue;
             }
+            // `sizing_keep_vt_`: the same VT index — the same set of IMPLANT layers.
+            if self.limits.keep_vt && implant_set(m) != implant_set(master) {
+                continue;
+            }
             if !source_cell.user_function_class.is_empty() && source_cell.user_function_class != cell.user_function_class {
                 continue;
             }
             out.push(name.clone());
         }
         Ok(out)
+    }
+
+    /// `Resizer::getVTEquivCells(source)`, the source among them: none with fewer than two VT
+    /// categories (`sorted_vt_categories`) or no equivalent cells; else each equivalent cell — the
+    /// source kept as is — not dont_use, with a master, of ANOTHER VT category, the same area
+    /// (fuzzily), site, footprint and user function class; stably sorted by leakage (none = 0),
+    /// ascending; then of two neighbours in one VT category, the one sharing the longer name
+    /// prefix with the source is kept (ties: the later). The last is the least leaky's — the best.
+    pub fn vt_equiv_cells(&self, source: &str, vt_category_count: usize) -> Vec<String> {
+        if vt_category_count < 2 {
+            return Vec::new();
+        }
+        let (Some(&k), Some(src_master), Some(src_cell)) = (self.equiv.class_of.get(source), self.masters.get(source), self.libs.link_cell(source)) else { return Vec::new() };
+        // `cellVTType(a) == cellVTType(b)`: the same set of IMPLANT layers (the index and name
+        // follow from the set).
+        let vt = implant_set;
+        let mut out: Vec<String> = Vec::new();
+        for name in &self.equiv.classes[k] {
+            if name == source {
+                out.push(name.clone());
+                continue;
+            }
+            if self.dont_use.contains(name) {
+                continue;
+            }
+            let (Some(m), Some(cell)) = (self.masters.get(name), self.libs.link_cell(name)) else { continue };
+            if vt(m) == vt(src_master) || !vyges_sta::fuzzy::equal(m.area as f32, src_master.area as f32) || m.site != src_master.site || cell.footprint != src_cell.footprint || cell.user_function_class != src_cell.user_function_class {
+                continue;
+            }
+            out.push(name.clone());
+        }
+        let leak = |n: &String| self.libs.link_cell(n).and_then(cell_leakage).unwrap_or(0.0);
+        out.sort_by(|a, b| if leak(a) < leak(b) { std::cmp::Ordering::Less } else if leak(b) < leak(a) { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal });
+        let common = |a: &str| a.bytes().zip(source.bytes()).take_while(|(x, y)| x == y).count();
+        let mut i = 0;
+        while i + 1 < out.len() {
+            let (c, n) = (&out[i], &out[i + 1]);
+            if vt(&self.masters[c]) == vt(&self.masters[n]) {
+                if common(c) > common(n) {
+                    out.remove(i + 1);
+                } else {
+                    out.remove(i);
+                }
+            } else {
+                i += 1;
+            }
+        }
+        out
     }
 
     /// `(*target_load_map_)[cell]`: a cell not in the map reads 0 (the reference's operator[]).

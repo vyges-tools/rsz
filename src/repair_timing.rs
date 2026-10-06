@@ -372,6 +372,27 @@ pub fn phase_plan(phases: &str) -> PhasePlan {
     }
 }
 
+/// `SdcNetwork::staToSdc` (what `Vertex::name` prints): each lone escape `\\` dropped, an escaped
+/// escape kept as both characters — `out\\[7\\]` reads `out[7]`.
+pub fn sta_to_sdc(name: &str) -> String {
+    let b: Vec<char> = name.chars().collect();
+    let mut out = String::with_capacity(name.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == '\\' {
+            if b.get(i + 1) == Some(&'\\') {
+                out.push('\\');
+                out.push('\\');
+                i += 1;
+            }
+        } else {
+            out.push(b[i]);
+        }
+        i += 1;
+    }
+    out
+}
+
 /// `dbNetwork::stripParentPrefix`: the name after the last `/` that is not escaped (`\\/` inside a
 /// Verilog escaped identifier), else the whole name.
 pub fn strip_parent_prefix(name: &str) -> &str {
@@ -626,6 +647,15 @@ mod tests {
         let s = Args::parse(&["-sequence".into(), "size_down_fanout sizeup".into()]).unwrap();
         assert_eq!(move_sequence(&s, false), [Move::SizeDownFanout, Move::SizeUp]);
         assert_eq!(parse_move_sequence("size").unwrap(), [Move::SizeUp, Move::SizeDownFanout]);
+    }
+
+    /// Rule (SdcNetwork::staToSdc, what an endpoint vertex's name prints): a lone escape drops, an
+    /// escaped escape stays.
+    #[test]
+    fn sdc_names_drop_lone_escapes() {
+        assert_eq!(sta_to_sdc(r"dpath.a_reg.out\[7\]$_DFFE_PP_/D"), "dpath.a_reg.out[7]$_DFFE_PP_/D");
+        assert_eq!(sta_to_sdc(r"a\\b"), r"a\\b");
+        assert_eq!(sta_to_sdc(r"x\"), "x");
     }
 
     /// Rule (dbNetwork::stripParentPrefix): the last unescaped `/` splits; an escaped one does not.

@@ -214,8 +214,9 @@ pub struct BufferList<'l> {
     pub cells: Vec<&'l Cell>,
     /// Each listed cell's VT category, by name.
     pub vt: BTreeMap<String, VtCategory>,
-    /// `vt_leakage_by_category`'s keys: the categories the list holds.
-    pub categories: Vec<VtCategory>,
+    /// `sorted_vt_categories`: the categories the list holds (`vt_leakage_by_category`, a map in
+    /// category order), sorted by average leakage, least leaky first (libc++ `std::sort`).
+    pub sorted_vt: Vec<VtCategory>,
     /// `cells_by_site` / `cells_by_footprint`, by name.
     pub by_site: BTreeMap<String, usize>,
     pub by_footprint: BTreeMap<String, usize>,
@@ -233,6 +234,8 @@ pub fn get_buffer_list<'l>(libs: &'l Libs, masters: &BTreeMap<String, Master>, d
     let mut by_footprint: BTreeMap<String, usize> = BTreeMap::new();
     let mut vt: BTreeMap<String, VtCategory> = BTreeMap::new();
     let mut seen: Vec<Vec<String>> = Vec::new();
+    // `VTLeakageStats`: the cell count, and the leakage summed in `float` (a cell with none counts).
+    let mut leakage: BTreeMap<VtCategory, (u32, f32)> = BTreeMap::new();
     for (li, lib) in libs.libs.iter().enumerate() {
         for cell in lib.cells.values().filter(|c| !c.dont_use && c.is_buffer()) {
             if exclude_clock_buffers && is_clock_buffer(cell) {
@@ -246,7 +249,13 @@ pub fn get_buffer_list<'l>(libs: &'l Libs, masters: &BTreeMap<String, Master>, d
             if !cell.footprint.is_empty() {
                 *by_footprint.entry(cell.footprint.clone()).or_default() += 1;
             }
-            vt.insert(cell.name.clone(), vt_category(&master.implant_obs, &mut seen));
+            let category = vt_category(&master.implant_obs, &mut seen);
+            let stats = leakage.entry(category.clone()).or_default();
+            stats.0 += 1;
+            if let Some(l) = crate::sizing::cell_leakage(cell) {
+                stats.1 += l;
+            }
+            vt.insert(cell.name.clone(), category);
             list.push(cell);
         }
     }
@@ -258,17 +267,27 @@ pub fn get_buffer_list<'l>(libs: &'l Libs, masters: &BTreeMap<String, Master>, d
         buffer_drive_resistance(a) < buffer_drive_resistance(b)
     })
     .map_err(|h| Stop::refused("RSZ-ORDER", format!("{} buffers reach the sort's heap fallback, which is not modelled", h.len)))?;
-    let categories: Vec<VtCategory> = vt.values().cloned().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
-    Ok(BufferList { cells: list, vt, categories, by_site, by_footprint })
+    let average = |c: &VtCategory| {
+        let (count, total) = leakage[c];
+        if count > 0 {
+            total / count as f32
+        } else {
+            0.0
+        }
+    };
+    let mut sorted_vt: Vec<VtCategory> = leakage.keys().cloned().collect();
+    crate::order::libcxx_sort_by(&mut sorted_vt, |a, b| average(a) < average(b)).map_err(|h| Stop::refused("RSZ-ORDER", format!("{} VT categories reach the sort's heap fallback, which is not modelled", h.len)))?;
+    Ok(BufferList { cells: list, vt, sorted_vt, by_site, by_footprint })
 }
 
 pub fn find_buffers(libs: &Libs, masters: &BTreeMap<String, Master>, dont_use: &std::collections::BTreeSet<String>, exclude_clock_buffers: bool) -> Result<Buffers, Stop> {
-    let BufferList { cells: list, by_site, by_footprint, categories, .. } = get_buffer_list(libs, masters, dont_use, exclude_clock_buffers)?;
-    // "Pick the second most leaky VT for multiple VTs" (`sorted_vt_categories`, by average cell
-    // leakage): one category keeps every buffer; several need the leakage, not read here.
-    if categories.len() > 1 {
-        return Err(Stop::refused("RSZ-VT", format!("{} VT categories among the buffers: the second most leaky (average cell leakage) is not modelled", categories.len())));
-    }
+    let BufferList { cells: list, by_site, by_footprint, sorted_vt, vt } = get_buffer_list(libs, masters, dont_use, exclude_clock_buffers)?;
+    // "Pick the second most leaky VT for multiple VTs"; the only one with one.
+    let best_vt = match sorted_vt.len() {
+        0 => None,
+        1 => Some(sorted_vt[0].index),
+        n => Some(sorted_vt[n - 2].index),
+    };
 
     // findBuffers: the footprint.
     let mut best_footprint: Option<&str> = None;
@@ -289,7 +308,7 @@ pub fn find_buffers(libs: &Libs, masters: &BTreeMap<String, Master>, dont_use: &
         return Err(Stop::refused("RSZ-SITES", format!("buffer sites with equal shares ({}): their order is the reference's pointer order, not modelled", sites.iter().map(|(s, c)| format!("{s}:{c}")).collect::<Vec<_>>().join(" "))));
     }
     let best_sites: Vec<&str> = sites.iter().take(2).map(|(s, _)| *s).collect();
-    let kept: Vec<&Cell> = list.into_iter().filter(|c| best_footprint.is_none_or(|fp| c.footprint == fp)).collect();
+    let kept: Vec<&Cell> = list.into_iter().filter(|c| best_footprint.is_none_or(|fp| c.footprint == fp) && best_vt.is_none_or(|i| vt[&c.name].index == i)).collect();
 
     // Five buckets, two buffers each by R·Cin.
     const BUCKETS: usize = 5;

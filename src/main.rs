@@ -298,13 +298,14 @@ fn disconnect_pins(p: &mut NetParasitics, net: &str, pins: &[String]) {
 
 /// `Resizer::initBlock`'s sizing restrictions from the block's properties (`set_opt_config`
 /// writes them before the repair): a limit absent is the default; `keep_sizing_site` absent is
-/// off. `keep_sizing_vt` is moot: a VT library is refused.
+/// off, as is `keep_sizing_vt`.
 fn sizing_limits(db: &Db) -> Result<vyges_rsz::sizing::SizingLimits, String> {
     let d = vyges_rsz::sizing::SizingLimits::default();
     Ok(vyges_rsz::sizing::SizingLimits {
         area: db.block_double_property("limit_sizing_area").map_err(|e| e.to_string())?.or(d.area),
         leakage: db.block_double_property("limit_sizing_leakage").map_err(|e| e.to_string())?.or(d.leakage),
         keep_site: db.block_bool_property("keep_sizing_site").map_err(|e| e.to_string())?.unwrap_or(false),
+        keep_vt: db.block_bool_property("keep_sizing_vt").map_err(|e| e.to_string())?.unwrap_or(false),
     })
 }
 
@@ -377,6 +378,8 @@ struct CliDesign<'a> {
     sdc_nets: BTreeSet<String>,
     /// The edits as the incremental timer receives them.
     timer: TimerLog,
+    /// Per instance, the cell its output-to-output edges carry after equivalent-arcs swaps.
+    stale_out_arcs: BTreeMap<String, String>,
 }
 
 /// The incremental timer's side of the edits: the database's callbacks as read, and the
@@ -572,6 +575,19 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
     /// `Resizer::replaceCell` → `dbInst::swapMaster`; the callback invalidates the net on every
     /// pin of the instance (not a tristate one).
     fn swap_master(&mut self, inst: &str, cell: &str) -> Result<(), String> {
+        // `Sta::replaceCell`: with equivalent arcs, `replaceEquivCellBefore` swaps the arc sets of
+        // the edges leaving the INPUT pins only — an output-to-output edge keeps the cell it was
+        // made with (the first one, across further equivalent swaps); otherwise the instance's
+        // edges are made anew from the new cell.
+        let from = self.netlist.insts.iter().find(|(n, _)| n == inst).map(|(_, c)| c.clone());
+        if let Some(from) = from {
+            let equiv = matches!((self.libs.link_cell(&from), self.libs.link_cell(cell)), (Some(a), Some(b)) if vyges_sta::incr::equiv_cells_arcs(a, b));
+            if equiv {
+                self.stale_out_arcs.entry(inst.to_string()).or_insert(from);
+            } else {
+                self.stale_out_arcs.remove(inst);
+            }
+        }
         if !self.db.swap_master(inst, cell).map_err(|e| e.to_string())? {
             return Err(format!("swapMaster {inst} -> {cell} failed"));
         }
@@ -610,6 +626,10 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
 
     fn inst_location(&self, inst: &str) -> (i32, i32) {
         self.db.inst_location(inst)
+    }
+
+    fn stale_out_arcs(&self) -> Option<&BTreeMap<String, String>> {
+        Some(&self.stale_out_arcs)
     }
 
     fn pin_location(&self, pin: &str) -> (i32, i32) {
@@ -1488,7 +1508,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 let core = (db.block_get_core_area_x_min(), db.block_get_core_area_y_min(), db.block_get_core_area_x_max(), db.block_get_core_area_y_max());
                 let core = (core != (0, 0, 0, 0)).then_some(core);
                 let port_caps = port_caps_at(step["sdc"].as_str(), sdc.as_ref(), &libs, &netlist)?;
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), timer: TimerLog::default() };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new() };
                 let r = buffer_ports::buffer_ports(&mut design, &o, &weakest);
                 let parasitics = std::mem::take(&mut design.parasitics);
                 match r {
@@ -1580,7 +1600,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 }
                 let port_caps = env.port_pin_cap.clone();
                 let limits_of_block = sizing_limits(&db)?;
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), timer: TimerLog::default() };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new() };
                 let inputs = Inputs { libs: &libs, masters: &m, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins, sizing_limits: limits_of_block };
                 outcome = Some(repair_design::repair_design(&inputs, &mut design, &a, &mut trace));
             }
@@ -1606,13 +1626,8 @@ fn run(job: &Value) -> Result<Value, String> {
                     return Err("repair_timing without estimate_parasitics -placement: not modelled".into());
                 }
                 let m = masters(&db)?;
-                // VT categories are modelled where `-hold` alone reads them (the buffer list and the
-                // hold buffer's VT); the setup moves' VT rules (equivalent cells, VT swap) are not.
-                if a.setup {
-                    if let Some((n, _)) = m.iter().find(|(_, mm)| !mm.implant_obs.is_empty()) {
-                        return Err(format!("master {n} has IMPLANT obstructions: VT categories are not modelled for -setup"));
-                    }
-                }
+                // VT categories (IMPLANT obstructions) are read where the reference reads them: the
+                // buffer list, the hold buffer's VT, VtSwapMove; CRIT_VT_SWAP refuses itself.
                 let lib0 = libs.default_library().ok_or("repair_timing before any liberty library")?;
                 let time_scale = lib0.time_scale;
                 let s = sdc.as_ref().ok_or("repair_timing without constraints: not modelled")?;
@@ -1689,7 +1704,16 @@ fn run(job: &Value) -> Result<Value, String> {
                 let margin = vyges_sta::sdc::user_to_sta(a.setup_margin, time_scale);
                 let violating = rt::collect_violating(&ends, margin);
                 let violating_starts = rt::collect_violating(&starts, margin);
-                let seq = rt::move_sequence(&a, false);
+                // `hasVtSwapCells`: more than one VT category among the buffers (`getBufferList` in
+                // the preamble, clock buffers excluded for -setup).
+                let vt_category_count = {
+                    let mut du = set_dont_use.clone();
+                    for lib in &libs.libs {
+                        du.extend(lib.cells.values().filter(|c| c.dont_use).map(|c| c.name.clone()));
+                    }
+                    vyges_rsz::preamble::get_buffer_list(&libs, &m, &du, !hold_only).map_err(|e| format!("{}: {}", e.code(), e.message()))?.sorted_vt.len()
+                };
+                let seq = rt::move_sequence(&a, vt_category_count > 1);
                 let mut lines = rt::preamble(&seq, violating.len(), a.repair_tns_end_percent, a.phases.as_deref());
                 // The moves modelled, over one corner or several (each reads the scenes the
                 // reference's does: see the moves), LEGACY and LAST_GASP.
@@ -1807,6 +1831,7 @@ fn run(job: &Value) -> Result<Value, String> {
                         rebuffer: rb_ctx,
                         lowest_buffer: &buffers.lowest,
                         fast_buffers: &fast_buffers,
+                        vt_category_count,
                         pin_addr: pin_addr.as_ref(),
                         hierarchy: db_hierarchy,
                     };
@@ -1819,7 +1844,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     let core = (core != (0, 0, 0, 0)).then_some(core);
                     let port_caps = env.port_pin_cap.clone();
                     let sdc_nets: BTreeSet<String> = s.env.iter().filter(|e| e.cmd == "set_load" && e.accessor == "get_nets").flat_map(|e| e.objects.iter().cloned()).collect();
-                    let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated, journal: Vec::new(), sdc_nets, timer: TimerLog::default() };
+                    let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated, journal: Vec::new(), sdc_nets, timer: TimerLog::default(), stale_out_arcs: BTreeMap::new() };
                     if hold_only {
                         let mut trace_head = Vec::new();
                         if debug_levels.get(&("RSZ".to_string(), "resizer".to_string())).is_some_and(|&l| l >= 1) {

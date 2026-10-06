@@ -52,6 +52,11 @@ pub trait Design {
     fn insert_repeater(&mut self, loads: &[String], cell: &str, loc: (i32, i32), reason: &str) -> Result<Repeater, String>;
     /// `Resizer::replaceCell`: `dbInst::swapMaster`.
     fn swap_master(&mut self, inst: &str, cell: &str) -> Result<(), String>;
+    /// Per instance, the cell whose arc sets its output-to-output edges still carry after
+    /// equivalent-arcs replacements ([`vyges_sta::graph::Graph::stale_out_arcs`]); none by default.
+    fn stale_out_arcs(&self) -> Option<&std::collections::BTreeMap<String, String>> {
+        None
+    }
     /// An instance's location.
     fn inst_location(&self, inst: &str) -> (i32, i32);
     /// `dbNetwork::location(pin)`: an instance terminal's average XY (else its instance's origin),

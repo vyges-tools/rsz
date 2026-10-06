@@ -81,6 +81,8 @@ pub struct Ctx<'a> {
     pub lowest_buffer: &'a str,
     /// `buffer_fast_sizes_` (`findFastBuffers`): SizeDownFanout's sizes for a buffer load.
     pub fast_buffers: &'a [String],
+    /// `vtCategoryCount()`: the VT categories among the buffers (`sorted_vt_categories`).
+    pub vt_category_count: usize,
     /// The reference's pin addresses, when the gate supplies them ([`unbuffer::PinAddr`]).
     pub pin_addr: Option<&'a unbuffer::PinAddr>,
     /// `dbNetwork::hasHierarchy`: instance and net names print without their parent prefix.
@@ -381,6 +383,9 @@ fn timed_all<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits: Ti
         if ctx.ideal_clock {
             gk.ideal_clock = ck.iter().copied().collect();
         }
+        if let Some(stale) = design.stale_out_arcs() {
+            gk.set_stale_out_arcs(stale);
+        }
         inc_prepare(ctx, design, &mut gk, &mut timer.inc[k], &edits)?;
         graphs.push(gk);
         all_clocks.push(ck);
@@ -399,7 +404,7 @@ fn timed_all<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits: Ti
             let net = g.vertex_net[v].map(|n| g.netlist.nets[n].name.clone()).unwrap_or_default();
             let has_par = design.parasitics(0).contains_key(&net);
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                let _ = writeln!(f, "SNAP {pin} slew={:e},{:e} net={net} parasitic={has_par} ideal={}", g.slew[v][0][MAX], g.slew[v][1][MAX], g.ideal_clock.contains(&v));
+                let _ = writeln!(f, "SNAP {pin} slew={:e},{:e} min={:e},{:e} net={net} parasitic={has_par} ideal={}", g.slew[v][0][MAX], g.slew[v][1][MAX], g.slew[v][0][vyges_sta::liberty::MIN], g.slew[v][1][vyges_sta::liberty::MIN], g.ideal_clock.contains(&v));
             }
         }
     }
@@ -1793,12 +1798,39 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
                     r.print_tracker_phase_summary("LAST_GASP Phase Endpoint Profiler");
                 }
             }
-            // No VT cells (a VT library is refused): nothing to swap, no endpoint profile asked.
-            "CRIT_VT_SWAP" => {}
+            // `SetupCritVtSwapPolicy`: nothing to do when skipped or with one VT category; with
+            // several it swaps critical cells, which is not modelled.
+            "CRIT_VT_SWAP" => {
+                if !(args.skip_crit_vt_swap || args.skip_vt_swap || ctx.vt_category_count < 2) {
+                    return Err(Stop::refused("RSZ-ABSENT", "the CRIT_VT_SWAP phase over several VT categories is not modelled".into()));
+                }
+            }
             other => return Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -phases: {other} is not modelled"))),
         }
     }
     r.finalize_and_report()?;
+    // A diagnostic: the timer as the call left it — incremental — every pin's max slack per
+    // transition in fs (the least over the scenes), as the capture's `post-1.slacks` holds the
+    // reference's (`VYGES_RSZ_POST_SLACKS=<file>`).
+    if let Ok(path) = std::env::var("VYGES_RSZ_POST_SLACKS") {
+        let edits = r.design.take_timer_edits();
+        let text = timed_all(ctx, r.design.as_design(), &mut r.timer, edits, |gs, ss, _| {
+            let mut out = String::new();
+            for (v, vx) in gs[0].vertices.iter().enumerate() {
+                let mut slack = [vyges_sta::search::INF_SLACK; 2];
+                for (k, s) in ss.iter().enumerate() {
+                    let vk = if k == 0 { Some(v) } else { gs[k].vertices.iter().position(|x| x.name == vx.name) };
+                    let Some(vk) = vk else { continue };
+                    for (rf, sl) in slack.iter_mut().enumerate() {
+                        *sl = sl.min(s.slack_of(vk, MAX, Some(rf)));
+                    }
+                }
+                out.push_str(&format!("{} {:.6} {:.6}\n", vx.name, f64::from(slack[0]) * 1e15, f64::from(slack[1]) * 1e15));
+            }
+            Ok(out)
+        })?;
+        let _ = std::fs::write(path, text);
+    }
     r.out.resized = r.committer.committed(Move::SizeUp) + r.committer.committed(Move::SizeDownFanout);
     r.out.removed = r.committer.committed(Move::Unbuffer);
     r.out.inserted = r.committer.committed(Move::Buffer);
@@ -2905,7 +2937,7 @@ impl Repair<'_, '_> {
         es.journal_open = true;
         let line = format!(
             "{phase} Phase: Doing endpoint {} ({}/{}) WNS = {}, endpoint slack = {}, TNS = {}",
-            es.end,
+            crate::repair_timing::sta_to_sdc(&es.end),
             self.end_index,
             self.max_end_count,
             self.ds(es.worst_slack, 3),
@@ -3092,7 +3124,7 @@ impl Repair<'_, '_> {
             es.journal_open = true;
             es.prev_end_slack = es.end_slack;
             es.prev_worst_slack = es.worst_slack;
-            let line = format!("{phase} Phase: Doing endpoint {} ({}/{}) endpoint slack = {}, WNS = {}", es.end, self.end_index, self.max_end_count, self.ds(es.end_slack, 3), self.ds(es.worst_slack, 3));
+            let line = format!("{phase} Phase: Doing endpoint {} ({}/{}) endpoint slack = {}, WNS = {}", crate::repair_timing::sta_to_sdc(&es.end), self.end_index, self.max_end_count, self.ds(es.end_slack, 3), self.ds(es.worst_slack, 3));
             self.debug("repair_setup", 1, line);
             self.repair_last_gasp_endpoint(&mut es, &mut prev_worst_slack)?;
             if self.args.verbose || self.opto_iteration == 1 {
@@ -3306,9 +3338,7 @@ impl Repair<'_, '_> {
                 Move::Clone => self.clone_move(view, index)?,
                 Move::SplitLoad => self.split_load_move(view, index)?,
                 Move::SizeUpMatch => self.size_up_match_move(view, index)?,
-                // VtSwapGenerator: a candidate needs two VT categories, and a VT library is
-                // refused before the repair — so it never has one.
-                Move::VtSwap => None,
+                Move::VtSwap => self.vt_swap_move(view, index)?,
                 other => return Err(Stop::refused("RSZ-ABSENT", format!("{}: not modelled", other.name()))),
             };
             if let Some(r) = result {
@@ -3580,6 +3610,27 @@ impl Repair<'_, '_> {
         if let Some(level) = self.committer.levels.last_mut() {
             level.push((r, ids));
         }
+    }
+
+    /// `VtSwapGenerator::selectPathBestCell` → `VtSwapCandidate::applyReplacement`: the path driver's
+    /// instance, with two VT categories or more, not dont_touch, a logic standard cell; the best
+    /// VT-equivalent cell (`getVTEquivCells(..).back()`) unless it is the cell itself; refused by
+    /// the max-capacitance guard, else `replaceCell`.
+    fn vt_swap_move(&mut self, view: &PathView, index: usize) -> Result<Option<MoveResult>, Stop> {
+        let st = &view.stages[index];
+        let (Some(inst), Some(cell)) = (&st.inst, &st.cell) else { return Ok(None) };
+        if self.ctx.vt_category_count < 2 || self.design.net_info().dont_touch_insts.contains(inst) || !self.ctx.sizing.masters.get(cell).is_some_and(|m| m.logic_std) {
+            return Ok(None);
+        }
+        let equiv = self.ctx.sizing.vt_equiv_cells(cell, self.ctx.vt_category_count);
+        let Some(best) = equiv.last().filter(|b| *b != cell).cloned() else { return Ok(None) };
+        if !replacement_preserves_max_cap(self.ctx.libs, cell, &best, &st.fanin_caps) {
+            self.debug("vt_swap_move", 2, format!("REJECT VTSwapMove {}: {cell} -> {best} violates max capacitance", st.pin));
+            return Ok(None);
+        }
+        self.design.swap_master(inst, &best).map_err(|e| Stop::error("RSZ-REPLACE", e))?;
+        self.debug("vt_swap_move", 1, format!("ACCEPT VTSwapMove {}: {cell} -> {best}", st.pin));
+        Ok(Some(MoveResult { kind: Move::VtSwap, count: 1, insts: vec![inst.clone()] }))
     }
 
     /// SizeUpGenerator → SizeUpCandidate::apply (`Resizer::replaceCell`).
@@ -4049,7 +4100,7 @@ impl Repair<'_, '_> {
                 iter: &field,
                 removed: self.committer.total(Move::Unbuffer),
                 // SizeUp, SizeDownFanout, SizeUpMatch and VtSwap (none: no VT library).
-                resized: self.committer.total(Move::SizeUp) + self.committer.total(Move::SizeDownFanout) + self.committer.total(Move::SizeUpMatch),
+                resized: self.committer.total(Move::SizeUp) + self.committer.total(Move::SizeDownFanout) + self.committer.total(Move::SizeUpMatch) + self.committer.total(Move::VtSwap),
                 inserted: self.committer.total(Move::Buffer) + self.committer.total(Move::SplitLoad),
                 cloned: self.committer.total(Move::Clone),
                 swaps: self.committer.total(Move::SwapPins),
@@ -4077,7 +4128,7 @@ impl Repair<'_, '_> {
                 iter: "final",
                 removed: self.committer.total(Move::Unbuffer),
                 // SizeUp, SizeDownFanout, SizeUpMatch and VtSwap (none: no VT library).
-                resized: self.committer.total(Move::SizeUp) + self.committer.total(Move::SizeDownFanout) + self.committer.total(Move::SizeUpMatch),
+                resized: self.committer.total(Move::SizeUp) + self.committer.total(Move::SizeDownFanout) + self.committer.total(Move::SizeUpMatch) + self.committer.total(Move::VtSwap),
                 inserted: self.committer.total(Move::Buffer) + self.committer.total(Move::SplitLoad),
                 cloned: self.committer.total(Move::Clone),
                 swaps: self.committer.total(Move::SwapPins),
@@ -4105,9 +4156,9 @@ impl Repair<'_, '_> {
                 self.report(format!("[INFO RSZ-0045] Inserted {} buffers, {splits} to split loads.", buffers + splits));
             }
         }
-        let (size_up, up_match, down) = (self.committer.committed(Move::SizeUp), self.committer.committed(Move::SizeUpMatch), self.committer.committed(Move::SizeDownFanout));
-        if size_up + up_match + down > 0 {
-            self.report(format!("[INFO RSZ-0051] Resized {} instances: {size_up} up, {up_match} up match, {down} down, 0 VT", size_up + up_match + down));
+        let (size_up, up_match, down, vt) = (self.committer.committed(Move::SizeUp), self.committer.committed(Move::SizeUpMatch), self.committer.committed(Move::SizeDownFanout), self.committer.committed(Move::VtSwap));
+        if size_up + up_match + down + vt > 0 {
+            self.report(format!("[INFO RSZ-0051] Resized {} instances: {size_up} up, {up_match} up match, {down} down, {vt} VT", size_up + up_match + down + vt));
         }
         let swaps = self.committer.committed(Move::SwapPins);
         if swaps > 0 {
