@@ -1111,27 +1111,29 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
 /// and is not a setup input; any other flag is refused.
 fn search_sdc(s: &vyges_loom::sdc::Sdc, text: &str, time_scale: f32, propagated: bool, hold_repair: bool) -> Result<vyges_sta::sdc::Sdc, String> {
     use vyges_sta::sdc::{Clock, PortDelay};
-    // One clock: on one source port, or virtual (no source — its edges launch the input delays and
-    // close the output delays; nothing is clocked on the design). A mixture is refused.
-    // None: nothing clocked — every path unclocked (the timer's own refusals apply).
-    let clock = match s.clocks.as_slice() {
-        [] => None,
-        [clock] => Some(clock),
-        _ => {
-            let real = s.clocks.iter().filter(|c| !c.is_virtual()).count();
-            return Err(format!("repair_timing with {real} clocks and {} virtual: not modelled (one clock or none is)", s.clocks.len() - real));
-        }
-    };
-    let source: &str = match clock {
-        None => "",
-        Some(clock) if clock.is_virtual() => "",
-        Some(clock) => {
+    // The clocks in the order they were made (`Clock::index`): each on one source port, or virtual
+    // (no source — its edges launch input delays and close output delays). None: every path
+    // unclocked. A clock is propagated when `set_propagated_clock` names it (the reference writes it
+    // per clock; a virtual clock never is), or — named by none — when the run's command set it.
+    let named_propagated: Vec<String> = text
+        .lines()
+        .filter(|l| l.trim_start().starts_with("set_propagated_clock"))
+        .flat_map(|l| l.split("[get_clocks {").skip(1).filter_map(|r| r.split('}').next()).flat_map(|n| n.split_whitespace().map(String::from).collect::<Vec<_>>()).collect::<Vec<_>>())
+        .collect();
+    let mut clocks = Vec::new();
+    for clock in &s.clocks {
+        let source: &str = if clock.is_virtual() {
+            ""
+        } else {
             let [source] = clock.sources.as_slice() else {
                 return Err(format!("clock {} on {} sources: not modelled (one is)", clock.name, clock.sources.len()));
             };
             source
-        }
-    };
+        };
+        let prop = !clock.is_virtual() && if named_propagated.is_empty() { propagated } else { named_propagated.contains(&clock.name) };
+        clocks.push(Clock::new(&clock.name, vyges_sta::sdc::user_to_sta(clock.period, time_scale), source, prop));
+    }
+    let clock_index = |name: &str| s.clocks.iter().position(|c| c.name == name);
     // A hold uncertainty moves only hold checks: read by a hold repair alone.
     if s.setup_uncertainty != 0.0 || (s.hold_uncertainty != 0.0 && hold_repair) {
         return Err("set_clock_uncertainty: not modelled".into());
@@ -1145,6 +1147,7 @@ fn search_sdc(s: &vyges_loom::sdc::Sdc, text: &str, time_scale: f32, propagated:
     // Per side (input, output): each port and its delay by `[rf][min/max]`, as set so far.
     type Delays = Vec<(String, [[Option<f32>; 2]; 2])>;
     let mut delays: [Delays; 2] = [Vec::new(), Vec::new()];
+    let mut delay_clock: BTreeMap<(usize, String), usize> = BTreeMap::new();
     for line in text.lines() {
         let line = line.trim();
         let side = if line.starts_with("set_input_delay ") { 0 } else if line.starts_with("set_output_delay ") { 1 } else { continue };
@@ -1157,9 +1160,9 @@ fn search_sdc(s: &vyges_loom::sdc::Sdc, text: &str, time_scale: f32, propagated:
             }
         }
         let clock_name = line.split("[get_clocks {").nth(1).and_then(|r| r.split('}').next()).ok_or_else(|| format!("{line}: a delay without -clock is not modelled"))?;
-        if clock.is_none_or(|c| clock_name != c.name) {
-            return Err(format!("{line}: a delay on another clock is not modelled"));
-        }
+        let Some(ci) = clock_index(clock_name) else {
+            return Err(format!("{line}: a delay on an unknown clock is not modelled"));
+        };
         let ports = line.split("[get_ports {").nth(1).and_then(|r| r.split('}').next()).ok_or_else(|| format!("{line}: ports not read"))?;
         let mms: Vec<usize> = match (flag("-min"), flag("-max")) {
             (true, false) => vec![0],
@@ -1173,6 +1176,10 @@ fn search_sdc(s: &vyges_loom::sdc::Sdc, text: &str, time_scale: f32, propagated:
         };
         let v = vyges_sta::sdc::user_to_sta(value, time_scale);
         for port in ports.split_whitespace() {
+            // One clock per port and side (the timer keeps one delay per port).
+            if *delay_clock.entry((side, port.to_string())).or_insert(ci) != ci {
+                return Err(format!("port {port}: delays on two clocks are not modelled"));
+            }
             let list = &mut delays[side];
             let k = match list.iter().position(|(p, _)| p == port) {
                 Some(k) => k,
@@ -1197,7 +1204,7 @@ fn search_sdc(s: &vyges_loom::sdc::Sdc, text: &str, time_scale: f32, propagated:
             .map(|(p, d)| {
                 let max = |rf: usize| d[rf][1].ok_or_else(|| format!("port {p}: an input delay without its max value for both transitions is not modelled"));
                 let (r, f) = (max(0)?, max(1)?);
-                Ok(PortDelay { port: p.clone(), delay: [[d[0][0].unwrap_or(r), r], [d[1][0].unwrap_or(f), f]], exists: [[true; 2]; 2] })
+                Ok(PortDelay { port: p.clone(), delay: [[d[0][0].unwrap_or(r), r], [d[1][0].unwrap_or(f), f]], exists: [[true; 2]; 2], clock: delay_clock[&(0, p.clone())] })
             })
             .collect()
     };
@@ -1211,15 +1218,15 @@ fn search_sdc(s: &vyges_loom::sdc::Sdc, text: &str, time_scale: f32, propagated:
                 }
                 let exists = [[d[0][0].is_some(), d[0][1].is_some()], [d[1][0].is_some(), d[1][1].is_some()]];
                 let v = |rf: usize, mm: usize| d[rf][mm].unwrap_or(0.0);
-                Ok(PortDelay { port: p.clone(), delay: [[v(0, 0), v(0, 1)], [v(1, 0), v(1, 1)]], exists })
+                Ok(PortDelay { port: p.clone(), delay: [[v(0, 0), v(0, 1)], [v(1, 0), v(1, 1)]], exists, clock: delay_clock[&(1, p.clone())] })
             })
             .collect()
     };
     Ok(vyges_sta::sdc::Sdc {
-        clock: clock.map(|c| Clock::new(&c.name, vyges_sta::sdc::user_to_sta(c.period, time_scale), source, propagated)),
+        clocks,
         input_delays: inputs(&delays[0])?,
         output_delays: outputs(&delays[1])?,
-        path_delays: path_delays(text, clock.map(|c| c.name.as_str()), time_scale)?,
+        path_delays: path_delays(text, &s.clocks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), time_scale)?,
     })
 }
 
@@ -1228,7 +1235,7 @@ fn search_sdc(s: &vyges_loom::sdc::Sdc, text: &str, time_scale: f32, propagated:
 /// <delay>`, objects `[get_pins {..}]` or `[get_clocks {..}]`. Any other flag is refused; so is
 /// more than one (an exception's id is the order it was MADE in, which the file may not keep).
 /// Which forms the timer models is the search's to say (`Search::path_delays_modelled`).
-fn path_delays(text: &str, clock: Option<&str>, time_scale: f32) -> Result<Vec<vyges_sta::sdc::PathDelay>, String> {
+fn path_delays(text: &str, clocks: &[&str], time_scale: f32) -> Result<Vec<vyges_sta::sdc::PathDelay>, String> {
     use vyges_sta::liberty::{MAX, MIN};
     let joined = text.replace("\\\n", " ");
     let mut out = Vec::new();
@@ -1242,7 +1249,7 @@ fn path_delays(text: &str, clock: Option<&str>, time_scale: f32) -> Result<Vec<v
             let names: Vec<String> = inner.split('{').nth(1).and_then(|r| r.split('}').next()).unwrap_or("").split_whitespace().map(String::from).collect();
             if inner.starts_with("get_pins ") {
                 Ok((names, false))
-            } else if inner.starts_with("get_clocks ") && clock.is_some_and(|c| names == [c]) {
+            } else if inner.starts_with("get_clocks ") && names.len() == 1 && clocks.contains(&names[0].as_str()) {
                 Ok((Vec::new(), true))
             } else {
                 Err(format!("{line}: {flag} [{inner}]: not modelled (pins or the clock are)"))

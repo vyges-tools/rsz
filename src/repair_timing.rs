@@ -601,7 +601,8 @@ pub fn timing_points(g: &vyges_sta::graph::Graph<'_>, search: &vyges_sta::search
         // `Search::isEndpoint` (a path delay's internal pins included); an end whose fanout the
         // search still walks is refused — a path delay's internal `-to` pin breaks it.
         if search.is_endpoint(v) {
-            if search.has_fanout(v) && !search.is_path_delay_internal_to_break(v) && !search.fanout_only_latch_d_to_q(v) {
+            // A gated clock enable's fanout continues as data into the clock network: no end there.
+            if search.has_fanout(v) && !search.is_path_delay_internal_to_break(v) && !search.fanout_only_latch_d_to_q(v) && !search.is_gated_clk_enable(v) {
                 return Err(format!("endpoint {} has fanout: its slack through the path ends downstream is not modelled", vx.name));
             }
             ends.push(Point { pin: vx.name.clone(), slack: search.vertex_slack(v) });

@@ -713,8 +713,8 @@ fn probe_rebuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[
             let ideal_clk = set.role == Role::RegClkToQ && gk.ideal_clock.contains(&prev.vertex);
             let from_slew = if ideal_clk { 0.0 } else { gk.slew[prev.vertex][arc.from_rf][MAX] };
             // clkPathArrival for a clock path: the ideal clock's edge, else its arrival.
-            let prev_arrival = match ctx.ssdc.clock.as_ref() {
-                Some(c) if dp.tag.is_clock && !c.propagated => c.edge_time(dp.tag.clk_edge.unwrap_or(dp.tag.rf)),
+            let prev_arrival = match dp.tag.clk_edge.and_then(|e| ctx.ssdc.clocks.get(e / 2).map(|c| (e, c))) {
+                Some((e, c)) if dp.tag.is_clock && !c.propagated => c.edge_time(e % 2),
                 _ => dp.arrival,
             };
             Some(rebuffer::DriverArc { model: arc.model.clone(), from_slew, prev_arrival, arrival: ap.arrival })
@@ -2543,7 +2543,13 @@ impl Repair<'_, '_> {
         // From the path's start: the pins before it are its clock path (`isClock`). ⚠️ No run has
         // a driver on its clock path (each clock port drives the registers directly): the mutant
         // scanning from 0 survives.
-        let pins: Vec<String> = view.stages.iter().skip(view.start).filter(|s| s.is_driver && !s.top_port).map(|s| s.pin.clone()).collect::<BTreeSet<_>>().into_iter().collect();
+        let mut pins: BTreeSet<String> = view.stages.iter().skip(view.start).filter(|s| s.is_driver && !s.top_port).map(|s| s.pin.clone()).collect();
+        // `visitLatchFaninSegments` → `collectExpandedPathDriverPins`: each latch D fanin path's
+        // drivers from its start (no top-level port, no clock pin).
+        for seg in &view.latch_segments {
+            pins.extend(seg.stages.iter().skip(seg.start).filter(|s| s.is_driver && !s.top_port).map(|s| s.pin.clone()));
+        }
+        let pins: Vec<String> = pins.into_iter().collect();
         let mut data = self.violator_data(&pins)?;
         crate::order::libcxx_sort_by(&mut data, |a, b| a.1 > b.1 || (a.1 == b.1 && a.2 < b.2) || (a.1 == b.1 && a.2 == b.2 && a.0 < b.0))
             .map_err(|e| Stop::refused("RSZ-ABSENT", format!("the violator sort over {} pins falls back to heap sort: not modelled", e.len)))?;
@@ -2626,12 +2632,14 @@ impl Repair<'_, '_> {
                     &own
                 }
             };
-            let Some(index) = (view.start..view.stages.len()).find(|&i| view.stages[i].pin == *pin && view.stages[i].is_driver) else { continue };
-            if view.stages[index].top_port {
+            // `visitPathSegments`: the main path first, then each latch D fanin path.
+            let found = std::iter::once(view).chain(view.latch_segments.iter()).find_map(|seg| (seg.start..seg.stages.len()).find(|&i| seg.stages[i].pin == *pin && seg.stages[i].is_driver).map(|i| (seg, i)));
+            let Some((seg, index)) = found else { continue };
+            if seg.stages[index].top_port {
                 continue;
             }
             let rej = rejected.get(pin).cloned().unwrap_or_default();
-            if let Some(kind) = self.try_repair_target(view, index, &mut changed, repairs_per_pass, &rej)? {
+            if let Some(kind) = self.try_repair_target(seg, index, &mut changed, repairs_per_pass, &rej)? {
                 chosen.push((pin.clone(), kind));
                 moved = true;
             }
@@ -2706,7 +2714,7 @@ impl Repair<'_, '_> {
     /// ends; and `trackCriticalPins`' pins (a non-clock driver whose RISE slack in ps is below 0)
     /// in Category 2's order — the set's (pin address) order, sorted by slack.
     fn tracker_reports(&mut self) -> Result<(Vec<move_tracker::TopEnd>, Vec<move_tracker::CriticalPin>), Stop> {
-        if self.ctx.libs.scene_count() > 1 || self.ctx.ssdc.clock.as_ref().is_some_and(|c| c.propagated) {
+        if self.ctx.libs.scene_count() > 1 || self.ctx.ssdc.clocks.iter().any(|c| c.propagated) {
             let ends = collect_violating(&self.timing.ends, 0.0).len();
             if ends > 0 {
                 return Err(Stop::refused("RSZ-ABSENT", "repair_timing: the move tracker's path enumeration over several scenes or a propagated clock is not modelled".into()));
