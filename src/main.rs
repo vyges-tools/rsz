@@ -1177,7 +1177,59 @@ fn search_sdc(s: &vyges_loom::sdc::Sdc, text: &str, time_scale: f32, propagated:
         clock: Clock::new(&clock.name, vyges_sta::sdc::user_to_sta(clock.period, time_scale), source, propagated),
         input_delays: inputs(&delays[0])?,
         output_delays: outputs(&delays[1])?,
+        path_delays: path_delays(text, &clock.name, time_scale)?,
     })
+}
+
+/// Every `set_max_delay` / `set_min_delay` as the reference's `write_sdc` writes it — one command
+/// over `\`-continued lines: `[-ignore_clock_latency] [-probe] [-from <objs>] [-to <objs>]
+/// <delay>`, objects `[get_pins {..}]` or `[get_clocks {..}]`. Any other flag is refused; so is
+/// more than one (an exception's id is the order it was MADE in, which the file may not keep).
+/// Which forms the timer models is the search's to say (`Search::path_delays_modelled`).
+fn path_delays(text: &str, clock: &str, time_scale: f32) -> Result<Vec<vyges_sta::sdc::PathDelay>, String> {
+    use vyges_sta::liberty::{MAX, MIN};
+    let joined = text.replace("\\\n", " ");
+    let mut out = Vec::new();
+    for line in joined.lines() {
+        let line = line.trim();
+        let min_max = if line.starts_with("set_max_delay ") { MAX } else if line.starts_with("set_min_delay ") { MIN } else { continue };
+        // The objects of one flag: (pins, names the clock).
+        let objs = |flag: &str| -> Result<(Vec<String>, bool), String> {
+            let Some(rest) = line.split(&format!(" {flag} [")).nth(1) else { return Ok((Vec::new(), false)) };
+            let inner = rest.split(']').next().unwrap_or("");
+            let names: Vec<String> = inner.split('{').nth(1).and_then(|r| r.split('}').next()).unwrap_or("").split_whitespace().map(String::from).collect();
+            if inner.starts_with("get_pins ") {
+                Ok((names, false))
+            } else if inner.starts_with("get_clocks ") && names == [clock] {
+                Ok((Vec::new(), true))
+            } else {
+                Err(format!("{line}: {flag} [{inner}]: not modelled (pins or the clock are)"))
+            }
+        };
+        let words: Vec<&str> = line.split_whitespace().collect();
+        for w in words.iter().filter(|w| w.starts_with('-')) {
+            if !matches!(*w, "-ignore_clock_latency" | "-probe" | "-from" | "-to") {
+                return Err(format!("{} {w}: not modelled", words[0]));
+            }
+        }
+        let value: f64 = words.last().and_then(|w| w.parse().ok()).ok_or_else(|| format!("{line}: the delay value is not modelled"))?;
+        let (from_pins, from_clock) = objs("-from")?;
+        let (to_pins, to_clock) = objs("-to")?;
+        out.push(vyges_sta::sdc::PathDelay {
+            from_pins,
+            from_clock,
+            to_pins,
+            to_clock,
+            min_max,
+            ignore_clk_latency: words.contains(&"-ignore_clock_latency"),
+            break_path: !words.contains(&"-probe"),
+            delay: vyges_sta::sdc::user_to_sta(value, time_scale),
+        });
+    }
+    if out.len() > 1 {
+        return Err(format!("{} path delays: not modelled (one is; ids are the order they were made in)", out.len()));
+    }
+    Ok(out)
 }
 
 fn run(job: &Value) -> Result<Value, String> {
@@ -1217,6 +1269,9 @@ fn run(job: &Value) -> Result<Value, String> {
     // The SDC file last read (its text: the I/O delays' flags).
     let mut sdc_path: Option<String> = None;
     let mut sdc_propagated = false;
+    // `set_max_delay` / `set_min_delay` in the file: read by repair_timing's search, which says
+    // which forms it models; every other command refuses them.
+    let mut sdc_path_delays = false;
     // Each repair_timing's lines; a refusal after them stops the job.
     let mut timing_runs: Vec<Value> = Vec::new();
     // `set_debug_level`: each (tool, group) and its level.
@@ -1349,7 +1404,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 let unmodelled: Vec<&str> = s
                     .ignored_affecting_timing()
                     .into_iter()
-                    .filter(|c| (*c != "set_max_transition" || s.max_transition_on_objects) && (*c != "set_max_fanout" || s.max_fanout_on_objects) && *c != "set_driving_cell" && *c != "set_propagated_clock")
+                    .filter(|c| (*c != "set_max_transition" || s.max_transition_on_objects) && (*c != "set_max_fanout" || s.max_fanout_on_objects) && *c != "set_driving_cell" && *c != "set_propagated_clock" && *c != "set_max_delay" && *c != "set_min_delay")
                     .collect();
                 if !unmodelled.is_empty() {
                     return Err(format!("{path}: {} not modelled", unmodelled.join(", ")));
@@ -1357,12 +1412,16 @@ fn run(job: &Value) -> Result<Value, String> {
                 // `set_propagated_clock` in the file: read by repair_timing's search; the other
                 // commands refuse it when they run.
                 sdc_propagated = s.ignored.iter().any(|c| c == "set_propagated_clock");
+                sdc_path_delays = s.ignored.iter().any(|c| c == "set_max_delay" || c == "set_min_delay");
                 sdc = Some(s);
                 sdc_path = Some(path.clone());
             }
             "buffer_ports" => {
                 if sdc_propagated {
                     return Err("set_propagated_clock: not modelled for buffer_ports".into());
+                }
+                if sdc_path_delays {
+                    return Err("set_max_delay / set_min_delay: not modelled for buffer_ports".into());
                 }
                 link_corner_is_first(&libs)?;
                 let o = buffer_ports::Options::parse(&args)?;
@@ -1430,6 +1489,9 @@ fn run(job: &Value) -> Result<Value, String> {
                 link_corner_is_first(&libs)?;
                 if sdc_propagated {
                     return Err("set_propagated_clock: not modelled for repair_design".into());
+                }
+                if sdc_path_delays {
+                    return Err("set_max_delay / set_min_delay: not modelled for repair_design".into());
                 }
                 let a = parse_args(&args)?;
                 // dont_use_: every liberty dont_use cell (copyDontUseFromLiberty), then set_dont_use.
@@ -1558,6 +1620,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 g.find_delays(&parasitics[0], None)?;
                 let ssdc = search_sdc(s, &text, time_scale, clock_propagated, a.hold)?;
                 let mut search = vyges_sta::search::Search::in_graph_order(&g, &ssdc);
+                search.path_delays_modelled()?;
                 search.find_arrivals()?;
                 search.find_requireds()?;
                 // A diagnostic: every vertex's max-path arrivals, requireds and slews (seconds),
@@ -1968,12 +2031,15 @@ REPAIR_TIMING:
   preamble and row 0 (an empty list or an unknown first phase is the command's own error;
   GLOBAL_SIZING, MT1, MEASURED_VT_SWAP refused before the lines). Refused before the lines:
   -recover_power, several corners, VT libraries, a latch, a virtual clock, clock
-  uncertainty / latency / transition, derates, path exceptions; refused during the repair:
+  uncertainty / latency / transition, derates, false and multicycle paths, a path delay other
+  than one set_max_delay -ignore_clock_latency from register clock pins to setup-checked pins;
+  refused during the repair:
   -setup with -max_utilization, more than one repair per pass.
 
 CONSTRAINTS READ FROM SDC:
   create_clock, set_max_transition and set_max_fanout on the design, set_load on nets and ports,
-  set_input_transition, set_driving_cell; any other timing-affecting command is refused
+  set_input_transition, set_driving_cell, set_max_delay / set_min_delay (repair_timing only, the
+  forms above); any other timing-affecting command is refused
 
 OPTIONS:
   -o FILE               write the JSON report to FILE instead of stdout
@@ -2015,7 +2081,7 @@ const DESCRIBE: &str = r#"{
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "status is one of repaired, up_to_date, vacuous, refused or error. repaired means the design changed (buffers inserted or drivers resized); up_to_date means drivers were checked and none needed a change (nets_checked says how many; for a job with buffer_ports and no repair_design, ports_checked); vacuous means nothing was checked and is NOT a pass. The declared assertion passes on repaired or up_to_date. Exit status is 0 for repaired and up_to_date, 2 for vacuous and for error, 3 for refused.",
     "Modelled: placement parasitics, one or more corners, flat and hierarchical netlists, the default buffer selection, the SDC constraints the usage lists, buffer_ports before the repair (the estimate it leaves carried into it). Refused rather than guessed: global-route parasitics, the early sizing round, footprint matching, rerouting, any other netlist edit between the estimate and the repair, buffer_ports on a hierarchical design, a tristate driver or a bidirect pin on a net, and any other timing-affecting SDC command.",
-    "repair_timing -setup is modelled for every move of the default sequence in the LEGACY phase and LAST_GASP, and repair_timing -hold alone in full (ending with RSZ-0050 / RSZ-0060 as the command does): every progress row, the summary and the design left, for one ideal or propagated clock, over one corner or several; -setup with -hold runs the setup part and is refused after it; other -phases are refused after the preamble (an empty list or an unknown first phase is the command's error), VT libraries, latches, virtual clocks, clock uncertainty, latency or transition, derates and exceptions are refused before the lines."
+    "repair_timing -setup is modelled for every move of the default sequence in the LEGACY phase and LAST_GASP, and repair_timing -hold alone in full (ending with RSZ-0050 / RSZ-0060 as the command does): every progress row, the summary and the design left, for one ideal or propagated clock, over one corner or several; -setup with -hold runs the setup part and is refused after it; other -phases are refused after the preamble (an empty list or an unknown first phase is the command's error), VT libraries, latches, virtual clocks, clock uncertainty, latency or transition, derates, false and multicycle paths and path delays other than one set_max_delay -ignore_clock_latency from register clock pins to setup-checked pins are refused before the lines."
   ],
   "invocation": {
     "args_template": ["repair_design", "{job}"],
