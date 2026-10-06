@@ -100,8 +100,8 @@ fn is_delay_cell(name: &str) -> bool {
 /// `filterHoldBuffers`: `getBufferList` with clock buffers kept, then the first of four ever
 /// looser matches that keeps any buffer — site, VT and footprint; VT and footprint; footprint;
 /// none. The site is the shortest among the list's (`cells_by_site`, a map keyed by the site
-/// object: a tie on the shortest height is ordered by pointer — refused); one VT category here,
-/// so every buffer matches it; the footprint matches when no footprint in the list is a delay
+/// object: a tie on the shortest height is ordered by pointer — refused); the VT the least leaky
+/// category (one category here; several refused); the footprint matches when no footprint in the list is a delay
 /// cell's, else when the buffer's is. Each kept buffer is logged as it is added.
 fn filter_hold_buffers<'l>(ctx: &HoldCtx<'l>, out: &mut HoldOutcome) -> Result<Vec<&'l Cell>, Stop> {
     let list = get_buffer_list(ctx.libs, ctx.masters, ctx.dont_use, false)?;
@@ -112,13 +112,21 @@ fn filter_hold_buffers<'l>(ctx: &HoldCtx<'l>, out: &mut HoldOutcome) -> Result<V
         return Err(Stop::refused("RSZ-SITES", format!("hold buffer sites of equal height ({}): the first is the reference's pointer order, not modelled", shortest.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" "))));
     }
     let best_site = shortest.first().map(|s| s.as_str());
+    // "Pick the least leaky VT": `sorted_vt_categories[0]` by average cell leakage — with one
+    // category, that one; several would need the leakage, not read here.
+    let best_vt = match list.categories.as_slice() {
+        [] => None,
+        [only] => Some(only.index),
+        many => return Err(Stop::refused("RSZ-VT", format!("{} VT categories among the hold buffers: the least leaky (average cell leakage) is not modelled", many.len()))),
+    };
     let lib_has_footprints = list.by_footprint.keys().any(|f| is_delay_cell(f));
-    for (match_site, match_footprint) in [(true, true), (false, true), (false, true), (false, false)] {
+    for (match_site, match_vt, match_footprint) in [(true, true, true), (false, true, true), (false, false, true), (false, false, false)] {
         let mut kept = Vec::new();
         for &b in &list.cells {
             let site_matches = !match_site || ctx.masters.get(&b.name).map(|m| m.site.as_str()) == best_site;
+            let vt_matches = !match_vt || best_vt.is_none_or(|i| list.vt[&b.name].index == i);
             let footprint_matches = !match_footprint || !lib_has_footprints || is_delay_cell(&b.footprint);
-            if site_matches && footprint_matches {
+            if site_matches && vt_matches && footprint_matches {
                 debug(ctx, out, "resizer", 1, format!("{} added to hold buffer", b.name));
                 kept.push(b);
             }

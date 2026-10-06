@@ -186,6 +186,21 @@ fn rise_fall(flags: &[String]) -> [bool; 2] {
 /// overwrites); a net's load keyed by the net's DRIVER pins when it is set (`setNetWireCap`); a
 /// port's load is its pin load (the default). Refused: `-wire_load`, objects named by anything
 /// but `get_nets` / `get_ports`, and an input transition for a clock.
+/// `Sim::isConstant` on the design as read (est's `constant_pins`: a signal pin on a power or
+/// ground net, and what the cells' functions propagate from it), by pin name with its value — what
+/// delay calculation and the search skip, and the search's conditional arcs and arc senses read.
+fn sim_constants(db: &Db, liberty: &vyges_est::liberty::LibertyClocks) -> Result<HashMap<String, bool>, String> {
+    use vyges_est::sim::Pin;
+    let values = vyges_est::sim::constant_pins(db, liberty).map_err(|e| format!("constant propagation: {e}"))?;
+    Ok(values
+        .into_iter()
+        .map(|(p, v)| match p {
+            Pin::Port(n) => (n, v),
+            Pin::ITerm(i, t) => (format!("{i}/{t}"), v),
+        })
+        .collect())
+}
+
 fn sdc_env(s: &vyges_loom::sdc::Sdc, libs: &Libs, nl: &vyges_sta::netlist::Netlist) -> Result<vyges_sta::graph::SdcEnv, String> {
     let mut env = vyges_sta::graph::SdcEnv::default();
     // `set_driving_cell -lib_cell C -pin P [-from_pin F] [-input_transition_rise/-fall S]`: the
@@ -1545,10 +1560,11 @@ fn run(job: &Value) -> Result<Value, String> {
                 }
                 let info = net_info(&db, &netlist)?;
                 let netlist_for_env = netlist.clone();
-                let env = match &sdc {
+                let mut env = match &sdc {
                     Some(s) => sdc_env(s, &libs, &netlist_for_env)?,
-                    None => Default::default(),
+                    None => vyges_sta::graph::SdcEnv::default(),
                 };
+                env.constants = sim_constants(&db, &liberty)?;
                 let dbu = db.tech_get_db_units_per_micron();
                 let core = (db.block_get_core_area_x_min(), db.block_get_core_area_y_min(), db.block_get_core_area_x_max(), db.block_get_core_area_y_max());
                 let core = (core != (0, 0, 0, 0)).then_some(core);
@@ -1590,8 +1606,12 @@ fn run(job: &Value) -> Result<Value, String> {
                     return Err("repair_timing without estimate_parasitics -placement: not modelled".into());
                 }
                 let m = masters(&db)?;
-                if let Some((n, _)) = m.iter().find(|(_, mm)| !mm.implant_obs.is_empty()) {
-                    return Err(format!("master {n} has IMPLANT obstructions: VT categories are not modelled"));
+                // VT categories are modelled where `-hold` alone reads them (the buffer list and the
+                // hold buffer's VT); the setup moves' VT rules (equivalent cells, VT swap) are not.
+                if a.setup {
+                    if let Some((n, _)) = m.iter().find(|(_, mm)| !mm.implant_obs.is_empty()) {
+                        return Err(format!("master {n} has IMPLANT obstructions: VT categories are not modelled for -setup"));
+                    }
                 }
                 let lib0 = libs.default_library().ok_or("repair_timing before any liberty library")?;
                 let time_scale = lib0.time_scale;
@@ -1611,7 +1631,8 @@ fn run(job: &Value) -> Result<Value, String> {
                         estimate_state(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, estimate_propagated, estimate_alpha, libs.scene_count(), &caps)?
                     }
                 };
-                let env = sdc_env(s, &libs, &netlist)?;
+                let mut env = sdc_env(s, &libs, &netlist)?;
+                env.constants = sim_constants(&db, &liberty)?;
                 let mpins = master_pins(&db)?;
                 let mut g = repair_design::timer_graph(&libs, 0, &netlist, &env, &mpins).map_err(|e| e.message().to_string())?;
                 let clock_propagated = propagated || sdc_propagated;
@@ -1630,13 +1651,13 @@ fn run(job: &Value) -> Result<Value, String> {
                 search.constraints_modelled()?;
                 search.find_arrivals()?;
                 search.find_requireds()?;
-                // A diagnostic: every vertex's max-path arrivals, requireds and slews (seconds),
+                // A diagnostic: every vertex's paths' arrivals, requireds and slews (seconds),
                 // to set against the reference's `report_checks -fields {slew}` along a path.
                 if let Ok(path) = std::env::var("VYGES_RSZ_TIMING_DUMP") {
                     let mut out = String::new();
                     for (v, vx) in g.vertices.iter().enumerate() {
-                        for p in search.paths[v].iter().filter(|p| p.tag.mm == 1) {
-                            out.push_str(&format!("{} rf={} clk={} arr={:e} req={:e} slew={:e}\n", vx.name, p.tag.rf, p.tag.is_clock, p.arrival, p.required, g.slew[v][p.tag.rf][1]));
+                        for p in &search.paths[v] {
+                            out.push_str(&format!("{} mm={} rf={} clk={} edge={:?} states={} arr={:e} req={:e} slew={:e}\n", vx.name, p.tag.mm, p.tag.rf, p.tag.is_clock, p.tag.clk_edge, p.tag.states.0, p.arrival, p.required, g.slew[v][p.tag.rf][p.tag.mm]));
                         }
                     }
                     std::fs::write(&path, out).map_err(|e| format!("{path}: {e}"))?;

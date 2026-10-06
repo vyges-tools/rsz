@@ -141,10 +141,81 @@ fn is_clock_buffer(cell: &Cell) -> bool {
 /// Refused rather than modelled (no corpus witness): a buffer master with IMPLANT obstructions
 /// (the VT categories are numbered in the order masters are first asked about), and two sites
 /// with equal shares (ordered by the reference's site pointers).
+/// `VTCategory`: the index of the master's set of IMPLANT obstruction layers (0 with none) and its
+/// composite name. Ordered by index, then name (`operator<`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct VtCategory {
+    pub index: u32,
+    pub name: String,
+}
+
+/// `mergeVTLayerNames`: position by position, a character both names share, or the one only the
+/// longer has; differing characters drop out. No overlap at all: the two concatenated.
+fn merge_vt_layer_names(new_name: &str, curr_name: &str) -> String {
+    let (a, b) = (new_name.as_bytes(), curr_name.as_bytes());
+    let mut merged = Vec::new();
+    for i in 0..a.len().max(b.len()) {
+        match (a.get(i), b.get(i)) {
+            (Some(c1), Some(c2)) if c1 == c2 => merged.push(*c1),
+            (None, Some(c2)) => merged.push(*c2),
+            (Some(c1), None) => merged.push(*c1),
+            _ => {}
+        }
+    }
+    if merged.is_empty() {
+        return format!("{new_name}{curr_name}");
+    }
+    String::from_utf8_lossy(&merged).into_owned()
+}
+
+/// `compressVTLayerName`: every "VT" removed, then one trailing underscore.
+fn compress_vt_layer_name(name: &mut String) {
+    while let Some(pos) = name.find("VT") {
+        name.replace_range(pos..pos + 2, "");
+    }
+    if name.ends_with('_') {
+        name.pop();
+    }
+}
+
+/// `Resizer::cellVTType`: the master's IMPLANT obstruction layers, each once, sorted; none → 0
+/// "-". Each distinct set is numbered in the order it is FIRST asked about (`vt_hash_map_.size()
+/// + 1`) — `seen` holds the sets in that order, so the caller's call order is the numbering. The
+/// name folds the sorted layer names with [`merge_vt_layer_names`], then compresses it.
+pub fn vt_category(implant_obs: &[String], seen: &mut Vec<Vec<String>>) -> VtCategory {
+    let mut layers: Vec<String> = Vec::new();
+    for l in implant_obs {
+        if !layers.contains(l) {
+            layers.push(l.clone());
+        }
+    }
+    layers.sort();
+    if layers.is_empty() {
+        return VtCategory { index: 0, name: "-".into() };
+    }
+    let index = match seen.iter().position(|s| *s == layers) {
+        Some(k) => k + 1,
+        None => {
+            seen.push(layers.clone());
+            seen.len()
+        }
+    };
+    let mut name = String::new();
+    for l in &layers {
+        name = merge_vt_layer_names(&name, l);
+    }
+    compress_vt_layer_name(&mut name);
+    VtCategory { index: index as u32, name }
+}
+
 /// `Resizer::getBufferList`: the buffer list and what it tallies (`lib_data_`).
 pub struct BufferList<'l> {
     /// Sorted by VT category, then output drive resistance (libc++ `std::sort`).
     pub cells: Vec<&'l Cell>,
+    /// Each listed cell's VT category, by name.
+    pub vt: BTreeMap<String, VtCategory>,
+    /// `vt_leakage_by_category`'s keys: the categories the list holds.
+    pub categories: Vec<VtCategory>,
     /// `cells_by_site` / `cells_by_footprint`, by name.
     pub by_site: BTreeMap<String, usize>,
     pub by_footprint: BTreeMap<String, usize>,
@@ -154,12 +225,14 @@ pub struct BufferList<'l> {
 /// NAME order that are not liberty `dont_use` and are buffers; a clock buffer skipped when
 /// `exclude_clock_buffers` (setup) and kept otherwise (`repairHold`); kept: not in `dont_use`,
 /// not always-on / isolation / level shifter, the link cell, with a LEF master. Sorted by VT
-/// category then drive resistance — one category here (a master with IMPLANT obstructions is
-/// refused), so by drive resistance, in libc++'s order for ties.
+/// category ([`vt_category`], numbered in this loop's order — the first to ask, as in the
+/// reference's `repair_timing`) then drive resistance, in libc++'s order for ties.
 pub fn get_buffer_list<'l>(libs: &'l Libs, masters: &BTreeMap<String, Master>, dont_use: &std::collections::BTreeSet<String>, exclude_clock_buffers: bool) -> Result<BufferList<'l>, Stop> {
     let mut list: Vec<&Cell> = Vec::new();
     let mut by_site: BTreeMap<String, usize> = BTreeMap::new();
     let mut by_footprint: BTreeMap<String, usize> = BTreeMap::new();
+    let mut vt: BTreeMap<String, VtCategory> = BTreeMap::new();
+    let mut seen: Vec<Vec<String>> = Vec::new();
     for (li, lib) in libs.libs.iter().enumerate() {
         for cell in lib.cells.values().filter(|c| !c.dont_use && c.is_buffer()) {
             if exclude_clock_buffers && is_clock_buffer(cell) {
@@ -169,23 +242,33 @@ pub fn get_buffer_list<'l>(libs: &'l Libs, masters: &BTreeMap<String, Master>, d
                 continue;
             }
             let Some(master) = masters.get(&cell.name) else { continue };
-            if !master.implant_obs.is_empty() {
-                return Err(Stop::refused("RSZ-VT", format!("buffer {} has IMPLANT obstructions ({}): VT categories are not modelled", cell.name, master.implant_obs.join(" "))));
-            }
             *by_site.entry(master.site.clone()).or_default() += 1;
             if !cell.footprint.is_empty() {
                 *by_footprint.entry(cell.footprint.clone()).or_default() += 1;
             }
+            vt.insert(cell.name.clone(), vt_category(&master.implant_obs, &mut seen));
             list.push(cell);
         }
     }
-    crate::order::libcxx_sort_by(&mut list, |a, b| buffer_drive_resistance(a) < buffer_drive_resistance(b))
-        .map_err(|h| Stop::refused("RSZ-ORDER", format!("{} buffers reach the sort's heap fallback, which is not modelled", h.len)))?;
-    Ok(BufferList { cells: list, by_site, by_footprint })
+    crate::order::libcxx_sort_by(&mut list, |a, b| {
+        let (va, vb) = (&vt[&a.name], &vt[&b.name]);
+        if va != vb {
+            return va < vb;
+        }
+        buffer_drive_resistance(a) < buffer_drive_resistance(b)
+    })
+    .map_err(|h| Stop::refused("RSZ-ORDER", format!("{} buffers reach the sort's heap fallback, which is not modelled", h.len)))?;
+    let categories: Vec<VtCategory> = vt.values().cloned().collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    Ok(BufferList { cells: list, vt, categories, by_site, by_footprint })
 }
 
 pub fn find_buffers(libs: &Libs, masters: &BTreeMap<String, Master>, dont_use: &std::collections::BTreeSet<String>, exclude_clock_buffers: bool) -> Result<Buffers, Stop> {
-    let BufferList { cells: list, by_site, by_footprint } = get_buffer_list(libs, masters, dont_use, exclude_clock_buffers)?;
+    let BufferList { cells: list, by_site, by_footprint, categories, .. } = get_buffer_list(libs, masters, dont_use, exclude_clock_buffers)?;
+    // "Pick the second most leaky VT for multiple VTs" (`sorted_vt_categories`, by average cell
+    // leakage): one category keeps every buffer; several need the leakage, not read here.
+    if categories.len() > 1 {
+        return Err(Stop::refused("RSZ-VT", format!("{} VT categories among the buffers: the second most leaky (average cell leakage) is not modelled", categories.len())));
+    }
 
     // findBuffers: the footprint.
     let mut best_footprint: Option<&str> = None;
@@ -520,17 +603,29 @@ mod tests {
         assert_eq!(b.lowest, "A5");
     }
 
-    // Rules: IMPLANT obstructions (VT categories), and two sites with EQUAL shares (their order is
-    // the reference's site pointers), are refused, never guessed.
+    // Rule: two sites with EQUAL shares (their order is the reference's site pointers) are
+    // refused, never guessed.
     #[test]
-    fn vt_categories_and_tied_sites_are_refused() {
+    fn tied_sites_are_refused() {
         let libs = library(&[buf("B1", 1.0, 1.0, ""), buf("B2", 2.0, 1.0, "")]);
         let mut m = masters(&["B1", "B2"]);
         m.get_mut("B2").unwrap().site = "tall".into();
         assert!(matches!(find_buffers(&libs, &m, &Default::default(), true), Err(Stop::Refused { code: "RSZ-SITES", .. })));
-        let mut m = masters(&["B1", "B2"]);
-        m.get_mut("B1").unwrap().implant_obs = vec!["LVT".into()];
-        assert!(matches!(find_buffers(&libs, &m, &Default::default(), true), Err(Stop::Refused { code: "RSZ-VT", .. })));
+    }
+
+    /// Rules (`cellVTType`, `mergeVTLayerNames`, `compressVTLayerName`): a master's IMPLANT layer
+    /// SET is numbered in the order first asked (none: 0 "-"); the name merges the sorted layer
+    /// names character by character and drops "VT" — asap7's {RVTN, RVTP} is "R".
+    #[test]
+    fn vt_categories_number_in_first_ask_order() {
+        let mut seen = Vec::new();
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(vt_category(&s(&["RVTP", "RVTN", "RVTN"]), &mut seen), VtCategory { index: 1, name: "R".into() });
+        assert_eq!(vt_category(&s(&["SLVTN", "SLVTP"]), &mut seen), VtCategory { index: 2, name: "SL".into() });
+        assert_eq!(vt_category(&s(&["RVTN", "RVTP"]), &mut seen).index, 1);
+        assert_eq!(vt_category(&[], &mut seen), VtCategory { index: 0, name: "-".into() });
+        assert_eq!(merge_vt_layer_names("", "LVT_N"), "LVT_N");
+        assert_eq!(merge_vt_layer_names("abc", "xyz"), "abcxyz");
     }
 
     // Rule (findTargetLoad): for a slew linear in the load, the lower bisection bound within 1 %
