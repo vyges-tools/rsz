@@ -2086,14 +2086,15 @@ REPAIR_TIMING:
   RSZ-0132, RSZ-0032 and the buffers it inserts; -max_utilization or -max_buffer_percent reached
   ends it with RSZ-0050 / RSZ-0060 (status error).
   status repaired (the design changed), unrepaired (violations, nothing kept), up_to_date or
-  error. One clock, ideal or propagated, with its I/O delays. -setup and -hold together (or
-  neither): the setup repair, then refused. -phases other than LEGACY: refused after the
-  preamble and row 0 (an empty list or an unknown first phase is the command's own error;
-  GLOBAL_SIZING, MT1, MEASURED_VT_SWAP refused before the lines). Refused before the lines:
-  -recover_power, several corners, VT libraries, a latch, a virtual clock, clock
-  uncertainty / latency / transition, derates, false and multicycle paths, a path delay other
-  than one set_max_delay -ignore_clock_latency from register clock pins to setup-checked pins;
-  refused during the repair:
+  error. Clocks (one or several, real or virtual), each ideal or propagated, with their I/O
+  delays; latches (time borrowing); VT libraries (VtSwapMove); pins tied to supply nets.
+  -setup and -hold together (or neither): the setup repair, then refused. Phases LEGACY, WNS,
+  TNS, ENDPOINT_FANIN, STARTPOINT_FANOUT and LAST_GASP are modelled (an empty list or an
+  unknown first phase is the command's own error); CRIT_VT_SWAP is refused when it would swap
+  (several VT categories). Refused before the lines: -recover_power, GLOBAL_SIZING, MT1,
+  MEASURED_VT_SWAP, LEGACY_MT, REROUTE, parasitics other than -placement, setup clock
+  uncertainty, clock latency / transition, derates, false and multicycle paths, clock groups,
+  path delays other than the forms the timer models (see --describe); refused during the repair:
   -setup with -max_utilization, more than one repair per pass.
 
 CONSTRAINTS READ FROM SDC:
@@ -2141,7 +2142,7 @@ const DESCRIBE: &str = r#"{
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "status is one of repaired, up_to_date, vacuous, refused or error. repaired means the design changed (buffers inserted or drivers resized); up_to_date means drivers were checked and none needed a change (nets_checked says how many; for a job with buffer_ports and no repair_design, ports_checked); vacuous means nothing was checked and is NOT a pass. The declared assertion passes on repaired or up_to_date. Exit status is 0 for repaired and up_to_date, 2 for vacuous and for error, 3 for refused.",
     "Modelled: placement parasitics, one or more corners, flat and hierarchical netlists, the default buffer selection, the SDC constraints the usage lists, buffer_ports before the repair (the estimate it leaves carried into it). Refused rather than guessed: global-route parasitics, the early sizing round, footprint matching, rerouting, any other netlist edit between the estimate and the repair, buffer_ports on a hierarchical design, a tristate driver or a bidirect pin on a net, and any other timing-affecting SDC command.",
-    "repair_timing -setup is modelled for every move of the default sequence in the LEGACY phase and LAST_GASP, and repair_timing -hold alone in full (ending with RSZ-0050 / RSZ-0060 as the command does): every progress row, the summary and the design left, for one ideal or propagated clock, over one corner or several; -setup with -hold runs the setup part and is refused after it; other -phases are refused after the preamble (an empty list or an unknown first phase is the command's error), VT libraries, latches, virtual clocks, clock uncertainty, latency or transition, derates, false and multicycle paths and path delays other than one set_max_delay -ignore_clock_latency from register clock pins to setup-checked pins are refused before the lines."
+    "repair_timing -setup is modelled for every move of the default sequence and VtSwapMove in the LEGACY, WNS, TNS, ENDPOINT_FANIN, STARTPOINT_FANOUT and LAST_GASP phases, and repair_timing -hold alone in full (ending with RSZ-0050 / RSZ-0060 as the command does): every progress row, the summary and the design left, for one or several clocks (real or virtual, each ideal or propagated), latches with time borrowing, VT libraries, pins tied to supply nets, set_max_delay / set_min_delay in the forms the timer models, over one corner or several; -setup with -hold runs the setup part and is refused after it; CRIT_VT_SWAP over several VT categories, GLOBAL_SIZING, MT1, MEASURED_VT_SWAP, LEGACY_MT, REROUTE, -recover_power, parasitics other than -placement, setup clock uncertainty, clock latency or transition, derates, false and multicycle paths and clock groups are refused before the lines."
   ],
   "invocation": {
     "args_template": ["repair_design", "{job}"],
