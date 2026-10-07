@@ -249,7 +249,7 @@ impl Recovery<'_, '_> {
         }
         let masters = self.ctx.sizing.masters;
         match (masters.get(candidate), masters.get(cell)) {
-            (Some(c), Some(cur)) => c.width <= cur.width && c.height == cur.height,
+            (Some(c), Some(cur)) => no_wider_same_height((c.width, c.height), (cur.width, cur.height)),
             _ => false,
         }
     }
@@ -346,6 +346,13 @@ fn sort_load_delays(v: &mut [(usize, f32)]) {
     v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
 }
 
+/// `meetsSizeCriteria`'s test on (width, height) in DBU: the candidate no wider than the cell, the
+/// same height. ⚠️ No Nangate45 downsize reaches it (every weaker equivalent is narrower, one row
+/// height) — the unit test below is its only witness.
+fn no_wider_same_height(candidate: (u32, u32), cell: (u32, u32)) -> bool {
+    candidate.0 <= cell.0 && candidate.1 == cell.1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +363,15 @@ mod tests {
         let mut v = vec![(5usize, 0.1f32), (3, 0.2), (2, 0.1), (7, 0.3)];
         sort_load_delays(&mut v);
         assert_eq!(v, vec![(7, 0.3), (3, 0.2), (2, 0.1), (5, 0.1)]);
+    }
+
+    /// `meetsSizeCriteria`: `candidate width <= cell width && candidate height == cell height`.
+    #[test]
+    fn a_downsize_is_no_wider_and_the_same_height() {
+        assert!(no_wider_same_height((760, 2800), (760, 2800)));
+        assert!(no_wider_same_height((570, 2800), (760, 2800)));
+        assert!(!no_wider_same_height((950, 2800), (760, 2800)));
+        assert!(!no_wider_same_height((570, 5600), (760, 2800)));
+        assert!(!no_wider_same_height((570, 1400), (760, 2800)));
     }
 }
