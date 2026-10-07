@@ -448,7 +448,7 @@ mod tests {
             buf("B2", 2.0, 40.0),
             buf("B4", 1.0, 41.0)
         ));
-        let masters: BTreeMap<String, Master> = ["B1", "B2", "B4"].iter().map(|n| (n.to_string(), Master { site: "s".into(), area: 1, is_core: true, logic_std: true, implant_obs: vec![] })).collect();
+        let masters: BTreeMap<String, Master> = ["B1", "B2", "B4"].iter().map(|n| (n.to_string(), Master { site: "s".into(), area: 1, width: 1, height: 1, is_core: true, logic_std: true, implant_obs: vec![] })).collect();
         let equiv = make_equiv_cells(&l);
         let (dont_use, loads) = (BTreeSet::new(), BTreeMap::new());
         let s = Sizing { libs: &l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: SizingLimits::default() };

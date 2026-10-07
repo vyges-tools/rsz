@@ -38,6 +38,9 @@ use crate::timing::Limits;
 use crate::{clone, move_tracker, rebuffer, swap_pins, unbuffer};
 use crate::Stop;
 
+mod recover_power;
+pub use recover_power::{recover_power, PowerArgs, PowerOutcome};
+
 /// `decreasing_slack_max_passes_`, `print_interval_`, `opto_small_interval_`,
 /// `opto_large_interval_`, `inc_fix_rate_threshold_`.
 const DECREASING_SLACK_MAX_PASSES: i64 = 50;
@@ -109,6 +112,9 @@ struct Stage {
     port: Option<String>,
     /// `arcDelay(prev_edge, prev_arc) − prev_arc->intrinsicDelay()`, for a pin reached by a gate arc.
     load_delay: Option<f32>,
+    /// `arcDelay(prev_edge, prev_arc)` at the path's scene, for a pin reached by a WIRE edge (the
+    /// REROUTE phase ranks a driver by the wire into the next pin).
+    in_wire_delay: Option<f32>,
     /// The from-port of the arc the path took into this pin.
     in_port: Option<String>,
     /// Wire edges out of the pin.
@@ -586,6 +592,7 @@ fn expand_path(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTr
             cell: vx.cell.clone(),
             port: vx.port.clone(),
             load_delay: None,
+            in_wire_delay: None,
             in_port: None,
             fanout: g.out_edges[*v].iter().filter(|&&e| matches!(g.edges[e].kind, EdgeKind::Wire)).count(),
             load_cap: 0.0,
@@ -598,6 +605,9 @@ fn expand_path(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTr
             split_slacks: None,
         };
         if let Some(prev) = p.prev {
+            if matches!(g.edges[prev.edge].kind, EdgeKind::Wire) {
+                st.in_wire_delay = Some(g.delay[prev.edge][prev.arc][MAX]);
+            }
             if let Some(set) = edge_arc_set(g, prev.edge) {
                 st.in_port = Some(set.from.clone());
                 st.load_delay = Some(g.delay[prev.edge][prev.arc][MAX] - arc_intrinsic(&set.arcs[prev.arc].model));
@@ -1213,6 +1223,8 @@ struct Repair<'c, 'd> {
     startpoint_rows: bool,
     /// The slack of the target being repaired (`Target::slack`: the path's, or the focus slack).
     target_slack: f32,
+    /// Inside the REROUTE phase (`SetupReroutePolicy`): its own `repairPath`.
+    reroute_phase: bool,
 }
 
 /// What `Resizer::swapPins` did.
@@ -1279,6 +1291,27 @@ pub trait SetupDesign: Design {
     /// `Resizer::insertBufferBeforeLoads(net, loads, cell, loc, base, "net", ALWAYS, diff_nets)`.
     #[allow(clippy::too_many_arguments)]
     fn insert_buffer_before_loads(&mut self, net: Option<&str>, loads: &[String], cell: &str, loc: (i32, i32), reason: &str, loads_on_diff_nets: bool, uniquify: &str) -> Result<crate::design::Repeater, String>;
+    /// Global-route parasitics are in force (a global router alive over the repair).
+    fn global_routed(&self) -> bool {
+        false
+    }
+    /// The net a pin is on, by name (`flatNet`), and whether it is special.
+    fn pin_net(&self, _pin: &str) -> Option<(String, bool)> {
+        None
+    }
+    /// `GlobalRouter::isNetResAware(db_net)`.
+    fn net_res_aware(&self, _net: &str) -> bool {
+        false
+    }
+    /// `getFRNetResistance` and `getFRNetResistanceOnMinResistanceLayer` of a net.
+    fn net_resistances(&self, _net: &str) -> (f32, f32) {
+        (0.0, 0.0)
+    }
+    /// `RerouteCandidate::apply`: `setResistanceAware(true)`, `addDirtyNet`, `setNetIsResAware`,
+    /// `parasiticsInvalid` — the net routed again, resistance-aware, at the next update.
+    fn reroute_net(&mut self, _net: &str) -> Result<(), String> {
+        Err("rerouting needs global-route parasitics".into())
+    }
 }
 
 /// `Resizer::repairHold` → `RepairHold::repairHold`: the hold buffer, then the passes over the
@@ -1799,6 +1832,7 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
         current_endpoint: None,
         startpoint_rows: false,
         target_slack: 0.0,
+        reroute_phase: false,
     };
     // `SetupLegacyBase::start`: with the move tracker on, `captureInitialSlackDistribution` (and
     // `captureOriginalEndpointSlack`, read only by the level-2 profiles) after RSZ-0099.
@@ -1823,6 +1857,14 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
                 r.phase = format!("LEGACY{marker}");
                 r.sequence = ctx.sequence.to_vec();
                 r.iterate()?;
+            }
+            // `SetupReroutePolicy`: the LEGACY loop with RerouteMove alone and its own `repairPath`.
+            "REROUTE" => {
+                r.phase = format!("REROUTE{marker}");
+                r.sequence = vec![Move::Reroute];
+                r.reroute_phase = true;
+                r.iterate()?;
+                r.reroute_phase = false;
             }
             "WNS" | "WNS_PATH" => r.wns_phase(marker)?,
             "TNS" => r.tns_phase(marker)?,
@@ -3324,6 +3366,9 @@ impl Repair<'_, '_> {
         if view.stages.len() <= 1 {
             return Ok(false);
         }
+        if self.reroute_phase {
+            return self.reroute_repair_path(&view, path_slack);
+        }
         let repairs_per_pass = self.repair_budget(path_slack, force_single_repair);
         if repairs_per_pass > 1 {
             return Err(Stop::refused("RSZ-ABSENT", format!("{repairs_per_pass} repairs in one pass: a target after the first move would read a timer the move changed, which is not modelled")));
@@ -3347,6 +3392,80 @@ impl Repair<'_, '_> {
             self.try_repair_path_target(segments[k], index, &mut changed, repairs_per_pass)?;
         }
         Ok(changed > 0)
+    }
+
+    /// `SetupReroutePolicy::repairPath`: each path driver (not the first pin, not a top port, not
+    /// the last pin) whose next pin is reached by a wire — its wire delay printed, kept when
+    /// positive — ranked by that delay, larger first, then the LATER pin first; each tried in
+    /// turn with one repair, the first that changes anything ending the pass.
+    fn reroute_repair_path(&mut self, view: &PathView, path_slack: f32) -> Result<bool, Stop> {
+        let n = view.stages.len();
+        let mut wire_delays: Vec<(usize, f32)> = Vec::new();
+        for i in view.start..n {
+            let st = &view.stages[i];
+            if i == 0 || !st.is_driver || st.top_port || i + 1 >= n {
+                continue;
+            }
+            let Some(delay) = view.stages[i + 1].in_wire_delay else { continue };
+            if delay > 0.0 {
+                wire_delays.push((i, delay));
+            }
+            let line = format!("{} wire delay = {}", crate::repair_timing::sta_to_sdc(&st.pin), self.ds(delay, 3));
+            self.debug("repair_setup", 3, line);
+        }
+        // A strict order (the index breaks every tie), so the sort's stability is no value.
+        wire_delays.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(b.0.cmp(&a.0)));
+        let line = format!("Reroute wire pass: delays: {}, path slack: {}", wire_delays.len(), self.ds(path_slack, 3));
+        self.debug("repair_setup", 3, line);
+        self.target_slack = path_slack;
+        let mut changed = 0i64;
+        for (index, _) in wire_delays {
+            if self.try_repair_path_target(view, index, &mut changed, 1)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// `RerouteGenerator::generate` → `RerouteCandidate::apply`: on global-route parasitics only;
+    /// the driver's instance not dont_touch, its net present and not special nor already
+    /// resistance-aware, and rerouting it on the least resistive layer at least halving its
+    /// resistance (`kMinResistanceReduction`); then the net marked to be routed again
+    /// resistance-aware.
+    fn reroute_move(&mut self, view: &PathView, index: usize) -> Result<Option<MoveResult>, Stop> {
+        const MIN_RESISTANCE_REDUCTION: f32 = 0.50;
+        let st = &view.stages[index];
+        let pin = st.pin.clone();
+        let Some(inst) = st.inst.clone() else {
+            self.debug("reroute_move", 2, "REJECT RerouteMove: No driver pin".into());
+            return Ok(None);
+        };
+        if self.design.net_info().dont_touch_insts.contains(&inst) {
+            self.debug("reroute_move", 2, format!("REJECT RerouteMove {pin}: {inst} is \"don't touch\""));
+            return Ok(None);
+        }
+        let Some((net, special)) = self.design.pin_net(&pin) else {
+            self.debug("reroute_move", 2, format!("REJECT RerouteMove {pin}: No net found for driver pin"));
+            return Ok(None);
+        };
+        if special {
+            self.debug("reroute_move", 2, format!("REJECT RerouteMove {pin}: Net is special"));
+            return Ok(None);
+        }
+        if self.design.net_res_aware(&net) {
+            self.debug("reroute_move", 2, format!("REJECT RerouteMove {pin}: Net is already resistance-aware routed"));
+            return Ok(None);
+        }
+        let (resistance, estimated) = self.design.net_resistances(&net);
+        let reduction = if resistance > 0.0 { (resistance - estimated) / resistance } else { 0.0 };
+        if reduction < MIN_RESISTANCE_REDUCTION {
+            let line = format!("REJECT RerouteMove {pin}: Expected resistance reduction {:.1}% below threshold {:.1}% ({resistance} -> {estimated} estimated)", 100.0 * reduction, 100.0 * MIN_RESISTANCE_REDUCTION);
+            self.debug("reroute_move", 2, line);
+            return Ok(None);
+        }
+        self.design.reroute_net(&net).map_err(|e| Stop::refused("RSZ-GR", e))?;
+        self.debug("reroute_move", 1, format!("ACCEPT RerouteMove {pin}: Rerouted net {net} (resistance {resistance} -> {estimated} estimated)"));
+        Ok(Some(MoveResult { kind: Move::Reroute, count: 1, insts: vec![inst] }))
     }
 
     /// `tryRepairPathTarget` → `logRepairTarget`, then `tryRepairTarget`: each generator of the
@@ -3390,6 +3509,7 @@ impl Repair<'_, '_> {
                 Move::SplitLoad => self.split_load_move(view, index)?,
                 Move::SizeUpMatch => self.size_up_match_move(view, index)?,
                 Move::VtSwap => self.vt_swap_move(view, index)?,
+                Move::Reroute => self.reroute_move(view, index)?,
                 other => return Err(Stop::refused("RSZ-ABSENT", format!("{}: not modelled", other.name()))),
             };
             if let Some(r) = result {
@@ -3410,6 +3530,8 @@ impl Repair<'_, '_> {
         match m {
             Move::Buffer => st.fanout > 1 && st.fanout < rebuffer::REBUFFER_MAX_FANOUT && self.design.ok_to_buffer_net(&st.pin),
             Move::SizeUpMatch => index >= 2,
+            // `RerouteGenerator::isApplicable`: a global router and its parasitics.
+            Move::Reroute => self.design.global_routed(),
             _ => true,
         }
     }
@@ -4219,6 +4341,10 @@ impl Repair<'_, '_> {
         if clones > 0 {
             self.report(format!("[INFO RSZ-0049] Cloned {clones} instances."));
         }
+        let reroutes = self.committer.committed(Move::Reroute);
+        if reroutes > 0 {
+            self.report(format!("[INFO RSZ-0053] Rerouted {reroutes} nets resistance-aware."));
+        }
         if fuzzy::less(wns, self.ctx.margin) {
             self.report("[WARNING RSZ-0062] Unable to repair all setup violations.".to_string());
         }
@@ -4244,6 +4370,7 @@ mod tests {
             cell: None,
             port: None,
             load_delay: Some(load_delay),
+            in_wire_delay: None,
             in_port: None,
             fanout: 1,
             load_cap: 0.0,
@@ -4304,7 +4431,7 @@ mod tests {
     }
 
     fn with_sizing<R>(l: &Libs, f: impl FnOnce(&Sizing<'_>) -> R) -> R {
-        let masters: BTreeMap<String, Master> = l.libs[0].cells.keys().map(|n| (n.clone(), Master { site: "s".into(), area: 1, is_core: true, logic_std: true, implant_obs: vec![] })).collect();
+        let masters: BTreeMap<String, Master> = l.libs[0].cells.keys().map(|n| (n.clone(), Master { site: "s".into(), area: 1, width: 1, height: 1, is_core: true, logic_std: true, implant_obs: vec![] })).collect();
         let equiv = crate::sizing::make_equiv_cells(l);
         let (dont_use, loads) = (BTreeSet::new(), BTreeMap::new());
         f(&Sizing { libs: l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: Default::default() })

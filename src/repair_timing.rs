@@ -36,6 +36,8 @@ pub struct Args {
     pub sequence: Vec<Move>,
     pub phases: Option<String>,
     pub recover_power: bool,
+    /// `-recover_power`'s percent (`check_percent`: 0 to 100), as a fraction.
+    pub recover_power_percent: f64,
     pub skip_pin_swap: bool,
     pub skip_gate_cloning: bool,
     pub skip_size_down_fanout: bool,
@@ -132,6 +134,7 @@ impl Args {
             sequence: Vec::new(),
             phases: None,
             recover_power: false,
+            recover_power_percent: -1.0,
             skip_pin_swap: false,
             skip_gate_cloning: false,
             skip_size_down_fanout: false,
@@ -173,7 +176,11 @@ impl Args {
                     i += 1;
                 }
                 "-recover_power" => {
+                    let v = value(i)?;
+                    // `sta::check_percent`: a double in [0, 100], else STA-0576 (the Tcl's error).
+                    let p: f64 = v.parse().ok().filter(|p: &f64| (0.0..=100.0).contains(p)).ok_or_else(|| format!("STA-0576: -recover_power '{v}' is not between 0 and 100."))?;
                     a.recover_power = true;
+                    a.recover_power_percent = p / 100.0;
                     i += 1;
                 }
                 "-max_passes" | "-max_iterations" | "-max_repairs_per_pass" => {
@@ -361,7 +368,7 @@ pub fn phase_names(phases: Option<&str>) -> Vec<String> {
 
 /// Whether every phase of the list is modelled.
 pub fn phases_modelled(phases: &str) -> bool {
-    phase_names(Some(phases)).iter().all(|n| matches!(n.as_str(), "LEGACY" | "WNS" | "WNS_PATH" | "TNS" | "ENDPOINT_FANIN" | "STARTPOINT_FANOUT" | "LAST_GASP" | "CRIT_VT_SWAP"))
+    phase_names(Some(phases)).iter().all(|n| matches!(n.as_str(), "LEGACY" | "WNS" | "WNS_PATH" | "TNS" | "ENDPOINT_FANIN" | "STARTPOINT_FANOUT" | "LAST_GASP" | "CRIT_VT_SWAP" | "REROUTE"))
 }
 
 /// `sta::parseTokens(phases)` (space and tab delimited), then the first phase's policy.

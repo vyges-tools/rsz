@@ -88,6 +88,9 @@ pub struct Master {
     pub site: String,
     /// `dbMaster::getArea()` (width × height, DBU²) and `isCore()`.
     pub area: i64,
+    /// `dbMaster::getWidth()` / `getHeight()` (DBU): `RecoverPower::meetsSizeCriteria`.
+    pub width: u32,
+    pub height: u32,
     pub is_core: bool,
     /// `isLogicStdCell`'s test: the master's type is CORE exactly (not a CORE subtype).
     pub logic_std: bool,
@@ -543,7 +546,7 @@ mod tests {
     }
 
     fn masters(names: &[&str]) -> BTreeMap<String, Master> {
-        names.iter().map(|n| (n.to_string(), Master { site: "core".into(), area: 1, is_core: true, logic_std: true, implant_obs: vec![] })).collect()
+        names.iter().map(|n| (n.to_string(), Master { site: "core".into(), area: 1, width: 1, height: 1, is_core: true, logic_std: true, implant_obs: vec![] })).collect()
     }
 
     // Rules (getBufferList, findBuffers): clock buffers, dont_use and master-less cells are out;

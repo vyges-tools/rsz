@@ -476,7 +476,12 @@ impl GrLive {
         let order: Vec<String> = db.net_names().into_iter().filter(|n| self.dirty.contains(n)).collect();
         self.dirty.clear();
         gr_trace(&format!("VYGR|upd|enter|{}", order.iter().map(|n| format!("{n};")).collect::<String>()));
-        let routed = vyges_grt::global_route::update_dirty_routes_fast_route(db, &self.opts, &mut self.after, &order, &grt_stt, &grt_flutes, &mut |_, _| {}, true).map_err(|e| format!("incremental global route: {e}"))?;
+        // A resistance-aware run's `updateSlacks` reads `sta_->slack(net)`: only a net a reroute
+        // marked is answered (it is on a violating path, so constrained; with one net routed only
+        // that matters); any other is NaN, which the router refuses.
+        let res_aware = self.after.res_aware_nets.clone();
+        let slack = move |net: &str| if res_aware.contains(net) { -1.0 } else { f32::NAN };
+        let routed = vyges_grt::global_route::update_dirty_routes_fast_route(db, &self.opts, &mut self.after, &order, &grt_stt, &grt_flutes, &mut |_, _| {}, true, Some(&slack)).map_err(|e| format!("incremental global route: {e}"))?;
         gr_trace(&format!("VYGR|upd|route|{}", routed.iter().map(|n| format!("{n};")).collect::<String>()));
         for net in &routed {
             gr_trace(&format!("VYGR|upd|seg|{net}|{}", gr_segs(&self.after, net)));
@@ -956,6 +961,37 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
 }
 
 impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
+    fn global_routed(&self) -> bool {
+        self.gr.is_some()
+    }
+
+    fn pin_net(&self, pin: &str) -> Option<(String, bool)> {
+        let net = self.net_of_load(pin);
+        (!net.is_empty()).then(|| (net.clone(), self.db.net_is_special(&net)))
+    }
+
+    fn net_res_aware(&self, net: &str) -> bool {
+        self.gr.as_ref().is_some_and(|gr| vyges_grt::global_route::is_net_res_aware(&gr.after, net))
+    }
+
+    fn net_resistances(&self, net: &str) -> (f32, f32) {
+        match self.gr.as_ref() {
+            Some(gr) => (vyges_grt::global_route::net_resistance_on_layer(&gr.after, net, None), vyges_grt::global_route::net_resistance_on_min_resistance_layer(&gr.after, net)),
+            None => (0.0, 0.0),
+        }
+    }
+
+    fn reroute_net(&mut self, net: &str) -> Result<(), String> {
+        let Some(gr) = self.gr.as_mut() else { return Err("rerouting needs global-route parasitics".into()) };
+        vyges_grt::global_route::set_resistance_aware(&mut gr.after);
+        gr.mark(self.db, net);
+        vyges_grt::global_route::set_net_res_aware(&mut gr.after, net);
+        // `parasiticsInvalid(db_net)`: re-estimated, and its delays invalidated, at the next update.
+        self.invalidate(net);
+        self.timer.est_invalid.insert(net.to_string());
+        Ok(())
+    }
+
     /// `Resizer::computeDesignArea`: over the block's instances in order, each master's
     /// `width × height` in m² (`dbuToMeters` each side) — 0 for a master that is not core
     /// autoplaceable (`isCoreAutoPlaceable`) — fillers (`CORE SPACER`) left out.
@@ -1322,8 +1358,9 @@ fn masters(db: &Db) -> Result<BTreeMap<String, Master>, String> {
                 implant_obs.push(lname.clone());
             }
         }
-        let area = i64::from(db.master_get_width(&name)) * i64::from(db.master_get_height(&name));
-        out.insert(name.clone(), Master { site: db.master_get_site(&name), area, is_core: db.master_is_core(&name), logic_std: db.master_get_type(&name).map_err(|e| e.to_string())? == "CORE", implant_obs });
+        let (width, height) = (db.master_get_width(&name), db.master_get_height(&name));
+        let area = i64::from(width) * i64::from(height);
+        out.insert(name.clone(), Master { site: db.master_get_site(&name), area, width, height, is_core: db.master_is_core(&name), logic_std: db.master_get_type(&name).map_err(|e| e.to_string())? == "CORE", implant_obs });
     }
     Ok(out)
 }
@@ -1992,13 +2029,19 @@ fn run(job: &Value) -> Result<Value, String> {
             "repair_timing" => {
                 use vyges_rsz::repair_timing as rt;
                 let a = rt::Args::parse(&args)?;
-                if a.recover_power {
-                    return Err("repair_timing -recover_power: not modelled".into());
+                // `-recover_power` dispatches to `rsz::recover_power` in place of setup and hold:
+                // -phases, -sequence and the setup flags never reach it.
+                let recover = a.recover_power;
+                if recover && a.match_cell_footprint {
+                    return Err("repair_timing -recover_power -match_cell_footprint: not modelled".into());
+                }
+                if recover && gr_estimated {
+                    return Err("repair_timing -recover_power on global-route parasitics (initMacrosAndGrid, legalCellPos in replaceCell): not modelled".into());
                 }
                 // `-phases`: LEGACY alone is the default pipeline without LAST_GASP; another policy
                 // after the shared preamble is refused there; an empty list or an unknown first
                 // phase is the reference's error, before any line.
-                let plan = a.phases.as_deref().map(rt::phase_plan);
+                let plan = a.phases.as_deref().filter(|_| !recover).map(rt::phase_plan);
                 match &plan {
                     Some(rt::PhasePlan::Error { code, line }) if a.setup => {
                         timing_runs.push(json!({ "lines": [line], "endpoints": 0, "violating_endpoints": 0, "resized": 0, "removed": 0, "inserted": 0, "error": code }));
@@ -2068,7 +2111,16 @@ fn run(job: &Value) -> Result<Value, String> {
                 if !clock_propagated {
                     g.ideal_clock = clocks.iter().copied().collect();
                 }
-                g.find_delays(&parasitics[0], None)?;
+                // A diagnostic: the delay calculation's trace at the repair's start
+                // (`VYGES_RSZ_DCALC_TRACE=<file>`: each gate call and load), as the repair_design
+                // job's `dcalc_trace` writes it.
+                if let Ok(path) = std::env::var("VYGES_RSZ_DCALC_TRACE") {
+                    let mut lines = Vec::new();
+                    g.find_delays(&parasitics[0], Some(&mut lines))?;
+                    std::fs::write(&path, lines.join("\n") + "\n").map_err(|e| format!("{path}: {e}"))?;
+                } else {
+                    g.find_delays(&parasitics[0], None)?;
+                }
                 let ssdc = search_sdc(s, &text, time_scale, clock_propagated, a.hold)?;
                 let mut search = vyges_sta::search::Search::in_graph_order(&g, &ssdc);
                 search.constraints_modelled()?;
@@ -2121,14 +2173,22 @@ fn run(job: &Value) -> Result<Value, String> {
                     }
                     vyges_rsz::preamble::get_buffer_list(&libs, &m, &du, !hold_only).map_err(|e| format!("{}: {}", e.code(), e.message()))?.sorted_vt.len()
                 };
-                let seq = rt::move_sequence(&a, vt_category_count > 1);
-                let mut lines = rt::preamble(&seq, violating.len(), a.repair_tns_end_percent, a.phases.as_deref());
+                let seq = if recover { Vec::new() } else { rt::move_sequence(&a, vt_category_count > 1) };
+                let mut lines = if recover { Vec::new() } else { rt::preamble(&seq, violating.len(), a.repair_tns_end_percent, a.phases.as_deref()) };
                 // The moves modelled, over one corner or several (each reads the scenes the
                 // reference's does: see the moves), LEGACY and LAST_GASP.
                 let startpoint_rows = matches!(plan, Some(rt::PhasePlan::LegacyPreamble { startpoints: true }));
-                let unmodelled = if matches!(plan, Some(rt::PhasePlan::LegacyPreamble { .. })) && !a.phases.as_deref().is_some_and(rt::phases_modelled) {
+                let unmodelled = if seq.contains(&rt::Move::Reroute) {
+                    // RerouteMove and the REROUTE phase are built (resistance-aware incremental
+                    // re-routes, the wire-delay ranking): `repair_setup_reroute2` matches the
+                    // reference decision by decision for 416 trace lines, then a TNS differs in its
+                    // last printed digit — the reference's incremental timer drifts from a fresh
+                    // timing by up to ~1 fs per pin after the reroutes (measured with
+                    // `instruments/rsz/slack-bisect.sh`). Until that is matched, stopped here.
+                    Some("repair_timing: RerouteMove — the reference's incremental timing after resistance-aware reroutes is matched only to ~1 fs; not modelled".into())
+                } else if matches!(plan, Some(rt::PhasePlan::LegacyPreamble { .. })) && !a.phases.as_deref().is_some_and(rt::phases_modelled) {
                     Some(format!("repair_timing -phases {}: not modelled", a.phases.as_deref().unwrap_or_default()))
-                } else if let Some(m) = seq.iter().find(|m| !matches!(m, rt::Move::SizeUp | rt::Move::SizeDownFanout | rt::Move::Unbuffer | rt::Move::SwapPins | rt::Move::Buffer | rt::Move::Clone | rt::Move::SplitLoad | rt::Move::SizeUpMatch | rt::Move::VtSwap)) {
+                } else if let Some(m) = seq.iter().find(|m| !matches!(m, rt::Move::SizeUp | rt::Move::SizeDownFanout | rt::Move::Unbuffer | rt::Move::SwapPins | rt::Move::Buffer | rt::Move::Clone | rt::Move::SplitLoad | rt::Move::SizeUpMatch | rt::Move::VtSwap | rt::Move::Reroute)) {
                     Some(format!("repair_timing: {} is not modelled", m.name()))
                 } else if a.match_cell_footprint {
                     Some("repair_timing -match_cell_footprint: not modelled".into())
@@ -2138,9 +2198,9 @@ fn run(job: &Value) -> Result<Value, String> {
                 } else {
                     None
                 };
-                if !hold_only && violating.is_empty() {
+                if !recover && !hold_only && violating.is_empty() {
                     timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": 0 }));
-                } else if let Some(why) = unmodelled.filter(|_| !hold_only) {
+                } else if let Some(why) = unmodelled.filter(|_| !hold_only && !recover) {
                     lines.extend(rt::row0_with(&ends, violating.len(), &violating_starts, time_scale, startpoint_rows));
                     timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len() }));
                     timing_stop = Some(why);
@@ -2270,6 +2330,38 @@ fn run(job: &Value) -> Result<Value, String> {
                     let port_caps = env.port_pin_cap.clone();
                     let sdc_nets: BTreeSet<String> = s.env.iter().filter(|e| e.cmd == "set_load" && e.accessor == "get_nets").flat_map(|e| e.objects.iter().cloned()).collect();
                     let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated, journal: Vec::new(), sdc_nets, timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr, gr_error: None, undoing: false };
+                    if recover {
+                        // `Resizer::recoverPower`: `resizePreamble`, then `RecoverPower::recoverPower`.
+                        let max_area = match a.max_utilization.as_deref() {
+                            None => 0.0,
+                            Some(v) => {
+                                let u: f64 = v.parse().map_err(|_| "repair_timing -max_utilization: not a number".to_string())?;
+                                if !(0.0..=100.0).contains(&u) {
+                                    return Err("RSZ-0004: -max_utilization must be between 0 and 100%.".into());
+                                }
+                                vyges_rsz::repair_setup::SetupDesign::core_area(&design) * (u / 100.0)
+                            }
+                        };
+                        let pa = vyges_rsz::repair_setup::PowerArgs { percent: a.recover_power_percent as f32, verbose: a.verbose, max_area };
+                        let r = vyges_rsz::repair_setup::recover_power(&ctx, &mut design, &pa);
+                        carried = Some(std::mem::take(&mut design.parasitics));
+                        let o = match r {
+                            Ok(o) => o,
+                            Err(Stop::Refused { msg, .. }) => {
+                                timing_stop = Some(format!("{msg} (not modelled)"));
+                                break;
+                            }
+                            Err(Stop::Error { code, msg }) => return Err(format!("{code}: {msg}")),
+                        };
+                        if let Some(path) = job["timing_trace"].as_str() {
+                            std::fs::write(path, o.trace.join("\n") + "\n").map_err(|e| format!("{path}: {e}"))?;
+                        }
+                        timing_runs.push(json!({ "lines": o.lines, "endpoints": ends.len(), "violating_endpoints": violating.len(), "resized": o.resized, "error": o.error }));
+                        if o.error.is_some() {
+                            break;
+                        }
+                        continue;
+                    }
                     if hold_only {
                         let mut trace_head = Vec::new();
                         if debug_levels.get(&("RSZ".to_string(), "resizer".to_string())).is_some_and(|&l| l >= 1) {
@@ -2511,7 +2603,8 @@ REPAIR_TIMING:
   -setup and -hold together (or neither): the setup repair, then refused. Phases LEGACY, WNS,
   TNS, ENDPOINT_FANIN, STARTPOINT_FANOUT and LAST_GASP are modelled (an empty list or an
   unknown first phase is the command's own error); CRIT_VT_SWAP is refused when it would swap
-  (several VT categories). Refused before the lines: -recover_power, GLOBAL_SIZING, MT1,
+  (several VT categories). -recover_power runs in full (RecoverPower: every row, the trace, the design; -match_cell_footprint
+  and global-route parasitics refused). Refused before the lines: GLOBAL_SIZING, MT1,
   MEASURED_VT_SWAP, LEGACY_MT, REROUTE, parasitics other than -placement, setup clock
   uncertainty, clock latency / transition, derates, false and multicycle paths, clock groups,
   path delays other than the forms the timer models (see --describe); refused during the repair:
@@ -2562,7 +2655,7 @@ const DESCRIBE: &str = r#"{
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "status is one of repaired, up_to_date, vacuous, refused or error. repaired means the design changed (buffers inserted or drivers resized); up_to_date means drivers were checked and none needed a change (nets_checked says how many; for a job with buffer_ports and no repair_design, ports_checked); vacuous means nothing was checked and is NOT a pass. The declared assertion passes on repaired or up_to_date. Exit status is 0 for repaired and up_to_date, 2 for vacuous and for error, 3 for refused.",
     "Modelled: placement parasitics, one or more corners, flat and hierarchical netlists, the default buffer selection, the SDC constraints the usage lists, buffer_ports before the repair (the estimate it leaves carried into it). Global-route parasitics (set_routing_layers, global_route with no options on one corner, estimate_parasitics -global_routing): repair_timing -hold on them in full, with the router alive over the repair (the dirty nets re-routed before each estimate, new nets added, each new instance legalized to a site and row); -setup on them to its preamble (a journal undo restores routes from guides, not modelled); a design with a block instance, repair_design and buffer_ports on them are refused. Refused rather than guessed: the early sizing round, footprint matching, rerouting, any other netlist edit between the estimate and the repair, buffer_ports on a hierarchical design, a tristate driver or a bidirect pin on a net, and any other timing-affecting SDC command.",
-    "repair_timing -setup is modelled for every move of the default sequence and VtSwapMove in the LEGACY, WNS, TNS, ENDPOINT_FANIN, STARTPOINT_FANOUT and LAST_GASP phases, and repair_timing -hold alone in full (ending with RSZ-0050 / RSZ-0060 as the command does): every progress row, the summary and the design left, for one or several clocks (real or virtual, each ideal or propagated), latches with time borrowing, VT libraries, pins tied to supply nets, set_max_delay / set_min_delay in the forms the timer models, over one corner or several; -setup with -hold runs the setup part and is refused after it; CRIT_VT_SWAP over several VT categories, GLOBAL_SIZING, MT1, MEASURED_VT_SWAP, LEGACY_MT, -recover_power, any setup move on global-route parasitics (REROUTE among them; the preamble is modelled), setup clock uncertainty, clock latency or transition, derates, false and multicycle paths and clock groups are refused before the lines."
+    "repair_timing -setup is modelled for every move of the default sequence and VtSwapMove in the LEGACY, WNS, TNS, ENDPOINT_FANIN, STARTPOINT_FANOUT and LAST_GASP phases, and repair_timing -hold alone and repair_timing -recover_power in full (ending with RSZ-0050 / RSZ-0060 / RSZ-0125 as the command does): every progress row, the summary and the design left, for one or several clocks (real or virtual, each ideal or propagated), latches with time borrowing, VT libraries, pins tied to supply nets, set_max_delay / set_min_delay in the forms the timer models, over one corner or several; -setup with -hold runs the setup part and is refused after it; CRIT_VT_SWAP over several VT categories, GLOBAL_SIZING, MT1, MEASURED_VT_SWAP, LEGACY_MT, any setup move on global-route parasitics (REROUTE among them; the preamble is modelled), setup clock uncertainty, clock latency or transition, derates, false and multicycle paths and clock groups are refused before the lines."
   ],
   "invocation": {
     "args_template": ["repair_design", "{job}"],
