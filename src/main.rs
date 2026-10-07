@@ -36,6 +36,40 @@ fn est_stt(x: &[i32], y: &[i32], drvr: usize, alpha: f32) -> vyges_est::placemen
     })
 }
 
+fn to_rsmt(t: &vyges_stt::Tree) -> vyges_grt::RsmtTree {
+    vyges_grt::RsmtTree { deg: t.deg, length: t.length, branch: t.branch.iter().map(|b| vyges_grt::Branch { x: b.x, y: b.y, n: b.n }).collect() }
+}
+
+/// `SteinerTreeBuilder::makeSteinerTree(x, y, drvr, alpha)`, as the global router calls it.
+fn grt_stt(x: &[i32], y: &[i32], drvr: usize, alpha: f32) -> vyges_grt::RsmtTree {
+    LUT.with(|lut| to_rsmt(&vyges_stt::make_steiner_tree(lut, x, y, drvr, alpha).0.expect("a Steiner tree")))
+}
+
+/// FastRoute's pre-sorted FLUTE.
+fn grt_flutes(xs: &[i32], ys: &[i32], s: &[usize], acc: i32) -> vyges_grt::RsmtTree {
+    LUT.with(|lut| to_rsmt(&vyges_stt::flute::medium_degree::flutes_all_degree_acc(lut, xs.len(), xs, ys, s, acc).expect("flute")))
+}
+
+/// The estimator's `set_layer_rc` table as the global router's parasitics read it: per routing
+/// level (ohm/m, F/m), and per cut layer name its resistance — only the entries the table has.
+fn grt_layer_rc(db: &Db, rc: &vyges_est::rc::Rc) -> (BTreeMap<i32, (f64, f64)>, BTreeMap<String, f64>) {
+    let (mut layers, mut vias) = (BTreeMap::new(), BTreeMap::new());
+    for name in db.tech_get_layers() {
+        let number = db.layer_get_number(&name);
+        if !rc.layer_res.contains_key(&number) && !rc.layer_cap.contains_key(&number) {
+            continue;
+        }
+        let (res, cap) = rc.layer_rc(number, 0);
+        let level = db.layer_get_routing_level(&name);
+        if level > 0 {
+            layers.insert(level, (res, cap));
+        } else {
+            vias.insert(name, res);
+        }
+    }
+    (layers, vias)
+}
+
 /// Whether the signal wire capacitance is zero or unset (EST-0018): the estimator then makes no
 /// parasitics at all, and every net is timed lumped — as the router's timer does.
 fn no_signal_cap(db: &Db, rc: &vyges_est::rc::Rc) -> bool {
@@ -1326,6 +1360,11 @@ fn run(job: &Value) -> Result<Value, String> {
     // `set_debug_level`: each (tool, group) and its level.
     let mut debug_levels: BTreeMap<(String, String), i64> = BTreeMap::new();
     let mut timing_stop: Option<String> = None;
+    // `global_route`: the router's result (its routes, and the parasitics
+    // `estimate_parasitics -global_routing` builds from them); `gr_estimated` when that estimate is
+    // the one in force (`estimated` stays for the placement estimate's).
+    let mut groute: Option<vyges_grt::global_route::RouteResult> = None;
+    let mut gr_estimated = false;
     for step in job["steps"].as_array().ok_or("steps")? {
         let cmd = step["cmd"].as_str().ok_or("cmd")?;
         let args: Vec<String> = step["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
@@ -1416,11 +1455,25 @@ fn run(job: &Value) -> Result<Value, String> {
                 rc.check_set_wire_rc(&db, &args)?;
                 rc.set_wire_rc(&db, units(&liberty)?, &args)?
             }
+            // `-global_routing`: `estimateGlobalRouteRC` — every routed net's network from its route
+            // (`MakeWireParasitics`), over the router's routes as they stand.
+            "estimate_parasitics" if args.iter().any(|a| a == "-global_routing") => {
+                if args.len() != 1 {
+                    return Err(format!("estimate_parasitics {}: options with -global_routing are not modelled", args.join(" ")));
+                }
+                if groute.is_none() {
+                    return Err("estimate_parasitics -global_routing before global_route: not modelled".into());
+                }
+                estimated = false;
+                gr_estimated = true;
+                carried = None;
+            }
             "estimate_parasitics" => {
                 if !args.iter().any(|a| a == "-placement") {
                     return Err("estimate_parasitics without -placement: not modelled".into());
                 }
                 estimated = true;
+                gr_estimated = false;
                 carried = None;
                 estimate_alpha = routing_alpha;
                 estimate_db = step["db"].as_str().map(String::from);
@@ -1436,6 +1489,63 @@ fn run(job: &Value) -> Result<Value, String> {
                 let [tool, group, level] = args.as_slice() else { return Err(format!("set_debug_level {}: needs a tool, a group and a level", args.join(" "))) };
                 let level: i64 = level.parse().map_err(|_| format!("set_debug_level {level}: not an integer"))?;
                 debug_levels.insert((tool.clone(), group.clone()), level);
+            }
+            // `set_routing_layers -signal lo-hi [-clock lo-hi]`: the block's routing layer range.
+            "set_routing_layers" => {
+                let mut i = 0;
+                while i < args.len() {
+                    let range = args.get(i + 1).ok_or_else(|| format!("set_routing_layers {}: a range", args[i]))?;
+                    let (lo, hi) = range.split_once('-').ok_or_else(|| format!("set_routing_layers {range}: lo-hi"))?;
+                    let level = |n: &str| -> Result<i32, String> {
+                        match db.layer_get_routing_level(n) {
+                            0 => Err(format!("set_routing_layers: {n} is not a routing layer")),
+                            l => Ok(l),
+                        }
+                    };
+                    let (lo, hi) = (level(lo)?, level(hi)?);
+                    match args[i].as_str() {
+                        "-signal" => {
+                            db.block_set_min_routing_layer(lo).map_err(|e| e.to_string())?;
+                            db.block_set_max_routing_layer(hi).map_err(|e| e.to_string())?;
+                        }
+                        "-clock" => {
+                            db.block_set_min_layer_for_clock(lo).map_err(|e| e.to_string())?;
+                            db.block_set_max_layer_for_clock(hi).map_err(|e| e.to_string())?;
+                        }
+                        other => return Err(format!("set_routing_layers {other}: not modelled")),
+                    }
+                    i += 2;
+                }
+            }
+            // `global_route` (no options): FastRoute over the design, timing-driven on this
+            // design's constraints (the router reads its net slacks from the timer, as the
+            // reference's does). Its routes stay for `estimate_parasitics -global_routing`.
+            "global_route" => {
+                if !args.is_empty() {
+                    return Err(format!("global_route {}: options are not modelled", args.join(" ")));
+                }
+                if estimated || gr_estimated {
+                    return Err("global_route after estimate_parasitics: the router's timer on those parasitics is not modelled".into());
+                }
+                if libs.scene_count() > 1 {
+                    return Err("global_route over several corners: not modelled".into());
+                }
+                let mut opts = vyges_grt::global_route::RouteOptions::new();
+                opts.liberty = Some(liberty.clone());
+                opts.alpha = routing_alpha;
+                (opts.layer_rc, opts.via_rc) = grt_layer_rc(&db, &rc);
+                if let Some(s) = sdc.as_ref() {
+                    let lib0 = libs.default_library().ok_or("global_route before any liberty library")?;
+                    let text = read_text(sdc_path.as_deref().ok_or("global_route: no SDC file")?)?;
+                    opts.clock_sources = s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect();
+                    let ssdc = search_sdc(s, &text, lib0.time_scale, propagated || sdc_propagated, false)?;
+                    opts.timing = Some(vyges_grt::timer::Timing { libs: libs.libs.clone(), constraints: Default::default(), sdc: Some(ssdc) });
+                }
+                let res = vyges_grt::global_route::route_design(&mut db, &opts, &grt_stt, &grt_flutes).map_err(|e| format!("global_route: {e}"))?;
+                if res.total_overflow > 0 {
+                    return Err("global_route left overflow (GRT-0116): not modelled".into());
+                }
+                groute = Some(res);
             }
             "set_routing_alpha" => {
                 if args.iter().any(|a| a.starts_with('-')) {
@@ -1465,6 +1575,8 @@ fn run(job: &Value) -> Result<Value, String> {
                 sdc = Some(s);
                 sdc_path = Some(path.clone());
             }
+            "buffer_ports" if gr_estimated => return Err("buffer_ports on global-route parasitics: not modelled".into()),
+            "repair_design" if gr_estimated => return Err("repair_design on global-route parasitics: not modelled".into()),
             "buffer_ports" => {
                 if sdc_propagated {
                     return Err("set_propagated_clock: not modelled for buffer_ports".into());
@@ -1629,8 +1741,11 @@ fn run(job: &Value) -> Result<Value, String> {
                     Some(rt::PhasePlan::Other) => return Err("repair_timing -phases: GLOBAL_SIZING, MT1 and MEASURED_VT_SWAP are not modelled".into()),
                     _ => {}
                 }
-                if !estimated {
+                if !estimated && !gr_estimated {
                     return Err("repair_timing without estimate_parasitics -placement: not modelled".into());
+                }
+                if gr_estimated && !a.setup {
+                    return Err("repair_timing -hold on global-route parasitics: the incremental re-route inside the repair is not modelled".into());
                 }
                 let m = masters(&db)?;
                 // VT categories (IMPLANT obstructions) are read where the reference reads them: the
@@ -1646,6 +1761,29 @@ fn run(job: &Value) -> Result<Value, String> {
                 let clock_sources: Vec<String> = s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect();
                 let parasitics = match carried.take() {
                     Some(p) => p,
+                    None if gr_estimated => {
+                        // `estimateGlobalRouteRC`: one scene (checked at global_route).
+                        let caps = port_caps_at(None, sdc.as_ref(), &libs, &netlist)?;
+                        let res = groute.as_ref().expect("estimated from routes");
+                        let map: HashMap<String, NetParasitics> = res
+                            .routed_parasitics
+                            .iter()
+                            .map(|(net, n)| {
+                                let mut p = vyges_grt::timer::timer_network(net, n);
+                                p.port_pin_caps = Some(caps.clone());
+                                (net.clone(), p)
+                            })
+                            .collect();
+                        // A diagnostic: each net's network as built (`<net> <total ground cap F> <nodes>
+                        // <resistors>`), against the reference's `report_net` wire capacitance.
+                        if let Ok(path) = std::env::var("VYGES_RSZ_PAR_DUMP") {
+                            let mut nets: Vec<_> = map.iter().collect();
+                            nets.sort_by(|a, b| a.0.cmp(b.0));
+                            let text: String = nets.iter().map(|(n, p)| format!("{n} {:e} {} {}\n", p.network.node_caps.iter().map(|&c| f64::from(c)).sum::<f64>(), p.network.node_caps.len(), p.network.resistors.len())).collect();
+                            std::fs::write(&path, text).map_err(|e| format!("{path}: {e}"))?;
+                        }
+                        vec![map]
+                    }
                     None => {
                         let mut est_rc = estimate_rc.clone().expect("estimated");
                         est_rc.sort_clk_and_signal_layers();
@@ -1725,7 +1863,12 @@ fn run(job: &Value) -> Result<Value, String> {
                 // The moves modelled, over one corner or several (each reads the scenes the
                 // reference's does: see the moves), LEGACY and LAST_GASP.
                 let startpoint_rows = matches!(plan, Some(rt::PhasePlan::LegacyPreamble { startpoints: true }));
-                let unmodelled = if matches!(plan, Some(rt::PhasePlan::LegacyPreamble { .. })) && !a.phases.as_deref().is_some_and(rt::phases_modelled) {
+                let unmodelled = if gr_estimated {
+                    // Under global-route parasitics every `updateParasitics` first re-routes the
+                    // nets the router's callbacks marked dirty (`IncrementalGRoute::updateRoutes`):
+                    // not modelled, so no move is.
+                    Some("repair_timing on global-route parasitics: the incremental re-route inside the repair is not modelled".into())
+                } else if matches!(plan, Some(rt::PhasePlan::LegacyPreamble { .. })) && !a.phases.as_deref().is_some_and(rt::phases_modelled) {
                     Some(format!("repair_timing -phases {}: not modelled", a.phases.as_deref().unwrap_or_default()))
                 } else if let Some(m) = seq.iter().find(|m| !matches!(m, rt::Move::SizeUp | rt::Move::SizeDownFanout | rt::Move::Unbuffer | rt::Move::SwapPins | rt::Move::Buffer | rt::Move::Clone | rt::Move::SplitLoad | rt::Move::SizeUpMatch | rt::Move::VtSwap)) {
                     Some(format!("repair_timing: {} is not modelled", m.name()))
@@ -2049,7 +2192,9 @@ JOB FIELDS:
                script passes them:
                  read_lef, read_def, read_db, define_corners, read_liberty [-corner C],
                  read_sdc, set_dont_use, set_layer_rc, set_wire_rc, set_routing_alpha,
-                 estimate_parasitics -placement, set_propagated_clock, buffer_ports [options],
+                 set_routing_layers -signal LO-HI [-clock LO-HI], global_route,
+                 estimate_parasitics -placement | -global_routing, set_propagated_clock,
+                 buffer_ports [options],
                  repair_design [options], repair_timing [options]
                an estimate_parasitics step may carry \"db\": the database as the estimate saw it,
                when cells were moved between it and the repair
@@ -2141,8 +2286,8 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "status is one of repaired, up_to_date, vacuous, refused or error. repaired means the design changed (buffers inserted or drivers resized); up_to_date means drivers were checked and none needed a change (nets_checked says how many; for a job with buffer_ports and no repair_design, ports_checked); vacuous means nothing was checked and is NOT a pass. The declared assertion passes on repaired or up_to_date. Exit status is 0 for repaired and up_to_date, 2 for vacuous and for error, 3 for refused.",
-    "Modelled: placement parasitics, one or more corners, flat and hierarchical netlists, the default buffer selection, the SDC constraints the usage lists, buffer_ports before the repair (the estimate it leaves carried into it). Refused rather than guessed: global-route parasitics, the early sizing round, footprint matching, rerouting, any other netlist edit between the estimate and the repair, buffer_ports on a hierarchical design, a tristate driver or a bidirect pin on a net, and any other timing-affecting SDC command.",
-    "repair_timing -setup is modelled for every move of the default sequence and VtSwapMove in the LEGACY, WNS, TNS, ENDPOINT_FANIN, STARTPOINT_FANOUT and LAST_GASP phases, and repair_timing -hold alone in full (ending with RSZ-0050 / RSZ-0060 as the command does): every progress row, the summary and the design left, for one or several clocks (real or virtual, each ideal or propagated), latches with time borrowing, VT libraries, pins tied to supply nets, set_max_delay / set_min_delay in the forms the timer models, over one corner or several; -setup with -hold runs the setup part and is refused after it; CRIT_VT_SWAP over several VT categories, GLOBAL_SIZING, MT1, MEASURED_VT_SWAP, LEGACY_MT, REROUTE, -recover_power, parasitics other than -placement, setup clock uncertainty, clock latency or transition, derates, false and multicycle paths and clock groups are refused before the lines."
+    "Modelled: placement parasitics, one or more corners, flat and hierarchical netlists, the default buffer selection, the SDC constraints the usage lists, buffer_ports before the repair (the estimate it leaves carried into it). Global-route parasitics (set_routing_layers, global_route with no options on one corner, estimate_parasitics -global_routing) are modelled up to repair_timing -setup's preamble; every move on them, -hold on them, and repair_design or buffer_ports on them are refused. Refused rather than guessed: the early sizing round, footprint matching, rerouting, any other netlist edit between the estimate and the repair, buffer_ports on a hierarchical design, a tristate driver or a bidirect pin on a net, and any other timing-affecting SDC command.",
+    "repair_timing -setup is modelled for every move of the default sequence and VtSwapMove in the LEGACY, WNS, TNS, ENDPOINT_FANIN, STARTPOINT_FANOUT and LAST_GASP phases, and repair_timing -hold alone in full (ending with RSZ-0050 / RSZ-0060 as the command does): every progress row, the summary and the design left, for one or several clocks (real or virtual, each ideal or propagated), latches with time borrowing, VT libraries, pins tied to supply nets, set_max_delay / set_min_delay in the forms the timer models, over one corner or several; -setup with -hold runs the setup part and is refused after it; CRIT_VT_SWAP over several VT categories, GLOBAL_SIZING, MT1, MEASURED_VT_SWAP, LEGACY_MT, -recover_power, any move on global-route parasitics (REROUTE among them; the preamble is modelled), setup clock uncertainty, clock latency or transition, derates, false and multicycle paths and clock groups are refused before the lines."
   ],
   "invocation": {
     "args_template": ["repair_design", "{job}"],

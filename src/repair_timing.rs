@@ -226,8 +226,16 @@ impl Args {
     }
 }
 
-/// `buildMainMoveSequence`. `has_vt_swap_cells`: more than one VT category among the libraries.
+/// `buildMainMoveSequence` of the policy that logs RSZ-0100 — the FIRST phase's (its `start()` runs
+/// the shared preamble). `has_vt_swap_cells`: more than one VT category among the libraries.
+///
+/// Upstream rule: the call is virtual. `SetupReroutePolicy` (phase `REROUTE`) overrides it to
+/// RerouteMove alone, whatever `-sequence` and the skip flags say; every other setup policy keeps
+/// the base's sequence.
 pub fn move_sequence(a: &Args, has_vt_swap_cells: bool) -> Vec<Move> {
+    if a.phases.as_deref().and_then(|p| p.split([' ', '\t']).find(|s| !s.is_empty())) == Some("REROUTE") {
+        return vec![Move::Reroute];
+    }
     let mut seq = Vec::new();
     let mut push = |enabled: bool, m: Move| {
         if enabled {
@@ -648,6 +656,19 @@ mod tests {
         let s = Args::parse(&["-sequence".into(), "size_down_fanout sizeup".into()]).unwrap();
         assert_eq!(move_sequence(&s, false), [Move::SizeDownFanout, Move::SizeUp]);
         assert_eq!(parse_move_sequence("size").unwrap(), [Move::SizeUp, Move::SizeDownFanout]);
+    }
+
+    /// Rule (`SetupReroutePolicy::buildMainMoveSequence` overrides the base's): a REROUTE first
+    /// phase logs and runs RerouteMove alone; REROUTE later in the list leaves the first phase's
+    /// sequence, and `-sequence reroute` under LEGACY is the base's own list.
+    #[test]
+    fn a_reroute_first_phase_has_its_own_sequence() {
+        let a = Args::parse(&["-setup".into(), "-phases".into(), "REROUTE".into(), "-sequence".into(), "sizeup".into()]).unwrap();
+        assert_eq!(move_sequence(&a, true), [Move::Reroute]);
+        let later = Args::parse(&["-setup".into(), "-phases".into(), "LEGACY REROUTE".into()]).unwrap();
+        assert_eq!(move_sequence(&later, false).first(), Some(&Move::Unbuffer));
+        let legacy = Args::parse(&["-setup".into(), "-phases".into(), "LEGACY".into(), "-sequence".into(), "reroute".into()]).unwrap();
+        assert_eq!(move_sequence(&legacy, false), [Move::Reroute]);
     }
 
     /// Rule (SdcNetwork::staToSdc, what an endpoint vertex's name prints): a lone escape drops, an
