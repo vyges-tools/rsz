@@ -140,8 +140,6 @@ enum RebufProbe {
     Skip,
     /// A warning, then nothing inserted (RSZ-2020 top port driver, RSZ-0075 no buffered net).
     Warn(String),
-    /// A buffered net this engine does not rebuffer (a global route's vias and layered wires).
-    Refused(String),
     /// The annotated net and the driver's timing.
     Ready(Box<rebuffer::Probe>),
 }
@@ -694,10 +692,10 @@ fn probe_rebuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[
         let kind = match n.kind {
             crate::buffered_net::Kind::Load { pin } => rebuffer::Kind::Load { pin: g.vertices[pin].name.clone() },
             crate::buffered_net::Kind::Junction { r, r2 } => rebuffer::Kind::Junction { r, r2 },
-            crate::buffered_net::Kind::Wire { r } if n.layer == crate::buffered_net::NULL_LAYER => rebuffer::Kind::Wire { r },
-            _ => return RebufProbe::Refused(format!("rebuffering {}: a global route's vias and layered wires are not modelled", vx.name)),
+            crate::buffered_net::Kind::Wire { r } => rebuffer::Kind::Wire { r },
+            crate::buffered_net::Kind::Via { r, ref_layer } => rebuffer::Kind::Via { r, ref_layer },
         };
-        nodes.push(rebuffer::Node { kind, x: n.x, y: n.y, cap: n.cap, fanout: n.fanout, max_load_slew: n.max_load_slew, area: 0.0, slack_rf: None, slack: rebuffer::FixedDelay::ZERO, delay: rebuffer::FixedDelay::ZERO, arrival: rebuffer::FixedDelay::ZERO });
+        nodes.push(rebuffer::Node { kind, x: n.x, y: n.y, layer: n.layer, cap: n.cap, fanout: n.fanout, max_load_slew: n.max_load_slew, area: 0.0, slack_rf: None, slack: rebuffer::FixedDelay::ZERO, delay: rebuffer::FixedDelay::ZERO, arrival: rebuffer::FixedDelay::ZERO });
     }
     let mut arrival_paths: [Option<(usize, vyges_sta::search::Path)>; 2] = [None, None];
     let mut warnings = Vec::new();
@@ -3521,7 +3519,6 @@ impl Repair<'_, '_> {
                 0
             }
             Some(RebufProbe::Ready(probe)) => self.rebuffer_pin(&probe)?,
-            Some(RebufProbe::Refused(why)) => return Err(Stop::refused("RSZ-GR", why)),
         };
         if count <= 0 {
             self.debug("buffer_move", 2, format!("REJECT BufferMove {}: Couldn't insert any buffers", st.pin));
@@ -3566,7 +3563,7 @@ impl Repair<'_, '_> {
     /// on other nets allowed) and its input becomes the parent's load.
     fn export_buffer_tree(&mut self, rb: &rebuffer::Rebuf<'_>, n: usize, net: &str, current: &mut Vec<String>, count: &mut i64, inputs: &mut HashMap<usize, String>) -> Result<(), Stop> {
         match rb.nodes[n].kind.clone() {
-            rebuffer::Kind::Wire { r } => self.export_buffer_tree(rb, r, net, current, count, inputs),
+            rebuffer::Kind::Wire { r } | rebuffer::Kind::Via { r, .. } => self.export_buffer_tree(rb, r, net, current, count, inputs),
             rebuffer::Kind::Junction { r, r2 } => {
                 self.export_buffer_tree(rb, r, net, current, count, inputs)?;
                 self.export_buffer_tree(rb, r2, net, current, count, inputs)

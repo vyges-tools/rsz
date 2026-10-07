@@ -2126,12 +2126,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 // The moves modelled, over one corner or several (each reads the scenes the
                 // reference's does: see the moves), LEGACY and LAST_GASP.
                 let startpoint_rows = matches!(plan, Some(rt::PhasePlan::LegacyPreamble { startpoints: true }));
-                let unmodelled = if gr_estimated && seq.iter().any(|m| matches!(m, rt::Move::Buffer | rt::Move::SplitLoad)) {
-                    // Under global-route parasitics the buffered net is the route's
-                    // (`makeBufferedNetGroute`, layered wires and vias): not modelled. A journal
-                    // undo refuses where it happens (routes restored from guides).
-                    Some("repair_timing -setup on global-route parasitics: BufferMove / SplitLoadMove (makeBufferedNetGroute) are not modelled".into())
-                } else if matches!(plan, Some(rt::PhasePlan::LegacyPreamble { .. })) && !a.phases.as_deref().is_some_and(rt::phases_modelled) {
+                let unmodelled = if matches!(plan, Some(rt::PhasePlan::LegacyPreamble { .. })) && !a.phases.as_deref().is_some_and(rt::phases_modelled) {
                     Some(format!("repair_timing -phases {}: not modelled", a.phases.as_deref().unwrap_or_default()))
                 } else if let Some(m) = seq.iter().find(|m| !matches!(m, rt::Move::SizeUp | rt::Move::SizeDownFanout | rt::Move::Unbuffer | rt::Move::SwapPins | rt::Move::Buffer | rt::Move::Clone | rt::Move::SplitLoad | rt::Move::SizeUpMatch | rt::Move::VtSwap)) {
                     Some(format!("repair_timing: {} is not modelled", m.name()))
@@ -2173,6 +2168,8 @@ fn run(job: &Value) -> Result<Value, String> {
                         vyges_rsz::buffered_net::WireRc { h_res: v[0], v_res: v[1], h_cap: v[2], v_cap: v[3] }
                     };
                     let slew_shape_factor = vyges_rsz::preamble::compute_slew_shape_factor(lib0).map_err(|e| format!("{}: {}", e.code(), e.message()))?;
+                    // Global-route parasitics: the per-layer RC a layered wire reads in buffering.
+                    let gr_layers = gr_estimated.then(|| std::sync::Arc::new(gr_layer_rc(&db, &rc)));
                     // The reference's pin addresses, when the gate supplies them (debug order only).
                     let pin_addr = match job["pin_address"].as_str() {
                         Some(path) => Some(vyges_rsz::unbuffer::PinAddr::parse(&read_text(path)?)?),
@@ -2185,7 +2182,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     let mut fast_buffers: Vec<String> = Vec::new();
                     let rb_ctx = if !hold_only && (seq.contains(&rt::Move::Buffer) || seq.contains(&rt::Move::SizeDownFanout)) {
                         // `corner_` is `cmdScene()`, the first corner: scene 0.
-                        let base = vyges_rsz::rebuffer::Ctx { libs: &libs, sizes: &[], rc: wire_rc, dbu: db.tech_get_db_units_per_micron(), slew_shape_factor, tgt_slews, time_scale, cap_scale: lib0.cap_scale, cmd: 0, tgt: tgt_scene };
+                        let base = vyges_rsz::rebuffer::Ctx { libs: &libs, sizes: &[], rc: wire_rc, dbu: db.tech_get_db_units_per_micron(), slew_shape_factor, tgt_slews, time_scale, cap_scale: lib0.cap_scale, cmd: 0, tgt: tgt_scene, layers: gr_layers.clone() };
                         let lowest = libs.link_cell(&buffers.lowest).ok_or("no lowest-drive buffer")?;
                         let r_max = lowest.buffer_ports().map_or(0.0, |(_, o)| lowest.drive_resistance(&o.name));
                         // `findSlewLimit(port, corner_)` / `maxInputSlew(port, corner_)`: the scene
@@ -2277,7 +2274,7 @@ fn run(job: &Value) -> Result<Value, String> {
                         let mut trace_head = Vec::new();
                         if debug_levels.get(&("RSZ".to_string(), "resizer".to_string())).is_some_and(|&l| l >= 1) {
                             // `findFastBuffers`' list (`pre-selected buffers`).
-                            let base = vyges_rsz::rebuffer::Ctx { libs: &libs, sizes: &[], rc: wire_rc, dbu: db_dbu, slew_shape_factor, tgt_slews, time_scale, cap_scale: lib0.cap_scale, cmd: 0, tgt: tgt_scene };
+                            let base = vyges_rsz::rebuffer::Ctx { libs: &libs, sizes: &[], rc: wire_rc, dbu: db_dbu, slew_shape_factor, tgt_slews, time_scale, cap_scale: lib0.cap_scale, cmd: 0, tgt: tgt_scene, layers: gr_layers.clone() };
                             let lowest = libs.link_cell(&buffers.lowest).ok_or("no lowest-drive buffer")?;
                             let r_max = lowest.buffer_ports().map_or(0.0, |(_, o)| lowest.drive_resistance(&o.name));
                             let slew_limit = |c: &vyges_sta::liberty::Cell, port: &str| {

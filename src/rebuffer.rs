@@ -129,6 +129,9 @@ pub enum Kind {
     Junction { r: usize, r2: usize },
     Wire { r: usize },
     Buffer { cell: String, r: usize },
+    /// A global route's via, from the node's layer to `ref_layer` — only in a buffered net as built
+    /// (`bufferForTiming` strips it with the wires and buffers).
+    Via { r: usize, ref_layer: i32 },
 }
 
 /// One `BufferedNet` node with the rebuffer annotations; an arena index is its identity, and a
@@ -138,6 +141,8 @@ pub struct Node {
     pub kind: Kind,
     pub x: i32,
     pub y: i32,
+    /// A wire's routing layer (`BufferedNet::null_layer` off a global route), a via's from layer.
+    pub layer: i32,
     pub cap: f32,
     pub fanout: f32,
     pub max_load_slew: f32,
@@ -157,6 +162,9 @@ pub struct BufferSize {
     pub driver_resistance: f32,
     /// `long_wire_asymptotics[-1]` (the signal wire RC): none without parasitics.
     pub asym: Option<Asymptotics>,
+    /// `long_wire_asymptotics[layer]` per routing layer with a non-zero `layerRC` (global-route
+    /// parasitics only); a layer missing reads all zeros, as the reference's `operator[]` does.
+    pub asym_layers: std::collections::BTreeMap<i32, Asymptotics>,
     /// The input port's capacitance (`capacitance()`, the largest value), fanout load and max
     /// input slew; the output port's name; the cell's area.
     pub in_cap: f32,
@@ -191,6 +199,8 @@ pub struct Ctx<'a> {
     pub cmd: usize,
     /// `tgt_slew_corner_`: the scene of `findFastBuffers`' delays.
     pub tgt: usize,
+    /// Global-route parasitics: the estimator's per-layer RC, which a layered wire reads.
+    pub layers: Option<std::sync::Arc<crate::buffered_net::LayerRc>>,
 }
 
 impl Ctx<'_> {
@@ -204,6 +214,14 @@ impl Ctx<'_> {
     /// `wireSignalRC`: the mean of the horizontal and vertical values.
     fn signal_rc(&self) -> (f64, f64) {
         ((self.rc.h_res + self.rc.v_res) / 2.0, (self.rc.h_cap + self.rc.v_cap) / 2.0)
+    }
+    /// `layerRC(findRoutingLayer(layer), corner_)`: the estimator's table (0 where unset).
+    fn layer_rc(&self, layer: i32) -> (f64, f64) {
+        self.layers.as_ref().and_then(|l| l.wire.get(&layer).copied()).unwrap_or((0.0, 0.0))
+    }
+    /// The RC per meter a wire on `layer` reads for buffering: the signal wire's on no layer.
+    fn rc_on(&self, layer: i32) -> (f64, f64) {
+        if layer == crate::buffered_net::NULL_LAYER { self.signal_rc() } else { self.layer_rc(layer) }
     }
     fn cell(&self, name: &str) -> &Cell {
         self.libs.link_cell(name).expect("a buffer cell")
@@ -309,6 +327,7 @@ pub fn characterize(ci: &CharInputs<'_>, buffer_cells: &[String]) -> Result<Vec<
             margined_max_cap: 0.0,
             driver_resistance: c.drive_resistance(&out.name),
             asym: None,
+            asym_layers: std::collections::BTreeMap::new(),
             in_cap: port_cap(c, &inp.name),
             in_cap_cmd: port_cap(ctx.scene_cell(ctx.cmd, name), &inp.name),
             in_fanout: 0.0,
@@ -330,6 +349,14 @@ pub fn characterize(ci: &CharInputs<'_>, buffer_cells: &[String]) -> Result<Vec<
         let slew_cap = find_buffer_load_limit_implied_by_driver_slew(ci, c);
         s.margined_max_cap = cap_limit.map_or(INF, max_cap_margined).min(slew_cap);
         s.asym = find_long_wire_asymptotics(ctx, s);
+        // `characterizeBuffers` then runs every routing layer (1..N) on its `layerRC`.
+        if let Some(l) = ctx.layers.as_ref() {
+            for (&level, &(res, cap)) in &l.wire {
+                if let Some(a) = long_wire_asymptotics_at(ctx, s, res, cap) {
+                    s.asym_layers.insert(level, a);
+                }
+            }
+        }
     }
     Ok(sizes)
 }
@@ -469,6 +496,11 @@ fn find_buffer_load_limit_implied_by_driver_slew(ci: &CharInputs<'_>, c: &Cell) 
 /// buffer spacing that balances wire and buffer delay; none without parasitics.
 fn find_long_wire_asymptotics(ctx: &Ctx<'_>, s: &BufferSize) -> Option<Asymptotics> {
     let (wire_res, wire_cap) = ctx.signal_rc();
+    long_wire_asymptotics_at(ctx, s, wire_res, wire_cap)
+}
+
+/// `findLongWireAsymptotics(layer, size)` on a wire RC per meter (the layer's, or the signal wire's).
+fn long_wire_asymptotics_at(ctx: &Ctx<'_>, s: &BufferSize, wire_res: f64, wire_cap: f64) -> Option<Asymptotics> {
     if wire_res <= 0.0 || wire_cap <= 0.0 {
         return None;
     }
@@ -568,6 +600,7 @@ impl Rebuf<'_> {
             Kind::Wire { .. } => format!("wire ({x}, {y}) cap {cap} slack {slack} buffers {buffers} load sl {sl}"),
             Kind::Buffer { cell, .. } => format!("buffer ({x}, {y}) {cell} cap {cap} slack {slack} buffers {buffers} load sl {sl}"),
             Kind::Junction { .. } => format!("junction ({x}, {y}) cap {cap} slack {slack} buffers {buffers} load sl {sl}"),
+            Kind::Via { ref_layer, .. } => format!("via ({x}, {y}) layer {} -> {ref_layer}", nd.layer),
         };
         // A diagnostic: the raw slack (fs) and load slew bits (`VYG_RAW`), as the instrumented
         // reference appends them.
@@ -581,7 +614,7 @@ impl Rebuf<'_> {
     pub fn buffer_count(&self, n: usize) -> i64 {
         match &self.nodes[n].kind {
             Kind::Buffer { r, .. } => self.buffer_count(*r) + 1,
-            Kind::Wire { r } => self.buffer_count(*r),
+            Kind::Wire { r } | Kind::Via { r, .. } => self.buffer_count(*r),
             Kind::Junction { r, r2 } => self.buffer_count(*r) + self.buffer_count(*r2),
             Kind::Load { .. } => 0,
         }
@@ -597,9 +630,14 @@ impl Rebuf<'_> {
     }
 
     /// The wire node's RC per meter on no layer (`BufferedNet::wireRC`): each direction's share.
-    fn wire_rc_of(&self, at: (i32, i32), r: usize) -> (f64, f64, i32) {
+    /// On a routing layer: the estimator's `layerRC` for it, whatever the length.
+    fn wire_rc_of(&self, at: (i32, i32), r: usize, layer: i32) -> (f64, f64, i32) {
         let rl = self.loc(r);
         let len = (at.0 - rl.0).abs() + (at.1 - rl.1).abs();
+        if layer != crate::buffered_net::NULL_LAYER {
+            let (res, cap) = self.ctx.layer_rc(layer);
+            return (res, cap, len);
+        }
         if len == 0 {
             return (0.0, 0.0, 0);
         }
@@ -610,11 +648,11 @@ impl Rebuf<'_> {
     }
 
     /// The wire constructor: the ref's cap plus the wire's, fanout, slew limit and area.
-    fn new_wire(&mut self, at: (i32, i32), r: usize) -> usize {
-        let (_, wire_cap, len) = self.wire_rc_of(at, r);
+    fn new_wire(&mut self, at: (i32, i32), r: usize, layer: i32) -> usize {
+        let (_, wire_cap, len) = self.wire_rc_of(at, r, layer);
         let p = &self.nodes[r];
         let cap = (f64::from(p.cap) + self.ctx.dbu_to_meters(len) * wire_cap) as f32;
-        let node = Node { kind: Kind::Wire { r }, x: at.0, y: at.1, cap, fanout: p.fanout, max_load_slew: p.max_load_slew, area: p.area, slack_rf: None, slack: FixedDelay::ZERO, delay: FixedDelay::ZERO, arrival: FixedDelay::ZERO };
+        let node = Node { kind: Kind::Wire { r }, x: at.0, y: at.1, layer, cap, fanout: p.fanout, max_load_slew: p.max_load_slew, area: p.area, slack_rf: None, slack: FixedDelay::ZERO, delay: FixedDelay::ZERO, arrival: FixedDelay::ZERO };
         self.push(node)
     }
 
@@ -625,6 +663,7 @@ impl Rebuf<'_> {
             kind: Kind::Junction { r: p, r2: q },
             x: at.0,
             y: at.1,
+            layer: crate::buffered_net::NULL_LAYER,
             cap: a.cap + b.cap,
             fanout: a.fanout + b.fanout,
             max_load_slew: a.max_load_slew.min(b.max_load_slew),
@@ -644,6 +683,7 @@ impl Rebuf<'_> {
             kind: Kind::Buffer { cell: s.cell.clone(), r },
             x: at.0,
             y: at.1,
+            layer: crate::buffered_net::NULL_LAYER,
             cap: s.in_cap_cmd,
             fanout: s.in_fanout,
             max_load_slew: s.in_max_slew,
@@ -658,9 +698,9 @@ impl Rebuf<'_> {
 
     /// `Rebuffer::addWire`: a wire from `end` to `p`, its delay `R·(C/2 + Cload)` taken off the
     /// slack and its slew degradation off the slew limit.
-    fn add_wire(&mut self, p: usize, end: (i32, i32), level: Option<usize>) -> usize {
-        let z = self.new_wire(end, p);
-        let (layer_res, layer_cap, len) = self.wire_rc_of(end, p);
+    fn add_wire(&mut self, p: usize, end: (i32, i32), layer: i32, level: Option<usize>) -> usize {
+        let z = self.new_wire(end, p, layer);
+        let (layer_res, layer_cap, len) = self.wire_rc_of(end, p, layer);
         let wire_length = self.ctx.dbu_to_meters(len);
         let wire_res = wire_length * layer_res;
         let wire_cap = wire_length * layer_cap;
@@ -750,7 +790,7 @@ impl Rebuf<'_> {
     }
 
     fn strip_wire(&self, mut n: usize) -> usize {
-        while let Kind::Wire { r } = self.nodes[n].kind {
+        while let Kind::Wire { r } | Kind::Via { r, .. } = self.nodes[n].kind {
             n = r;
         }
         n
@@ -759,8 +799,19 @@ impl Rebuf<'_> {
     fn strip_wires_and_buffers(&self, mut n: usize) -> usize {
         loop {
             match self.nodes[n].kind {
-                Kind::Wire { r } | Kind::Buffer { r, .. } => n = r,
+                Kind::Wire { r } | Kind::Buffer { r, .. } | Kind::Via { r, .. } => n = r,
                 _ => return n,
+            }
+        }
+    }
+
+    /// `findWireLayer`: past buffers and vias to the first wire — its layer — else none.
+    fn find_wire_layer(&self, mut n: usize) -> i32 {
+        loop {
+            match self.nodes[n].kind {
+                Kind::Buffer { r, .. } | Kind::Via { r, .. } => n = r,
+                Kind::Wire { .. } => return self.nodes[n].layer,
+                _ => return crate::buffered_net::NULL_LAYER,
             }
         }
     }
@@ -787,11 +838,11 @@ impl Rebuf<'_> {
         let (p1, p2, p3) = (self.loc(aux1), self.loc(aux2), self.loc(crit2));
         let jp = (middle_value(p1.0, p2.0, p3.0), middle_value(p1.1, p2.1, p3.1));
         let node_loc = self.loc(node);
-        let in1 = self.add_wire(aux1, jp, None);
-        let in2 = self.add_wire(aux2, jp, None);
+        let in1 = self.add_wire(aux1, jp, crate::buffered_net::NULL_LAYER, None);
+        let in2 = self.add_wire(aux2, jp, crate::buffered_net::NULL_LAYER, None);
         let j = self.create_junction(in1, in2, jp);
-        let junc1 = self.add_wire(j, node_loc, None);
-        let in3 = self.add_wire(crit2, node_loc, None);
+        let junc1 = self.add_wire(j, node_loc, crate::buffered_net::NULL_LAYER, None);
+        let in3 = self.add_wire(crit2, node_loc, crate::buffered_net::NULL_LAYER, None);
         let lr_cap = self.nodes[left].cap + self.nodes[right].cap;
         for size in 0..self.ctx.sizes.len() {
             let s = &self.ctx.sizes[size];
@@ -846,7 +897,8 @@ impl Rebuf<'_> {
     /// `bufferForTiming`'s visitor at `node` (`level` from 1 at the root).
     fn timing_options(&mut self, node: usize, level: usize, rewrite: bool) -> Vec<usize> {
         match self.nodes[node].kind.clone() {
-            Kind::Wire { r } | Kind::Buffer { r, .. } => {
+            Kind::Wire { r } | Kind::Buffer { r, .. } | Kind::Via { r, .. } => {
+                let layer = self.find_wire_layer(node);
                 let rf_ = self.strip_wires_and_buffers(r);
                 let ref_loc = self.loc(rf_);
                 let target = self.loc(node);
@@ -856,12 +908,13 @@ impl Rebuf<'_> {
                 let mut wired: Vec<usize> = Vec::with_capacity(opts.len());
                 for &opt in &opts {
                     if self.can_drive(strong, opt, segment_wl) {
-                        wired.push(self.add_wire(opt, target, None));
+                        wired.push(self.add_wire(opt, target, layer, None));
                     }
                 }
-                let (_, wire_cap) = self.ctx.signal_rc();
+                let (_, wire_cap) = self.ctx.rc_on(layer);
                 for size in 0..self.ctx.sizes.len() {
-                    let asym = self.ctx.sizes[size].asym.unwrap_or_default();
+                    let sz = &self.ctx.sizes[size];
+                    let asym = if layer == crate::buffered_net::NULL_LAYER { sz.asym.unwrap_or_default() } else { sz.asym_layers.get(&layer).copied().unwrap_or_default() };
                     let target_load = (f64::from(asym.input_cap) + f64::from(asym.buffer_spacing) * wire_cap) as f32;
                     let mut best_appraisal = f32::NEG_INFINITY;
                     let mut head: Option<usize> = None;
@@ -894,7 +947,7 @@ impl Rebuf<'_> {
                             dy = if dy > 0 { dy_abs } else { -dy_abs };
                         }
                         let next = (hl.0 + dx, hl.1 + dy);
-                        let wire_head = self.add_wire(h, next, None);
+                        let wire_head = self.add_wire(h, next, layer, None);
                         let bd = self.buffer_delay(size, self.nodes[wire_head].slack_rf, self.nodes[wire_head].cap);
                         if !self.can_drive(size, wire_head, 0) {
                             inserted = false;
@@ -913,7 +966,7 @@ impl Rebuf<'_> {
                         let hl = self.loc(h);
                         let remaining = (target.0 - hl.0).abs() + (target.1 - hl.1).abs();
                         if self.can_drive(strong, h, remaining) {
-                            let hw = self.add_wire(h, target, None);
+                            let hw = self.add_wire(h, target, layer, None);
                             let hc = self.nodes[hw].cap;
                             let at = wired.iter().position(|&o| self.nodes[o].cap >= hc).unwrap_or(wired.len());
                             wired.insert(at, hw);
@@ -1164,7 +1217,7 @@ impl Rebuf<'_> {
     fn spread_arrival(&mut self, n: usize, arrival: FixedDelay) {
         self.nodes[n].arrival = arrival;
         match self.nodes[n].kind.clone() {
-            Kind::Wire { r } | Kind::Buffer { r, .. } => {
+            Kind::Wire { r } | Kind::Buffer { r, .. } | Kind::Via { r, .. } => {
                 let d = self.nodes[n].delay;
                 self.spread_arrival(r, arrival + d);
             }
@@ -1178,6 +1231,12 @@ impl Rebuf<'_> {
 
     fn area_options(&mut self, node: usize, level: usize, upstream_wl: i32, slack_target: FixedDelay, alpha: f32) -> Vec<usize> {
         match self.nodes[node].kind.clone() {
+            // `recoverArea` runs on `bufferForTiming`'s trees, which carry no via (the reference
+            // aborts on one).
+            Kind::Via { .. } => {
+                self.failed.get_or_insert_with(|| "recoverArea: a via in a buffered tree (unhandled BufferedNet type)".into());
+                Vec::new()
+            }
             Kind::Buffer { .. } | Kind::Wire { .. } => {
                 let inner = match self.nodes[node].kind { Kind::Buffer { r, .. } => r, _ => node };
                 let mut opts = match self.nodes[inner].kind.clone() {
@@ -1187,8 +1246,8 @@ impl Rebuf<'_> {
                             (a.0 - b.0).abs() + (a.1 - b.1).abs()
                         };
                         let o = self.area_options(r, level + 1, len, slack_target, alpha);
-                        let at = self.loc(inner);
-                        o.into_iter().map(|opt| self.add_wire(opt, at, Some(level))).collect()
+                        let (at, layer) = (self.loc(inner), self.nodes[inner].layer);
+                        o.into_iter().map(|opt| self.add_wire(opt, at, layer, Some(level))).collect()
                     }
                     _ => self.area_options(inner, level + 1, 0, slack_target, alpha),
                 };
@@ -1278,7 +1337,7 @@ impl Rebuf<'_> {
         let mut stack = vec![root];
         while let Some(n) = stack.pop() {
             match &self.nodes[n].kind {
-                Kind::Wire { r } | Kind::Buffer { r, .. } => stack.push(*r),
+                Kind::Wire { r } | Kind::Buffer { r, .. } | Kind::Via { r, .. } => stack.push(*r),
                 Kind::Junction { r, r2 } => {
                     stack.push(*r2);
                     stack.push(*r);
@@ -1294,7 +1353,8 @@ impl Rebuf<'_> {
     pub fn rebuffer_pin(&mut self) -> Result<Option<usize>, String> {
         let mut bnet = Some(self.probe.root);
         for i in 0..3 {
-            bnet = self.buffer_for_timing(bnet.expect("a tree"), true);
+            // `allow_topology_rewrite`: placement parasitics only.
+            bnet = self.buffer_for_timing(bnet.expect("a tree"), self.ctx.layers.is_none());
             if bnet.is_none() {
                 let line = format!("[WARNING RSZ-2021] cannot find a viable buffering solution on pin {} after {} rounds of buffering (no solution meets design rules)", self.pin, i + 1);
                 self.warn(line);
@@ -1321,7 +1381,7 @@ impl Rebuf<'_> {
     /// instance it inserted).
     pub fn export_order(&self, root: usize, out: &mut Vec<(usize, Vec<Load>)>) -> Vec<Load> {
         match &self.nodes[root].kind {
-            Kind::Wire { r } => self.export_order(*r, out),
+            Kind::Wire { r } | Kind::Via { r, .. } => self.export_order(*r, out),
             Kind::Junction { r, r2 } => {
                 let mut l = self.export_order(*r, out);
                 l.extend(self.export_order(*r2, out));
