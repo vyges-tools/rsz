@@ -15,7 +15,7 @@ odb = ["dep:vyges-opendb", "vyges-opendb/gen-write"]
 # The command-line engine: the database, the netlist and placement parasitics the timer reads
 # (the timer adapter shared with the router, the estimator, the Steiner-tree builder), the SDC
 # reader, and JSON jobs.
-cli = ["odb", "dep:vyges-grt", "dep:vyges-est", "dep:vyges-stt", "dep:vyges-loom", "dep:serde_json", "dep:flate2", "dep:vyges-events"]
+cli = ["odb", "dep:vyges-grt", "dep:vyges-est", "dep:vyges-stt", "dep:vyges-loom", "dep:vyges-dpl", "dep:serde_json", "dep:flate2", "dep:vyges-events"]
 
 [dependencies]
 # The timer's library model: cells, ports, arcs and their tables.
@@ -25,6 +25,9 @@ vyges-grt = { git = "https://github.com/vyges-tools/grt.git", branch = "main", d
 vyges-est = { git = "https://github.com/vyges-tools/est.git", branch = "main", features = ["odb"], optional = true }
 vyges-stt = { git = "https://github.com/vyges-tools/stt.git", branch = "main", optional = true }
 vyges-loom = { git = "https://github.com/vyges-tools/loom.git", branch = "main", optional = true }
+# The detailed placer's grid: `legalCellPos` on each new or resized instance under global-route
+# parasitics.
+vyges-dpl = { git = "https://github.com/vyges-tools/dpl.git", branch = "main", optional = true }
 vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main", default-features = false, optional = true }
 serde_json = { version = "1", optional = true }
 flate2 = { version = "1", optional = true }
@@ -56,6 +59,9 @@ vyges-est = { path = "../vyges-tools-est" }
 
 [patch."https://github.com/vyges-tools/stt.git"]
 vyges-stt = { path = "../vyges-tools-stt" }
+
+[patch."https://github.com/vyges-tools/dpl.git"]
+vyges-dpl = { path = "../vyges-tools-dpl" }
 
 [patch."https://github.com/vyges-tools/loom.git"]
 vyges-loom = { path = "../vyges-tools-loom" }

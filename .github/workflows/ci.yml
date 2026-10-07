@@ -65,6 +65,10 @@ jobs:
         with:
           repository: vyges-tools/layout
           path: vyges-tools-layout
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/dpl
+          path: vyges-tools-dpl
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -115,6 +119,10 @@ jobs:
         with:
           repository: vyges-tools/layout
           path: vyges-tools-layout
+      - uses: actions/checkout@v4
+        with:
+          repository: vyges-tools/dpl
+          path: vyges-tools-dpl
 
       - name: Toolchain
         # Boost (headers) + zlib only; fmt/spdlog/abseil are built from source by libodb's build.

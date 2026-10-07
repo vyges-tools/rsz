@@ -414,6 +414,66 @@ struct CliDesign<'a> {
     timer: TimerLog,
     /// Per instance, the cell its output-to-output edges carry after equivalent-arcs swaps.
     stale_out_arcs: BTreeMap<String, String>,
+    /// The global router alive across the repair, when the parasitics are global-route ones.
+    gr: Option<GrLive>,
+    /// A router callback this engine refuses (raised at the next parasitics update).
+    gr_error: Option<String>,
+}
+
+/// `IncrementalGRoute` over the repair: the router's state after `global_route` (its routes, its
+/// graphs, the nets it holds), the options it ran with, and `dirty_nets_` by name — marked by
+/// `GRouteDbCbk` from the database's callbacks, read in odb id order (a `PtrSet`).
+struct GrLive {
+    after: vyges_grt::global_route::AfterRoute,
+    opts: vyges_grt::global_route::RouteOptions,
+    dirty: BTreeSet<String>,
+    /// The detailed placer's grid (`opendp_->initMacrosAndGrid()` in the repair's preamble), which
+    /// `legalCellPos` snaps each new or resized instance to.
+    grid: vyges_dpl::grid::Grid,
+}
+
+impl GrLive {
+    /// `GlobalRouter::addDirtyNet`, as `GRouteDbCbk` calls it: a net set and not special, marked
+    /// only when the router holds it.
+    fn mark(&mut self, db: &Db, net: &str) {
+        if !net.is_empty() && !db.net_is_special(net) && vyges_grt::global_route::holds(&self.after, net) {
+            self.dirty.insert(net.to_string());
+        }
+    }
+
+    /// `IncrementalGRoute::updateRoutes` → `updateDirtyRoutesFastRoute`: the dirty nets (odb id
+    /// order) whose pins moved are released and routed again from the graphs as they stand.
+    fn update_routes(&mut self, db: &mut Db) -> Result<(), String> {
+        if self.dirty.is_empty() {
+            return Ok(());
+        }
+        let order: Vec<String> = db.net_names().into_iter().filter(|n| self.dirty.contains(n)).collect();
+        self.dirty.clear();
+        gr_trace(&format!("VYGR|upd|enter|{}", order.iter().map(|n| format!("{n};")).collect::<String>()));
+        let routed = vyges_grt::global_route::update_dirty_routes_fast_route(db, &self.opts, &mut self.after, &order, &grt_stt, &grt_flutes, &mut |_, _| {}).map_err(|e| format!("incremental global route: {e}"))?;
+        gr_trace(&format!("VYGR|upd|route|{}", routed.iter().map(|n| format!("{n};")).collect::<String>()));
+        for net in &routed {
+            gr_trace(&format!("VYGR|upd|seg|{net}|{}", gr_segs(&self.after, net)));
+        }
+        Ok(())
+    }
+}
+
+/// A route as the reference's trace prints it: `x0,y0,l0-x1,y1,l1;` per segment.
+fn gr_segs(a: &vyges_grt::global_route::AfterRoute, net: &str) -> String {
+    a.net_routes.iter().find(|r| r.name == net).map_or_else(String::new, |r| {
+        r.segments.iter().map(|g| format!("{},{},{}-{},{},{};", g.init_x, g.init_y, g.init_layer, g.final_x, g.final_y, g.final_layer)).collect()
+    })
+}
+
+/// A diagnostic: the router's and the estimator's calls inside the repair, appended to
+/// `VYGES_RSZ_GR_TRACE` in the shape of the reference's instrumented trace (`VYGR|…`).
+fn gr_trace(line: &str) {
+    if let Ok(path) = std::env::var("VYGES_RSZ_GR_TRACE") {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes());
+        }
+    }
 }
 
 /// The incremental timer's side of the edits: the database's callbacks as read, and the
@@ -454,6 +514,27 @@ impl CliDesign<'_> {
         }
         for ev in self.db.edit_log_take() {
             let f: Vec<&str> = ev.split('|').collect();
+            // GlobalRouter's callbacks (`GRouteDbCbk`), in the order the database made them.
+            if let Some(gr) = self.gr.as_mut() {
+                match f.as_slice() {
+                    ["net_create", net] => {
+                        vyges_grt::global_route::add_net(self.db, &mut gr.after, net);
+                    }
+                    ["net_destroy", net, ..] => {
+                        gr.dirty.remove(*net);
+                        if let Err(e) = vyges_grt::global_route::remove_net(&mut gr.after, net) {
+                            self.gr_error.get_or_insert(e.to_string());
+                        }
+                    }
+                    ["iterm_connect" | "iterm_disconnect" | "bterm_connect" | "bterm_disconnect", _, net, ..] => gr.mark(self.db, net),
+                    ["swap_after", _, terms] => {
+                        for net in terms.split(';').filter_map(|t| t.split('=').nth(1)) {
+                            gr.mark(self.db, net);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             match f.as_slice() {
                 ["net_create", net] | ["iterm_connect" | "iterm_disconnect", _, net, _] if !net.is_empty() => {
                     self.timer.est_invalid.insert(net.to_string());
@@ -469,6 +550,64 @@ impl CliDesign<'_> {
                 _ => {}
             }
             self.timer.events.push(ev);
+        }
+    }
+
+    /// `GRouteDbCbk::inDbPostMoveInst` → `instItermsDirty`: every net on the moved instance's
+    /// terminals marked dirty. Called after each `setLocation` this engine makes (the edit log does
+    /// not carry moves).
+    fn gr_inst_moved(&mut self, inst: &str) {
+        if let Some(gr) = self.gr.as_mut() {
+            for (term, _) in self.db.master_mterms(&self.db.inst_master(inst)).unwrap_or_default() {
+                let net = self.db.net_of(inst, &term);
+                gr.mark(self.db, &net);
+            }
+        }
+    }
+
+    /// `opendp_->legalCellPos(inst)` under global-route parasitics, "for accurate parasitic
+    /// estimation": the instance moved to the nearest site and row when it is not on one (a MOVE:
+    /// the router marks its nets dirty).
+    fn gr_legal_cell_pos(&mut self, inst: &str) -> Result<(), String> {
+        let Some(gr) = self.gr.as_ref() else { return Ok(()) };
+        let master = self.db.inst_master(inst);
+        let (mut w, mut h) = (self.db.master_get_width(&master) as i32, self.db.master_get_height(&master) as i32);
+        // `getBbox`: width and height swapped for a quarter-turn orientation (`swapWidthHeight`).
+        if matches!(self.db.inst_get_orient(inst).as_str(), "R90" | "R270" | "MXR90" | "MYR90") {
+            std::mem::swap(&mut w, &mut h);
+        }
+        let (x, y) = self.db.inst_location(inst);
+        if let Some((nx, ny)) = gr.grid.legal_cell_pos(x, y, w, h) {
+            self.db.set_inst_location(inst, nx, ny).map_err(|e| e.to_string())?;
+            self.gr_inst_moved(inst);
+        }
+        Ok(())
+    }
+
+    /// `estimateGlobalRouteRC(db_net)` into every scene: the net's network from its route as the
+    /// router holds it now; a net with no route keeps what it had.
+    fn gr_estimate(&mut self, net: &str) {
+        let Some(gr) = self.gr.as_ref() else { return };
+        let segs = gr_segs(&gr.after, net);
+        gr_trace(&if segs.is_empty() { format!("VYGR|est|grc_none|{net}") } else { format!("VYGR|est|grc|{net}|{segs}") });
+        if let Some(n) = vyges_grt::global_route::routed_network(&gr.after, net) {
+            gr_trace(&format!("VYGR|est|cap|{net}|{:.9}", n.nodes.iter().map(|(_, c)| f64::from(*c)).sum::<f64>() * 1e12));
+            let mut p = vyges_grt::timer::timer_network(net, &n);
+            p.port_pin_caps = Some(self.port_caps.clone());
+            for map in self.parasitics.iter_mut() {
+                map.insert(net.to_string(), p.clone());
+            }
+        }
+    }
+
+    /// The router's state as a refused callback left it, or the incremental re-route.
+    fn gr_update_routes(&mut self) -> Result<(), String> {
+        if let Some(e) = self.gr_error.take() {
+            return Err(e);
+        }
+        match self.gr.as_mut() {
+            Some(gr) => gr.update_routes(self.db),
+            None => Ok(()),
         }
     }
 
@@ -509,6 +648,8 @@ impl CliDesign<'_> {
         let inst = self.db.insert_buffer_before_loads(net, &iterms, &bterms, cell, Some(loc), reason, None, uniquify, loads_on_diff_nets).map_err(|e| e.to_string())?;
         let at = self.clamp_loc_to_core(self.db.inst_location(&inst), cell);
         self.db.set_inst_location(&inst, at.0, at.1).map_err(|e| e.to_string())?;
+        self.gr_inst_moved(&inst);
+        self.gr_legal_cell_pos(&inst)?;
         let c = self.libs.link_cell(cell).ok_or_else(|| format!("{cell}: no liberty cell"))?;
         let (input, output) = c.buffer_ports().ok_or_else(|| format!("{cell}: not a buffer"))?;
         let in_net = self.db.net_of(&inst, &input.name);
@@ -555,6 +696,16 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
         // Estimated now and erased from the invalid set, with no delay invalidation.
         self.pull_edits();
         self.timer.est_invalid.remove(net);
+        if self.gr.is_some() {
+            // Under global-route parasitics: invalid or with no pi model (no network here — a net
+            // with a route has one) → the dirty nets re-routed, then this net from its route.
+            if self.invalid.contains(net) || !self.parasitics[0].contains_key(net) {
+                self.gr_update_routes()?;
+                self.gr_estimate(net);
+                self.invalid.remove(net);
+            }
+            return Ok(());
+        }
         if !self.estimating || !(self.invalid.contains(net) || !self.parasitics[0].contains_key(net)) {
             return Ok(());
         }
@@ -587,6 +738,16 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
         self.pull_edits();
         let updated = std::mem::take(&mut self.timer.est_invalid);
         self.timer.updated.extend(updated);
+        if self.gr.is_some() {
+            // Under global-route parasitics the dirty nets are re-routed FIRST, whatever is
+            // invalid; then each invalid net from its route (a net with none keeps its network).
+            gr_trace(&format!("VYGR|est|update|src=2|{}", self.invalid.iter().map(|n| format!("{n};")).collect::<String>()));
+            self.gr_update_routes()?;
+            for net in std::mem::take(&mut self.invalid) {
+                self.gr_estimate(&net);
+            }
+            return Ok(());
+        }
         let invalid: Vec<String> = self.invalid.iter().cloned().collect();
         for net in invalid {
             self.ensure_wire_parasitic(&net)?;
@@ -625,6 +786,8 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
         if !self.db.swap_master(inst, cell).map_err(|e| e.to_string())? {
             return Err(format!("swapMaster {inst} -> {cell} failed"));
         }
+        // `Resizer::replaceCell`: "legalize the position of the instance in case it leaves the die".
+        self.gr_legal_cell_pos(inst)?;
         self.refresh()?;
         let nets: Vec<String> = self.netlist.nets.iter().filter(|n| n.pins.iter().any(|c| matches!(c, vyges_sta::netlist::Conn::Inst(i, _) if self.netlist.insts[*i].0 == inst))).map(|n| n.name.clone()).collect();
         for n in nets {
@@ -740,6 +903,11 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
     }
 
     fn restore_journal(&mut self) -> Result<bool, String> {
+        // Under global-route parasitics the undo's `inDbNetPostGuideRestore` brings each touched
+        // net's route back from its guides (`loadRoutingFromDBGuides`, `updateNetResources`).
+        if self.gr.is_some() {
+            return Err("a journal undo on global-route parasitics: the routes restored from guides are not modelled".into());
+        }
         let had_changes = !self.db.eco_is_empty().map_err(|e| e.to_string())?;
         self.db.eco_undo().map_err(|e| e.to_string())?;
         let s = self.journal.pop().ok_or("undoEco without beginEco")?;
@@ -823,6 +991,8 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
         self.db.inst_set_source_type(&name, "TIMING").map_err(e)?;
         let at = self.clamp_loc_to_core(loc, cell);
         self.db.set_inst_location(&name, at.0, at.1).map_err(e)?;
+        self.gr_inst_moved(&name);
+        self.gr_legal_cell_pos(&name)?;
         let master = self.db.inst_master(drvr_inst);
         let lc = self.libs.link_cell(&master).ok_or_else(|| format!("{master}: no liberty cell"))?.clone();
         let terms: Vec<String> = self.db.master_mterms(&master).map_err(e)?.into_iter().filter(|(_, t)| t != "POWER" && t != "GROUND").map(|(n, _)| n).collect();
@@ -1007,6 +1177,8 @@ impl CliDesign<'_> {
     fn insert_buffer_post_process(&mut self, inst: &str, cell: &str) -> Result<(), String> {
         let at = self.clamp_loc_to_core(self.db.inst_location(inst), cell);
         self.db.set_inst_location(inst, at.0, at.1).map_err(|e| e.to_string())?;
+        self.gr_inst_moved(inst);
+        self.gr_legal_cell_pos(inst)?;
         let c = self.libs.link_cell(cell).ok_or_else(|| format!("{cell}: no liberty cell"))?;
         let (input, output) = c.buffer_ports().ok_or_else(|| format!("{cell}: not a buffer"))?;
         let in_net = self.db.net_of(inst, &input.name);
@@ -1364,6 +1536,7 @@ fn run(job: &Value) -> Result<Value, String> {
     // `estimate_parasitics -global_routing` builds from them); `gr_estimated` when that estimate is
     // the one in force (`estimated` stays for the placement estimate's).
     let mut groute: Option<vyges_grt::global_route::RouteResult> = None;
+    let mut groute_opts: Option<vyges_grt::global_route::RouteOptions> = None;
     let mut gr_estimated = false;
     for step in job["steps"].as_array().ok_or("steps")? {
         let cmd = step["cmd"].as_str().ok_or("cmd")?;
@@ -1546,6 +1719,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     return Err("global_route left overflow (GRT-0116): not modelled".into());
                 }
                 groute = Some(res);
+                groute_opts = Some(opts);
             }
             "set_routing_alpha" => {
                 if args.iter().any(|a| a.starts_with('-')) {
@@ -1627,7 +1801,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 let core = (db.block_get_core_area_x_min(), db.block_get_core_area_y_min(), db.block_get_core_area_x_max(), db.block_get_core_area_y_max());
                 let core = (core != (0, 0, 0, 0)).then_some(core);
                 let port_caps = port_caps_at(step["sdc"].as_str(), sdc.as_ref(), &libs, &netlist)?;
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new() };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr: None, gr_error: None };
                 let r = buffer_ports::buffer_ports(&mut design, &o, &weakest);
                 let parasitics = std::mem::take(&mut design.parasitics);
                 match r {
@@ -1719,7 +1893,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 }
                 let port_caps = env.port_pin_cap.clone();
                 let limits_of_block = sizing_limits(&db)?;
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new() };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr: None, gr_error: None };
                 let inputs = Inputs { libs: &libs, masters: &m, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins, sizing_limits: limits_of_block };
                 outcome = Some(repair_design::repair_design(&inputs, &mut design, &a, &mut trace));
             }
@@ -1743,9 +1917,6 @@ fn run(job: &Value) -> Result<Value, String> {
                 }
                 if !estimated && !gr_estimated {
                     return Err("repair_timing without estimate_parasitics -placement: not modelled".into());
-                }
-                if gr_estimated && !a.setup {
-                    return Err("repair_timing -hold on global-route parasitics: the incremental re-route inside the repair is not modelled".into());
                 }
                 let m = masters(&db)?;
                 // VT categories (IMPLANT obstructions) are read where the reference reads them: the
@@ -1864,10 +2035,10 @@ fn run(job: &Value) -> Result<Value, String> {
                 // reference's does: see the moves), LEGACY and LAST_GASP.
                 let startpoint_rows = matches!(plan, Some(rt::PhasePlan::LegacyPreamble { startpoints: true }));
                 let unmodelled = if gr_estimated {
-                    // Under global-route parasitics every `updateParasitics` first re-routes the
-                    // nets the router's callbacks marked dirty (`IncrementalGRoute::updateRoutes`):
-                    // not modelled, so no move is.
-                    Some("repair_timing on global-route parasitics: the incremental re-route inside the repair is not modelled".into())
+                    // Under global-route parasitics a setup move is tried under the journal, and its
+                    // undo restores routes from guides (`inDbNetPostGuideRestore`): not modelled.
+                    // The hold repair (no journal) runs.
+                    Some("repair_timing -setup on global-route parasitics: a journal undo restores routes from guides, which is not modelled".into())
                 } else if matches!(plan, Some(rt::PhasePlan::LegacyPreamble { .. })) && !a.phases.as_deref().is_some_and(rt::phases_modelled) {
                     Some(format!("repair_timing -phases {}: not modelled", a.phases.as_deref().unwrap_or_default()))
                 } else if let Some(m) = seq.iter().find(|m| !matches!(m, rt::Move::SizeUp | rt::Move::SizeDownFanout | rt::Move::Unbuffer | rt::Move::SwapPins | rt::Move::Buffer | rt::Move::Clone | rt::Move::SplitLoad | rt::Move::SizeUpMatch | rt::Move::VtSwap)) {
@@ -1988,13 +2159,27 @@ fn run(job: &Value) -> Result<Value, String> {
                     drop(search);
                     drop(g);
                     let info = net_info(&db, &netlist)?;
-                    let estimating = !no_signal_cap(&db, &rc);
+                    // Global-route parasitics are estimated whatever the wire RC says.
+                    let estimating = gr_estimated || !no_signal_cap(&db, &rc);
+                    // `IncrementalParasiticsGuard` on a global-route source: the router alive over
+                    // the repair (`IncrementalGRoute`), from the state `global_route` left.
+                    let gr = match (gr_estimated, groute.as_ref(), groute_opts.as_ref()) {
+                        (true, Some(r), Some(o)) => {
+                            // `pointOffMacro` reads the grid's block pixels: not modelled.
+                            if let Some(i) = db.inst_names().into_iter().find(|i| db.master_is_block(&db.inst_master(i))) {
+                                return Err(format!("{i}: a block instance under global-route parasitics — legalCellPos' pointOffMacro is not modelled"));
+                            }
+                            let grid = vyges_dpl::grid::Grid::build(&db)?;
+                            Some(GrLive { after: r.after.clone(), opts: o.clone(), dirty: BTreeSet::new(), grid })
+                        }
+                        _ => None,
+                    };
                     rc.sort_clk_and_signal_layers();
                     let core = (db.block_get_core_area_x_min(), db.block_get_core_area_y_min(), db.block_get_core_area_x_max(), db.block_get_core_area_y_max());
                     let core = (core != (0, 0, 0, 0)).then_some(core);
                     let port_caps = env.port_pin_cap.clone();
                     let sdc_nets: BTreeSet<String> = s.env.iter().filter(|e| e.cmd == "set_load" && e.accessor == "get_nets").flat_map(|e| e.objects.iter().cloned()).collect();
-                    let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated, journal: Vec::new(), sdc_nets, timer: TimerLog::default(), stale_out_arcs: BTreeMap::new() };
+                    let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated, journal: Vec::new(), sdc_nets, timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr, gr_error: None };
                     if hold_only {
                         let mut trace_head = Vec::new();
                         if debug_levels.get(&("RSZ".to_string(), "resizer".to_string())).is_some_and(|&l| l >= 1) {
@@ -2286,8 +2471,8 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "status is one of repaired, up_to_date, vacuous, refused or error. repaired means the design changed (buffers inserted or drivers resized); up_to_date means drivers were checked and none needed a change (nets_checked says how many; for a job with buffer_ports and no repair_design, ports_checked); vacuous means nothing was checked and is NOT a pass. The declared assertion passes on repaired or up_to_date. Exit status is 0 for repaired and up_to_date, 2 for vacuous and for error, 3 for refused.",
-    "Modelled: placement parasitics, one or more corners, flat and hierarchical netlists, the default buffer selection, the SDC constraints the usage lists, buffer_ports before the repair (the estimate it leaves carried into it). Global-route parasitics (set_routing_layers, global_route with no options on one corner, estimate_parasitics -global_routing) are modelled up to repair_timing -setup's preamble; every move on them, -hold on them, and repair_design or buffer_ports on them are refused. Refused rather than guessed: the early sizing round, footprint matching, rerouting, any other netlist edit between the estimate and the repair, buffer_ports on a hierarchical design, a tristate driver or a bidirect pin on a net, and any other timing-affecting SDC command.",
-    "repair_timing -setup is modelled for every move of the default sequence and VtSwapMove in the LEGACY, WNS, TNS, ENDPOINT_FANIN, STARTPOINT_FANOUT and LAST_GASP phases, and repair_timing -hold alone in full (ending with RSZ-0050 / RSZ-0060 as the command does): every progress row, the summary and the design left, for one or several clocks (real or virtual, each ideal or propagated), latches with time borrowing, VT libraries, pins tied to supply nets, set_max_delay / set_min_delay in the forms the timer models, over one corner or several; -setup with -hold runs the setup part and is refused after it; CRIT_VT_SWAP over several VT categories, GLOBAL_SIZING, MT1, MEASURED_VT_SWAP, LEGACY_MT, -recover_power, any move on global-route parasitics (REROUTE among them; the preamble is modelled), setup clock uncertainty, clock latency or transition, derates, false and multicycle paths and clock groups are refused before the lines."
+    "Modelled: placement parasitics, one or more corners, flat and hierarchical netlists, the default buffer selection, the SDC constraints the usage lists, buffer_ports before the repair (the estimate it leaves carried into it). Global-route parasitics (set_routing_layers, global_route with no options on one corner, estimate_parasitics -global_routing): repair_timing -hold on them in full, with the router alive over the repair (the dirty nets re-routed before each estimate, new nets added, each new instance legalized to a site and row); -setup on them to its preamble (a journal undo restores routes from guides, not modelled); a design with a block instance, repair_design and buffer_ports on them are refused. Refused rather than guessed: the early sizing round, footprint matching, rerouting, any other netlist edit between the estimate and the repair, buffer_ports on a hierarchical design, a tristate driver or a bidirect pin on a net, and any other timing-affecting SDC command.",
+    "repair_timing -setup is modelled for every move of the default sequence and VtSwapMove in the LEGACY, WNS, TNS, ENDPOINT_FANIN, STARTPOINT_FANOUT and LAST_GASP phases, and repair_timing -hold alone in full (ending with RSZ-0050 / RSZ-0060 as the command does): every progress row, the summary and the design left, for one or several clocks (real or virtual, each ideal or propagated), latches with time borrowing, VT libraries, pins tied to supply nets, set_max_delay / set_min_delay in the forms the timer models, over one corner or several; -setup with -hold runs the setup part and is refused after it; CRIT_VT_SWAP over several VT categories, GLOBAL_SIZING, MT1, MEASURED_VT_SWAP, LEGACY_MT, -recover_power, any setup move on global-route parasitics (REROUTE among them; the preamble is modelled), setup clock uncertainty, clock latency or transition, derates, false and multicycle paths and clock groups are refused before the lines."
   ],
   "invocation": {
     "args_template": ["repair_design", "{job}"],
