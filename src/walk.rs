@@ -97,6 +97,8 @@ impl Walk<'_, '_> {
             Kind::Wire { r } => self.repair_net_wire(bn, n, r, level, st, trace),
             Kind::Junction { r, r2 } => self.repair_net_junc(bn, n, r, r2, level, st, trace),
             Kind::Load { pin } => self.repair_net_load(bn, n, pin, level, st, trace),
+            // `repairNetVia`: only on a global route, where repair_design is refused.
+            Kind::Via { .. } => Err(Stop::refused("RSZ-GR", "repairNetVia (a global route's buffered net) is not modelled".into())),
         }
     }
 

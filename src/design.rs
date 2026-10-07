@@ -47,6 +47,11 @@ pub trait Design {
     fn update_parasitics(&mut self) -> Result<(), String>;
     /// `est::makeSteinerTree(drvr_pin)` for a net and its driver, at the current routing alpha.
     fn steiner(&self, net: &str, drvr_pin: &str) -> Option<Tree>;
+    /// What `Resizer::makeBufferedNet` builds from for a net and its driver: the Steiner tree under
+    /// placement parasitics, the global route under global-route parasitics.
+    fn net_shape(&self, net: &str, drvr_pin: &str) -> Option<crate::buffered_net::NetShape> {
+        self.steiner(net, drvr_pin).map(crate::buffered_net::NetShape::Steiner)
+    }
     /// `Resizer::insertBufferBeforeLoads(nullptr, loads, cell, &loc, reason)` with its
     /// `insertBufferPostProcess` (the location clamped to the core, placed).
     fn insert_repeater(&mut self, loads: &[String], cell: &str, loc: (i32, i32), reason: &str) -> Result<Repeater, String>;

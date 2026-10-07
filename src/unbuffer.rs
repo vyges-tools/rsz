@@ -141,7 +141,7 @@ pub struct Timer<'t, 'g> {
     /// Vertex by pin name.
     pub index: &'t HashMap<String, usize>,
     /// `est::makeSteinerTree(drvr_pin)` for a net and its driver.
-    pub steiner: &'t dyn Fn(&str, &str) -> Option<buffered_net::Tree>,
+    pub steiner: &'t dyn Fn(&str, &str) -> Option<buffered_net::NetShape>,
     /// Several corners: every scene's timer (`g` … `index` are the path's scene).
     pub multi: Option<&'t Multi<'t, 'g>>,
 }
@@ -587,20 +587,22 @@ fn estimate_input_slew_impact(ctx: &Ctx<'_>, t: &Timer<'_, '_>, load: usize, old
     true
 }
 
-/// `Resizer::makeBufferedNet(drvr_pin)` under placement parasitics: the driver's net's Steiner tree
-/// as a buffered net.
+/// `Resizer::makeBufferedNet(drvr_pin)`: the driver's net's Steiner tree (placement parasitics) or
+/// global route as a buffered net. ⚠️ A route that misses a load (RSZ-0074) gives none here.
 fn make_buffered_net(ctx: &Ctx<'_>, t: &Timer<'_, '_>, drvr: usize) -> Option<(BufferedNet, usize)> {
     let net = t.g.vertex_net[drvr]?;
-    let tree = (t.steiner)(&t.g.netlist.nets[net].name, &t.g.vertices[drvr].name)?;
+    let shape = (t.steiner)(&t.g.netlist.nets[net].name, &t.g.vertices[drvr].name)?;
     let bctx = buffered_net::Ctx { graph: t.g, libs: ctx.libs, sdc: ctx.sdc, limits: ctx.limits, dbu: ctx.dbu, rc: ctx.wire_rc };
-    buffered_net::make_buffered_net_steiner(&bctx, &tree)
+    buffered_net::make_buffered_net(&bctx, &shape).ok().flatten()
 }
 
 /// `Resizer::stitchTrees(outer, stitching_load, inner)`: the outer tree with the load node of
-/// `stitching_load` replaced by the inner tree — spliced in at the same location, else reached by
-/// a wire from the load's location (every node is on no layer). Unchanged nodes are shared; an
-/// ancestor of the change is made anew. The arena holds both trees; returns the new root, or the
-/// outer root itself when no load matched.
+/// `stitching_load` replaced by the inner tree. Same location and layer: spliced in. Same layer
+/// elsewhere: reached by a wire on that layer from the load. Different layers (a global route's
+/// tree): ⚠️ either below layer 1 (the null layer) — the inner tree as is; else a via stack from the
+/// inner root's layer to the load's, then a wire from the load when the locations differ.
+/// Unchanged nodes are shared; an ancestor of the change is made anew (a wire keeps its layer).
+/// The arena holds both trees; returns the new root, or the outer root itself when no load matched.
 fn stitch_trees(ctx: &buffered_net::Ctx<'_, '_>, bn: &mut BufferedNet, node: usize, stitching_load: usize, inner: usize) -> usize {
     match bn.nodes[node].kind.clone() {
         Kind::Wire { r } => {
@@ -608,8 +610,16 @@ fn stitch_trees(ctx: &buffered_net::Ctx<'_, '_>, bn: &mut BufferedNet, node: usi
             if new_ref == r {
                 return node;
             }
-            let at = bn.location(node);
-            bn.wire(ctx, at, new_ref)
+            let (at, layer) = (bn.location(node), bn.nodes[node].layer);
+            bn.wire_on(ctx, at, layer, new_ref)
+        }
+        Kind::Via { r, ref_layer } => {
+            let new_ref = stitch_trees(ctx, bn, r, stitching_load, inner);
+            if new_ref == r {
+                return node;
+            }
+            let (at, layer) = (bn.location(node), bn.nodes[node].layer);
+            bn.via(at, layer, ref_layer, new_ref)
         }
         Kind::Junction { r, r2 } => {
             let new_ref = stitch_trees(ctx, bn, r, stitching_load, inner);
@@ -624,11 +634,28 @@ fn stitch_trees(ctx: &buffered_net::Ctx<'_, '_>, bn: &mut BufferedNet, node: usi
             if pin != stitching_load {
                 return node;
             }
-            let at = bn.location(node);
-            if at == bn.location(inner) {
+            let (in_loc, in_layer) = (bn.location(node), bn.nodes[node].layer);
+            let (out_loc, out_layer) = (bn.location(inner), bn.nodes[inner].layer);
+            if in_loc == out_loc && in_layer == out_layer {
                 return inner;
             }
-            bn.wire(ctx, at, inner)
+            if in_layer == out_layer {
+                return bn.wire_on(ctx, in_loc, in_layer, inner);
+            }
+            if in_layer < 1 || out_layer < 1 {
+                return inner;
+            }
+            let step = if in_layer > out_layer { 1 } else { -1 };
+            let mut current = inner;
+            let mut layer = out_layer;
+            while layer != in_layer {
+                current = bn.via(out_loc, layer, layer + step, current);
+                layer += step;
+            }
+            if in_loc != out_loc {
+                current = bn.wire_on(ctx, in_loc, in_layer, current);
+            }
+            current
         }
     }
 }
@@ -644,6 +671,13 @@ fn estimate_slews_in_tree(bctx: &buffered_net::Ctx<'_, '_>, bn: &BufferedNet, ro
                 let (unit_res, unit_cap) = bn.wire_rc(n, bctx);
                 let t_wire = length * unit_res * (f64::from(bn.nodes[r].cap) + length * unit_cap / 2.0) * f64::from(factor);
                 visit(bctx, bn, r, upstream + t_wire, factor, out);
+            }
+            Kind::Via { r, .. } => {
+                // ⛔ A missing cut layer is RSZ-0093 upstream; it never reaches here (the tree is
+                // built from the router's own layers), so it reads 0 rather than refusing mid-walk.
+                let r_via = bn.via_resistance(n).unwrap_or(0.0);
+                let t_via = r_via * f64::from(bn.nodes[r].cap) * f64::from(factor);
+                visit(bctx, bn, r, upstream + t_via, factor, out);
             }
             Kind::Junction { r, r2 } => {
                 visit(bctx, bn, r, upstream, factor, out);
@@ -676,6 +710,7 @@ fn estimate_slews_after_buffer_removal(ctx: &Ctx<'_>, t: &Timer<'_, '_>, p: &Sla
         let mut node = node.clone();
         node.kind = match node.kind {
             Kind::Wire { r } => Kind::Wire { r: r + offset },
+            Kind::Via { r, ref_layer } => Kind::Via { r: r + offset, ref_layer },
             Kind::Junction { r, r2 } => Kind::Junction { r: r + offset, r2: r2 + offset },
             k @ Kind::Load { .. } => k,
         };
@@ -791,6 +826,7 @@ mod tests {
                     // inner root: a load at (30, 0)
                     node(Kind::Load { pin: 9 }, 30, 0, 5e-15),
                 ],
+                layers: None,
             };
             assert_eq!(stitch_trees(ctx, &mut bn, 3, 99, 4), 3, "no matching load: the outer root");
             let root = stitch_trees(ctx, &mut bn, 3, 8, 4);
@@ -823,6 +859,7 @@ mod tests {
                     node(Kind::Load { pin: 2 }, 0, 0, 2e-15),
                     node(Kind::Junction { r: 0, r2: 1 }, 0, 0, 3e-15),
                 ],
+                layers: None,
             };
             let mut bn = bn;
             let w = bn.wire(ctx, (0, 0), 0);

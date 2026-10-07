@@ -140,6 +140,8 @@ enum RebufProbe {
     Skip,
     /// A warning, then nothing inserted (RSZ-2020 top port driver, RSZ-0075 no buffered net).
     Warn(String),
+    /// A buffered net this engine does not rebuffer (a global route's vias and layered wires).
+    Refused(String),
     /// The annotated net and the driver's timing.
     Ready(Box<rebuffer::Probe>),
 }
@@ -683,7 +685,7 @@ fn probe_rebuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[
     }
     let net_name = &g.netlist.nets[net].name;
     let bctx = crate::buffered_net::Ctx { graph: g, libs: ctx.libs, sdc: ctx.env, limits: ctx.limits, dbu: ctx.dbu, rc: ctx.wire_rc };
-    let Some((bn, root)) = design.steiner(net_name, &vx.name).and_then(|tree| crate::buffered_net::make_buffered_net_steiner(&bctx, &tree)) else {
+    let Some((bn, root)) = design.net_shape(net_name, &vx.name).and_then(|shape| crate::buffered_net::make_buffered_net(&bctx, &shape).ok().flatten()) else {
         return RebufProbe::Warn(format!("[WARNING RSZ-0075] makeBufferedNet failed for driver {}", vx.name));
     };
     // The buffered net as rebuffer nodes, its loads annotated in visit order.
@@ -692,7 +694,8 @@ fn probe_rebuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[
         let kind = match n.kind {
             crate::buffered_net::Kind::Load { pin } => rebuffer::Kind::Load { pin: g.vertices[pin].name.clone() },
             crate::buffered_net::Kind::Junction { r, r2 } => rebuffer::Kind::Junction { r, r2 },
-            crate::buffered_net::Kind::Wire { r } => rebuffer::Kind::Wire { r },
+            crate::buffered_net::Kind::Wire { r } if n.layer == crate::buffered_net::NULL_LAYER => rebuffer::Kind::Wire { r },
+            _ => return RebufProbe::Refused(format!("rebuffering {}: a global route's vias and layered wires are not modelled", vx.name)),
         };
         nodes.push(rebuffer::Node { kind, x: n.x, y: n.y, cap: n.cap, fanout: n.fanout, max_load_slew: n.max_load_slew, area: 0.0, slack_rf: None, slack: rebuffer::FixedDelay::ZERO, delay: rebuffer::FixedDelay::ZERO, arrival: rebuffer::FixedDelay::ZERO });
     }
@@ -784,7 +787,7 @@ fn fanout_slacks(gs: &[Graph<'_>], scene: usize, drvr: usize, rf: usize, split: 
 #[allow(clippy::too_many_arguments)]
 fn annotate_load_slacks(gs: &[Graph<'_>], ss: &[Search<'_, '_>], bn: &crate::buffered_net::BufferedNet, n: usize, drvr: &str, nodes: &mut [rebuffer::Node], arrival_paths: &mut [Option<(usize, vyges_sta::search::Path)>; 2], warnings: &mut Vec<String>) {
     match bn.nodes[n].kind {
-        crate::buffered_net::Kind::Wire { r } => annotate_load_slacks(gs, ss, bn, r, drvr, nodes, arrival_paths, warnings),
+        crate::buffered_net::Kind::Wire { r } | crate::buffered_net::Kind::Via { r, .. } => annotate_load_slacks(gs, ss, bn, r, drvr, nodes, arrival_paths, warnings),
         crate::buffered_net::Kind::Junction { r, r2 } => {
             annotate_load_slacks(gs, ss, bn, r, drvr, nodes, arrival_paths, warnings);
             annotate_load_slacks(gs, ss, bn, r2, drvr, nodes, arrival_paths, warnings);
@@ -843,7 +846,7 @@ fn annotate_load_slacks(gs: &[Graph<'_>], ss: &[Search<'_, '_>], bn: &crate::buf
 fn probe_unbuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet<usize>], design: &dyn Design, scene: usize, ideal: &BTreeSet<usize>, chain: &[(usize, vyges_sta::search::Path)], stages: &mut [Stage]) {
     let (g, search) = (&gs[scene], &ss[scene]);
     let index: HashMap<String, usize> = g.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect();
-    let steiner = |net: &str, drvr: &str| design.steiner(net, drvr);
+    let steiner = |net: &str, drvr: &str| design.net_shape(net, drvr);
     // Several corners: every scene's timer, for the reads made over all of them.
     let several = gs.len() > 1;
     let all_parasitics: Vec<HashMap<String, vyges_sta::graph::NetParasitics>> =
@@ -3518,6 +3521,7 @@ impl Repair<'_, '_> {
                 0
             }
             Some(RebufProbe::Ready(probe)) => self.rebuffer_pin(&probe)?,
+            Some(RebufProbe::Refused(why)) => return Err(Stop::refused("RSZ-GR", why)),
         };
         if count <= 0 {
             self.debug("buffer_move", 2, format!("REJECT BufferMove {}: Couldn't insert any buffers", st.pin));
