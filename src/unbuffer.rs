@@ -755,10 +755,10 @@ fn estimate_slews_after_buffer_removal(ctx: &Ctx<'_>, t: &Timer<'_, '_>, p: &Sla
 
 /// The order of a `std::map<const Pin*, …>`: a pin is its odb object's address, so instance pins
 /// and ports sit in two tables. Probed on the reference over the 88 repair_timing designs (pin
-/// handles printed by address): every run of a design gives the same order, and in 64 of them every
-/// instance pin precedes every port, each table in id order — the rule here. In the other 24 the
-/// heap put a port page first or between instance pins; that changes only which loads print before
-/// the first rejection, never the verdict (every load must pass).
+/// handles printed by address): in 64 of them every instance pin precedes every port, each table in
+/// id order — the rule here. In the other 24 the heap put a port page first or between instance
+/// pins, and on some designs the reference's own order differs run to run; that changes only which
+/// loads print before the first rejection, never the verdict (every load must pass).
 fn pointer_order(t: &Timer<'_, '_>, v: usize) -> (bool, u64) {
     pin_table_order(t.info.pin_id.get(&t.g.vertices[v].name).copied().unwrap_or(u64::MAX))
 }

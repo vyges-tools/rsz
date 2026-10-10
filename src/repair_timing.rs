@@ -350,7 +350,14 @@ pub enum PhasePlan {
     /// then runs a policy that is not modelled. `startpoints`: STARTPOINT_FANOUT, whose rows
     /// name the worst STARTPOINT (`printProgress(.., use_startpoint_metrics)`).
     LegacyPreamble { startpoints: bool },
-    /// The first phase is GLOBAL_SIZING, MT1 or MEASURED_VT_SWAP: another preamble, not modelled.
+    /// MEASURED_VT_SWAP alone: `MeasuredVtSwapPolicy`, which prints no preamble (modelled).
+    MeasuredVtSwap,
+    /// MT1 alone: `SetupMt1Policy`, which prints no preamble (modelled).
+    Mt1,
+    /// GLOBAL_SIZING alone: `GlobalSizingPolicy`, which prints no preamble (modelled).
+    GlobalSizing,
+    /// The first phase is GLOBAL_SIZING, MT1 or MEASURED_VT_SWAP followed by more phases: another
+    /// preamble, not modelled.
     Other,
 }
 
@@ -379,6 +386,15 @@ pub fn phase_plan(phases: &str) -> PhasePlan {
     };
     if names == ["LEGACY"] {
         return PhasePlan::Legacy;
+    }
+    if names == ["MEASURED_VT_SWAP"] {
+        return PhasePlan::MeasuredVtSwap;
+    }
+    if names == ["MT1"] {
+        return PhasePlan::Mt1;
+    }
+    if names == ["GLOBAL_SIZING"] {
+        return PhasePlan::GlobalSizing;
     }
     match first {
         "LEGACY" | "LEGACY_MT" | "WNS" | "WNS_PATH" | "WNS_CONE" | "TNS" | "ENDPOINT_FANIN" | "STARTPOINT_FANOUT" | "LAST_GASP" | "CRIT_VT_SWAP" | "REROUTE" => PhasePlan::LegacyPreamble { startpoints: first == "STARTPOINT_FANOUT" },
@@ -757,7 +773,15 @@ mod tests {
         assert_eq!(phase_plan("WNS_PATH BAD_PHASE LAST_GASP"), PhasePlan::LegacyPreamble { startpoints: false });
         assert_eq!(phase_plan("LEGACY"), PhasePlan::Legacy);
         assert_eq!(phase_plan("\tLEGACY "), PhasePlan::Legacy);
-        assert_eq!(phase_plan("GLOBAL_SIZING"), PhasePlan::Other);
+        assert_eq!(phase_plan("GLOBAL_SIZING"), PhasePlan::GlobalSizing);
+        assert_eq!(phase_plan("GLOBAL_SIZING LEGACY"), PhasePlan::Other);
+        // MEASURED_VT_SWAP is not legacy-compatible: no implicit CRIT_VT_SWAP follows it, and
+        // alone it is modelled; with a later phase (whose start prints its own preamble) it is not.
+        assert_eq!(phase_plan("MEASURED_VT_SWAP"), PhasePlan::MeasuredVtSwap);
+        assert_eq!(phase_names(Some("MEASURED_VT_SWAP")), vec!["MEASURED_VT_SWAP"]);
+        assert_eq!(phase_plan("MEASURED_VT_SWAP LEGACY"), PhasePlan::Other);
+        assert_eq!(phase_plan("MT1"), PhasePlan::Mt1);
+        assert_eq!(phase_names(Some("MT1")), vec!["MT1"]);
         assert_eq!(phase_plan("WNS LEGACY LAST_GASP"), PhasePlan::LegacyPreamble { startpoints: false });
         assert_eq!(phase_plan("STARTPOINT_FANOUT"), PhasePlan::LegacyPreamble { startpoints: true });
     }

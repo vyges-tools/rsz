@@ -38,6 +38,12 @@ use crate::timing::Limits;
 use crate::{clone, move_tracker, rebuffer, swap_pins, unbuffer};
 use crate::Stop;
 
+mod crit_vt_swap;
+mod global_sizing;
+mod measured_vt_swap;
+mod mt1;
+
+pub use global_sizing::GlobalSizingConfig;
 mod recover_power;
 pub use recover_power::{recover_power, PowerArgs, PowerOutcome};
 
@@ -90,6 +96,50 @@ pub struct Ctx<'a> {
     pub pin_addr: Option<&'a unbuffer::PinAddr>,
     /// `dbNetwork::hasHierarchy`: instance and net names print without their parent prefix.
     pub hierarchy: bool,
+    /// The policy tunables `loadPolicyEnvars` reads from the environment (the job's `setenv`).
+    pub policy: PolicyConfig,
+    /// `Resizer::globalSizingConfig`: the block's `gs_*` properties over the defaults.
+    pub gs: GlobalSizingConfig,
+}
+
+/// `OptimizationPolicyConfig` as `OptimizationPolicy::loadPolicyEnvars` fills it: the fields a
+/// modelled policy reads (0: unlimited).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PolicyConfig {
+    /// `RSZ_VTSWAP_CANDIDATES`: VT-swap candidates per target.
+    pub max_candidate_generation: i32,
+    /// `RSZ_VTSWAP_MAX_MOVES`: accepted moves.
+    pub max_committed_moves: i32,
+    /// `RSZ_MT_DELAY_LEVELS` (default 1): the delay estimator's fanin/fanout stages.
+    pub delay_estimation_levels: i32,
+    /// `RSZ_MT_SLEW_BIAS` (default 1, on when positive): the estimator's STA slew-bias sampling.
+    pub sta_slew_bias: bool,
+}
+
+impl PolicyConfig {
+    /// `utl::readEnvarNonNegativeInt(name, 0)` for each field, from the variables in force: a value
+    /// the reference would throw on (not an integer, negative) is an `Err`.
+    pub fn from_env(vars: &BTreeMap<String, String>) -> Result<PolicyConfig, String> {
+        // `utl::readEnvarInt`: `std::stoi` skips leading white space and takes a sign; every
+        // character must parse.
+        let read_int = |name: &str, default: i32| -> Result<i32, String> {
+            let Some(v) = vars.get(name) else { return Ok(default) };
+            v.trim_start().parse().map_err(|_| format!("Environment variable {name} must be an integer."))
+        };
+        let read = |name: &str| -> Result<i32, String> {
+            let n = read_int(name, 0)?;
+            if n < 0 {
+                return Err(format!("Environment variable {name} must be a non-negative integer."));
+            }
+            Ok(n)
+        };
+        Ok(PolicyConfig {
+            max_candidate_generation: read("RSZ_VTSWAP_CANDIDATES")?,
+            max_committed_moves: read("RSZ_VTSWAP_MAX_MOVES")?,
+            delay_estimation_levels: read_int("RSZ_MT_DELAY_LEVELS", 1)?,
+            sta_slew_bias: read_int("RSZ_MT_SLEW_BIAS", 1)? > 0,
+        })
+    }
 }
 
 /// A driver's `checkCapacitance`: its load, limit and slack, and whether it has a limit at all.
@@ -112,6 +162,15 @@ struct Stage {
     port: Option<String>,
     /// `arcDelay(prev_edge, prev_arc) − prev_arc->intrinsicDelay()`, for a pin reached by a gate arc.
     load_delay: Option<f32>,
+    /// `arcDelay(prev_edge, prev_arc)` at the path's scene, any edge (`None`: the path's root).
+    arc_delay: Option<f32>,
+    /// `Path::arrival` of the path at this pin.
+    arrival: f32,
+    /// The pin's vertex in the scene graph the path was expanded in, and the edge and arc index
+    /// the path took into it (`Path::prevEdge` / `prevArc`) — indices into THAT graph, valid only
+    /// while it is (the delay estimator reads them in the same timer update).
+    vertex: usize,
+    in_edge: Option<(usize, usize)>,
     /// `arcDelay(prev_edge, prev_arc)` at the path's scene, for a pin reached by a WIRE edge (the
     /// REROUTE phase ranks a driver by the wire into the next pin).
     in_wire_delay: Option<f32>,
@@ -209,6 +268,9 @@ pub struct Snapshot {
     ends: Vec<Point>,
     starts: Vec<Point>,
     paths: HashMap<String, PathView>,
+    /// Per scene, each driver pin's `Sta::arrival(vertex, riseFall, {scene}, max)` (only when
+    /// [`Timer::driver_arrivals`] asks for them).
+    driver_arrivals: Vec<HashMap<String, f32>>,
 }
 
 impl Snapshot {
@@ -233,10 +295,16 @@ fn timer_stop(e: String) -> Stop {
 }
 
 /// The arc set of a gate edge.
+/// The arc set of a gate edge as the graph holds it — `Path::prevArc`'s: after an equivalent-arcs
+/// replacement an output-to-output edge keeps the OLD cell's arcs (`Graph::arc_set`). Witness:
+/// a VT-swapped HAxp5's CON -> SN arc ranks by the old cell's intrinsic delay
+/// (`repair_setup_vt_swap2`, rankPathDrivers).
 fn edge_arc_set<'g>(g: &'g Graph<'_>, e: usize) -> Option<&'g vyges_sta::liberty::ArcSet> {
     let EdgeKind::Gate { set } = g.edges[e].kind else { return None };
     let vx = &g.vertices[g.edges[e].to];
-    Some(&g.libs[vx.lib?].cells[vx.cell.as_deref()?].arc_sets[set])
+    vx.lib?;
+    vx.cell.as_deref()?;
+    Some(g.arc_set(e, set))
 }
 
 /// `TimingArc::intrinsicDelay`: the gate delay at slew 0 and load 0.
@@ -288,6 +356,8 @@ struct Timer {
     inc: Vec<IncTimer>,
     /// The decision trace's length when the update ran (for `VYGES_RSZ_INC_TRACE`).
     trace_at: usize,
+    /// Each snapshot also keeps every driver pin's arrival (MeasuredVtSwapPolicy's measure).
+    driver_arrivals: bool,
 }
 
 impl Timer {
@@ -295,7 +365,7 @@ impl Timer {
         design.start_timer_edits().map_err(timer_stop)?;
         let mut inc = IncTimer::default();
         inc.track_netlist(design.netlist());
-        Ok(Timer { inc: vec![inc; scenes], trace_at: 0 })
+        Ok(Timer { inc: vec![inc; scenes], trace_at: 0, driver_arrivals: false })
     }
 }
 
@@ -303,6 +373,7 @@ impl Timer {
 /// estimator's current ones; `edits`, what the timer has not seen. `want`: the endpoints whose
 /// worst path the repair will read.
 fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], timer: &mut Timer, edits: TimerEdits) -> Result<Snapshot, Stop> {
+    let with_arrivals = timer.driver_arrivals;
     timed_all(ctx, design, timer, edits, |gs, ss, cs| {
         // Each point's slack: the least over the scenes (`Sta::slack` over every path).
         let mut per_scene = Vec::with_capacity(gs.len());
@@ -347,8 +418,30 @@ fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], timer: &mut Tim
                 paths.insert(n, view);
             }
         }
-        Ok(Snapshot { ends, starts, paths })
+        let driver_arrivals = if with_arrivals { (0..gs.len()).map(|k| driver_arrivals(&gs[k], &ss[k])).collect() } else { Vec::new() };
+        Ok(Snapshot { ends, starts, paths, driver_arrivals })
     })
+}
+
+/// `Sta::arrival(vertex, RiseFallBoth::riseFall(), {scene}, max)` of every driver vertex of one
+/// scene: from `MinMax::max()->initValue()` (-INF), each max path's arrival that is
+/// `delayGreater` — FUZZY (`DelayOps::greater` is `fuzzyGreater`), so of fuzzily equal arrivals the
+/// first in tag order is kept (no generated clock source path here).
+fn driver_arrivals(g: &Graph<'_>, s: &Search<'_, '_>) -> HashMap<String, f32> {
+    let mut out = HashMap::new();
+    for (v, vx) in g.vertices.iter().enumerate() {
+        if !vx.is_driver {
+            continue;
+        }
+        let mut arrival = -INF;
+        for p in s.paths[v].iter().filter(|p| p.tag.mm == MAX) {
+            if fuzzy::greater(p.arrival, arrival) {
+                arrival = p.arrival;
+            }
+        }
+        out.insert(vx.name.clone(), arrival);
+    }
+    out
 }
 
 /// The endpoints' setup points over every scene: each the least over the scenes (`Sta::slack`).
@@ -595,6 +688,10 @@ fn expand_path(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTr
             cell: vx.cell.clone(),
             port: vx.port.clone(),
             load_delay: None,
+            arc_delay: None,
+            arrival: p.arrival,
+            vertex: *v,
+            in_edge: p.prev.map(|prev| (prev.edge, prev.arc)),
             in_wire_delay: None,
             in_port: None,
             fanout: g.out_edges[*v].iter().filter(|&&e| matches!(g.edges[e].kind, EdgeKind::Wire)).count(),
@@ -608,6 +705,7 @@ fn expand_path(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTr
             split_slacks: None,
         };
         if let Some(prev) = p.prev {
+            st.arc_delay = Some(g.delay[prev.edge][prev.arc][MAX]);
             if matches!(g.edges[prev.edge].kind, EdgeKind::Wire) {
                 st.in_wire_delay = Some(g.delay[prev.edge][prev.arc][MAX]);
             }
@@ -1228,7 +1326,17 @@ struct Repair<'c, 'd> {
     target_slack: f32,
     /// Inside the REROUTE phase (`SetupReroutePolicy`): its own `repairPath`.
     reroute_phase: bool,
+    /// `RepairSetupContext::progress_header_printed`: a legacy phase's preamble printed the
+    /// progress header; a policy without one (MEASURED_VT_SWAP) leaves it to the final report.
+    progress_header_printed: bool,
 }
+
+/// `OptimizationPolicy::printProgressHeader`'s lines (no trailing blanks, unlike the legacy
+/// preamble's header).
+const POLICY_PROGRESS_HEADER: [&str; 2] = [
+    "   Iter   | Removed | Resized | Inserted | Cloned |  Pin  |   Area   |    WNS   |   StTNS    |   EnTNS    |  Viol  |  Worst",
+    "          | Buffers |  Gates  | Buffers  |  Gates | Swaps |          |          |            |            | Endpts | St/EnPt",
+];
 
 /// What `Resizer::swapPins` did.
 #[derive(Debug, Clone, PartialEq)]
@@ -1836,6 +1944,9 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
         startpoint_rows: false,
         target_slack: 0.0,
         reroute_phase: false,
+        // Only a policy alone that has no legacy start (MEASURED_VT_SWAP, MT1) runs without the
+        // legacy preamble.
+        progress_header_printed: !matches!(args.phases.as_deref().map(crate::repair_timing::phase_plan), Some(crate::repair_timing::PhasePlan::MeasuredVtSwap | crate::repair_timing::PhasePlan::Mt1 | crate::repair_timing::PhasePlan::GlobalSizing)),
     };
     // `SetupLegacyBase::start`: with the move tracker on, `captureInitialSlackDistribution` (and
     // `captureOriginalEndpointSlack`, read only by the level-2 profiles) after RSZ-0099.
@@ -1870,6 +1981,9 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
                 r.reroute_phase = false;
             }
             "WNS" | "WNS_PATH" => r.wns_phase(marker)?,
+            "MEASURED_VT_SWAP" => r.measured_vt_swap_policy()?,
+            "MT1" => r.mt1_policy()?,
+            "GLOBAL_SIZING" => r.global_sizing_policy()?,
             "TNS" => r.tns_phase(marker)?,
             "ENDPOINT_FANIN" => r.directional_phase(marker, false)?,
             "STARTPOINT_FANOUT" => r.directional_phase(marker, true)?,
@@ -1879,13 +1993,8 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
                     r.print_tracker_phase_summary("LAST_GASP Phase Endpoint Profiler");
                 }
             }
-            // `SetupCritVtSwapPolicy`: nothing to do when skipped or with one VT category; with
-            // several it swaps critical cells, which is not modelled.
-            "CRIT_VT_SWAP" => {
-                if !(args.skip_crit_vt_swap || args.skip_vt_swap || ctx.vt_category_count < 2) {
-                    return Err(Stop::refused("RSZ-ABSENT", "the CRIT_VT_SWAP phase over several VT categories is not modelled".into()));
-                }
-            }
+            // `SetupCritVtSwapPolicy`: nothing to do when skipped or with one VT category.
+            "CRIT_VT_SWAP" => r.crit_vt_swap_phase()?,
             other => return Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -phases: {other} is not modelled"))),
         }
     }
@@ -1912,7 +2021,8 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
         })?;
         let _ = std::fs::write(path, text);
     }
-    r.out.resized = r.committer.committed(Move::SizeUp) + r.committer.committed(Move::SizeDownFanout);
+    // RSZ-0051's count: every resize, VT swaps and up-match sizes too.
+    r.out.resized = r.committer.committed(Move::SizeUp) + r.committer.committed(Move::SizeDownFanout) + r.committer.committed(Move::SizeUpMatch) + r.committer.committed(Move::VtSwap);
     r.out.removed = r.committer.committed(Move::Unbuffer);
     r.out.inserted = r.committer.committed(Move::Buffer);
     Ok(r.out)
@@ -3657,7 +3767,8 @@ impl Repair<'_, '_> {
     /// `Rebuffer::rebufferPin` with the net annotated: the passes, then the export.
     fn rebuffer_pin(&mut self, probe: &rebuffer::Probe) -> Result<i64, Stop> {
         let rctx = self.ctx.rebuffer.ok_or_else(|| Stop::refused("RSZ-ABSENT", "BufferMove without characterized buffers".into()))?;
-        self.debug("rebuffer", 2, format!("driver {}", probe.pin));
+        // The SDC network's pathName: a lone escape drops (`out\[12\]` prints `out[12]`).
+        self.debug("rebuffer", 2, format!("driver {}", crate::repair_timing::sta_to_sdc(&probe.pin)));
         for w in &probe.warnings {
             self.report(w.clone());
         }
@@ -3755,10 +3866,12 @@ impl Repair<'_, '_> {
             return Ok(None);
         };
         // hasSingleStageFanout: its wire fanout — counted only until it passes 1, so a rejection
-        // always reports 2.
-        if prev.fanout != 1 {
-            let line = if prev.fanout > 1 { format!("REJECT SizeUpMatchMove {}: Previous driver fanout 2 > 1", st.pin) } else { format!("REJECT SizeUpMatchMove {}: No previous driver vertex", st.pin) };
-            self.debug("size_up_match_move", 2, line);
+        // always reports 2. NO wire fanout passes: a half adder's SN reached through CON has its
+        // input pin two stages back (no wire out-edge), which goes on to selectReplacement — its own
+        // cell, so nothing, silently. ("No previous driver vertex" is a pin with no vertex: none
+        // on a path.)
+        if prev.fanout > 1 {
+            self.debug("size_up_match_move", 2, format!("REJECT SizeUpMatchMove {}: Previous driver fanout 2 > 1", st.pin));
             return Ok(None);
         }
         // selectReplacement: the previous driver's cell when it is the same family (buffer or
@@ -4296,6 +4409,14 @@ impl Repair<'_, '_> {
     /// `OptimizationPolicy::finalizeAndReport`: a fresh collector's row, the closing rule, then
     /// `reportRepairSummary`.
     fn finalize_and_report(&mut self) -> Result<(), Stop> {
+        // `printFinalProgress` → `printProgressHeader`, unless a phase printed it.
+        if !self.progress_header_printed {
+            self.progress_header_printed = true;
+            for l in POLICY_PROGRESS_HEADER {
+                self.report(l.to_string());
+            }
+            self.report("-".repeat(126));
+        }
         let violating = collect_violating(&self.timing.ends, self.ctx.margin).len();
         let starts = collect_violating(&self.timing.starts, self.ctx.margin);
         let (wns, worst) = self.timing.worst();
@@ -4373,6 +4494,10 @@ mod tests {
             cell: None,
             port: None,
             load_delay: Some(load_delay),
+            arc_delay: None,
+            arrival: 0.0,
+            vertex: 0,
+            in_edge: None,
             in_wire_delay: None,
             in_port: None,
             fanout: 1,

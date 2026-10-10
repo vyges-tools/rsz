@@ -29,6 +29,7 @@
 pub mod buffer_ports;
 pub mod buffered_net;
 pub mod clone;
+pub mod delay_estimator;
 pub mod design;
 pub mod driver_slew;
 pub mod fanout;

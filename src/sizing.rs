@@ -196,7 +196,7 @@ impl Default for SizingLimits {
 
 /// A master's IMPLANT obstruction layers as a set — what `cellVTType` hashes, so two masters share
 /// a VT index exactly when their sets are equal, whatever order the categories were numbered in.
-fn implant_set(m: &Master) -> Vec<String> {
+pub(crate) fn implant_set(m: &Master) -> Vec<String> {
     let mut l = m.implant_obs.clone();
     l.sort();
     l.dedup();
