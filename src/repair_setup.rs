@@ -491,6 +491,9 @@ fn inc_trace(inc: &IncTimer, trace_at: usize) {
     for (v, c) in &inc.arrival_visits {
         let _ = writeln!(f, "AV|{v}|{}", u8::from(*c));
     }
+    for l in &inc.arrival_values {
+        let _ = writeln!(f, "AA|{l}");
+    }
     for (v, c) in &inc.required_visits {
         let _ = writeln!(f, "RV|{v}|{}", u8::from(*c));
     }
@@ -3084,7 +3087,7 @@ impl Repair<'_, '_> {
                     let line = format!("{phase} Phase: Restoring best slack; endpoint slack = {}, WNS = {}", self.ds(es.prev_end_slack, 3), self.ds(es.prev_worst_slack, 3));
                     self.debug("repair_setup", 2, line);
                 }
-                self.debug("repair_setup", 1, format!("{phase} Phase: No change possible for endpoint {} ", es.end));
+                self.debug("repair_setup", 1, format!("{phase} Phase: No change possible for endpoint {} ", crate::repair_timing::sta_to_sdc(&es.end)));
                 self.finish_endpoint_search(es)?;
                 break;
             }

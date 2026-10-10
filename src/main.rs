@@ -2178,15 +2178,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 // The moves modelled, over one corner or several (each reads the scenes the
                 // reference's does: see the moves), LEGACY and LAST_GASP.
                 let startpoint_rows = matches!(plan, Some(rt::PhasePlan::LegacyPreamble { startpoints: true }));
-                let unmodelled = if seq.contains(&rt::Move::Reroute) {
-                    // RerouteMove and the REROUTE phase are built (resistance-aware incremental
-                    // re-routes, the wire-delay ranking): `repair_setup_reroute2` matches the
-                    // reference decision by decision for 416 trace lines, then a TNS differs in its
-                    // last printed digit — the reference's incremental timer drifts from a fresh
-                    // timing by up to ~1 fs per pin after the reroutes (measured with
-                    // `instruments/rsz/slack-bisect.sh`). Until that is matched, stopped here.
-                    Some("repair_timing: RerouteMove — the reference's incremental timing after resistance-aware reroutes is matched only to ~1 fs; not modelled".into())
-                } else if matches!(plan, Some(rt::PhasePlan::LegacyPreamble { .. })) && !a.phases.as_deref().is_some_and(rt::phases_modelled) {
+                let unmodelled = if matches!(plan, Some(rt::PhasePlan::LegacyPreamble { .. })) && !a.phases.as_deref().is_some_and(rt::phases_modelled) {
                     Some(format!("repair_timing -phases {}: not modelled", a.phases.as_deref().unwrap_or_default()))
                 } else if let Some(m) = seq.iter().find(|m| !matches!(m, rt::Move::SizeUp | rt::Move::SizeDownFanout | rt::Move::Unbuffer | rt::Move::SwapPins | rt::Move::Buffer | rt::Move::Clone | rt::Move::SplitLoad | rt::Move::SizeUpMatch | rt::Move::VtSwap | rt::Move::Reroute)) {
                     Some(format!("repair_timing: {} is not modelled", m.name()))
