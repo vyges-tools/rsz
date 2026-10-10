@@ -43,38 +43,7 @@ struct Estimate {
     score: f32,
 }
 
-/// C's `%a` of a double, as glibc prints it: `0x1.<hex, trailing zeros dropped>p<exp>`, `0x0p+0`
-/// for zero, `inf` / `-inf` — the instrumented reference prints its floats so (`VYGV` lines).
-pub(super) fn c_hex(v: f64) -> String {
-    if v.is_infinite() {
-        return if v < 0.0 { "-inf".into() } else { "inf".into() };
-    }
-    if v.is_nan() {
-        return "nan".into();
-    }
-    let sign = if v.is_sign_negative() { "-" } else { "" };
-    if v == 0.0 {
-        return format!("{sign}0x0p+0");
-    }
-    let bits = v.to_bits();
-    let mut exp = ((bits >> 52) & 0x7ff) as i64;
-    let mant = bits & ((1u64 << 52) - 1);
-    let lead = if exp == 0 {
-        // Subnormal: glibc prints 0x0.<mant>p-1022.
-        exp = -1022;
-        0
-    } else {
-        exp -= 1023;
-        1
-    };
-    let mut digits = format!("{mant:013x}");
-    while digits.ends_with('0') {
-        digits.pop();
-    }
-    let frac = if digits.is_empty() { String::new() } else { format!(".{digits}") };
-    let esign = if exp < 0 { "-" } else { "+" };
-    format!("{sign}0x{lead}{frac}p{esign}{}", exp.abs())
-}
+pub(super) use crate::trace::c_hex;
 
 impl Repair<'_, '_> {
     /// One `VYGV|` decision line, as the instrumented reference prints it (`rsz-mvt-patch.py`), to

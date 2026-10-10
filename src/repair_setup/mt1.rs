@@ -19,29 +19,29 @@ use crate::delay_estimator::{self, ArcDelayState, PathPin, Reader};
 use crate::repair_timing::{collect_violating, Move};
 
 /// `Target` of the path driver view, with the prepared `arc_delay` (`None`: `buildContext` failed).
-struct Mt1Target {
-    pin: String,
-    inst: String,
-    cell: String,
-    endpoint: String,
-    slack: f32,
-    path_index: usize,
+pub(super) struct Mt1Target {
+    pub(super) pin: String,
+    pub(super) inst: String,
+    pub(super) cell: String,
+    pub(super) endpoint: String,
+    pub(super) slack: f32,
+    pub(super) path_index: usize,
     /// The driver's fanin nets' capacitance checks (`replacementPreservesMaxCap`).
-    fanin_caps: Vec<(String, Vec<CapCheck>)>,
-    arc_delay: Option<ArcDelayState>,
+    pub(super) fanin_caps: Vec<(String, Vec<CapCheck>)>,
+    pub(super) arc_delay: Option<ArcDelayState>,
 }
 
 /// One generated candidate: its move type and cell.
-struct Candidate {
-    kind: Move,
-    cell: String,
+pub(super) struct Candidate {
+    pub(super) kind: Move,
+    pub(super) cell: String,
 }
 
 /// `Estimate`.
 #[derive(Clone, Copy)]
-struct Estimate {
-    legal: bool,
-    score: f32,
+pub(super) struct Estimate {
+    pub(super) legal: bool,
+    pub(super) score: f32,
 }
 
 /// `TargetEvaluation`: the candidates, their estimates, the best.
@@ -61,7 +61,7 @@ pub(super) struct Mt1 {
     vt_swap: bool,
 }
 
-fn rfc(rf: usize) -> &'static str {
+pub(super) fn rfc(rf: usize) -> &'static str {
     if rf == vyges_sta::liberty::RISE { "^" } else { "v" }
 }
 
@@ -190,36 +190,45 @@ impl Repair<'_, '_> {
         for (i, t) in targets.iter().enumerate() {
             self.mt1_trace(format!("tgt|{i}|{}|{}|{}|{}", t.pin, t.path_index, t.endpoint, c_hex(f64::from(t.slack))));
         }
-        let libs = self.ctx.libs;
         for (i, t) in targets.iter().enumerate() {
             let Some(ad) = &t.arc_delay else {
                 self.mt1_trace(format!("ctx|{i}|-"));
                 continue;
             };
-            self.mt1_trace(format!("ctx|{i}|{}|{}|{}", ad.target_stage_index, ad.path_stages.len(), c_hex(f64::from(ad.current_total_delay))));
-            for (k, s) in ad.path_stages.iter().enumerate() {
-                let Some(cell) = libs.scene_cell(s.arc.scene, &s.arc.cell) else { continue };
-                let a = &cell.arc_sets[s.arc.set].arcs[s.arc.arc];
-                let h = |v: f32| c_hex(f64::from(v));
-                self.mt1_trace(format!("st|{i}|{k}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}", s.path_index, s.driver_pin, rfc(a.from_rf), rfc(a.to_rf), h(s.input_slew), h(s.load_cap), h(s.current_model_delay), h(s.current_delay), h(s.current_model_slew), h(s.current_slew), s.output_slew_merge_arcs.len()));
-                for m in &s.output_slew_merge_arcs {
-                    let set = &cell.arc_sets[m.set];
-                    self.mt1_trace(format!("merge|{i}|{k}|{}|{}|{}|{}", set.from, rfc(set.arcs[m.arc].from_rf), h(m.input_slew), h(m.current_model_slew)));
-                }
-                let b = &s.sta_slew_bias;
-                match (b.valid, b.table_worst_arc) {
-                    (true, Some((ws, wa))) => {
-                        let set = &cell.arc_sets[ws];
-                        let mut line = format!("bias|{i}|{k}|1|{}|{}|{}", set.from, rfc(set.arcs[wa].from_rf), h(b.input_slew));
-                        for x in &b.samples {
-                            line.push_str(&format!("|{}|{}|{}", h(x.load_cap), h(x.table_slew), h(x.sta_slew)));
-                        }
-                        self.mt1_trace(line);
-                    }
-                    _ => self.mt1_trace(format!("bias|{i}|{k}|0")),
-                }
+            for (tag, rest) in self.arc_delay_lines(ad) {
+                self.mt1_trace(format!("{tag}|{i}|{rest}"));
             }
         }
+    }
+
+    /// A prepared context as the instrumented references print it, each line its tag and the
+    /// fields after the target index: `ctx`, then per stage `st`, its `merge` arcs, its `bias`.
+    pub(super) fn arc_delay_lines(&self, ad: &ArcDelayState) -> Vec<(&'static str, String)> {
+        let libs = self.ctx.libs;
+        let h = |v: f32| c_hex(f64::from(v));
+        let mut out = vec![("ctx", format!("{}|{}|{}", ad.target_stage_index, ad.path_stages.len(), h(ad.current_total_delay)))];
+        for (k, s) in ad.path_stages.iter().enumerate() {
+            let Some(cell) = libs.scene_cell(s.arc.scene, &s.arc.cell) else { continue };
+            let a = &cell.arc_sets[s.arc.set].arcs[s.arc.arc];
+            out.push(("st", format!("{k}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}", s.path_index, s.driver_pin, rfc(a.from_rf), rfc(a.to_rf), h(s.input_slew), h(s.load_cap), h(s.current_model_delay), h(s.current_delay), h(s.current_model_slew), h(s.current_slew), s.output_slew_merge_arcs.len())));
+            for m in &s.output_slew_merge_arcs {
+                let set = &cell.arc_sets[m.set];
+                out.push(("merge", format!("{k}|{}|{}|{}|{}", set.from, rfc(set.arcs[m.arc].from_rf), h(m.input_slew), h(m.current_model_slew))));
+            }
+            let b = &s.sta_slew_bias;
+            match (b.valid, b.table_worst_arc) {
+                (true, Some((ws, wa))) => {
+                    let set = &cell.arc_sets[ws];
+                    let mut line = format!("{k}|1|{}|{}|{}", set.from, rfc(set.arcs[wa].from_rf), h(b.input_slew));
+                    for x in &b.samples {
+                        line.push_str(&format!("|{}|{}|{}", h(x.load_cap), h(x.table_slew), h(x.sta_slew)));
+                    }
+                    out.push(("bias", line));
+                }
+                _ => out.push(("bias", format!("{k}|0"))),
+            }
+        }
+        out
     }
 
     /// `generateAndEstimateTargets`: each target in order — `generateCandidates` (VtSwap's, then
@@ -233,6 +242,9 @@ impl Repair<'_, '_> {
                 candidates.extend(self.mt1_vt_swap_generate(t));
             }
             candidates.extend(self.mt1_size_up_generate(t));
+            for c in &candidates {
+                self.mt1_trace(format!("gen|{}|{}|{}", t.pin, if c.kind == Move::VtSwap { "vt" } else { "up" }, c.cell));
+            }
             let estimates: Vec<Estimate> = candidates.iter().map(|c| self.mt1_estimate(t, c)).collect();
             let mut best: Option<usize> = None;
             for (k, e) in estimates.iter().enumerate() {
@@ -255,7 +267,7 @@ impl Repair<'_, '_> {
     /// `VtSwapMtGenerator`: `isApplicable` (prepared; not dont_touch, a logic standard cell, two
     /// VT categories or more, VT-equivalent cells), then every VT-equivalent cell but the current
     /// one in `getVTEquivCells` order, the suffix trimmed past `RSZ_VTSWAP_CANDIDATES`.
-    fn mt1_vt_swap_generate(&self, t: &Mt1Target) -> Vec<Candidate> {
+    pub(super) fn mt1_vt_swap_generate(&self, t: &Mt1Target) -> Vec<Candidate> {
         if t.arc_delay.is_none() || self.design.net_info().dont_touch_insts.contains(&t.inst) || !self.ctx.sizing.masters.get(&t.cell).is_some_and(|m| m.logic_std) || self.ctx.vt_category_count < 2 {
             return Vec::new();
         }
@@ -268,16 +280,13 @@ impl Repair<'_, '_> {
         if cap > 0 && cells.len() > cap as usize {
             cells.truncate(cap as usize);
         }
-        for c in &cells {
-            self.mt1_trace(format!("gen|{}|vt|{c}", t.pin));
-        }
         cells.into_iter().map(|cell| Candidate { kind: Move::VtSwap, cell }).collect()
     }
 
     /// `SizeUpMtGenerator`: `isApplicable` (an instance not dont_touch, prepared), then
     /// `findSizeUpOptions` — the swappable cells of the arc's cell in the same VT class whose
     /// output port drives no weaker — each kept when it preserves the fanin nets' max capacitance.
-    fn mt1_size_up_generate(&self, t: &Mt1Target) -> Vec<Candidate> {
+    pub(super) fn mt1_size_up_generate(&self, t: &Mt1Target) -> Vec<Candidate> {
         let Some(ad) = &t.arc_delay else { return Vec::new() };
         if self.design.net_info().dont_touch_insts.contains(&t.inst) {
             return Vec::new();
@@ -308,7 +317,6 @@ impl Repair<'_, '_> {
                 continue;
             }
             if sw_cell.drive_resistance(&out_port) <= drive_r && replacement_preserves_max_cap(libs, &t.cell, &sw, &t.fanin_caps) {
-                self.mt1_trace(format!("gen|{}|up|{sw}", t.pin));
                 out.push(Candidate { kind: Move::SizeUp, cell: sw });
             }
         }
@@ -317,7 +325,7 @@ impl Repair<'_, '_> {
 
     /// `VtSwapMtCandidate::estimate` (the max-capacitance guard, then the estimator; a
     /// non-improving swap keeps its score) and `SizeUpMtCandidate::estimate` (the estimator).
-    fn mt1_estimate(&self, t: &Mt1Target, c: &Candidate) -> Estimate {
+    pub(super) fn mt1_estimate(&self, t: &Mt1Target, c: &Candidate) -> Estimate {
         let Some(ad) = &t.arc_delay else { return Estimate { legal: false, score: 0.0 } };
         if c.kind == Move::VtSwap && !replacement_preserves_max_cap(self.ctx.libs, &t.cell, &c.cell, &t.fanin_caps) {
             return Estimate { legal: false, score: 0.0 };

@@ -40,6 +40,7 @@ use crate::Stop;
 
 mod crit_vt_swap;
 mod global_sizing;
+mod legacy_mt;
 mod measured_vt_swap;
 mod mt1;
 
@@ -1326,6 +1327,8 @@ struct Repair<'c, 'd> {
     target_slack: f32,
     /// Inside the REROUTE phase (`SetupReroutePolicy`): its own `repairPath`.
     reroute_phase: bool,
+    /// Inside a LEGACY_MT phase (`SetupLegacyMtPolicy`): prepared targets, the MT VtSwap / SizeUp.
+    legacy_mt: bool,
     /// `RepairSetupContext::progress_header_printed`: a legacy phase's preamble printed the
     /// progress header; a policy without one (MEASURED_VT_SWAP) leaves it to the final report.
     progress_header_printed: bool,
@@ -1406,6 +1409,13 @@ pub trait SetupDesign: Design {
     fn global_routed(&self) -> bool {
         false
     }
+    /// The next `updateParasitics` re-routes nets resistance-aware: its `updateSlacks` reads the
+    /// timer's net slacks mid-update (the edits pulled first, so the router's dirty nets are known).
+    fn route_slacks_wanted(&mut self) -> bool {
+        false
+    }
+    /// Those slacks (`sta_->slack(net, max)` per net), for the next `updateParasitics` only.
+    fn set_route_slacks(&mut self, _slacks: HashMap<String, f32>) {}
     /// The net a pin is on, by name (`flatNet`), and whether it is special.
     fn pin_net(&self, _pin: &str) -> Option<(String, bool)> {
         None
@@ -1944,6 +1954,7 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
         startpoint_rows: false,
         target_slack: 0.0,
         reroute_phase: false,
+        legacy_mt: false,
         // Only a policy alone that has no legacy start (MEASURED_VT_SWAP, MT1) runs without the
         // legacy preamble.
         progress_header_printed: !matches!(args.phases.as_deref().map(crate::repair_timing::phase_plan), Some(crate::repair_timing::PhasePlan::MeasuredVtSwap | crate::repair_timing::PhasePlan::Mt1 | crate::repair_timing::PhasePlan::GlobalSizing)),
@@ -1971,6 +1982,21 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
                 r.phase = format!("LEGACY{marker}");
                 r.sequence = ctx.sequence.to_vec();
                 r.iterate()?;
+            }
+            // `SetupLegacyMtPolicy`: the LEGACY loop with prepared targets and the MT VtSwap / SizeUp
+            // (its RSZ-2024 opens the preamble: first phase only).
+            "LEGACY_MT" => {
+                if i != 0 {
+                    return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases: LEGACY_MT after another phase (its start's RSZ-2024 mid-run) is not modelled".into()));
+                }
+                if ctx.sequence.contains(&Move::SizeDownFanout) {
+                    return Err(Stop::refused("RSZ-ABSENT", "LEGACY_MT with SizeDownFanoutMove (its batch commits every accepted candidate of a generation): not modelled".into()));
+                }
+                r.phase = format!("LEGACY{marker}");
+                r.sequence = ctx.sequence.to_vec();
+                r.legacy_mt = true;
+                r.iterate()?;
+                r.legacy_mt = false;
             }
             // `SetupReroutePolicy`: the LEGACY loop with RerouteMove alone and its own `repairPath`.
             "REROUTE" => {
@@ -2058,11 +2084,40 @@ impl Repair<'_, '_> {
     /// The timer again over the design (`updateParasitics`, `findRequireds`), with the worst path
     /// of `want` ready.
     fn retime(&mut self, want: &[String]) -> Result<(), Stop> {
+        // `updateParasitics` under a resistance-aware router: `updateDirtyRoutes` runs first and its
+        // `updateSlacks` asks the timer for each routed net's slack — a timer update on the edits
+        // so far with the parasitics as they stand (invalid nets marked, none estimated); then
+        // the estimates, `delaysInvalidFromFanin`, and the timer again.
+        if self.design.route_slacks_wanted() {
+            let slacks = self.mid_update_net_slacks()?;
+            self.design.set_route_slacks(slacks);
+        }
         self.design.update_parasitics().map_err(timer_stop)?;
         let edits = self.design.take_timer_edits();
         self.timer.trace_at = self.out.trace.len();
         self.timing = snapshot(self.ctx, self.design.as_design(), want, &mut self.timer, edits)?;
         Ok(())
+    }
+
+    /// `Sta::slack(net, max)` of every net, on the timer updated with the edits so far and the
+    /// parasitics as they stand: the fuzzily least max slack over the net's load pins, the least
+    /// over the scenes; INF unconstrained.
+    fn mid_update_net_slacks(&mut self) -> Result<HashMap<String, f32>, Stop> {
+        let edits = self.design.take_timer_edits();
+        self.timer.trace_at = self.out.trace.len();
+        timed_all(self.ctx, self.design.as_design(), &mut self.timer, edits, |gs, ss, _| {
+            let mut out: HashMap<String, f32> = HashMap::new();
+            for k in 0..gs.len() {
+                let g = &gs[k];
+                let index: HashMap<&str, usize> = g.vertices.iter().enumerate().map(|(i, v)| (v.name.as_str(), i)).collect();
+                for n in &g.netlist.nets {
+                    let loads: Vec<usize> = n.pins.iter().filter_map(|c| index.get(g.netlist.pin_name(c).as_str()).copied()).filter(|&v| !g.vertices[v].is_driver).collect();
+                    let s = ss[k].net_slack(&loads);
+                    out.entry(n.name.clone()).and_modify(|x| if fuzzy::less(s, *x) { *x = s }).or_insert(s);
+                }
+            }
+            Ok(out)
+        })
     }
 
     /// `SetupLegacyPolicy::iterate`.
@@ -3593,11 +3648,36 @@ impl Repair<'_, '_> {
         let st = &view.stages[index];
         let line = format!("{} {} fanout = {} drvr_index = {index}", st.pin, st.cell.as_deref().unwrap_or("none"), st.fanout);
         self.debug("repair_setup", 3, line);
+        // `SetupLegacyMtPolicy::tryRepairTarget`: the target prepared first (no live fanout).
+        let mt_target = if self.legacy_mt {
+            if !view.latch_segments.is_empty() {
+                return Err(Stop::refused("RSZ-ABSENT", "LEGACY_MT on a path through a latch D -> Q: not modelled".into()));
+            }
+            Some(self.lmt_target(view, index)?)
+        } else {
+            None
+        };
         for m in self.sequence.clone() {
-            if rejected.contains(&m) || !self.is_applicable(m, st, index) {
+            let applicable = match (&mt_target, m) {
+                (Some(t), Move::SizeUp | Move::VtSwap) => self.lmt_is_applicable(m, t),
+                _ => self.is_applicable(m, st, index),
+            };
+            if rejected.contains(&m) || !applicable {
                 continue;
             }
             self.debug("repair_setup", 1, format!("Considering {} for {}", m.name(), st.pin));
+            if mt_target.is_some() {
+                self.lmt_trace(format!("try|{}", m.name()));
+            }
+            if let (Some(t), Move::SizeUp | Move::VtSwap) = (&mt_target, m) {
+                if let Some(r) = self.lmt_estimate_and_commit(m, t)? {
+                    *changed += 1;
+                    let kind = r.kind;
+                    self.commit(r);
+                    return Ok(Some(kind));
+                }
+                continue;
+            }
             // `allowsBatchRepair`: SizeDownFanout repeats on the target until nothing is accepted
             // (`trySizeDownFanoutBatch`), each round on the timer the last move changed.
             if m == Move::SizeDownFanout {

@@ -375,7 +375,7 @@ pub fn phase_names(phases: Option<&str>) -> Vec<String> {
 
 /// Whether every phase of the list is modelled.
 pub fn phases_modelled(phases: &str) -> bool {
-    phase_names(Some(phases)).iter().all(|n| matches!(n.as_str(), "LEGACY" | "WNS" | "WNS_PATH" | "TNS" | "ENDPOINT_FANIN" | "STARTPOINT_FANOUT" | "LAST_GASP" | "CRIT_VT_SWAP" | "REROUTE"))
+    phase_names(Some(phases)).iter().all(|n| matches!(n.as_str(), "LEGACY" | "LEGACY_MT" | "WNS" | "WNS_PATH" | "TNS" | "ENDPOINT_FANIN" | "STARTPOINT_FANOUT" | "LAST_GASP" | "CRIT_VT_SWAP" | "REROUTE"))
 }
 
 /// `sta::parseTokens(phases)` (space and tab delimited), then the first phase's policy.
