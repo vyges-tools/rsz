@@ -399,16 +399,16 @@ impl Repair<'_, '_> {
         Ok(())
     }
 
-    /// `commitBestCandidate`: the candidate applied (a size-up re-checks max capacitance first:
-    /// against the pass's stale snapshot — no re-check rejects in the witnesses), the pending moves
-    /// accepted, RSZ-2023.
+    /// `commitBestCandidate`: the candidate applied (a size-up re-checks max capacitance first, on
+    /// the design as the batch has left it — the candidates were screened on the pre-batch
+    /// snapshot), the pending moves accepted, RSZ-2023.
     fn mt1_commit_best_candidate(&mut self, p: &mut Mt1, t: &Mt1Target, c: &Candidate) -> Result<bool, Stop> {
         // `trackMoveAttempt(candidate, pin, endpoint)`: the endpoint current, the attempt.
         if !t.endpoint.is_empty() {
             self.trk_set_current_endpoint(&t.endpoint)?;
         }
         self.trk_attempt(&t.pin, c.kind)?;
-        if c.kind == Move::SizeUp && !replacement_preserves_max_cap(self.ctx.libs, &t.cell, &c.cell, &t.fanin_caps) {
+        if c.kind == Move::SizeUp && !replacement_preserves_max_cap(self.ctx.libs, &t.cell, &c.cell, &self.live_fanin_caps(&t.inst)?) {
             self.debug("opt_moves", 1, format!("REJECT size_up_mt1 {}: {} -> {} max-cap re-check failed", t.pin, t.cell, c.cell));
             // rejectTrackedMoves.
             if let Some(m) = self.moves.as_mut() {

@@ -1135,6 +1135,41 @@ fn replacement_preserves_max_cap(libs: &Libs, cell: &str, replacement: &str, fan
     true
 }
 
+impl Repair<'_, '_> {
+    /// `replacementPreservesMaxCap`'s reads on the design as it is NOW (`checkCapacitance` updates
+    /// no timing): each input pin of the instance, its net's drivers' capacitance checks, the pin
+    /// caps of the cells now and the parasitics now — a swap earlier in the batch grew a pin cap
+    /// and dropped its input nets' estimate (pin caps alone until re-estimated). Witness: MT1's
+    /// batch on one net near its limit (mt1_fanout_cap_rvt), whose apply re-check rejects the size-up
+    /// a pre-batch snapshot would pass.
+    pub(super) fn live_fanin_caps(&self, inst: &str) -> Result<Vec<(String, Vec<CapCheck>)>, Stop> {
+        let ctx = self.ctx;
+        let design = self.design.as_design();
+        let netlist = design.netlist();
+        let gs = (0..self.timer.inc.len()).map(|k| crate::repair_design::timer_graph(ctx.libs, k, netlist, ctx.env, ctx.master_pins)).collect::<Result<Vec<_>, _>>()?;
+        let g = &gs[0];
+        let ideal0: BTreeSet<usize> = if ctx.ideal_clock { crate::timing::clock_pins(g, ctx.clock_sources).into_iter().collect() } else { BTreeSet::new() };
+        let parasitics: Vec<HashMap<String, vyges_sta::graph::NetParasitics>> = (0..gs.len()).map(|k| design.parasitics(k).clone()).collect();
+        let Some(k) = netlist.insts.iter().position(|(n, _)| n == inst) else { return Ok(Vec::new()) };
+        let sc = crate::timing::Scenes::new(&gs);
+        let mut out = Vec::new();
+        for (u, ux) in g.vertices.iter().enumerate() {
+            if ux.is_driver || !matches!(&ux.conn, vyges_sta::netlist::Conn::Inst(i, _) if *i == k) {
+                continue;
+            }
+            let checks = crate::timing::net_drivers(g, u)
+                .into_iter()
+                .map(|d| {
+                    let (cap, max_cap, slack, limited, _) = crate::timing::check_capacitance(&sc, d, &parasitics, &ideal0);
+                    CapCheck { cap, max_cap, slack, limited }
+                })
+                .collect();
+            out.push((ux.port.clone().unwrap_or_default(), checks));
+        }
+        Ok(out)
+    }
+}
+
 /// A size-up the generator proposes: the instance, its cell now, the replacement.
 struct SizeUp {
     inst: String,

@@ -150,10 +150,11 @@ impl Repair<'_, '_> {
         Ok(result)
     }
 
-    /// `SizeUpMtCandidate::apply` (max capacitance re-checked, then `replaceCell`) and
+    /// `SizeUpMtCandidate::apply` (max capacitance re-checked on the design now — one repair per
+    /// pass, so it reads what the generator read — then `replaceCell`) and
     /// `VtSwapMtCandidate::apply` (`replaceCell`).
     fn lmt_apply(&mut self, t: &Mt1Target, c: &Candidate) -> Result<Option<MoveResult>, Stop> {
-        if c.kind == Move::SizeUp && !super::replacement_preserves_max_cap(self.ctx.libs, &t.cell, &c.cell, &t.fanin_caps) {
+        if c.kind == Move::SizeUp && !super::replacement_preserves_max_cap(self.ctx.libs, &t.cell, &c.cell, &self.live_fanin_caps(&t.inst)?) {
             self.debug("opt_moves", 1, format!("REJECT size_up_mt1 {}: {} -> {} max-cap re-check failed", t.pin, t.cell, c.cell));
             return Ok(None);
         }
