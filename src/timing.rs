@@ -20,6 +20,8 @@ pub struct Limits {
     pub design_max_transition: Option<f32>,
     /// `set_max_fanout V [current_design]` (`Sdc::fanoutLimit(top cell)`), unitless.
     pub design_max_fanout: Option<f32>,
+    /// `set_max_capacitance V [current_design]` (`Sdc::capacitanceLimit(top cell)`), farads.
+    pub design_max_capacitance: Option<f32>,
 }
 
 /// `set_max_transition V` in the reference: Tcl `time_ui_sta` is `Unit::userToSta(double)` —
@@ -27,6 +29,37 @@ pub struct Limits {
 /// so it is narrowed once, at the end.
 pub fn user_time_to_sta(value: f64, time_scale: f32) -> f32 {
     (value * f64::from(time_scale)) as f32
+}
+
+/// `set_max_capacitance V`: Tcl `capacitance_ui_sta` is the capacitance unit's `userToSta`, in
+/// double, and the limit setter takes a float — the same rounding as [`user_time_to_sta`].
+pub fn user_cap_to_sta(value: f64, cap_scale: f32) -> f32 {
+    (value * f64::from(cap_scale)) as f32
+}
+
+/// Two max limits, the tighter kept: `if (exists1 && (!exists || min_max->compare(limit,
+/// limit1)))` takes `limit1` — for max, when `limit > limit1`.
+fn tighter_max(limit: Option<f32>, limit1: Option<f32>) -> Option<f32> {
+    match (limit, limit1) {
+        (Some(l), Some(l1)) if l > l1 => Some(l1),
+        (Some(l), _) => Some(l),
+        (None, l1) => l1,
+    }
+}
+
+/// `CheckCapacitances::findLimit(pin, scene, max)`: "default to top (design) limit", then the
+/// tighter of that and — on an instance pin — its scene port's `max_capacitance`, or — on a
+/// top-level port — its driving cell's `-pin` port's. SDC limits on cells, ports and pins are
+/// refused at read; the library default is never set in the reference.
+fn find_cap_limit(g: &Graph<'_>, v: usize, limits: &Limits) -> Option<f32> {
+    tighter_max(limits.design_max_capacitance, limit_port_of(g, v).and_then(|(_, p)| p.max_capacitance))
+}
+
+/// `Resizer::maxLoad(cell)`: over the output ports in order, the tighter of the design limit and
+/// the port's own; the first port with either returns it, else 0. With a design limit that is
+/// always the first output port.
+pub fn max_load(cell: &vyges_sta::liberty::Cell, limits: &Limits) -> f32 {
+    cell.ports.iter().filter(|p| p.direction == vyges_sta::liberty::Direction::Output).find_map(|p| tighter_max(limits.design_max_capacitance, p.max_capacitance)).unwrap_or(0.0)
 }
 
 /// A netlist the timer here cannot level the way the reference does, named — or `None`.
@@ -492,18 +525,17 @@ pub fn check_fanout(g: &Graph<'_>, info: &NetInfo, drvr: usize, limits: &Limits,
 }
 
 /// `Sta::checkCapacitance(drvr, scenes, max)`: on a driver that is not an ideal clock pin, with
-/// a limit — an instance pin's port `max_capacitance` (the library default is never set in the
-/// reference) — `slack = limit − loadCap` (rise taken; fall is the same cap). No limit: cap 0,
-/// limit −INF, slack INF, no scene.
+/// a limit ([`find_cap_limit`]: the design's and the pin's port's, the tighter) —
+/// `slack = limit − loadCap` (rise taken; fall is the same cap). No limit: cap 0, limit −INF,
+/// slack INF, no scene.
 /// Over the scenes in order (each its scene port's limit and its own load cap), rise then fall:
 /// a FUZZILY smaller slack wins, a fuzzy tie with a lower transition index too. Returns the scene.
-pub fn check_capacitance(sc: &Scenes<'_, '_>, drvr: usize, parasitics: &[std::collections::HashMap<String, vyges_sta::graph::NetParasitics>], clocks: &std::collections::BTreeSet<usize>) -> (f32, f32, f32, bool, Option<usize>) {
+pub fn check_capacitance(sc: &Scenes<'_, '_>, drvr: usize, parasitics: &[std::collections::HashMap<String, vyges_sta::graph::NetParasitics>], clocks: &std::collections::BTreeSet<usize>, limits: &Limits) -> (f32, f32, f32, bool, Option<usize>) {
     let mut best: Option<(f32, f32, f32, usize, usize)> = None;
     if !clocks.contains(&drvr) {
         for (k, g) in sc.graphs.iter().enumerate() {
             let vk = sc.at(k, drvr);
-            let Some((_, port)) = limit_port_of(g, vk) else { continue };
-            let Some(limit) = port.max_capacitance else { continue };
+            let Some(limit) = find_cap_limit(g, vk, limits) else { continue };
             for rf in [RISE, FALL] {
                 let cap = g.load_cap(vk, &parasitics[k]);
                 let slack = limit - cap;
@@ -556,6 +588,46 @@ mod tests {
 
     fn lib(default_max: Option<f32>) -> Library {
         Library { default_max_transition: default_max, ..Default::default() }
+    }
+
+    fn port(name: &str, direction: Direction, max_cap: Option<f32>) -> vyges_sta::liberty::Port {
+        vyges_sta::liberty::Port { name: name.into(), direction, is_clock: false, capacitance: [[0.0; 2]; 2], function: None, max_transition: None, max_capacitance: max_cap, fanout_load: None, max_fanout: None, three_state: None }
+    }
+
+    // Rule (CheckCapacitances::findLimit, Resizer::maxLoad): "default to top (design) limit",
+    // then `if (exists1 && (!exists || min_max->compare(limit, limit1)))` takes the other — for
+    // max, the smaller; either alone stands.
+    #[test]
+    fn the_tighter_max_limit_wins_and_either_alone_stands() {
+        assert_eq!(tighter_max(Some(5.0), Some(3.0)), Some(3.0));
+        assert_eq!(tighter_max(Some(3.0), Some(5.0)), Some(3.0));
+        assert_eq!(tighter_max(Some(3.0), None), Some(3.0));
+        assert_eq!(tighter_max(None, Some(5.0)), Some(5.0));
+        assert_eq!(tighter_max(None, None), None);
+    }
+
+    // Rule (Resizer::maxLoad): over the OUTPUT ports in order, the first with a limit — the
+    // design's tightened by the port's — returns it, else 0. With a design limit the first output
+    // port always answers, even when a later one has a tighter limit of its own.
+    #[test]
+    fn max_load_takes_the_first_output_port_with_any_limit() {
+        let cell = vyges_sta::liberty::Cell { name: "c".into(), ports: vec![port("A", Direction::Input, Some(1.0)), port("Y", Direction::Output, None), port("Z", Direction::Output, Some(4.0))], ..Default::default() };
+        let none = Limits::default();
+        let design = |c: f32| Limits { design_max_capacitance: Some(c), ..Default::default() };
+        assert_eq!(max_load(&cell, &none), 4.0);
+        assert_eq!(max_load(&cell, &design(9.0)), 9.0);
+        assert_eq!(max_load(&cell, &design(2.0)), 2.0);
+        let bare = vyges_sta::liberty::Cell { name: "b".into(), ports: vec![port("Y", Direction::Output, None)], ..Default::default() };
+        assert_eq!(max_load(&bare, &none), 0.0);
+    }
+
+    // Rule (set_max_capacitance, Tcl `capacitance_ui_sta`): the user value times the cap unit's
+    // float scale in double, narrowed once. 1.1 fF lands on bits 269e86d6; narrowing 1.1 to float
+    // first would give 269e86d7, one ulp up.
+    #[test]
+    fn a_design_cap_limit_rounds_where_the_command_does() {
+        assert_eq!(user_cap_to_sta(1.1, 1e-15).to_bits(), 0x269e_86d6);
+        assert_ne!(user_cap_to_sta(1.1, 1e-15).to_bits(), (1.1f32 * 1e-15f32).to_bits());
     }
 
     // Rule (Resizer::maxInputSlew(port, corner)): the limit is the CORNER port's; the fallback

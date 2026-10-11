@@ -728,7 +728,7 @@ fn expand_path(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTr
                     .into_iter()
                     .filter_map(to_scene0)
                     .map(|d| {
-                        let (cap, max_cap, slack, limited, _) = crate::timing::check_capacitance(&sc, d, parasitics, &ideal0);
+                        let (cap, max_cap, slack, limited, _) = crate::timing::check_capacitance(&sc, d, parasitics, &ideal0, ctx.limits);
                         CapCheck { cap, max_cap, slack, limited }
                     })
                     .collect();
@@ -970,7 +970,7 @@ fn probe_unbuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[
         Vec::new()
     };
     let multi = unbuffer::Multi { graphs: gs, searches: ss, parasitics: &all_parasitics, ideals: &ideals, indices: &indices };
-    let t = unbuffer::Timer { g, search, parasitics: design.parasitics(scene), ideal, info: design.net_info(), index: &index, steiner: &steiner, multi: several.then_some(&multi) };
+    let t = unbuffer::Timer { g, search, parasitics: design.parasitics(scene), ideal, info: design.net_info(), index: &index, steiner: &steiner, multi: several.then_some(&multi), limits: ctx.limits };
     let uctx = unbuffer::Ctx {
         libs: ctx.libs,
         limits: ctx.limits,
@@ -1160,7 +1160,7 @@ impl Repair<'_, '_> {
             let checks = crate::timing::net_drivers(g, u)
                 .into_iter()
                 .map(|d| {
-                    let (cap, max_cap, slack, limited, _) = crate::timing::check_capacitance(&sc, d, &parasitics, &ideal0);
+                    let (cap, max_cap, slack, limited, _) = crate::timing::check_capacitance(&sc, d, &parasitics, &ideal0, self.ctx.limits);
                     CapCheck { cap, max_cap, slack, limited }
                 })
                 .collect();
@@ -1914,7 +1914,7 @@ impl HoldRepair<'_, '_> {
             let v = g.vertices.iter().position(|x| x.name == drvr).ok_or_else(|| timer_stop(format!("{drvr}: not in the timing graph")))?;
             let sc = crate::timing::Scenes::new(gs);
             const RATIO: f32 = 0.2;
-            let (_, limit, slack, _, corner) = crate::timing::check_capacitance(&sc, v, &parasitics, clocks);
+            let (_, limit, slack, _, corner) = crate::timing::check_capacitance(&sc, v, &parasitics, clocks, ctx.limits);
             if corner.is_some() && slack / limit < RATIO {
                 return Ok(false);
             }
@@ -3873,7 +3873,7 @@ impl Repair<'_, '_> {
         let swappable = self.ctx.sizing.swappable_cells(cell_name)?;
         let cands: Vec<&Cell> = swappable.iter().filter_map(|n| self.ctx.libs.link_cell(n)).collect();
         let dont_use = |n: &str| self.ctx.sizing.dont_use.contains(n);
-        let clone_cell = clone::choose_clone_cell(cell, &cands, &dont_use).map_err(|e| Stop::refused("RSZ-ABSENT", e))?;
+        let clone_cell = clone::choose_clone_cell(cell, &cands, &dont_use, self.ctx.limits).map_err(|e| Stop::refused("RSZ-ABSENT", e))?;
         let d = self.design.as_design();
         let loc = clone::compute_clone_location(d.pin_location(&st.pin), &fanouts, &|p| d.pin_location(p));
         self.trk_attempt(&st.pin, Move::Clone)?;

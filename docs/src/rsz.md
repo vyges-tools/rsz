@@ -110,7 +110,9 @@ See the full [CLI reference](./reference/vyges-rsz.md) (generated from `--help`)
   `set_max_transition`, whichever is tighter; an output's library default where the port sets
   none), less `-slew_margin`. Load slews take the running minimum of the limits seen.
 - **Capacitance**: the driver's load — pin capacitance plus the wire's share of its reduced
-  network — against the port's `max_capacitance`, less `-cap_margin`.
+  network — against the port's `max_capacitance` or the design's `set_max_capacitance`,
+  whichever is tighter, less `-cap_margin`. A top-level input port with no driving cell is held
+  to the design's limit alone.
 - **Fanout**: the loads' fanout load against the port's limit (or the design's `set_max_fanout`,
   or the library default); with no limit, the number of load pins against 50.
 - A top-level port with `set_driving_cell` takes its limits and its drive resistance from the

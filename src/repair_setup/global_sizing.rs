@@ -671,7 +671,7 @@ impl GsEnv<'_> {
                     // (a) the fanin net's drivers' capacitance checks.
                     if v.g.vertex_net[u].is_some() {
                         let drivers = crate::timing::net_drivers(v.g, u).into_iter().map(|dv| {
-                            let (cap, max_cap, slack, limited, _) = crate::timing::check_capacitance(&sc, dv, std::slice::from_ref(v.parasitics), &ideal);
+                            let (cap, max_cap, slack, limited, _) = crate::timing::check_capacitance(&sc, dv, std::slice::from_ref(v.parasitics), &ideal, self.ctx.limits);
                             DriverCapCheck { cap, max_cap, cap_slack: slack, corner_ok: max_cap > 0.0 && limited }
                         });
                         s.inputs.push(InputMaxCapCtx { in_port: p.clone(), old_cap: self.port_input_cap(&cell, p), drivers: drivers.collect() });

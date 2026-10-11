@@ -144,6 +144,8 @@ pub struct Timer<'t, 'g> {
     pub steiner: &'t dyn Fn(&str, &str) -> Option<buffered_net::NetShape>,
     /// Several corners: every scene's timer (`g` … `index` are the path's scene).
     pub multi: Option<&'t Multi<'t, 'g>>,
+    /// The constraints' limits (`set_max_capacitance` on the design).
+    pub limits: &'t timing::Limits,
 }
 
 /// Every scene's timer, for what the reference reads over all scenes (`Sta::slack(vertex, max)`,
@@ -161,7 +163,7 @@ impl<'t, 'g> Timer<'t, 'g> {
     /// The same timer at scene `k` (several corners).
     fn at_scene(&self, k: usize) -> Timer<'t, 'g> {
         let m = self.multi.expect("several scenes");
-        Timer { g: &m.graphs[k], search: &m.searches[k], parasitics: &m.parasitics[k], ideal: &m.ideals[k], info: self.info, index: &m.indices[k], steiner: self.steiner, multi: self.multi }
+        Timer { g: &m.graphs[k], search: &m.searches[k], parasitics: &m.parasitics[k], ideal: &m.ideals[k], info: self.info, index: &m.indices[k], steiner: self.steiner, multi: self.multi, limits: self.limits }
     }
 }
 
@@ -188,12 +190,12 @@ fn check_capacitance_all(t: &Timer<'_, '_>, v: usize) -> (f32, f32, f32, bool, O
     match t.multi {
         None => {
             let sc = timing::Scenes::new(std::slice::from_ref(t.g));
-            timing::check_capacitance(&sc, v, std::slice::from_ref(t.parasitics), t.ideal)
+            timing::check_capacitance(&sc, v, std::slice::from_ref(t.parasitics), t.ideal, t.limits)
         }
         Some(m) => {
             let sc = timing::Scenes::new(m.graphs);
             let Some(&v0) = m.indices[0].get(&t.g.vertices[v].name) else { return (0.0, 0.0, 0.0, false, None) };
-            timing::check_capacitance(&sc, v0, m.parasitics, &m.ideals[0])
+            timing::check_capacitance(&sc, v0, m.parasitics, &m.ideals[0], t.limits)
         }
     }
 }

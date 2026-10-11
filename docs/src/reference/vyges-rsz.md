@@ -62,8 +62,10 @@ REPAIR_TIMING:
   -setup with -max_utilization, more than one repair per pass.
 
 CONSTRAINTS READ FROM SDC:
-  create_clock, set_max_transition and set_max_fanout on the design, set_load on nets and ports,
-  set_input_transition, set_driving_cell; any other timing-affecting command is refused
+  create_clock (-waveform: a rise then a fall within one period), set_max_transition,
+  set_max_fanout and set_max_capacitance on the design, set_load on nets and ports,
+  set_input_transition, set_driving_cell, set_max_delay / set_min_delay (repair_timing only, the
+  forms above); any other timing-affecting command is refused
 
 OPTIONS:
   -o FILE               write the JSON report to FILE instead of stdout

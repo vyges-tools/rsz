@@ -164,7 +164,7 @@ impl Repair<'_, '_> {
                                     let checks = crate::timing::net_drivers(g, u)
                                         .into_iter()
                                         .map(|d| {
-                                            let (cap, max_cap, slack, limited, _) = crate::timing::check_capacitance(&sc, d, parasitics, &ideal);
+                                            let (cap, max_cap, slack, limited, _) = crate::timing::check_capacitance(&sc, d, parasitics, &ideal, self.ctx.limits);
                                             CapCheck { cap, max_cap, slack, limited }
                                         })
                                         .collect();

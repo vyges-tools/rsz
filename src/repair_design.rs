@@ -533,7 +533,7 @@ fn repair_net(design: &mut dyn Design, graphs: Vec<Graph<'_>>, drvr: usize, net:
 
     // Then the capacitance: the pre-check first (an unreasonably small limit is an error).
     let parasitics: Vec<HashMap<String, vyges_sta::graph::NetParasitics>> = (0..graphs.len()).map(|k| design.parasitics(k).clone()).collect();
-    let (cap1, max_cap1, _cap_slack1, has_corner, cap_scene) = timing::check_capacitance(&sc, drvr, &parasitics, clocks);
+    let (cap1, max_cap1, _cap_slack1, has_corner, cap_scene) = timing::check_capacitance(&sc, drvr, &parasitics, clocks, &inputs.limits);
     if max_cap1 > 0.0 && max_cap1 < ctx.min_cap_load {
         return Err(Stop::error("RSZ-0169", format!("Max cap for driver {name} is unreasonably small {max_cap1:e}F. Min buffer or inverter input cap is {:e}F", ctx.min_cap_load)));
     }

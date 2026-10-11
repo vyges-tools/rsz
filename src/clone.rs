@@ -72,26 +72,21 @@ pub fn is_single_output_combinational(cell: &Cell) -> Result<bool, String> {
     Ok(output_ports(cell).len() == 1 && combinational)
 }
 
-/// `Resizer::maxLoad(cell)`: the first output port with a capacitance limit (the library default
-/// is never set), else 0.
-pub fn max_load(cell: &Cell) -> f32 {
-    cell.ports.iter().filter(|p| p.direction == Direction::Output).find_map(|p| p.max_capacitance).unwrap_or(0.0)
-}
 
 /// `closestDriver(cell, candidates, scale)`: none unless the cell is single-output combinational;
 /// the first candidate (not dont_use) whose max load equals `scale` × the cell's, else the closest.
-pub fn closest_driver(cell: &Cell, candidates: &[&Cell], dont_use: &dyn Fn(&str) -> bool, scale: f32) -> Result<Option<String>, String> {
+pub fn closest_driver(cell: &Cell, candidates: &[&Cell], dont_use: &dyn Fn(&str) -> bool, scale: f32, limits: &crate::timing::Limits) -> Result<Option<String>, String> {
     if candidates.is_empty() || !is_single_output_combinational(cell)? {
         return Ok(None);
     }
-    let current = scale * max_load(cell);
+    let current = scale * crate::timing::max_load(cell, limits);
     let mut diff = 1e30f32;
     let mut closest = None;
     for c in candidates {
         if dont_use(&c.name) {
             continue;
         }
-        let limit = max_load(c);
+        let limit = crate::timing::max_load(c, limits);
         if limit == current {
             return Ok(Some(c.name.clone()));
         }
@@ -105,8 +100,8 @@ pub fn closest_driver(cell: &Cell, candidates: &[&Cell], dont_use: &dyn Fn(&str)
 }
 
 /// `chooseCloneCell`: the half-driving cell, else the original.
-pub fn choose_clone_cell(cell: &Cell, candidates: &[&Cell], dont_use: &dyn Fn(&str) -> bool) -> Result<String, String> {
-    Ok(closest_driver(cell, candidates, dont_use, 0.5)?.unwrap_or_else(|| cell.name.clone()))
+pub fn choose_clone_cell(cell: &Cell, candidates: &[&Cell], dont_use: &dyn Fn(&str) -> bool, limits: &crate::timing::Limits) -> Result<String, String> {
+    Ok(closest_driver(cell, candidates, dont_use, 0.5, limits)?.unwrap_or_else(|| cell.name.clone()))
 }
 
 #[cfg(test)]
