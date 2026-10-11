@@ -43,6 +43,7 @@ mod global_sizing;
 mod legacy_mt;
 mod measured_vt_swap;
 mod mt1;
+mod tracked_moves;
 
 pub use global_sizing::GlobalSizingConfig;
 mod recover_power;
@@ -1310,6 +1311,8 @@ struct Repair<'c, 'd> {
     collector_violating: usize,
     /// `MoveTracker`'s capture, with `RSZ move_tracker` at level 1.
     tracker: Option<move_tracker::Initial>,
+    /// What the tracker records at level 2 (`None` below it).
+    moves: Option<move_tracker::Moves>,
     /// The collector's `wns_visited_endpoints_` (it is shared by every phase): a TNS phase skips
     /// what a WNS phase worked on.
     wns_visited: BTreeSet<String>,
@@ -1947,6 +1950,7 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
         max_viol: 0.0,
         collector_violating: 0,
         tracker: None,
+        moves: None,
         wns_visited: BTreeSet::new(),
         collector_ends: Vec::new(),
         collector_starts: Vec::new(),
@@ -1961,8 +1965,17 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
     };
     // `SetupLegacyBase::start`: with the move tracker on, `captureInitialSlackDistribution` (and
     // `captureOriginalEndpointSlack`, read only by the level-2 profiles) after RSZ-0099.
+    // A policy alone with no legacy start captures nothing here (MT1 captures in its own start;
+    // MEASURED_VT_SWAP and GLOBAL_SIZING never do: "No initial slack data captured").
     if r.tracker_level() >= 1 {
-        r.capture_initial_slack_distribution()?;
+        if r.progress_header_printed {
+            r.capture_initial_slack_distribution(true)?;
+        } else {
+            r.tracker = Some(move_tracker::Initial::default());
+            if r.tracker_level() >= 2 {
+                r.moves = Some(move_tracker::Moves::default());
+            }
+        }
     }
     // `prepareForPhasePipeline`: the collector's violating endpoints (the Viol column until a
     // phase collects again) and the endpoints a phase may repair.
@@ -2016,7 +2029,7 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
             "LAST_GASP" => {
                 if !args.skip_last_gasp {
                     r.last_gasp(marker)?;
-                    r.print_tracker_phase_summary("LAST_GASP Phase Endpoint Profiler");
+                    r.print_tracker_phase_summary("LAST_GASP Phase Endpoint Profiler")?;
                 }
             }
             // `SetupCritVtSwapPolicy`: nothing to do when skipped or with one VT category.
@@ -2122,11 +2135,13 @@ impl Repair<'_, '_> {
 
     /// `SetupLegacyPolicy::iterate`.
     fn iterate(&mut self) -> Result<(), Stop> {
+        self.trk_capture_pre_phase_slack()?;
         let violating_ends = self.initialize_main_repair()?;
         if !violating_ends.is_empty() {
             self.run_main_repair_loop(&violating_ends)?;
         }
-        self.print_tracker_phase_summary("LEGACY Phase Endpoint Profiler");
+        // `phaseEndpointProfilerTitle`: SetupReroutePolicy names its own.
+        self.print_tracker_phase_summary(if self.reroute_phase { "REROUTE Phase Endpoint Profiler" } else { "LEGACY Phase Endpoint Profiler" })?;
         Ok(())
     }
 
@@ -2138,8 +2153,9 @@ impl Repair<'_, '_> {
         }
         self.phase = format!("WNS{marker}");
         self.sequence = self.ctx.sequence.to_vec();
+        self.trk_capture_pre_phase_slack()?;
         self.repair_setup_wns()?;
-        self.print_tracker_phase_summary("WNS_PATH Phase Endpoint Profiler");
+        self.print_tracker_phase_summary("WNS_PATH Phase Endpoint Profiler")?;
         Ok(())
     }
 
@@ -2177,6 +2193,7 @@ impl Repair<'_, '_> {
         self.current_endpoint = Some(current.clone());
         pass_limits.insert(current.clone(), INITIAL_DECREASING_SLACK_MAX_PASSES);
         decreasing_counts.insert(current.clone(), 0);
+        self.trk_set_current_endpoint(&current)?;
         loop {
             let (worst_slack, worst) = self.timing.worst();
             let Some(worst_pin) = worst else { break };
@@ -2206,6 +2223,7 @@ impl Repair<'_, '_> {
                 self.current_endpoint = Some(current.clone());
                 self.wns_visited.insert(worst_pin.clone());
                 rejected.clear();
+                self.trk_set_current_endpoint(&worst_pin)?;
                 pass_limits.entry(worst_pin.clone()).or_insert(INITIAL_DECREASING_SLACK_MAX_PASSES);
                 decreasing_counts.entry(worst_pin.clone()).or_insert(0);
             }
@@ -2335,8 +2353,9 @@ impl Repair<'_, '_> {
         }
         self.phase = format!("TNS{marker}");
         self.sequence = self.ctx.sequence.to_vec();
+        self.trk_capture_pre_phase_slack()?;
         self.repair_setup_tns()?;
-        self.print_tracker_phase_summary("TNS Phase Endpoint Profiler");
+        self.print_tracker_phase_summary("TNS Phase Endpoint Profiler")?;
         Ok(())
     }
 
@@ -2377,6 +2396,7 @@ impl Repair<'_, '_> {
             if !fuzzy::less(endpoint_slack, margin) || self.wns_visited.contains(&end) {
                 continue;
             }
+            self.trk_set_current_endpoint(&end)?;
             let line = format!("{phase} Phase: Working on endpoint {end} (index {endpoint_index}), slack = {}", self.ds(endpoint_slack, 3));
             self.debug("repair_setup", 1, line);
             let mut rejected: HashMap<String, Vec<Move>> = HashMap::new();
@@ -2467,10 +2487,11 @@ impl Repair<'_, '_> {
         self.phase = format!("{name}{marker}");
         self.sequence = self.ctx.sequence.to_vec();
         self.startpoint_rows = use_starts;
+        self.trk_capture_pre_phase_slack()?;
         let r = self.repair_setup_directional(use_starts);
         self.startpoint_rows = false;
         r?;
-        self.print_tracker_phase_summary(if use_starts { "STARTPOINT_FANOUT Phase Startpoint Profiler" } else { "ENDPOINT_FANIN Phase Endpoint Profiler" });
+        self.print_tracker_phase_summary(if use_starts { "STARTPOINT_FANOUT Phase Startpoint Profiler" } else { "ENDPOINT_FANIN Phase Endpoint Profiler" })?;
         Ok(())
     }
 
@@ -2522,6 +2543,7 @@ impl Repair<'_, '_> {
             let line = format!("{phase} Phase: Processing {point_type} {point} (index {point_index}), slack = {}", self.ds(point_slack, 3));
             self.debug("repair_setup", 1, line);
             let mut rejected: HashMap<String, Vec<Move>> = HashMap::new();
+            self.trk_set_current_endpoint(point)?;
             let mut pass_count = 0i64;
             let mut prev_point_slack = point_slack;
             for pct in MARGIN_PERCENTAGES {
@@ -2849,6 +2871,8 @@ impl Repair<'_, '_> {
             if seg.stages[index].top_port {
                 continue;
             }
+            let focus_slack = self.target_slack;
+            self.trk_violator(pin, focus_slack, focus_slack)?;
             let rej = rejected.get(pin).cloned().unwrap_or_default();
             if let Some(kind) = self.try_repair_target(seg, index, &mut changed, repairs_per_pass, &rej)? {
                 chosen.push((pin.clone(), kind));
@@ -2885,20 +2909,38 @@ impl Repair<'_, '_> {
         self.report(line);
     }
 
-    /// `MoveCommitter::printTrackerPhaseSummary(title, profiler, true)` at level 1: no move was
-    /// tracked (`printMoveSummary` prints nothing), no endpoint profile collected.
-    fn print_tracker_phase_summary(&mut self, profiler_title: &str) {
-        if self.tracker.is_some() {
-            self.tracker_line(move_tracker::endpoint_summary(profiler_title));
-        }
+    /// `MoveCommitter::printTrackerPhaseSummary("<PHASE> Phase Summary", profiler_title, true)`.
+    fn print_tracker_phase_summary(&mut self, profiler_title: &str) -> Result<(), Stop> {
+        let phase = profiler_title.split(" Phase ").next().unwrap_or_default();
+        self.trk_phase_summary(&format!("{phase} Phase Summary"), Some(profiler_title))
     }
 
     /// `MoveTracker::captureInitialSlackDistribution`: its two lines go to the preamble.
-    fn capture_initial_slack_distribution(&mut self) -> Result<(), Stop> {
+    /// `to_preamble`: the legacy start's capture (spliced after RSZ-0099); else a policy's own
+    /// start (MT1), in the report where it runs.
+    fn capture_initial_slack_distribution(&mut self, to_preamble: bool) -> Result<(), Stop> {
         let view = self.tracker_view()?;
         let initial = move_tracker::capture(&view.pins, &view.ends);
-        self.out.preamble.extend(move_tracker::capture_lines(&initial));
+        if to_preamble {
+            self.out.preamble.extend(move_tracker::capture_lines(&initial));
+        } else {
+            for l in move_tracker::capture_lines(&initial) {
+                self.tracker_line(l);
+            }
+        }
         self.tracker = Some(initial);
+        // `captureOriginalEndpointSlack`, right after: every endpoint's slack (level 2 reads it).
+        if self.tracker_level() >= 2 {
+            // Category 1 of the missed-opportunities report tests each visited pin's own slack
+            // against -1 ms; ours passes the path slack, which no pin slack falls below unless
+            // the design's WNS does. Guarded with half the threshold.
+            if self.timing.worst().0 < -0.5e-3 {
+                return Err(Stop::refused("RSZ-ABSENT", "the move tracker at level 2 with a WNS below -0.5 ms (its Category 1 test reads each pin's own slack): not modelled".into()));
+            }
+            let mut m = move_tracker::Moves::default();
+            m.capture_original_endpoint_slack(&view.ends);
+            self.moves = Some(m);
+        }
         Ok(())
     }
 
@@ -2913,8 +2955,17 @@ impl Repair<'_, '_> {
         let pins: Vec<(f32, f32)> = pins.iter().map(|&(id, s)| (s, view.slacks[&id][0])).collect();
         let ends: Vec<(f32, Option<f32>)> = ends.iter().map(|&(id, s)| (s, Some(view.slacks[&id][1]))).collect();
         let distribution = move_tracker::slack_distribution("Pin Slack Distribution", &pins, pins_destroyed, &ends, ends_destroyed);
-        let (top, critical) = self.tracker_reports()?;
-        for l in move_tracker::final_reports(distribution, &top, &critical) {
+        let visited = self.moves.as_ref().map(|m| m.visited()).unwrap_or_default();
+        let (top, critical, critical_count) = self.tracker_reports(&visited)?;
+        let moves = self.moves.clone().unwrap_or_default();
+        if !moves.names_known() {
+            return Err(Stop::refused("RSZ-ABSENT", "the move tracker's reports name a pin visited with no current endpoint (its name read from the netlist then): not modelled".into()));
+        }
+        let lines = {
+            let ptr = self.trk_pointer();
+            move_tracker::final_reports(distribution, &top, &critical, critical_count, &moves, &ptr).map_err(|e| Stop::refused("RSZ-ABSENT", e))?
+        };
+        for l in lines {
             self.tracker_line(l);
         }
         Ok(())
@@ -2924,11 +2975,11 @@ impl Repair<'_, '_> {
     /// vertex order, then sorted by slack), each with its worst path expanded and its k worst path
     /// ends; and `trackCriticalPins`' pins (a non-clock driver whose RISE slack in ps is below 0)
     /// in Category 2's order — the set's (pin address) order, sorted by slack.
-    fn tracker_reports(&mut self) -> Result<(Vec<move_tracker::TopEnd>, Vec<move_tracker::CriticalPin>), Stop> {
-        if self.ctx.libs.scene_count() > 1 || self.ctx.ssdc.clocks.iter().any(|c| c.propagated) {
+    fn tracker_reports(&mut self, visited: &std::collections::HashSet<u64>) -> Result<(Vec<move_tracker::TopEnd>, Vec<move_tracker::CriticalPin>, usize), Stop> {
+        if self.ctx.libs.scene_count() > 1 || self.ctx.ssdc.clocks.iter().any(|c| c.propagated) || !self.ctx.ssdc.path_delays.is_empty() {
             let ends = collect_violating(&self.timing.ends, 0.0).len();
             if ends > 0 {
-                return Err(Stop::refused("RSZ-ABSENT", "repair_timing: the move tracker's path enumeration over several scenes or a propagated clock is not modelled".into()));
+                return Err(Stop::refused("RSZ-ABSENT", "repair_timing: the move tracker's path enumeration over several scenes, a propagated clock or a path-delay exception is not modelled".into()));
             }
         }
         self.design.update_parasitics().map_err(timer_stop)?;
@@ -2965,6 +3016,11 @@ impl Repair<'_, '_> {
                 let Some(worst) = worst else { continue };
                 // `PathExpanded`: from the start (the clock source, for a register's path).
                 let mut expanded = vyges_sta::path_enum::chain(s, v, worst);
+                // The reference's expansion of a path through an enabled latch starts at the latch
+                // (its Q arrives from the enable); ours follows the D path back.
+                if expanded.iter().any(|n| n.prev.and_then(|(e, _)| edge_arc_set(g, e)).is_some_and(|a| a.role == Role::LatchDtoQ)) {
+                    return Err(Stop::refused("RSZ-ABSENT", format!("the move tracker's endpoint report on a path through a latch D -> Q ({name}): not modelled")));
+                }
                 expanded.reverse();
                 let startpoint = expanded
                     .iter()
@@ -3038,12 +3094,16 @@ impl Repair<'_, '_> {
                 Some(pa) => critical.sort_by_key(|c| pa.addr(c.0)),
                 None => critical.sort_by_key(|c| c.0),
             }
+            // `all_critical_pins_.size()`; Category 2 sorts only the pins never visited (filtered
+            // first, then libc++'s unstable sort — on tied slacks the order depends on both).
+            let critical_count = critical.len();
+            critical.retain(|c| !visited.contains(&c.0));
             crate::order::libcxx_sort_by(&mut critical, |a, b| a.3 < b.3).map_err(|e| Stop::refused("RSZ-ABSENT", format!("the move tracker's critical pin sort over {} pins falls back to heap sort: not modelled", e.len)))?;
             let critical = critical
                 .into_iter()
-                .map(|(_, name, dv, slack)| move_tracker::CriticalPin { cell: cell_of(dv), effort: effort_delays(g, s, dv), fanout: wire_fanout(dv), name, slack })
+                .map(|(id, name, dv, slack)| move_tracker::CriticalPin { id: (id != u64::MAX).then_some(id), cell: cell_of(dv), effort: effort_delays(g, s, dv), fanout: wire_fanout(dv), name, slack })
                 .collect();
-            Ok((top, critical))
+            Ok((top, critical, critical_count))
         })
     }
 
@@ -3183,6 +3243,7 @@ impl Repair<'_, '_> {
             journal_open: false,
         };
         self.refresh_endpoint_slacks(&mut es);
+        self.trk_set_current_endpoint(end)?;
         self.end_index += 1;
         if self.end_index > self.max_end_count {
             return Ok(None);
@@ -3295,8 +3356,10 @@ impl Repair<'_, '_> {
                 self.debug("repair_setup", 3, format!("{phase} Phase: Allowing decreasing slack for {}/{DECREASING_SLACK_MAX_PASSES} passes", es.decreasing_slack_passes));
             }
             // overMaxArea: -max_utilization is refused, so never.
+            // `useWorstEndpoint` and `setCurrentEndpoint` on the worst endpoint.
             if self.end_index == 1 {
                 if let Some(w) = es.worst_vertex.clone() {
+                    self.trk_set_current_endpoint(&w)?;
                     es.end = w;
                 }
             }
@@ -3314,6 +3377,7 @@ impl Repair<'_, '_> {
     /// SwapPins; the violating endpoints again; per endpoint up to 10 passes, a pass kept only
     /// when WNS and TNS both hold (fuzzily), else the journal restored.
     fn last_gasp(&mut self, marker: char) -> Result<(), Stop> {
+        self.trk_capture_pre_phase_slack()?;
         self.phase = format!("LAST_GASP{marker}");
         let phase = self.phase.clone();
         // initializeLastGaspRepair.
@@ -3369,6 +3433,7 @@ impl Repair<'_, '_> {
                 journal_open: false,
             };
             self.refresh_endpoint_slacks(&mut es);
+            self.trk_set_current_endpoint(&end.pin)?;
             self.end_index += 1;
             if self.end_index > self.max_end_count {
                 self.debug("repair_setup", 1, format!("{phase} Phase: Hit maximum endpoint repairs of {}", self.max_end_count));
@@ -3470,8 +3535,10 @@ impl Repair<'_, '_> {
                 break;
             }
             self.save_improved_checkpoint(es)?;
+            // `useWorstEndpoint` and `setCurrentEndpoint` on the worst endpoint.
             if self.end_index == 1 {
                 if let Some(w) = es.worst_vertex.clone() {
+                    self.trk_set_current_endpoint(&w)?;
                     es.end = w;
                 }
             }
@@ -3631,6 +3698,7 @@ impl Repair<'_, '_> {
             self.debug("reroute_move", 2, line);
             return Ok(None);
         }
+        self.trk_attempt(&pin, Move::Reroute)?;
         self.design.reroute_net(&net).map_err(|e| Stop::refused("RSZ-GR", e))?;
         self.debug("reroute_move", 1, format!("ACCEPT RerouteMove {pin}: Rerouted net {net} (resistance {resistance} -> {estimated} estimated)"));
         Ok(Some(MoveResult { kind: Move::Reroute, count: 1, insts: vec![inst] }))
@@ -3639,6 +3707,8 @@ impl Repair<'_, '_> {
     /// `tryRepairPathTarget` → `logRepairTarget`, then `tryRepairTarget`: each generator of the
     /// move sequence in order, until one's candidate is committed (`tryCandidateSequence`).
     fn try_repair_path_target(&mut self, view: &PathView, index: usize, changed: &mut i64, repairs_per_pass: i64) -> Result<bool, Stop> {
+        let slack = self.target_slack;
+        self.trk_violator(&view.stages[index].pin, slack, slack)?;
         Ok(self.try_repair_target(view, index, changed, repairs_per_pass, &[])?.is_some())
     }
 
@@ -3771,6 +3841,7 @@ impl Repair<'_, '_> {
         let clone_cell = clone::choose_clone_cell(cell, &cands, &dont_use).map_err(|e| Stop::refused("RSZ-ABSENT", e))?;
         let d = self.design.as_design();
         let loc = clone::compute_clone_location(d.pin_location(&st.pin), &fanouts, &|p| d.pin_location(p));
+        self.trk_attempt(&st.pin, Move::Clone)?;
         let clone_inst = self.design.clone_instance(inst, &clone_cell, loc, &moved).map_err(|e| Stop::error("RSZ-CLONE", e))?;
         self.debug("clone_move", 1, format!("ACCEPT CloneMove {}: ({cell_name}) -> {clone_inst} ({clone_cell})", st.pin));
         Ok(Some(MoveResult { kind: Move::Clone, count: 1, insts: vec![clone_inst, inst.clone()] }))
@@ -3806,6 +3877,8 @@ impl Repair<'_, '_> {
         let Some(net) = d.netlist().nets.iter().find(|n| n.pins.iter().any(|c| d.netlist().pin_name(c) == st.pin)).map(|n| n.name.clone()) else { return Ok(None) };
         let loc = d.pin_location(&st.pin);
         let cell = self.ctx.lowest_buffer.to_string();
+        // A candidate (its estimate always legal): the attempt, before its apply.
+        self.trk_attempt(&st.pin, Move::SplitLoad)?;
         let rep = match self.design.insert_buffer_before_loads(Some(&net), &loads, &cell, loc, "split", false, "IF_NEEDED") {
             Ok(r) => r,
             Err(_) => {
@@ -3827,6 +3900,8 @@ impl Repair<'_, '_> {
     /// anything.
     fn buffer_move(&mut self, view: &PathView, index: usize) -> Result<Option<MoveResult>, Stop> {
         let st = &view.stages[index];
+        // BufferGenerator always makes its candidate: the attempt, before its apply.
+        self.trk_attempt(&st.pin, Move::Buffer)?;
         let count = match st.rebuffer.clone() {
             None | Some(RebufProbe::Skip) => 0,
             Some(RebufProbe::Warn(w)) => {
@@ -3963,6 +4038,8 @@ impl Repair<'_, '_> {
             return Ok(None);
         }
         let to = prev_cell.name.clone();
+        // The candidate: the attempt, before its apply (the max-capacitance check is the apply's).
+        self.trk_attempt(&st.pin, Move::SizeUpMatch)?;
         if !replacement_preserves_max_cap(self.ctx.libs, &cell, &to, &st.fanin_caps) {
             self.debug("size_up_match_move", 2, format!("REJECT SizeUpMatchMove {}: Couldn't replace {cell} -> {to}", st.pin));
             return Ok(None);
@@ -3993,6 +4070,8 @@ impl Repair<'_, '_> {
         }
         let equiv = self.ctx.sizing.vt_equiv_cells(cell, self.ctx.vt_category_count);
         let Some(best) = equiv.last().filter(|b| *b != cell).cloned() else { return Ok(None) };
+        // The candidate: the attempt, before its apply (the max-capacitance guard is the apply's).
+        self.trk_attempt(&st.pin, Move::VtSwap)?;
         if !replacement_preserves_max_cap(self.ctx.libs, cell, &best, &st.fanin_caps) {
             self.debug("vt_swap_move", 2, format!("REJECT VTSwapMove {}: {cell} -> {best} violates max capacitance", st.pin));
             return Ok(None);
@@ -4006,6 +4085,7 @@ impl Repair<'_, '_> {
     fn size_up_move(&mut self, view: &PathView, index: usize) -> Result<Option<MoveResult>, Stop> {
         let st = &view.stages[index];
         let Some(m) = size_up(self.ctx, self.design.as_design(), view, index)? else { return Ok(None) };
+        self.trk_attempt(&st.pin, Move::SizeUp)?;
         self.design.swap_master(&m.inst, &m.to).map_err(|e| Stop::error("RSZ-REPLACE", e))?;
         self.debug("size_up_move", 1, format!("ACCEPT SizeUpMove {}: {} -> {}", st.pin, m.from, m.to));
         Ok(Some(MoveResult { kind: Move::SizeUp, count: 1, insts: vec![m.inst] }))
@@ -4121,6 +4201,7 @@ impl Repair<'_, '_> {
         }
         // `tryCandidateSequence`: the first candidate (every estimate is legal).
         let (f, to) = candidates.swap_remove(0);
+        self.trk_attempt(&st.pin, Move::SizeDownFanout)?;
         let inst = f.inst.clone().expect("a load instance");
         let from = f.cell.clone().expect("a load cell");
         self.design.swap_master(&inst, &to).map_err(|e| Stop::error("RSZ-REPLACE", e))?;
@@ -4286,7 +4367,8 @@ impl Repair<'_, '_> {
             self.debug("unbuffer_move", 4, format!("buffer {} is not removed because canRemoveBuffer rejected it", network_name(&r.inst, self.ctx.hierarchy)));
             return Ok(None);
         }
-        // removeBuffer.
+        // UnbufferCandidate::apply → removeBuffer.
+        self.trk_attempt(&st.pin, Move::Unbuffer)?;
         self.debug("repair_setup", 3, format!("remove_buffer {} ({})", r.inst, r.cell));
         // `name(net)` of each side, as the nets stand before the removal.
         let (in_name, out_name) = (self.net_display_name(&r.inst, &r.in_port), self.net_display_name(&r.inst, &r.out_port));
@@ -4349,6 +4431,7 @@ impl Repair<'_, '_> {
         if current_delay - swap_delay <= 0.0 {
             return Ok(None);
         }
+        self.trk_attempt(&st.pin, Move::SwapPins)?;
         self.debug("swap_pins_move", 1, format!("ACCEPT SwapPinsMove {}: Cell {cell_name}, pins {input_port} <-> {swap_port}", st.pin));
         match self.design.swap_pins(inst, input_port, &swap_port).map_err(|e| Stop::error("RSZ-SWAP", e))? {
             PinSwap::DontTouch(net) => {
@@ -4370,6 +4453,9 @@ impl Repair<'_, '_> {
     fn begin_journal(&mut self) -> Result<(), Stop> {
         self.design.begin_journal().map_err(|e| Stop::error("RSZ-JOURNAL", e))?;
         self.committer.levels.push(Vec::new());
+        if let Some(m) = self.moves.as_mut() {
+            m.begin_journal();
+        }
         Ok(())
     }
 
@@ -4379,9 +4465,19 @@ impl Repair<'_, '_> {
     fn commit_journal(&mut self) -> Result<(), Stop> {
         let Some(top) = self.committer.levels.pop() else { return Ok(()) };
         self.design.commit_journal().map_err(|e| Stop::error("RSZ-JOURNAL", e))?;
+        // The tracker mirrors it: an outermost commit finalizes the level's moves.
+        if let Some(m) = self.moves.as_mut() {
+            m.commit_journal();
+        }
         match self.committer.levels.last_mut() {
             Some(parent) => parent.extend(top),
-            None => self.committer.accept_pending(),
+            None => {
+                // acceptPendingMoves → commitTrackedMoves.
+                self.committer.accept_pending();
+                if let Some(m) = self.moves.as_mut() {
+                    m.commit_moves();
+                }
+            }
         }
         Ok(())
     }
@@ -4391,11 +4487,21 @@ impl Repair<'_, '_> {
     fn restore_journal(&mut self, want: &[String]) -> Result<(), Stop> {
         let Some(top) = self.committer.levels.pop() else { return Ok(()) };
         let had_changes = self.design.restore_journal().map_err(|e| Stop::error("RSZ-JOURNAL", e))?;
+        // The tracker mirrors it: the level's moves rejected.
+        if let Some(m) = self.moves.as_mut() {
+            m.restore_journal();
+        }
         for (r, ids) in &top {
             self.committer.unrecord(r, ids);
         }
         if had_changes {
             self.retime(want)?;
+        }
+        // The outermost restore: rejectTrackedMoves.
+        if self.committer.levels.is_empty() {
+            if let Some(m) = self.moves.as_mut() {
+                m.reject_moves();
+            }
         }
         Ok(())
     }

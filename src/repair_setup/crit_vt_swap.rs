@@ -55,10 +55,11 @@ impl Repair<'_, '_> {
         if self.args.skip_crit_vt_swap || self.args.skip_vt_swap || self.ctx.vt_category_count < 2 {
             return Ok(());
         }
+        self.trk_capture_pre_phase_slack()?;
         if self.swap_vt_crit_cells()? {
             self.retime(&[])?;
         }
-        Ok(())
+        self.trk_phase_summary("VT Swap Phase Summary", None)
     }
 
     /// `swapVTCritCells`: the critical instances of the worst violating endpoints' fanin cones,
@@ -76,6 +77,12 @@ impl Repair<'_, '_> {
         for c in &crit {
             if check_and_mark_vt_swappable(self.ctx, &dont_touch, &c.inst, &c.cell, &mut not_swappable).is_none() {
                 continue;
+            }
+            // Level 2 tracks each swap against its output pin as the current endpoint, and the
+            // batch's moves are finalized against the LAST one — the order of an
+            // `unordered_map<Instance*>`, a heap order no capture records.
+            if self.moves.is_some() {
+                return Err(Stop::refused("RSZ-ABSENT", "the move tracker at level 2 over a CRIT_VT_SWAP batch (its moves credited to the last instance of a heap-ordered map): not modelled".into()));
             }
             if !replacement_preserves_max_cap(self.ctx.libs, &c.cell, &c.best, &c.fanin_caps) {
                 self.debug("vt_swap_move", 2, format!("REJECT VTSwapMove {}: {} -> {} violates max capacitance", c.inst, c.cell, c.best));

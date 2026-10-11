@@ -79,7 +79,7 @@ impl Repair<'_, '_> {
     /// `Optimizer::run` for the phase: `start()`, then `iterate()` until converged.
     pub(super) fn mt1_policy(&mut self) -> Result<(), Stop> {
         let mut p = Mt1::default();
-        self.mt1_start(&mut p);
+        self.mt1_start(&mut p)?;
         while !p.converged {
             self.mt1_iterate(&mut p)?;
         }
@@ -87,9 +87,14 @@ impl Repair<'_, '_> {
     }
 
     /// `SetupMt1Policy::start`: the base's start (RSZ-2024, the tunables), the move sequence.
-    fn mt1_start(&mut self, p: &mut Mt1) {
+    fn mt1_start(&mut self, p: &mut Mt1) -> Result<(), Stop> {
         self.report("[WARNING RSZ-2024] Experimental repair setup policy 'SetupMt1Policy' selected. Do not use this for production.".to_string());
         p.vt_swap = !self.args.skip_vt_swap && self.ctx.vt_category_count > 1;
+        // `captureInitialSlackDistribution` + `captureOriginalEndpointSlack`, with the tracker on.
+        if self.tracker_level() >= 1 {
+            self.capture_initial_slack_distribution(false)?;
+        }
+        Ok(())
     }
 
     /// `SetupMt1Policy::iterate`.
@@ -101,6 +106,7 @@ impl Repair<'_, '_> {
             p.converged = true;
             return Ok(());
         }
+        self.trk_capture_pre_phase_slack()?;
         let tns_before = self.timing.tns();
         self.mt1_trace(format!("iter|{}|{}", p.iteration_index, c_hex(f64::from(tns_before))));
         // `collectWorstEndpointTargets`, then `prepareTargets` (one timer read: the stages'
@@ -112,8 +118,17 @@ impl Repair<'_, '_> {
             return Ok(());
         }
         let evaluations = self.mt1_generate_and_estimate_targets(p, &targets);
+        // `trackPreparedTargets`: each prepared target visited, its endpoint current.
+        for t in targets.iter().filter(|t| t.arc_delay.is_some()) {
+            if !t.endpoint.is_empty() {
+                self.trk_set_current_endpoint(&t.endpoint)?;
+            }
+            self.trk_violator(&t.pin, t.slack, t.slack)?;
+        }
         self.mt1_commit_and_update_timing(p, &targets, &evaluations)?;
         let tns_after = self.timing.tns();
+        // `printTrackerIterationSummary`.
+        self.trk_phase_summary("MT1 Iteration Summary", Some("MT1 Iteration Endpoint Profiler"))?;
         self.mt1_trace(format!("iterend|{}|{}", p.committed_moves, c_hex(f64::from(tns_after))));
         // `finishIfStopConditionReached`.
         let max_moves = self.ctx.policy.max_committed_moves;
@@ -388,15 +403,28 @@ impl Repair<'_, '_> {
     /// against the pass's stale snapshot — no re-check rejects in the witnesses), the pending moves
     /// accepted, RSZ-2023.
     fn mt1_commit_best_candidate(&mut self, p: &mut Mt1, t: &Mt1Target, c: &Candidate) -> Result<bool, Stop> {
+        // `trackMoveAttempt(candidate, pin, endpoint)`: the endpoint current, the attempt.
+        if !t.endpoint.is_empty() {
+            self.trk_set_current_endpoint(&t.endpoint)?;
+        }
+        self.trk_attempt(&t.pin, c.kind)?;
         if c.kind == Move::SizeUp && !replacement_preserves_max_cap(self.ctx.libs, &t.cell, &c.cell, &t.fanin_caps) {
             self.debug("opt_moves", 1, format!("REJECT size_up_mt1 {}: {} -> {} max-cap re-check failed", t.pin, t.cell, c.cell));
+            // rejectTrackedMoves.
+            if let Some(m) = self.moves.as_mut() {
+                m.reject_moves();
+            }
             return Ok(false);
         }
         self.design.swap_master(&t.inst, &c.cell).map_err(|e| Stop::error("RSZ-REPLACE", e))?;
         let tag = if c.kind == Move::VtSwap { "vt_swap_mt1" } else { "size_up_mt1" };
         self.debug("opt_moves", 1, format!("ACCEPT {tag} {}: {} -> {}", t.pin, t.cell, c.cell));
         self.commit(MoveResult { kind: c.kind, count: 1, insts: vec![t.inst.clone()] });
+        // acceptPendingMoves → commitTrackedMoves.
         self.committer.accept_pending();
+        if let Some(m) = self.moves.as_mut() {
+            m.commit_moves();
+        }
         p.committed_moves += 1;
         self.report(format!("[INFO RSZ-2023] SetupMt1Policy committed {} / {} moves.", p.committed_moves, self.ctx.policy.max_committed_moves));
         Ok(true)

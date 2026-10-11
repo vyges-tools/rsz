@@ -19,6 +19,8 @@
 //! Not modelled (refused by the caller): level 2 and above (the moves tracked), and the reports
 //! over violating endpoints left at the end, which enumerate each endpoint's k worst paths.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
+
 /// The debug group.
 pub const GROUP: &str = "move_tracker";
 
@@ -422,6 +424,8 @@ pub fn critical_endpoint_path_histogram(title: &str, ends: &[TopEnd]) -> Vec<Str
 /// One critical pin never visited, as Category 2 prints it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CriticalPin {
+    /// The odb terminal id (`None`: not a terminal on a net).
+    pub id: Option<u64>,
     pub name: String,
     pub cell: Option<String>,
     /// RISE slack over every scene (s).
@@ -466,20 +470,529 @@ pub fn missed_opportunities(title: &str, critical: &[CriticalPin]) -> Vec<String
     out
 }
 
-/// `MoveCommitter::printTrackerFinalReports` at level 1: `distribution` is
-/// [`slack_distribution`]'s lines; `ends` the violating endpoints sorted; `critical` the critical
-/// pins in the report's order. No move event at level 1: the success and failure reports are
-/// empty.
-pub fn final_reports(distribution: Vec<String>, ends: &[TopEnd], critical: &[CriticalPin]) -> Vec<String> {
+/// `MoveCommitter::printTrackerFinalReports`: `distribution` is [`slack_distribution`]'s lines;
+/// `ends` the violating endpoints sorted; `critical` the critical pins never visited, in the
+/// report's order, of `critical_count`;
+/// `moves` what level 2 tracked (empty at level 1: the success and failure reports print their
+/// empty branches, nothing was visited).
+pub fn final_reports(distribution: Vec<String>, ends: &[TopEnd], critical: &[CriticalPin], critical_count: usize, moves: &Moves, ptr: &dyn Fn(u64) -> Option<u64>) -> Result<Vec<String>, String> {
     let mut out = vec!["[INFO RSZ-0211] ".to_string(), "[INFO RSZ-0212] === Optimization Analysis Reports ===".to_string()];
     out.extend(distribution);
     out.extend(top_bin_endpoints("Most Critical Endpoints After Optimization", ends));
     out.extend(critical_endpoint_path_histogram("Critical Endpoint Path Distribution", ends));
-    out.push(debug("Successful Optimizations Report: No successful optimizations"));
-    out.push(debug("Unsuccessful Optimizations Report: No rejected optimizations"));
-    out.extend(missed_opportunities("Missed Opportunities Report", critical));
+    out.extend(moves.print_events_report("Successful Optimizations Report", State::Commit, ptr)?);
+    out.extend(moves.print_events_report("Unsuccessful Optimizations Report", State::Reject, ptr)?);
+    out.extend(moves.print_missed_opportunities_report("Missed Opportunities Report", critical, critical_count)?);
     out.push("[INFO RSZ-0213] ".to_string());
-    out
+    Ok(out)
+}
+
+/// `MoveStateType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    Attempt = 0,
+    Reject = 1,
+    Commit = 2,
+}
+
+/// A pin's identity as the tracker keys it: the reference keys by `const Pin*` — the odb
+/// terminal's address — so a slot reused after an undo is the same pin. Ours is the odb terminal
+/// id (`NetInfo::pin_id`, a slot), which names the same thing.
+pub type PinKey = u64;
+
+/// `const Pin*` as dbNetwork makes it: the terminal's address with its kind in the low bits (an
+/// instance terminal 1, a block terminal 2) — what a `map<const Pin*>` orders by.
+pub fn pin_pointer(addr: impl Fn(u64) -> Option<u64>, id: PinKey) -> Option<u64> {
+    addr(id).map(|a| a | if id & 1 == 1 { 2 } else { 1 })
+}
+
+/// `MoveTracker`'s level-2 state (`set_debug_level RSZ move_tracker 2`): the pins visited, the
+/// moves attempted, each move's fate as its journal decided it, and the per-endpoint profile.
+/// The reference's `map<const Pin*>` / `set<const Pin*>` orders are replayed at print time from
+/// the pins' addresses (`ptr`).
+#[derive(Debug, Clone, Default)]
+pub struct Moves {
+    current_endpoint: Option<PinKey>,
+    move_count: i64,
+    /// `visit_count_` (only its size and membership are read).
+    visit_count: HashMap<PinKey, i64>,
+    /// `moves_`: this pass's finalized moves, in finalize order.
+    moves: Vec<(PinKey, &'static str, State)>,
+    /// `pending_moves_` (outside any journal) and `pending_move_levels_` (one per open journal).
+    pending: Vec<(PinKey, &'static str)>,
+    levels: Vec<Vec<(PinKey, &'static str)>>,
+    total_move_count: i64,
+    total_no_attempt: i64,
+    total_attempt: i64,
+    total_reject: i64,
+    total_commit: i64,
+    /// `total_move_type_counts_`: `map<string, ...>`, so in byte order.
+    total_type_counts: BTreeMap<&'static str, [i64; 3]>,
+    /// `endpoint_move_counts_`: attempts, rejects, commits.
+    endpoint_move_counts: HashMap<PinKey, [i64; 3]>,
+    /// `endpoint_slack_`: original, pre-phase, post-phase slack (s).
+    endpoint_slack: HashMap<PinKey, [f32; 3]>,
+    /// `pin_move_events_`.
+    pin_move_events: HashMap<PinKey, Vec<(&'static str, State)>>,
+    /// `all_visited_pins_`.
+    all_visited: HashSet<PinKey>,
+    /// `pin_info_`: the name as the pin was visited (`pinPathName` reads it), and its pin and
+    /// endpoint slacks (s) — Category 1's test.
+    info: HashMap<PinKey, (String, f32, f32)>,
+}
+
+/// One row of a report keyed by pin: the pins in `map<const Pin*>` order.
+fn by_pointer<T>(entries: impl Iterator<Item = (PinKey, T)>, ptr: &dyn Fn(u64) -> Option<u64>) -> Result<Vec<(PinKey, T)>, String> {
+    let mut v: Vec<(u64, PinKey, T)> = Vec::new();
+    for (k, t) in entries {
+        v.push((ptr(k).ok_or_else(|| format!("the move tracker's map over pins needs pin {k}'s address, which the capture lacks: not modelled"))?, k, t));
+    }
+    v.sort_by_key(|e| e.0);
+    Ok(v.into_iter().map(|(_, k, t)| (k, t)).collect())
+}
+
+/// `std::ostringstream << std::right << setw(6) << n << " " << setw(5) << fixed << setprecision(1)
+/// << pct << "%"`.
+fn count_pct(n: i64, pct: f32) -> String {
+    format!("{n:>6} {:>5.1}%", f64::from(pct))
+}
+
+/// `(float) a / b * 100` (0 when `b` is 0).
+fn rate(a: i64, b: i64) -> f32 {
+    if b > 0 { a as f32 / b as f32 * 100.0 } else { 0.0 }
+}
+
+impl Moves {
+    /// `setCurrentEndpoint`: a pin not yet in `endpoint_slack_` enters with its slack now
+    /// (`slack`, `Sta::slack(pinLoadVertex, max)`) in all three places.
+    pub fn set_current_endpoint(&mut self, pin: PinKey, slack: Option<f32>) {
+        self.current_endpoint = Some(pin);
+        if let (false, Some(s)) = (self.endpoint_slack.contains_key(&pin), slack) {
+            self.endpoint_slack.insert(pin, [s; 3]);
+        }
+    }
+
+    /// Whether `setCurrentEndpoint(pin)` would add an entry (the caller reads its slack then).
+    pub fn knows_endpoint(&self, pin: PinKey) -> bool {
+        self.endpoint_slack.contains_key(&pin)
+    }
+
+    /// `trackViolatorWithInfo`: visited; with a current endpoint, its info replaced.
+    pub fn track_violator_with_info(&mut self, pin: PinKey, name: &str, pin_slack: f32, endpoint_slack: f32) {
+        *self.visit_count.entry(pin).or_default() += 1;
+        self.all_visited.insert(pin);
+        if self.current_endpoint.is_some() {
+            self.info.insert(pin, (name.to_string(), pin_slack, endpoint_slack));
+        }
+    }
+
+    /// `trackMove(pin, type, ATTEMPT)`: into the innermost open journal's level, else the flat
+    /// bucket.
+    pub fn track_move(&mut self, pin: PinKey, move_type: &'static str) {
+        match self.levels.last_mut() {
+            Some(level) => level.push((pin, move_type)),
+            None => self.pending.push((pin, move_type)),
+        }
+    }
+
+    /// `finalizeMoves`: each move logged with its fate; the current endpoint's counts.
+    fn finalize_moves(&mut self, level: Vec<(PinKey, &'static str)>, state: State) {
+        for &(pin, t) in &level {
+            self.moves.push((pin, t, state));
+            self.move_count += 1;
+            self.pin_move_events.entry(pin).or_default().push((t, state));
+        }
+        if let (Some(end), false) = (self.current_endpoint, level.is_empty()) {
+            let c = self.endpoint_move_counts.entry(end).or_default();
+            c[0] += level.len() as i64;
+            c[if state == State::Commit { 2 } else { 1 }] += level.len() as i64;
+        }
+    }
+
+    /// `commitMoves` / `rejectMoves`: the flat bucket.
+    pub fn commit_moves(&mut self) {
+        let level = std::mem::take(&mut self.pending);
+        self.finalize_moves(level, State::Commit);
+    }
+
+    pub fn reject_moves(&mut self) {
+        let level = std::mem::take(&mut self.pending);
+        self.finalize_moves(level, State::Reject);
+    }
+
+    /// `beginJournal` / `commitJournal` (outermost: committed; nested: into the parent) /
+    /// `restoreJournal` (rejected).
+    pub fn begin_journal(&mut self) {
+        self.levels.push(Vec::new());
+    }
+
+    pub fn commit_journal(&mut self) {
+        let Some(level) = self.levels.pop() else { return };
+        match self.levels.last_mut() {
+            Some(parent) => parent.extend(level),
+            None => self.finalize_moves(level, State::Commit),
+        }
+    }
+
+    pub fn restore_journal(&mut self) {
+        if let Some(level) = self.levels.pop() {
+            self.finalize_moves(level, State::Reject);
+        }
+    }
+
+    /// `clear`: the pass's state; what the final reports read survives.
+    pub fn clear(&mut self) {
+        self.move_count = 0;
+        self.visit_count.clear();
+        self.moves.clear();
+        self.pending.clear();
+        self.levels.clear();
+        self.current_endpoint = None;
+    }
+
+    /// `captureOriginalEndpointSlack`: every endpoint (id, slack).
+    pub fn capture_original_endpoint_slack(&mut self, ends: &[(PinKey, f32)]) {
+        for &(id, s) in ends {
+            match self.endpoint_slack.get_mut(&id) {
+                Some(e) => e[0] = s,
+                None => {
+                    self.endpoint_slack.insert(id, [s; 3]);
+                }
+            }
+        }
+    }
+
+    /// The pins `capturePrePhaseSlack` and `printEndpointSummary` read the slack of.
+    pub fn endpoint_slack_pins(&self) -> Vec<PinKey> {
+        self.endpoint_slack.keys().copied().collect()
+    }
+
+    /// `capturePrePhaseSlack`: `slack(pin)` now, for each entry with a load vertex.
+    pub fn capture_pre_phase_slack(&mut self, slack: &dyn Fn(PinKey) -> Option<f32>) {
+        for (&pin, e) in self.endpoint_slack.iter_mut() {
+            if let Some(s) = slack(pin) {
+                e[1] = s;
+            }
+        }
+    }
+
+    /// Whether `printEndpointSummary` reads the timer (it profiles some endpoint).
+    pub fn has_endpoint_profile(&self) -> bool {
+        !self.endpoint_move_counts.is_empty()
+    }
+
+    /// `printMoveSummary`: nothing when no move was finalized this pass; else the pass's and the
+    /// cumulative rates by move type, then the pass's summary cleared.
+    pub fn print_move_summary(&mut self, title: &str) -> Vec<String> {
+        if self.moves.is_empty() {
+            return Vec::new();
+        }
+        let mut counts: BTreeMap<&'static str, [i64; 3]> = BTreeMap::new();
+        let (mut attempted, mut rejected, mut committed) = (0i64, 0i64, 0i64);
+        let mut attempted_pins: HashSet<PinKey> = HashSet::new();
+        for &(pin, t, state) in &self.moves {
+            attempted += 1;
+            attempted_pins.insert(pin);
+            counts.entry(t).or_default()[0] += 1;
+            self.total_type_counts.entry(t).or_default()[0] += 1;
+            match state {
+                State::Reject => {
+                    rejected += 1;
+                    counts.entry(t).or_default()[1] += 1;
+                    self.total_type_counts.entry(t).or_default()[1] += 1;
+                }
+                State::Commit => {
+                    committed += 1;
+                    counts.entry(t).or_default()[2] += 1;
+                    self.total_type_counts.entry(t).or_default()[2] += 1;
+                }
+                State::Attempt => {}
+            }
+        }
+        let no_attempt = self.visit_count.keys().filter(|p| !attempted_pins.contains(p)).count() as i64;
+        let n = self.moves.len() as i64;
+        let mut out = vec![
+            debug(&format!("{title}:")),
+            debug(&format!("Current Summary: Not Attempted: {no_attempt} Attempts: {attempted} Rejects: {rejected} Commits: {committed} ")),
+            debug(&format!(
+                "Overall attempt_rate: {:.2}% ({attempted}) reject_rate: {:.2}% ({rejected}) commit_rate: {:.2}% ({committed})",
+                f64::from(rate(attempted, n)),
+                f64::from(rate(rejected, n)),
+                f64::from(rate(committed, n))
+            )),
+        ];
+        self.total_no_attempt += no_attempt;
+        self.total_attempt += attempted;
+        self.total_reject += rejected;
+        self.total_commit += committed;
+        self.total_move_count += self.move_count;
+        // The per-type counts are floats, printed with `{}` (an integral float prints bare).
+        let type_line = |t: &str, c: &[i64; 3], of: i64| {
+            debug(&format!(
+                "{t} attempt_rate: {:.2}% ({}) reject_rate: {:.2}% ({})  commit_rate: {:.2}% ({})",
+                f64::from(rate(c[0], of)),
+                c[0],
+                f64::from(rate(c[1], of)),
+                c[1],
+                f64::from(rate(c[2], of)),
+                c[2]
+            ))
+        };
+        for (t, c) in &counts {
+            out.push(type_line(t, c, n));
+        }
+        out.push(debug("Total statistics:"));
+        out.push(debug(&format!(
+            "Total Summary: Not Attempted: {} Attempts: {} Rejects: {} Commits: {} ",
+            self.total_no_attempt, self.total_attempt, self.total_reject, self.total_commit
+        )));
+        let tm = self.total_move_count;
+        out.push(debug(&format!(
+            "Overall attempt_rate: {:.2}% ({}) reject_rate: {:.2}% ({}) commit_rate: {:.2}% ({})",
+            f64::from(rate(self.total_attempt, tm)),
+            self.total_attempt,
+            f64::from(rate(self.total_reject, tm)),
+            self.total_reject,
+            f64::from(rate(self.total_commit, tm)),
+            self.total_commit
+        )));
+        for (t, c) in &self.total_type_counts {
+            out.push(type_line(t, c, tm));
+        }
+        // clearMoveSummary.
+        self.move_count = 0;
+        self.moves.clear();
+        self.visit_count.clear();
+        out
+    }
+
+    /// `printEndpointSummary`: `slack(pin)` the post-phase slack now; the profiled endpoints in
+    /// map order, sorted by it (libc++'s `std::sort`), the first 20 (1000 in a TNS phase).
+    pub fn print_endpoint_summary(&mut self, title: &str, slack: &dyn Fn(PinKey) -> Option<f32>, ptr: &dyn Fn(u64) -> Option<u64>, names: &dyn Fn(PinKey) -> String) -> Result<Vec<String>, String> {
+        if self.endpoint_move_counts.is_empty() {
+            return Ok(vec![endpoint_summary(title)]);
+        }
+        for (&pin, e) in self.endpoint_slack.iter_mut() {
+            if let Some(s) = slack(pin) {
+                e[2] = s;
+            }
+        }
+        let is_tns = title.contains("TNS");
+        let mut stats = by_pointer(self.endpoint_move_counts.iter().map(|(&k, &c)| (k, c)), ptr)?;
+        let all = stats.iter().fold([0i64; 3], |a, (_, c)| [a[0] + c[0], a[1] + c[1], a[2] + c[2]]);
+        let es = &self.endpoint_slack;
+        crate::order::libcxx_sort_by(&mut stats, |a, b| match (es.get(&a.0), es.get(&b.0)) {
+            (None, _) => false,
+            (_, None) => true,
+            (Some(x), Some(y)) => x[2] < y[2],
+        })
+        .map_err(|e| format!("the move tracker's endpoint profile sort over {} endpoints falls back to heap sort: not modelled", e.len))?;
+        let mut out = vec![
+            debug(&format!("{title}:")),
+            debug("Per-Endpoint Optimization Effort (sorted by WNS):"),
+            debug(&format!(
+                "{:<40} | {:>13} | {:>13} | {:>13} | {:>6} | {:>11} | {:>11} | {:>11} | {:>11}",
+                "Endpoint", "Attempts", "Rejects", "Commits", "Commit%", "OrigSlk(ns)", "PreSlk(ns)", "PostSlk(ns)", "Delta(ns)"
+            )),
+        ];
+        let max_print = if is_tns { 1000 } else { 20 };
+        let mut shown = [0i64; 3];
+        let (mut worst_orig, mut worst_pre, mut worst_post) = (crate::timing::INF, crate::timing::INF, crate::timing::INF);
+        let (mut tns_orig, mut tns_pre, mut tns_post) = (0.0f32, 0.0f32, 0.0f32);
+        for (pin, c) in stats.iter().take(max_print) {
+            for k in 0..3 {
+                shown[k] += c[k];
+            }
+            let [orig, pre, post] = match self.endpoint_slack.get(pin) {
+                Some(&s) => {
+                    worst_orig = std_min(s[0], worst_orig);
+                    worst_pre = std_min(s[1], worst_pre);
+                    worst_post = std_min(s[2], worst_post);
+                    if s[0] < 0.0 {
+                        tns_orig += s[0];
+                    }
+                    if s[1] < 0.0 {
+                        tns_pre += s[1];
+                    }
+                    if s[2] < 0.0 {
+                        tns_post += s[2];
+                    }
+                    s
+                }
+                None => [0.0; 3],
+            };
+            let (o, p, q) = (ns(orig), ns(pre), ns(post));
+            out.push(debug(&format!(
+                "{:<40} | {:>13} | {:>13} | {:>13} | {:>5.1}% | {:>11.3} | {:>11.3} | {:>11.3} | {:>11.3}",
+                trunc_tail(&names(*pin), 40),
+                count_pct(c[0], rate(c[0], all[0])),
+                count_pct(c[1], rate(c[1], all[1])),
+                count_pct(c[2], rate(c[2], all[2])),
+                f64::from(rate(c[2], c[0])),
+                f64::from(o),
+                f64::from(p),
+                f64::from(q),
+                f64::from(q - p)
+            )));
+        }
+        if stats.len() > max_print {
+            out.push(debug(&format!("... ({} more endpoints not shown)", stats.len() - max_print)));
+        }
+        out.push(debug(&format!(
+            "{:<40} | {:>13} | {:>13} | {:>13} | {:>5.1}% | {:>11} | {:>11} | {:>11} | {:>11}",
+            "Total (shown)",
+            count_pct(shown[0], rate(shown[0], all[0])),
+            count_pct(shown[1], rate(shown[1], all[1])),
+            count_pct(shown[2], rate(shown[2], all[2])),
+            f64::from(rate(shown[2], shown[0])),
+            "",
+            "",
+            "",
+            ""
+        )));
+        let (wo, wp, wq) = (ns(worst_orig), ns(worst_pre), ns(worst_post));
+        out.push(debug(&format!(
+            "{:<40} | {:>13} | {:>13} | {:>13} | {:>6} | {:>11.3} | {:>11.3} | {:>11.3} | {:>11.3}",
+            "Maximum (WNS)",
+            "",
+            "",
+            "",
+            "",
+            f64::from(wo),
+            f64::from(wp),
+            f64::from(wq),
+            f64::from(wq - wp)
+        )));
+        let (to, tp, tq) = (ns(tns_orig), ns(tns_pre), ns(tns_post));
+        out.push(debug(&format!(
+            "{:<40} | {:>13} | {:>13} | {:>13} | {:>6} | {:>11.3} | {:>11.3} | {:>11.3} | {:>11.3}",
+            "Total (TNS)",
+            "",
+            "",
+            "",
+            "",
+            f64::from(to),
+            f64::from(tp),
+            f64::from(tq),
+            f64::from(tq - tp)
+        )));
+        let (mut low, mut med, mut high) = (0, 0, 0);
+        for (_, c) in &stats {
+            if c[0] <= 10 {
+                low += 1;
+            } else if c[0] <= 50 {
+                med += 1;
+            } else {
+                high += 1;
+            }
+        }
+        out.push(debug(&format!("Endpoint effort distribution: {low} low (1-10), {med} medium (11-50), {high} high (51+)")));
+        Ok(out)
+    }
+
+    /// `pinPathName`: the name as visited, else `current` (the pin's name now).
+    fn pin_path_name(&self, pin: PinKey, current: &dyn Fn(PinKey) -> String) -> String {
+        self.info.get(&pin).map_or_else(|| current(pin), |i| i.0.clone())
+    }
+
+    /// `printSuccessReport` (`state` Commit) / `printFailureReport` (Reject): the pins with a move
+    /// of that fate, in map order; move types and pins each sorted by count (libc++'s sort).
+    pub fn print_events_report(&self, title: &str, state: State, ptr: &dyn Fn(u64) -> Option<u64>) -> Result<Vec<String>, String> {
+        let pins = by_pointer(
+            self.pin_move_events
+                .iter()
+                .map(|(&k, ev)| (k, ev.iter().filter(|e| e.1 == state).map(|e| e.0).collect::<Vec<&'static str>>()))
+                .filter(|(_, v)| !v.is_empty()),
+            ptr,
+        )?;
+        let (empty, header, by_type, unit, top) = match state {
+            State::Commit => ("No successful optimizations", "Successfully optimized {} pins with committed moves", "Successful moves by type:", "commits", "Top {} pins by successful moves:"),
+            _ => ("No rejected optimizations", "{} pins had rejected moves (timing did not improve)", "Rejected moves by type:", "rejects", "Top {} pins by rejected moves:"),
+        };
+        if pins.is_empty() {
+            return Ok(vec![debug(&format!("{title}: {empty}"))]);
+        }
+        let mut out = vec![debug(&format!("{title}:")), debug(&header.replacen("{}", &pins.len().to_string(), 1))];
+        let mut type_counts: BTreeMap<&'static str, i64> = BTreeMap::new();
+        for (_, moves) in &pins {
+            for t in moves {
+                *type_counts.entry(t).or_default() += 1;
+            }
+        }
+        let mut sorted: Vec<(&'static str, i64)> = type_counts.into_iter().collect();
+        crate::order::libcxx_sort_by(&mut sorted, |a, b| a.1 > b.1).map_err(|e| format!("the move tracker's move type sort over {} types falls back to heap sort: not modelled", e.len))?;
+        out.push(debug(by_type));
+        for (t, n) in &sorted {
+            out.push(debug(&format!("  {t:<20}: {n:>5} {unit}")));
+        }
+        let mut counts: Vec<(PinKey, usize)> = pins.iter().map(|(k, v)| (*k, v.len())).collect();
+        crate::order::libcxx_sort_by(&mut counts, |a, b| a.1 > b.1).map_err(|e| format!("the move tracker's pin sort over {} pins falls back to heap sort: not modelled", e.len))?;
+        const MAX_PINS: usize = 20;
+        const MAX_COLUMNS: usize = 6;
+        out.push(debug(&top.replacen("{}", &MAX_PINS.min(counts.len()).to_string(), 1)));
+        let moves_of: HashMap<PinKey, &Vec<&'static str>> = pins.iter().map(|(k, v)| (*k, v)).collect();
+        for &(pin, count) in counts.iter().take(MAX_PINS) {
+            let mut per: BTreeMap<&'static str, i64> = BTreeMap::new();
+            for t in moves_of[&pin].iter() {
+                *per.entry(t).or_default() += 1;
+            }
+            let mut per: Vec<(&'static str, i64)> = per.into_iter().collect();
+            crate::order::libcxx_sort_by(&mut per, |a, b| a.1 > b.1).map_err(|e| format!("the move tracker's per-pin move sort over {} types falls back to heap sort: not modelled", e.len))?;
+            let name = self.pin_path_name(pin, &|_| String::new());
+            let mut line = format!("  {:<34} | {count:>5}", trunc_tail(&name, 34));
+            let mut col = 0;
+            for (t, n) in per.iter().take(MAX_COLUMNS) {
+                line.push_str(&format!(" | {t:<14}{n:>4}"));
+                col += 1;
+            }
+            while col < MAX_COLUMNS {
+                line.push_str(&format!(" | {:18}", ""));
+                col += 1;
+            }
+            out.push(debug(&line));
+        }
+        if counts.len() > MAX_PINS {
+            out.push(debug(&format!("  ... ({} more pins not shown)", counts.len() - MAX_PINS)));
+        }
+        Ok(out)
+    }
+
+    /// `all_visited_pins_`.
+    pub fn visited(&self) -> HashSet<PinKey> {
+        self.all_visited.clone()
+    }
+
+    /// Whether every pin a report names was visited with its name kept (`pinPathName` then never
+    /// asks the netlist).
+    pub fn names_known(&self) -> bool {
+        self.pin_move_events.keys().all(|k| self.info.contains_key(k))
+    }
+
+    /// `printMissedOpportunitiesReport`: Category 1 — the visited pins with no move and a slack
+    /// below -1 ms (`slack_threshold` is -0.001 against seconds) — never has a row in any capture
+    /// and is refused when it would; Category 2 over the critical pins never visited.
+    pub fn print_missed_opportunities_report(&self, title: &str, never: &[CriticalPin], critical_count: usize) -> Result<Vec<String>, String> {
+        const SLACK_THRESHOLD: f32 = -0.001;
+        let category1 = self
+            .all_visited
+            .iter()
+            .filter(|p| self.pin_move_events.get(p).is_none_or(|e| e.is_empty()))
+            .filter(|p| self.info.get(p).is_some_and(|i| i.1 < SLACK_THRESHOLD || i.2 < SLACK_THRESHOLD))
+            .count();
+        if category1 > 0 {
+            return Err(format!("the move tracker's Category 1 ({category1} visited pins with no move and a slack below -1 ms): not modelled"));
+        }
+        let mut out = missed_opportunities(title, never);
+        let n = out.len();
+        out[n - 2] = debug(&format!(
+            "Summary: {} critical pins identified, {} visited, {} had moves attempted",
+            critical_count,
+            self.all_visited.len(),
+            self.pin_move_events.len()
+        ));
+        out[n - 1] = debug(&format!("  Missed opportunities: 0 visited but no moves, {} never visited", never.len()));
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -598,8 +1111,82 @@ mod tests {
     /// Rule (Category 2): a long pin name keeps 35 characters and "...".
     #[test]
     fn category2_truncates() {
-        let c = CriticalPin { name: "a".repeat(40), cell: Some("BUF_X4".into()), slack: -91.6e-12, effort: Some((21.38e-12, 12.58e-12)), fanout: 1 };
+        let c = CriticalPin { id: None, name: "a".repeat(40), cell: Some("BUF_X4".into()), slack: -91.6e-12, effort: Some((21.38e-12, 12.58e-12)), fanout: 1 };
         let l = missed_opportunities("Missed Opportunities Report", &[c]);
         assert_eq!(l[5], debug(&format!("  {:<38} | {:<30} | {:>10} | {:>9} | {:>9} | {:>6}", format!("{}...", "a".repeat(35)), "BUF_X4", "-91.60", "21.38", "12.58", 1)));
+    }
+
+    /// Rule (`MoveTracker::{beginJournal, commitJournal, restoreJournal}`): a move lands in the
+    /// innermost open journal; a nested commit hands it to the parent (still rejectable), the
+    /// outermost commit finalizes it as committed, a restore as rejected — whatever the move's own
+    /// apply said. The current endpoint's counts grow only for a non-empty level.
+    #[test]
+    fn journal_decides_a_moves_fate() {
+        let mut m = Moves::default();
+        m.set_current_endpoint(10, Some(-1e-10));
+        m.begin_journal();
+        m.track_violator_with_info(2, "u1/Z", -1e-10, -1e-10);
+        m.track_move(2, "SizeUpMove");
+        m.begin_journal();
+        m.track_move(2, "BufferMove");
+        m.commit_journal();
+        assert!(m.moves.is_empty(), "a nested commit finalizes nothing");
+        m.restore_journal();
+        assert_eq!(m.moves, vec![(2, "SizeUpMove", State::Reject), (2, "BufferMove", State::Reject)]);
+        m.begin_journal();
+        m.commit_journal();
+        assert_eq!(m.endpoint_move_counts[&10], [2, 2, 0], "an empty level adds nothing");
+        m.begin_journal();
+        m.track_move(2, "SizeUpMove");
+        m.commit_journal();
+        assert_eq!(m.endpoint_move_counts[&10], [3, 2, 1]);
+    }
+
+    /// Rule (dbNetwork): a `const Pin*` is the terminal's address tagged in its low bits — an
+    /// instance terminal 1, a block terminal 2 (the capture's `VYGK` pointers end in 1/9 and 2).
+    #[test]
+    fn pin_pointer_tags() {
+        let addr = |id: u64| Some(0x1000 + 0x58 * (id >> 1));
+        assert_eq!(pin_pointer(addr, 6), Some(0x1000 + 0x58 * 3 + 1));
+        assert_eq!(pin_pointer(addr, 7), Some(0x1000 + 0x58 * 3 + 2));
+    }
+
+    /// The upstream golden (`repair_setup_legacy_mt_tracker.ok`): five committed moves on one
+    /// endpoint — the phase summary, its rates by move type (counts are floats printed bare),
+    /// the totals, and the success report's rows.
+    #[test]
+    fn legacy_mt_tracker_golden_lines() {
+        let mut m = Moves::default();
+        m.set_current_endpoint(100, Some(-0.333e-9));
+        for (pin, name, t) in [(3u64, "r1/Q", "SizeUpMove"), (21, "u5/Z", "UnbufferMove"), (19, "u4/Z", "UnbufferMove"), (17, "u3/Z", "UnbufferMove"), (15, "u2/Z", "UnbufferMove")] {
+            m.begin_journal();
+            m.track_violator_with_info(pin, name, -1e-10, -1e-10);
+            m.track_move(pin, t);
+            m.commit_journal();
+            m.commit_moves();
+        }
+        let l = m.print_move_summary("LEGACY Phase Summary");
+        let want = [
+            "LEGACY Phase Summary:",
+            "Current Summary: Not Attempted: 0 Attempts: 5 Rejects: 0 Commits: 5 ",
+            "Overall attempt_rate: 100.00% (5) reject_rate: 0.00% (0) commit_rate: 100.00% (5)",
+            "SizeUpMove attempt_rate: 20.00% (1) reject_rate: 0.00% (0)  commit_rate: 20.00% (1)",
+            "UnbufferMove attempt_rate: 80.00% (4) reject_rate: 0.00% (0)  commit_rate: 80.00% (4)",
+            "Total statistics:",
+            "Total Summary: Not Attempted: 0 Attempts: 5 Rejects: 0 Commits: 5 ",
+            "Overall attempt_rate: 100.00% (5) reject_rate: 0.00% (0) commit_rate: 100.00% (5)",
+            "SizeUpMove attempt_rate: 20.00% (1) reject_rate: 0.00% (0)  commit_rate: 20.00% (1)",
+            "UnbufferMove attempt_rate: 80.00% (4) reject_rate: 0.00% (0)  commit_rate: 80.00% (4)",
+        ];
+        assert_eq!(l, want.iter().map(|s| debug(s)).collect::<Vec<_>>());
+        // Ids in address order: r1/Q first, then u2..u5 by id.
+        let ptr = |id: u64| Some(id * 0x58);
+        let r = m.print_events_report("Successful Optimizations Report", State::Commit, &ptr).unwrap();
+        assert_eq!(r[1], debug("Successfully optimized 5 pins with committed moves"));
+        assert_eq!(r[3], debug("  UnbufferMove        :     4 commits"));
+        assert_eq!(r[4], debug("  SizeUpMove          :     1 commits"));
+        let row = format!("  {:<34} | {:>5} | {:<14}{:>4}{}", "r1/Q", 1, "SizeUpMove", 1, format!(" | {:18}", "").repeat(5));
+        assert_eq!(r[6], debug(&row));
+        assert_eq!(m.print_events_report("Unsuccessful Optimizations Report", State::Reject, &ptr).unwrap(), vec![debug("Unsuccessful Optimizations Report: No rejected optimizations")]);
     }
 }

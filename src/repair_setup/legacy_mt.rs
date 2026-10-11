@@ -143,6 +143,8 @@ impl Repair<'_, '_> {
         };
         self.lmt_trace(format!("best|{b}|{}", super::measured_vt_swap::c_hex(f64::from(estimates[b].score))));
         let c = &candidates[b];
+        // `commitCandidate`: the attempt, then the candidate's apply.
+        self.trk_attempt(&t.pin, c.kind)?;
         let result = self.lmt_apply(t, c)?;
         self.lmt_trace(format!("commit|{}|{}", u8::from(result.is_some()), move_type_index(c.kind)));
         Ok(result)

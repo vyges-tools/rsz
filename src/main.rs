@@ -2280,9 +2280,6 @@ fn run(job: &Value) -> Result<Value, String> {
                     Some(format!("repair_timing: {} is not modelled", m.name()))
                 } else if a.match_cell_footprint {
                     Some("repair_timing -match_cell_footprint: not modelled".into())
-                } else if debug_levels.get(&("RSZ".to_string(), "move_tracker".to_string())).is_some_and(|&l| l > 1) {
-                    // Level 1's reports are modelled (`move_tracker`); level 2 tracks every move.
-                    Some("repair_timing: the move tracker's level-2 reports (set_debug_level RSZ move_tracker 2) are not modelled".into())
                 } else {
                     None
                 };
