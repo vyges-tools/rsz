@@ -450,6 +450,9 @@ struct CliDesign<'a> {
     /// The nets an SDC `set_load` names (`Sdc::hasNetWireCap`, keyed by the net object): such a
     /// net is constrained and is never merged away.
     sdc_nets: BTreeSet<String>,
+    /// The instance pins an SDC `set_max_capacitance [get_pins …]` names (`Sdc::isConstrained(pin)`:
+    /// a pin limit no check reads, but a constrained buffer pin keeps its buffer).
+    sdc_pins: BTreeSet<String>,
     /// The edits as the incremental timer receives them.
     timer: TimerLog,
     /// Per instance, the cell its output-to-output edges carry after equivalent-arcs swaps.
@@ -1129,8 +1132,8 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
 
     /// `canRemoveBuffer(buffer, true)`'s database checks: the buffer neither dont_touch nor FIXED,
     /// neither net dont_touch; then the net to go (the input net when the output net has a port,
-    /// else the output net): neither buffer pin a clock's source (`Sdc::isConstrained(pin)`: the
-    /// only pin constraint an accepted SDC can put on an instance pin), the net to go not named by
+    /// else the output net): neither buffer pin a clock's source nor named by `set_max_capacitance`
+    /// (`Sdc::isConstrained(pin)`: the pin constraints an accepted SDC can put on an instance pin), the net to go not named by
     /// `set_load` (`isConstrained(net)`), and that net mergeable into the other
     /// (`dbNet::canMergeNet`), or absent.
     fn can_remove_buffer(&self, inst: &str, in_pin: &str, out_pin: &str) -> bool {
@@ -1145,7 +1148,7 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
         let out_net_ports = !out_net.is_empty() && !self.db.net_bterms(&out_net).is_empty();
         let (survivor, removed) = if out_net_ports { (out_net, in_net) } else { (in_net, out_net) };
         let pins = [format!("{inst}/{in_pin}"), format!("{inst}/{out_pin}")];
-        if pins.iter().any(|p| self.clock_sources.contains(p)) || self.sdc_nets.contains(&removed) {
+        if pins.iter().any(|p| self.clock_sources.contains(p) || self.sdc_pins.contains(p)) || self.sdc_nets.contains(&removed) {
             return false;
         }
         if removed.is_empty() {
@@ -1481,6 +1484,36 @@ fn net_info(db: &Db, nl: &vyges_sta::netlist::Netlist) -> Result<NetInfo, String
     Ok(info)
 }
 
+/// `set_max_capacitance V <objects>` beyond the design: on ports (`set_port_capacitance_limit`) and
+/// on instance pins (`set_pin_capacitance_limit`), the two forms `write_sdc` writes besides the
+/// design's. A cell — named bare, `find_cells_matching` — or any other form is refused, as is a
+/// value that is not a number.
+fn sdc_cap_objects_modelled(s: &vyges_loom::sdc::Sdc) -> Result<(), String> {
+    for (v, o) in &s.max_capacitance_objects {
+        if v.is_nan() || !matches!(o.accessor.as_str(), "get_ports" | "get_pins") {
+            return Err(format!("set_max_capacitance {v} on [{} {}]: not modelled (the design, ports and pins are)", o.accessor, o.names.join(" ")));
+        }
+    }
+    Ok(())
+}
+
+/// Each port's `set_max_capacitance` (`Sdc::setCapacitanceLimit(port)`, the last command's value),
+/// in farads like the design's limit.
+fn sdc_port_cap_limits(s: &vyges_loom::sdc::Sdc, cap_scale: f32) -> BTreeMap<String, f32> {
+    let mut out = BTreeMap::new();
+    for (v, o) in s.max_capacitance_objects.iter().filter(|(_, o)| o.accessor == "get_ports") {
+        for port in &o.names {
+            out.insert(port.clone(), vyges_rsz::timing::user_cap_to_sta(*v, cap_scale));
+        }
+    }
+    out
+}
+
+/// The instance pins a `set_max_capacitance` names (`pin_cap_limit_map_`).
+fn sdc_cap_pins(s: &vyges_loom::sdc::Sdc) -> BTreeSet<String> {
+    s.max_capacitance_objects.iter().filter(|(_, o)| o.accessor == "get_pins").flat_map(|(_, o)| o.names.iter().cloned()).collect()
+}
+
 /// `repair_design`'s Tcl arguments. `-max_wire_length` is in microns (the default distance
 /// unit) and reaches the repair in meters.
 fn parse_args(args: &[String]) -> Result<Args, String> {
@@ -1569,10 +1602,12 @@ fn search_sdc(s: &vyges_loom::sdc::Sdc, time_scale: f32, propagated: bool, hold_
     if s.clock_latency != 0.0 || !s.clock_latencies.is_empty() || s.late_derate.is_some() || s.early_derate.is_some() || !s.exceptions.is_empty() || !s.async_groups.is_empty() {
         return Err("clock latency, derates, timing exceptions or clock groups: not modelled".into());
     }
-    // Per side (input, output): each port and its delay by `[rf][min/max]`, as set so far.
-    type Delays = Vec<(String, [[Option<f32>; 2]; 2])>;
+    // Per side (input, output): each delay by `[rf][min/max]` as set so far, keyed by port and
+    // clock (`Sdc::findInputDelay` / `findOutputDelay`), in the order made. Without `-add_delay`,
+    // `setInputDelay` deletes the port's delays on other clocks and overwrites the values it
+    // names; with it, merges them — a max kept if larger, a min if smaller (`mergeValue`).
+    type Delays = Vec<(String, usize, [[Option<f32>; 2]; 2])>;
     let mut delays: [Delays; 2] = [Vec::new(), Vec::new()];
-    let mut delay_clock: BTreeMap<(usize, String), usize> = BTreeMap::new();
     for (side, list) in [(0, &s.input_delays), (1, &s.output_delays)] {
         let cmd = ["set_input_delay", "set_output_delay"][side];
         for d in list {
@@ -1605,23 +1640,27 @@ fn search_sdc(s: &vyges_loom::sdc::Sdc, time_scale: f32, propagated: bool, hold_
                 (false, true) => vec![1],
                 _ => vec![0, 1],
             };
+            let add = flag("-add_delay");
             let v = vyges_sta::sdc::user_to_sta(d.value, time_scale);
             for port in &d.ports {
-                // One clock per port and side (the timer keeps one delay per port).
-                if *delay_clock.entry((side, port.clone())).or_insert(ci) != ci {
-                    return Err(format!("port {port}: delays on two clocks are not modelled"));
-                }
                 let list = &mut delays[side];
-                let k = match list.iter().position(|(p, _)| p == port) {
+                if !add {
+                    list.retain(|(p, c, _)| p != port || *c == ci);
+                }
+                let k = match list.iter().position(|(p, c, _)| p == port && *c == ci) {
                     Some(k) => k,
                     None => {
-                        list.push((port.clone(), [[None; 2]; 2]));
+                        list.push((port.clone(), ci, [[None; 2]; 2]));
                         list.len() - 1
                     }
                 };
                 for &rf in &rfs {
                     for &mm in &mms {
-                        list[k].1[rf][mm] = Some(v);
+                        let slot = &mut list[k].2[rf][mm];
+                        // `MinMax::compare`: max keeps the larger, min the smaller.
+                        if !add || slot.is_none_or(|old| if mm == 1 { v > old } else { v < old }) {
+                            *slot = Some(v);
+                        }
                     }
                 }
             }
@@ -1632,11 +1671,11 @@ fn search_sdc(s: &vyges_loom::sdc::Sdc, time_scale: f32, propagated: bool, hold_
     // arrivals; no capture has one.
     let inputs = |list: &Delays| -> Result<Vec<PortDelay>, String> {
         list.iter()
-            .filter(|(_, d)| d[0][1].is_some() || d[1][1].is_some())
-            .map(|(p, d)| {
+            .filter(|(_, _, d)| d[0][1].is_some() || d[1][1].is_some())
+            .map(|(p, clock, d)| {
                 let max = |rf: usize| d[rf][1].ok_or_else(|| format!("port {p}: an input delay without its max value for both transitions is not modelled"));
                 let (r, f) = (max(0)?, max(1)?);
-                Ok(PortDelay { port: p.clone(), delay: [[d[0][0].unwrap_or(r), r], [d[1][0].unwrap_or(f), f]], exists: [[true; 2]; 2], clock: delay_clock[&(0, p.clone())] })
+                Ok(PortDelay { port: p.clone(), delay: [[d[0][0].unwrap_or(r), r], [d[1][0].unwrap_or(f), f]], exists: [[true; 2]; 2], clock: *clock })
             })
             .collect()
     };
@@ -1644,13 +1683,13 @@ fn search_sdc(s: &vyges_loom::sdc::Sdc, time_scale: f32, propagated: bool, hold_
     // path end. A max set for one transition only is refused (unwitnessed).
     let outputs = |list: &Delays| -> Result<Vec<PortDelay>, String> {
         list.iter()
-            .map(|(p, d)| {
+            .map(|(p, clock, d)| {
                 if d[0][1].is_some() != d[1][1].is_some() {
                     return Err(format!("port {p}: an output delay set for one transition only is not modelled"));
                 }
                 let exists = [[d[0][0].is_some(), d[0][1].is_some()], [d[1][0].is_some(), d[1][1].is_some()]];
                 let v = |rf: usize, mm: usize| d[rf][mm].unwrap_or(0.0);
-                Ok(PortDelay { port: p.clone(), delay: [[v(0, 0), v(0, 1)], [v(1, 0), v(1, 1)]], exists, clock: delay_clock[&(1, p.clone())] })
+                Ok(PortDelay { port: p.clone(), delay: [[v(0, 0), v(0, 1)], [v(1, 0), v(1, 1)]], exists, clock: *clock })
             })
             .collect()
     };
@@ -1966,11 +2005,12 @@ fn run(job: &Value) -> Result<Value, String> {
                 let unmodelled: Vec<&str> = s
                     .ignored_affecting_timing()
                     .into_iter()
-                    .filter(|c| (*c != "set_max_transition" || s.max_transition_on_objects) && (*c != "set_max_fanout" || s.max_fanout_on_objects) && (*c != "set_max_capacitance" || s.max_capacitance_on_objects) && *c != "set_driving_cell" && *c != "set_propagated_clock" && *c != "set_max_delay" && *c != "set_min_delay")
+                    .filter(|c| (*c != "set_max_transition" || s.max_transition_on_objects) && (*c != "set_max_fanout" || s.max_fanout_on_objects) && *c != "set_max_capacitance" && *c != "set_driving_cell" && *c != "set_propagated_clock" && *c != "set_max_delay" && *c != "set_min_delay")
                     .collect();
                 if !unmodelled.is_empty() {
                     return Err(format!("{path}: {} not modelled", unmodelled.join(", ")));
                 }
+                sdc_cap_objects_modelled(&s).map_err(|e| format!("{path}: {e}"))?;
                 // `set_propagated_clock` in the file: read by repair_timing's search; the other
                 // commands refuse it when they run.
                 sdc_propagated = !s.propagated.is_empty();
@@ -2029,7 +2069,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 let core = (db.block_get_core_area_x_min(), db.block_get_core_area_y_min(), db.block_get_core_area_x_max(), db.block_get_core_area_y_max());
                 let core = (core != (0, 0, 0, 0)).then_some(core);
                 let port_caps = port_caps_at(step["sdc"].as_str(), sdc.as_ref(), &libs, &netlist)?;
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr: None, gr_error: None, undoing: false };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins: sdc.as_ref().map(sdc_cap_pins).unwrap_or_default(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr: None, gr_error: None, undoing: false };
                 let r = buffer_ports::buffer_ports(&mut design, &o, &weakest);
                 let parasitics = std::mem::take(&mut design.parasitics);
                 match r {
@@ -2074,6 +2114,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     design_max_fanout: sdc.as_ref().and_then(|s| s.max_fanout).map(|v| v as f32),
                     // In the first library's capacitance unit, like the time unit.
                     design_max_capacitance: sdc.as_ref().and_then(|s| s.max_capacitance).map(|v| vyges_rsz::timing::user_cap_to_sta(v, lib0.cap_scale)),
+                    port_max_capacitance: sdc.as_ref().map(|s| sdc_port_cap_limits(s, lib0.cap_scale)).unwrap_or_default(),
                 };
                 let clock_sources: Vec<String> = sdc.as_ref().map(|s| s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect()).unwrap_or_default();
                 let netlist = vyges_grt::timer::netlist(&db);
@@ -2123,7 +2164,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 }
                 let port_caps = env.port_pin_cap.clone();
                 let limits_of_block = sizing_limits(&db)?;
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr: None, gr_error: None, undoing: false };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins: sdc.as_ref().map(sdc_cap_pins).unwrap_or_default(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr: None, gr_error: None, undoing: false };
                 let inputs = Inputs { libs: &libs, masters: &m, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins, sizing_limits: limits_of_block };
                 outcome = Some(repair_design::repair_design(&inputs, &mut design, &a, &mut trace));
             }
@@ -2321,6 +2362,7 @@ fn run(job: &Value) -> Result<Value, String> {
                         design_max_transition: s.max_transition.map(|v| user_time_to_sta(v, time_scale)),
                         design_max_fanout: s.max_fanout.map(|v| v as f32),
                         design_max_capacitance: s.max_capacitance.map(|v| vyges_rsz::timing::user_cap_to_sta(v, lib0.cap_scale)),
+                        port_max_capacitance: sdc_port_cap_limits(s, lib0.cap_scale),
                     };
                     let wire_rc = {
                         rc.sort_clk_and_signal_layers();
@@ -2430,7 +2472,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     let core = (core != (0, 0, 0, 0)).then_some(core);
                     let port_caps = env.port_pin_cap.clone();
                     let sdc_nets: BTreeSet<String> = s.env.iter().filter(|e| e.cmd == "set_load" && e.accessor == "get_nets").flat_map(|e| e.objects.iter().cloned()).collect();
-                    let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated, journal: Vec::new(), sdc_nets, timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr, gr_error: None, undoing: false };
+                    let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated, journal: Vec::new(), sdc_nets, sdc_pins: sdc_cap_pins(s), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr, gr_error: None, undoing: false };
                     if recover {
                         // `Resizer::recoverPower`: `resizePreamble`, then `RecoverPower::recoverPower`.
                         let max_area = match a.max_utilization.as_deref() {
@@ -2720,10 +2762,12 @@ REPAIR_TIMING:
   -setup with -max_utilization, more than one repair per pass.
 
 CONSTRAINTS READ FROM SDC:
-  create_clock (-waveform: a rise then a fall within one period), set_max_transition,
-  set_max_fanout and set_max_capacitance on the design, set_load on nets and ports,
-  set_input_transition, set_driving_cell, set_max_delay / set_min_delay (repair_timing only, the
-  forms above); any other timing-affecting command is refused
+  create_clock (-waveform: a rise then a fall within one period), set_input_delay /
+  set_output_delay (-clock, one delay per port and clock; -add_delay adds a clock or merges),
+  set_max_transition and set_max_fanout on the design, set_max_capacitance on the design, ports
+  and pins, set_load on nets and ports, set_input_transition, set_driving_cell, set_max_delay /
+  set_min_delay (repair_timing only, the forms above); any other timing-affecting command is
+  refused
 
 OPTIONS:
   -o FILE               write the JSON report to FILE instead of stdout
@@ -2924,6 +2968,87 @@ mod tests {
         let d: Value = serde_json::from_str(&describe()).expect("--describe must be valid JSON");
         assert_eq!(d["name"], "rsz");
         assert_eq!(d["assertion"]["pass_when"]["in"], serde_json::json!(["repaired", "up_to_date"]));
+    }
+
+    /// One port delay as (port, clock, delay[rf][min/max]).
+    type DelayRow = (String, usize, [[f32; 2]; 2]);
+
+    /// The port delays [`search_sdc`] hands the timer: (inputs, outputs).
+    fn port_delays_of(text: &str) -> (Vec<DelayRow>, Vec<DelayRow>) {
+        let s = vyges_loom::sdc::Sdc::parse(text).unwrap();
+        let ss = search_sdc(&s, 1e-9, false, false).unwrap();
+        let rows = |l: &[vyges_sta::sdc::PortDelay]| l.iter().map(|d| (d.port.clone(), d.clock, d.delay)).collect::<Vec<_>>();
+        (rows(&ss.input_delays), rows(&ss.output_delays))
+    }
+
+    const TWO_CLOCKS: &str = "create_clock -name a -period 10 [get_ports clk]\ncreate_clock -name v -period 5\n";
+
+    /// Rules (`Sdc::setInputDelay` / `setOutputDelay`): a delay is keyed by port and clock edge.
+    /// `-add_delay` on another clock adds a second delay; without it, the new delay deletes the
+    /// port's delays on other clocks. Delays stay in the order they were made.
+    #[test]
+    fn io_delays_are_kept_per_port_and_clock() {
+        let ns = |x: f64| vyges_sta::sdc::user_to_sta(x, 1e-9);
+        let (i, o) = port_delays_of(&format!(
+            "{TWO_CLOCKS}set_input_delay 1 -clock a [get_ports x]\nset_input_delay 2 -clock v -add_delay [get_ports x]\n\
+             set_output_delay 3 -clock v [get_ports y]\nset_output_delay 4 -clock a [get_ports y]\n"
+        ));
+        assert_eq!(i, [("x".into(), 0, [[ns(1.0); 2]; 2]), ("x".into(), 1, [[ns(2.0); 2]; 2])]);
+        assert_eq!(o, [("y".into(), 0, [[ns(4.0); 2]; 2])], "without -add_delay the clock a delay replaces the clock v one");
+    }
+
+    /// Rule (`RiseFallMinMax::mergeValue`): `-add_delay` on the same clock merges — a max kept if
+    /// larger, a min if smaller; without it the named values are overwritten.
+    #[test]
+    fn add_delay_on_the_same_clock_merges_by_min_max() {
+        let ns = |x: f64| vyges_sta::sdc::user_to_sta(x, 1e-9);
+        let (i, _) = port_delays_of(&format!(
+            "{TWO_CLOCKS}set_input_delay 2 -clock a [get_ports x]\nset_input_delay 1 -clock a -add_delay [get_ports x]\n\
+             set_input_delay 3 -clock a -add_delay [get_ports x]\n\
+             set_input_delay 5 -clock a [get_ports z]\nset_input_delay 1 -clock a -max [get_ports z]\n"
+        ));
+        // x: max 2 → 2 (1 not larger) → 3; min 2 → 1 → 1 (3 not smaller).
+        assert_eq!(i[0], ("x".into(), 0, [[ns(1.0), ns(3.0)], [ns(1.0), ns(3.0)]]));
+        // z: the -max overwrite keeps the min.
+        assert_eq!(i[1], ("z".into(), 0, [[ns(5.0), ns(1.0)], [ns(5.0), ns(1.0)]]));
+    }
+
+    /// The oracle (probe `sdc_io2_replace`): the reference read these hand-written delays and its
+    /// `write_sdc` gave back the second text. Read both ways, they hand the timer the same delays.
+    #[test]
+    fn hand_written_replace_and_merge_read_as_the_reference_wrote_them() {
+        let clocks = "create_clock -name clk -period 0.1 [get_ports clk]\ncreate_clock -name vclk -period 0.1 -waveform {0.08 0.09}\n";
+        let hand = format!(
+            "{clocks}set_input_delay -clock clk 0.02 [get_ports a1]\nset_output_delay -clock clk 0.01 [get_ports y2]\n\
+             set_output_delay -clock vclk 0.0 [get_ports y2]\nset_output_delay -clock clk 0.012 [get_ports y2]\n\
+             set_input_delay -clock clk 0.03 -add_delay [get_ports a1]\nset_input_delay -clock clk 0.01 -add_delay [get_ports a1]\n"
+        );
+        let written = format!(
+            "{clocks}set_input_delay 0.0100 -clock [get_clocks {{clk}}] -min -add_delay [get_ports {{a1}}]\n\
+             set_input_delay 0.0300 -clock [get_clocks {{clk}}] -max -add_delay [get_ports {{a1}}]\n\
+             set_output_delay 0.0120 -clock [get_clocks {{clk}}] -add_delay [get_ports {{y2}}]\n"
+        );
+        assert_eq!(port_delays_of(&hand), port_delays_of(&written));
+    }
+
+    /// Rules (`set_capacitance_limit` → `parse_cell_port_pin_args`; `write_sdc` writes the design,
+    /// port and pin limits): ports and pins are read — a port's value per port, the last command's
+    /// — and a cell named bare (`find_cells_matching`) or any other form is refused.
+    #[test]
+    fn object_cap_limits_read_ports_and_pins_and_refuse_the_rest() {
+        let s = vyges_loom::sdc::Sdc::parse(
+            "set_max_capacitance 2 [get_ports {a b}]\nset_max_capacitance 3 [get_ports {b}]\nset_max_capacitance 4 [get_pins {u1/A}]\n",
+        )
+        .unwrap();
+        assert!(sdc_cap_objects_modelled(&s).is_ok());
+        let ports = sdc_port_cap_limits(&s, 1e-15);
+        let cap = |v: f64| vyges_rsz::timing::user_cap_to_sta(v, 1e-15);
+        assert_eq!(ports.iter().map(|(p, c)| (p.as_str(), *c)).collect::<Vec<_>>(), [("a", cap(2.0)), ("b", cap(3.0))]);
+        assert_eq!(sdc_cap_pins(&s).into_iter().collect::<Vec<_>>(), ["u1/A"]);
+        for refused in ["set_max_capacitance 2 BUF_X1\n", "set_max_capacitance 2 [get_cells u1]\n", "set_max_capacitance 2 [get_lib_cells BUF_X1]\n"] {
+            let s = vyges_loom::sdc::Sdc::parse(refused).unwrap();
+            assert!(sdc_cap_objects_modelled(&s).is_err(), "{refused}");
+        }
     }
 
     // Rule: only `repaired` exits 0; a refusal is never a pass.

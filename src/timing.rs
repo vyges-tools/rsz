@@ -22,6 +22,9 @@ pub struct Limits {
     pub design_max_fanout: Option<f32>,
     /// `set_max_capacitance V [current_design]` (`Sdc::capacitanceLimit(top cell)`), farads.
     pub design_max_capacitance: Option<f32>,
+    /// `set_max_capacitance V [get_ports …]` (`Sdc::capacitanceLimit(port)`), farads, per top-level
+    /// port; a later command on the same port replaces the value.
+    pub port_max_capacitance: std::collections::BTreeMap<String, f32>,
 }
 
 /// `set_max_transition V` in the reference: Tcl `time_ui_sta` is `Unit::userToSta(double)` —
@@ -48,11 +51,16 @@ fn tighter_max(limit: Option<f32>, limit1: Option<f32>) -> Option<f32> {
 }
 
 /// `CheckCapacitances::findLimit(pin, scene, max)`: "default to top (design) limit", then the
-/// tighter of that and — on an instance pin — its scene port's `max_capacitance`, or — on a
-/// top-level port — its driving cell's `-pin` port's. SDC limits on cells, ports and pins are
-/// refused at read; the library default is never set in the reference.
+/// tighter of that and — on a top-level port — the port's own SDC limit, then its driving cell's
+/// `-pin` port's; or — on an instance pin — its scene port's `max_capacitance`. An SDC limit on a
+/// pin is not read here (only `Sdc::isConstrained` sees it); one on a cell is refused at read; the
+/// library default is never set in the reference.
 fn find_cap_limit(g: &Graph<'_>, v: usize, limits: &Limits) -> Option<f32> {
-    tighter_max(limits.design_max_capacitance, limit_port_of(g, v).and_then(|(_, p)| p.max_capacitance))
+    let mut limit = limits.design_max_capacitance;
+    if matches!(g.vertices[v].conn, Conn::Port(_)) {
+        limit = tighter_max(limit, limits.port_max_capacitance.get(&g.vertices[v].name).copied());
+    }
+    tighter_max(limit, limit_port_of(g, v).and_then(|(_, p)| p.max_capacitance))
 }
 
 /// `Resizer::maxLoad(cell)`: over the output ports in order, the tighter of the design limit and
@@ -619,6 +627,33 @@ mod tests {
         assert_eq!(max_load(&cell, &design(2.0)), 2.0);
         let bare = vyges_sta::liberty::Cell { name: "b".into(), ports: vec![port("Y", Direction::Output, None)], ..Default::default() };
         assert_eq!(max_load(&bare, &none), 0.0);
+    }
+
+    // Rule (CheckCapacitances::findLimit): on a top-level port, the design limit tightened by the
+    // PORT's own SDC limit (`capacitanceLimit(port)`); on an instance pin, by its liberty port's —
+    // a port limit never reaches an instance pin, and a looser one leaves the design's.
+    #[test]
+    fn a_port_cap_limit_tightens_only_its_own_port() {
+        const LIB: &str = r#"library (t) { time_unit : "1ns"; capacitive_load_unit (1, pf);
+          cell (buf) { pin (A) { direction : input; capacitance : 0.001; }
+            pin (X) { direction : output; function : "A"; max_capacitance : 0.5; } } }"#;
+        let libs = vec![Library::read(&vyges_sta::liberty_parse::parse(LIB).unwrap()).unwrap()];
+        let netlist = vyges_sta::netlist::Netlist {
+            insts: vec![("b".into(), "buf".into())],
+            ports: vec![("in".into(), vyges_sta::netlist::PortDir::Input), ("out".into(), vyges_sta::netlist::PortDir::Output)],
+            nets: vec![
+                vyges_sta::netlist::Net { name: "in".into(), pins: vec![Conn::Port(0), Conn::Inst(0, "A".into())] },
+                vyges_sta::netlist::Net { name: "out".into(), pins: vec![Conn::Inst(0, "X".into()), Conn::Port(1)] },
+            ],
+        };
+        let g = Graph::build(&libs, &netlist).unwrap();
+        let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        let limits = |design: Option<f32>, port: &[(&str, f32)]| Limits { design_max_capacitance: design, port_max_capacitance: port.iter().map(|&(p, c)| (p.to_string(), c)).collect(), ..Default::default() };
+        assert_eq!(find_cap_limit(&g, v("in"), &limits(None, &[])), None);
+        assert_eq!(find_cap_limit(&g, v("in"), &limits(None, &[("in", 2e-12)])), Some(2e-12));
+        assert_eq!(find_cap_limit(&g, v("in"), &limits(Some(1e-12), &[("in", 2e-12)])), Some(1e-12), "a looser port limit loses");
+        assert_eq!(find_cap_limit(&g, v("in"), &limits(Some(3e-12), &[("in", 2e-12)])), Some(2e-12));
+        assert_eq!(find_cap_limit(&g, v("b/X"), &limits(None, &[("in", 1e-15), ("b/X", 1e-15)])), Some(0.5e-12), "an instance pin reads its liberty port only");
     }
 
     // Rule (set_max_capacitance, Tcl `capacitance_ui_sta`): the user value times the cap unit's
