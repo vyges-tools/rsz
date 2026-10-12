@@ -1439,6 +1439,13 @@ pub trait SetupDesign: Design {
     /// moved loads onto it (`moveLoads`: a load in another module through the hierarchy). Returns
     /// the clone's name.
     fn clone_instance(&mut self, drvr_inst: &str, cell: &str, loc: (i32, i32), moved_loads: &[String]) -> Result<String, String>;
+    /// `BufferToInvertersCandidate::apply`'s mutation: the buffer's pins disconnected and the
+    /// buffer deleted, then two `inv_cell` inverters made in its module (`makeInstance`, IF_NEEDED
+    /// names `<buffer>_inv1`/`_inv2`, each placed at its point of `locs` as `makeInstance` places),
+    /// the mid net, the chain and the module nets, the three nets' parasitics invalidated. The
+    /// inverters' names; `None` when nothing changed.
+    #[allow(clippy::too_many_arguments)]
+    fn buffer_to_inverters(&mut self, buffer: &str, in_pin: &str, out_pin: &str, inv_cell: &str, inv_in: &str, inv_out: &str, locs: [(i32, i32); 2]) -> Result<Option<(String, String)>, String>;
     /// `Resizer::insertBufferBeforeLoads(net, loads, cell, loc, base, "net", ALWAYS, diff_nets)`.
     #[allow(clippy::too_many_arguments)]
     fn insert_buffer_before_loads(&mut self, net: Option<&str>, loads: &[String], cell: &str, loc: (i32, i32), reason: &str, loads_on_diff_nets: bool, uniquify: &str) -> Result<crate::design::Repeater, String>;
@@ -3808,11 +3815,13 @@ impl Repair<'_, '_> {
                 Move::SizeUpMatch => self.size_up_match_move(view, index)?,
                 Move::VtSwap => self.vt_swap_move(view, index)?,
                 Move::Reroute => self.reroute_move(view, index)?,
+                Move::BufferToInverters => self.buffer_to_inverters_move(view, index)?,
                 other => return Err(Stop::refused("RSZ-ABSENT", format!("{}: not modelled", other.name()))),
             };
             if let Some(r) = result {
-                // repairProgressIncrement: an unbuffer spends the pass's whole budget.
-                *changed += if r.kind == Move::Unbuffer { repairs_per_pass } else { 1 };
+                // repairProgressIncrement: an unbuffer or a buffer-to-inverters spends the pass's
+                // whole budget.
+                *changed += if matches!(r.kind, Move::Unbuffer | Move::BufferToInverters) { repairs_per_pass } else { 1 };
                 let kind = r.kind;
                 self.commit(r);
                 return Ok(Some(kind));
@@ -4420,6 +4429,60 @@ impl Repair<'_, '_> {
         Ok(Some(MoveResult { kind: Move::Unbuffer, count: 1, insts: vec![r.inst] }))
     }
 
+    /// `BufferToInvertersGenerator::generate` → `BufferToInvertersCandidate::apply`: the path's
+    /// buffer (path index 2 or more) not claimed by another move and passing `canRemoveBuffer`
+    /// (dont_touch and fixed honoured), replaced by two inverters of [`pick_inverter`]'s cell at
+    /// [`inverter_points`] between the previous driver and the load centroid.
+    fn buffer_to_inverters_move(&mut self, view: &PathView, index: usize) -> Result<Option<MoveResult>, Stop> {
+        let st = &view.stages[index];
+        // `canBePathDriver() && path_index >= 2`: every target here is a path driver.
+        if index < 2 {
+            return Ok(None);
+        }
+        let (Some(inst), Some(cell_name)) = (&st.inst, &st.cell) else { return Ok(None) };
+        let Some(cell) = self.ctx.libs.link_cell(cell_name).filter(|c| c.is_buffer()) else { return Ok(None) };
+        let h = self.ctx.hierarchy;
+        if let Some(why) = self.committer.blocking_buffer_removal(self.design.inst_id(inst)) {
+            self.debug("buffer_to_inverters_move", 4, format!("Buffer {} is not inv-buffered because {why}", network_name(inst, h)));
+            return Ok(None);
+        }
+        let Some((in_port, out_port)) = cell.buffer_ports().map(|(i, o)| (i.name.clone(), o.name.clone())) else { return Ok(None) };
+        if !self.design.can_remove_buffer(inst, &in_port, &out_port) {
+            self.debug("buffer_to_inverters_move", 4, format!("Buffer {} is not inv-buffered because canRemoveBuffer rejected it", network_name(inst, h)));
+            return Ok(None);
+        }
+        let Some((inv, inv_in, inv_out)) = pick_inverter(self.ctx.libs, self.ctx.sizing.dont_use, cell) else {
+            self.debug("buffer_to_inverters_move", 4, format!("Buffer {} has no usable inverter replacement", network_name(inst, h)));
+            return Ok(None);
+        };
+        // `tryCandidateSequence`: the default estimate is legal; the attempt, then the commit.
+        self.trk_attempt(&st.pin, Move::BufferToInverters)?;
+        // apply: the previous driver (`prevDriverPath`), the buffer, the output net's loads.
+        let drvr_loc = self.design.pin_location(&view.stages[index - 2].pin);
+        let buffer_loc = self.design.inst_location(inst);
+        let loads: Vec<(i32, i32)> = self.output_net_loads(inst, &out_port).iter().map(|p| self.design.pin_location(p)).collect();
+        let locs = inverter_points(drvr_loc, load_centroid(&loads, buffer_loc));
+        let Some((_inv1, _inv2)) = self.design.buffer_to_inverters(inst, &in_port, &out_port, &inv, &inv_in, &inv_out, locs).map_err(|e| Stop::error("RSZ-0168", e))? else { return Ok(None) };
+        self.debug("buffer_to_inverters_move", 1, format!("ACCEPT BufferToInvertersMove: Replaced buffer {} with two {inv} inverters", network_name(inst, h)));
+        Ok(Some(MoveResult { kind: Move::BufferToInverters, count: 1, insts: vec![_inv1, _inv2] }))
+    }
+
+    /// `connectedPinIterator(net)` filtered by `isLoad`: the leaf input (or bidirectional) pins and
+    /// the top output (or inout) ports on the flat net of `inst/port`.
+    fn output_net_loads(&self, inst: &str, port: &str) -> Vec<String> {
+        let nl = self.design.netlist();
+        let Some(k) = nl.insts.iter().position(|(n, _)| n == inst) else { return Vec::new() };
+        let Some(net) = nl.nets.iter().find(|n| n.pins.iter().any(|c| matches!(c, vyges_sta::netlist::Conn::Inst(i, p) if *i == k && p == port))) else { return Vec::new() };
+        net.pins
+            .iter()
+            .filter(|c| match c {
+                vyges_sta::netlist::Conn::Inst(i, p) => self.ctx.libs.link_cell(&nl.insts[*i].1).and_then(|c| c.port(p)).is_some_and(|p| matches!(p.direction, vyges_sta::liberty::Direction::Input | vyges_sta::liberty::Direction::Bidirect)),
+                vyges_sta::netlist::Conn::Port(j) => matches!(nl.ports[*j].1, vyges_sta::netlist::PortDir::Output | vyges_sta::netlist::PortDir::Inout),
+            })
+            .map(|c| nl.pin_name(c))
+            .collect()
+    }
+
     /// `dbNetwork::name(Net*)` of the flat net on `inst/port`: its first output iterm (net pin
     /// order) decides the module prefix removed (`db_net_name`).
     fn net_display_name(&self, inst: &str, port: &str) -> Option<String> {
@@ -4692,6 +4755,11 @@ impl Repair<'_, '_> {
                 self.report(format!("[INFO RSZ-0045] Inserted {} buffers, {splits} to split loads.", buffers + splits));
             }
         }
+        // After the insertions, before the resizes (`OptimizationPolicy::printSummary`).
+        let to_inverters = self.committer.committed(Move::BufferToInverters);
+        if to_inverters > 0 {
+            self.report(format!("[INFO RSZ-0109] Replaced {to_inverters} buffers with inverters."));
+        }
         let (size_up, up_match, down, vt) = (self.committer.committed(Move::SizeUp), self.committer.committed(Move::SizeUpMatch), self.committer.committed(Move::SizeDownFanout), self.committer.committed(Move::VtSwap));
         if size_up + up_match + down + vt > 0 {
             self.report(format!("[INFO RSZ-0051] Resized {} instances: {size_up} up, {up_match} up match, {down} down, {vt} VT", size_up + up_match + down + vt));
@@ -4713,6 +4781,48 @@ impl Repair<'_, '_> {
         }
         Ok(())
     }
+}
+
+/// `BufferToInvertersGenerator::generate`'s replacement: over the libraries in order, each
+/// library's `inverters()` (liberty dont_use excluded, name order), skipping the resizer's
+/// dont_use and non-link cells and cells without buffer ports, the inverter whose drive
+/// resistance is closest to the buffer's — strict `<` on the float difference, so the FIRST of
+/// equals wins. The cell and its input and output ports.
+fn pick_inverter(libs: &Libs, dont_use: &BTreeSet<String>, buffer: &Cell) -> Option<(String, String, String)> {
+    let target = crate::sizing::cell_drive_resistance(buffer);
+    let mut best = None;
+    let mut min_diff = f32::MAX;
+    for (li, lib) in libs.libs.iter().enumerate() {
+        for cell in lib.cells.values().filter(|c| !c.dont_use && c.is_inverter()) {
+            if dont_use.contains(&cell.name) || !libs.is_link_cell(li, &cell.name) {
+                continue;
+            }
+            let Some((i, o)) = cell.buffer_ports() else { continue };
+            let diff = (crate::sizing::cell_drive_resistance(cell) - target).abs();
+            if diff < min_diff {
+                min_diff = diff;
+                best = Some((cell.name.clone(), i.name.clone(), o.name.clone()));
+            }
+        }
+    }
+    best
+}
+
+/// The loads' centroid: 64-bit sums divided by the count (truncating), else the buffer's location.
+fn load_centroid(loads: &[(i32, i32)], buffer_loc: (i32, i32)) -> (i32, i32) {
+    if loads.is_empty() {
+        return buffer_loc;
+    }
+    let n = loads.len() as i64;
+    let (sx, sy) = loads.iter().fold((0i64, 0i64), |(x, y), &(lx, ly)| (x + i64::from(lx), y + i64::from(ly)));
+    ((sx / n) as i32, (sy / n) as i32)
+}
+
+/// The two inverters at 1/3 and 2/3 from the previous driver to the load centroid, in `int`
+/// arithmetic: `d + (c − d) / 3` and `d + 2 (c − d) / 3`, each division truncating toward zero.
+fn inverter_points(drvr: (i32, i32), centroid: (i32, i32)) -> [(i32, i32); 2] {
+    let at = |k: i32| (drvr.0 + k * (centroid.0 - drvr.0) / 3, drvr.1 + k * (centroid.1 - drvr.1) / 3);
+    [at(1), at(2)]
 }
 
 /// `SetupLegacyPolicy::pathImproved`: a better WNS, or the same WNS and a better endpoint slack.
@@ -4802,6 +4912,49 @@ mod tests {
         let equiv = crate::sizing::make_equiv_cells(l);
         let (dont_use, loads) = (BTreeSet::new(), BTreeMap::new());
         f(&Sizing { libs: l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: Default::default() })
+    }
+
+    /// An inverter of drive resistance `r` (as [`buf`]); liberty `dont_use` when `du`.
+    fn inv(name: &str, r: f32, du: bool) -> String {
+        let du = if du { "dont_use : true ;" } else { "" };
+        format!(
+            r#"cell ({name}) {{ {du} pin (A) {{ direction : input ; capacitance : 0.01 ; }} pin (ZN) {{ direction : output ; function : "!A" ;
+              timing () {{ related_pin : "A" ; timing_sense : negative_unate ;
+                cell_rise (t) {{ values ("0.1, 0.2", "0.1, 0.2") ; }} cell_fall (t) {{ values ("0.1, 0.2", "0.1, 0.2") ; }}
+                rise_transition (t) {{ values ("0, {r}", "0, {r}") ; }} fall_transition (t) {{ values ("0, {r}", "0, {r}") ; }} }} }} }}"#
+        )
+    }
+
+    // Rule (BufferToInvertersGenerator::generate): the inverter whose drive resistance is closest
+    // to the buffer's, in library then name order, strict `<` — the first of equals wins; liberty
+    // dont_use cells are not in `inverters()`, the resizer's dont_use cells are skipped.
+    #[test]
+    fn buffer_to_inverters_picks_the_closest_drive_resistance_first_of_equals() {
+        let l = libs(&[buf("BUF", 0.01, 0.1, 0.2, 2.0), inv("I1", 4.0, false), inv("I2", 2.5, false), inv("I3", 2.5, false), inv("I4", 2.0, true)]);
+        let none = BTreeSet::new();
+        let b = &l.libs[0].cells["BUF"];
+        // I2 and I3 tie exactly (the same tables): I2 is first by name. I4 matches exactly but is
+        // liberty dont_use.
+        assert_eq!(pick_inverter(&l, &none, b).map(|x| x.0).as_deref(), Some("I2"));
+        assert_eq!(pick_inverter(&l, &none, b).map(|x| (x.1, x.2)), Some(("A".into(), "ZN".into())));
+        let du: BTreeSet<String> = ["I2".to_string()].into();
+        assert_eq!(pick_inverter(&l, &du, b).map(|x| x.0).as_deref(), Some("I3"));
+        let all: BTreeSet<String> = ["I1", "I2", "I3"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(pick_inverter(&l, &all, b), None);
+    }
+
+    // Rule (BufferToInvertersCandidate::apply): the inverters at d + (c − d)/3 and d + 2(c − d)/3
+    // in `int`, each division truncating toward zero; the centroid is the 64-bit sum over the count,
+    // truncated, or the buffer's location with no loads. The first case is the reference's own
+    // trace of repair_setup_buffer_to_inverters at 27288f5 (`rsz-b2i-patch.py`).
+    #[test]
+    fn buffer_to_inverters_points_truncate_toward_zero() {
+        assert_eq!(inverter_points((106270, 5801390), (101780, 201230)), [(104774, 3934670), (103277, 2067950)]);
+        // −4/3 is −1 and −8/3 is −2 (a floor would give −2 and −3).
+        assert_eq!(inverter_points((0, 0), (-4, 4)), [(-1, 1), (-2, 2)]);
+        assert_eq!(load_centroid(&[], (7, 9)), (7, 9));
+        assert_eq!(load_centroid(&[(101780, 201230)], (7, 9)), (101780, 201230));
+        assert_eq!(load_centroid(&[(-1, 0), (-2, 1)], (7, 9)), (-1, 0));
     }
 
     // Rule (weakerCellFirst): cells with the driver port first, the LARGER drive resistance

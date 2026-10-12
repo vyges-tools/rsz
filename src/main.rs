@@ -1253,6 +1253,28 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
         Ok(name)
     }
 
+    fn buffer_to_inverters(&mut self, buffer: &str, in_pin: &str, out_pin: &str, inv_cell: &str, inv_in: &str, inv_out: &str, locs: [(i32, i32); 2]) -> Result<Option<(String, String)>, String> {
+        let e = |x: vyges_opendb::Error| x.to_string();
+        let (in_net, out_net) = (self.db.net_of(buffer, in_pin), self.db.net_of(buffer, out_pin));
+        // The database half, in the candidate's order (disconnect, deleteInstance, makeInstance ×2,
+        // makeNet, connectPin ×4, the module nets): inv1 takes the freed slot.
+        let Some((inv1, inv2, mid)) = self.db.buffer_to_inverters(buffer, in_pin, out_pin, inv_cell, inv_in, inv_out).map_err(e)? else { return Ok(None) };
+        // ⚠️ `makeInstance` places inv1 before inv2 exists; here both exist (inv2 unplaced) when
+        // inv1 is placed. Placement reads placed instances only, so the order cannot show.
+        for (name, loc) in [(&inv1, locs[0]), (&inv2, locs[1])] {
+            self.db.inst_set_source_type(name, "TIMING").map_err(e)?;
+            let at = self.clamp_loc_to_core(loc, inv_cell);
+            self.db.set_inst_location(name, at.0, at.1).map_err(e)?;
+            self.gr_inst_moved(name);
+            self.gr_legal_cell_pos(name)?;
+        }
+        for n in [in_net, mid, out_net] {
+            self.invalidate(&n);
+        }
+        self.refresh()?;
+        Ok(Some((inv1, inv2)))
+    }
+
     fn inst_id(&self, inst: &str) -> u32 {
         self.db.inst_id(inst).unwrap_or(u32::MAX)
     }
@@ -2330,7 +2352,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 let startpoint_rows = matches!(plan, Some(rt::PhasePlan::LegacyPreamble { startpoints: true }));
                 let unmodelled = if matches!(plan, Some(rt::PhasePlan::LegacyPreamble { .. })) && !a.phases.as_deref().is_some_and(rt::phases_modelled) {
                     Some(format!("repair_timing -phases {}: not modelled", a.phases.as_deref().unwrap_or_default()))
-                } else if let Some(m) = seq.iter().find(|m| !matches!(m, rt::Move::SizeUp | rt::Move::SizeDownFanout | rt::Move::Unbuffer | rt::Move::SwapPins | rt::Move::Buffer | rt::Move::Clone | rt::Move::SplitLoad | rt::Move::SizeUpMatch | rt::Move::VtSwap | rt::Move::Reroute)) {
+                } else if let Some(m) = seq.iter().find(|m| !matches!(m, rt::Move::SizeUp | rt::Move::SizeDownFanout | rt::Move::Unbuffer | rt::Move::SwapPins | rt::Move::Buffer | rt::Move::Clone | rt::Move::SplitLoad | rt::Move::SizeUpMatch | rt::Move::VtSwap | rt::Move::Reroute | rt::Move::BufferToInverters)) {
                     Some(format!("repair_timing: {} is not modelled", m.name()))
                 } else if a.match_cell_footprint {
                     Some("repair_timing -match_cell_footprint: not modelled".into())

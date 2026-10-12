@@ -43,6 +43,8 @@ pub struct Args {
     pub skip_size_down_fanout: bool,
     pub skip_buffering: bool,
     pub skip_buffer_removal: bool,
+    /// `-skip_buffer_to_inverters`: BufferToInvertersMove left out of an explicit `-sequence`.
+    pub skip_buffer_to_inverters: bool,
     pub skip_vt_swap: bool,
     /// `-max_passes` (10000), `-max_iterations` (−1: no limit), `-max_repairs_per_pass` (1).
     pub max_passes: i64,
@@ -70,6 +72,8 @@ pub enum Move {
     SizeUpMatch,
     VtSwap,
     Reroute,
+    /// Only from an explicit `-sequence`: never in the default sequence (upstream `7770da8280`).
+    BufferToInverters,
 }
 
 impl Move {
@@ -86,6 +90,7 @@ impl Move {
             Move::Unbuffer => "UnbufferMove",
             Move::SplitLoad => "SplitLoadMove",
             Move::Reroute => "RerouteMove",
+            Move::BufferToInverters => "BufferToInvertersMove",
         }
     }
 
@@ -102,6 +107,7 @@ impl Move {
             "sizeup_match" => Move::SizeUpMatch,
             "vt_swap" => Move::VtSwap,
             "reroute" => Move::Reroute,
+            "buffer_to_inverters" => Move::BufferToInverters,
             _ => return Err(format!("Invalid move type: {w}")),
         })
     }
@@ -140,6 +146,7 @@ impl Args {
             skip_size_down_fanout: false,
             skip_buffering: false,
             skip_buffer_removal: false,
+            skip_buffer_to_inverters: false,
             skip_vt_swap: false,
             max_passes: 10000,
             max_iterations: -1,
@@ -215,12 +222,17 @@ impl Args {
                 "-skip_size_down" => a.skip_size_down_fanout = true,
                 "-skip_buffering" => a.skip_buffering = true,
                 "-skip_buffer_removal" => a.skip_buffer_removal = true,
+                "-skip_buffer_to_inverters" => a.skip_buffer_to_inverters = true,
                 "-skip_vt_swap" => a.skip_vt_swap = true,
                 "-skip_last_gasp" => a.skip_last_gasp = true,
                 "-skip_crit_vt_swap" => a.skip_crit_vt_swap = true,
                 "-allow_setup_violations" => a.allow_setup_violations = true,
                 "-match_cell_footprint" => a.match_cell_footprint = true,
                 "-verbose" => a.verbose = true,
+                // `-skip_crpr` turns `crpr_enabled` off for the repair, and CRPR only acts under
+                // on_chip_variation analysis (`StaState::crprActive`) — which, with set_timing_derate, the
+                // timer does not model. Its one witness (repair_timing_crpr) needs both.
+                "-skip_crpr" => return Err("repair_timing -skip_crpr: not modelled (CRPR acts only under on_chip_variation analysis and set_timing_derate, which the timer does not model)".into()),
                 other => return Err(format!("repair_timing {other}: not modelled")),
             }
             i += 1;
@@ -260,6 +272,7 @@ pub fn move_sequence(a: &Args, has_vt_swap_cells: bool) -> Vec<Move> {
                 Move::Clone => push(!a.skip_gate_cloning, m),
                 Move::SplitLoad => push(!a.skip_buffering, m),
                 Move::VtSwap => push(!a.skip_vt_swap && has_vt_swap_cells, m),
+                Move::BufferToInverters => push(!a.skip_buffer_to_inverters, m),
             }
         }
     } else {

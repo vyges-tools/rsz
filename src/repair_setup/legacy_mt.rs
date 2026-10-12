@@ -26,6 +26,7 @@ fn move_type_index(m: Move) -> u8 {
         Move::Unbuffer => 7,
         Move::SplitLoad => 8,
         Move::Reroute => 9,
+        Move::BufferToInverters => 10,
     }
 }
 
@@ -171,10 +172,10 @@ mod tests {
     use crate::repair_timing::Move;
 
     /// `MoveType`'s declaration order (Buffer, Clone, SizeUp, SizeUpMatch, SizeDownFanout,
-    /// SwapPins, VtSwap, Unbuffer, SplitLoad, Reroute): the number a `VYGL|commit` line prints.
+    /// SwapPins, VtSwap, Unbuffer, SplitLoad, Reroute, BufferToInverters): the number a `VYGL|commit` line prints.
     #[test]
     fn move_type_numbers_follow_the_declaration_order() {
-        let order = [Move::Buffer, Move::Clone, Move::SizeUp, Move::SizeUpMatch, Move::SizeDownFanout, Move::SwapPins, Move::VtSwap, Move::Unbuffer, Move::SplitLoad, Move::Reroute];
+        let order = [Move::Buffer, Move::Clone, Move::SizeUp, Move::SizeUpMatch, Move::SizeDownFanout, Move::SwapPins, Move::VtSwap, Move::Unbuffer, Move::SplitLoad, Move::Reroute, Move::BufferToInverters];
         for (k, m) in order.into_iter().enumerate() {
             assert_eq!(usize::from(move_type_index(m)), k);
         }

@@ -27,6 +27,7 @@ pub(super) fn move_name(m: Move) -> &'static str {
         Move::Unbuffer => "UnbufferMove",
         Move::SplitLoad => "SplitLoadMove",
         Move::Reroute => "RerouteMove",
+        Move::BufferToInverters => "BufferToInvertersMove",
     }
 }
 
