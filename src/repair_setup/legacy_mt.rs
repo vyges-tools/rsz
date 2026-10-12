@@ -99,7 +99,7 @@ impl Repair<'_, '_> {
     /// `canTryGenerator` for the MT generators: `VtSwapMtGenerator::isApplicable` (prepared; an
     /// instance not dont_touch, a logic standard cell with a library cell, two VT categories or
     /// more, more than one VT-equivalent cell) and `SizeUpMtGenerator::isApplicable` (prepared, an
-    /// instance not dont_touch).
+    /// instance not dont_touch, not fixed).
     pub(super) fn lmt_is_applicable(&self, m: Move, t: &Mt1Target) -> bool {
         if t.arc_delay.is_none() || t.inst.is_empty() || self.design.net_info().dont_touch_insts.contains(&t.inst) {
             return false;
@@ -111,7 +111,7 @@ impl Repair<'_, '_> {
                     && self.ctx.libs.link_cell(&t.cell).is_some()
                     && self.ctx.sizing.vt_equiv_cells(&t.cell, self.ctx.vt_category_count).len() > 1
             }
-            _ => true,
+            _ => !self.design.net_info().fixed_insts.contains(&t.inst),
         }
     }
 

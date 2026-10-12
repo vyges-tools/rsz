@@ -620,6 +620,7 @@ fn repair_driver_slew(design: &dyn Design, graphs: &[Graph<'_>], corner: usize, 
         cell,
         port,
         dont_touch: design.net_info().dont_touch_insts.contains(&inst),
+        fixed: design.net_info().fixed_insts.contains(&inst),
         logic_std_cell: ctx.inputs.masters.get(cell).is_some_and(|m| m.logic_std),
     };
     let clocks = timing::clock_pins(g, ctx.inputs.clock_sources);

@@ -698,7 +698,9 @@ impl GsEnv<'_> {
                 continue;
             }
             s.cur_leakage = self.leakage_or_area(gs, &cell);
-            for cand in self.ctx.sizing.swappable_cells(&cell).unwrap_or_default() {
+            // A fixed instance keeps its footprint: its VT equivalents only.
+            let cands = if self.design.net_info().fixed_insts.contains(&name) { self.ctx.sizing.vt_equiv_cells(&cell, self.ctx.vt_category_count) } else { self.ctx.sizing.swappable_cells(&cell).unwrap_or_default() };
+            for cand in cands {
                 if cand != cell {
                     let l = self.leakage_or_area(gs, &cand);
                     s.candidates.push((cand, l));
@@ -1039,8 +1041,8 @@ impl Repair<'_, '_> {
         let mut replacements = 0;
         let mut cache = HashMap::new();
         for (_, name, cell) in self.gs_env().leaf_insts() {
-            // `isEditableLogicStdCell`.
-            if self.design.net_info().dont_touch_insts.contains(&name) || !self.ctx.sizing.masters.get(&cell).is_some_and(|m| m.logic_std) || self.ctx.libs.link_cell(&cell).is_none() {
+            // `isEditableLogicStdCell`, and not fixed (a fixed instance keeps its footprint).
+            if self.design.net_info().dont_touch_insts.contains(&name) || !self.ctx.sizing.masters.get(&cell).is_some_and(|m| m.logic_std) || self.ctx.libs.link_cell(&cell).is_none() || self.design.net_info().fixed_insts.contains(&name) {
                 continue;
             }
             if skip.contains(&name) {

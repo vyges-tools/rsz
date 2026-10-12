@@ -531,10 +531,12 @@ pub fn total_negative_slack(endpoints: &[Point]) -> f32 {
     tns as f32
 }
 
-/// `getOverallStartpointTns(false)`: each violating startpoint's own slack below zero, in float.
-pub fn startpoint_tns(violating_startpoints: &[Point]) -> f32 {
+/// `getOverallStartpointTns(false)`: over EVERY startpoint the collector cached (`startpoints_`, in
+/// `walkStartpoints` order — not only the violating ones, nor in their slack order), each one's own
+/// slack below zero, summed in float.
+pub fn startpoint_tns(startpoints: &[Point]) -> f32 {
     let mut tns = 0.0f32;
-    for p in violating_startpoints {
+    for p in startpoints {
         if p.slack < 0.0 {
             tns += p.slack;
         }
@@ -542,13 +544,22 @@ pub fn startpoint_tns(violating_startpoints: &[Point]) -> f32 {
     tns
 }
 
-/// The progress table's three header lines (`printProgress(0, …)`).
-pub fn progress_header() -> Vec<String> {
-    vec![
-        "   Iter   | Removed | Resized | Inserted | Cloned |  Pin  |   Area   |    WNS   |   StTNS    |   EnTNS    |  Viol  |  Worst  ".to_string(),
-        "          | Buffers |  Gates  | Buffers  |  Gates | Swaps |          |          |            |            | Endpts | St/EnPt ".to_string(),
-        "-".repeat(126),
-    ]
+/// `OptimizationPolicy::printProgressHeader`'s three lines, the legacy phases' and the policies'
+/// alike: with the startpoint metrics (a STARTPOINT_FANOUT phase, `showStartpointMetrics`) a StTNS
+/// column and the worst startpoint; without, TNS alone and the worst endpoint.
+pub fn progress_header(show_startpoints: bool) -> Vec<String> {
+    let (top, bottom) = if show_startpoints {
+        (
+            "   Iter   | Removed | Resized | Inserted | Cloned |  Pin  |   Area   |    WNS   |   StTNS    |    TNS     |  Viol  |  Worst",
+            "          | Buffers |  Gates  | Buffers  |  Gates | Swaps |          |          |            |            | Endpts | St/EnPt",
+        )
+    } else {
+        (
+            "   Iter   | Removed | Resized | Inserted | Cloned |  Pin  |   Area   |    WNS   |    TNS     |  Viol  |  Worst",
+            "          | Buffers |  Gates  | Buffers  |  Gates | Swaps |          |          |            | Endpts | Endpoint",
+        )
+    };
+    vec![top.to_string(), bottom.to_string(), "-".repeat(126)]
 }
 
 /// One progress row's values: the move totals by column, the area growth (%), the slacks.
@@ -562,16 +573,18 @@ pub struct Row<'a> {
     pub swaps: i64,
     pub area_growth_percent: f64,
     pub wns: f32,
-    pub st_tns: f32,
+    /// The StTNS column, printed only with the startpoint metrics.
+    pub st_tns: Option<f32>,
     pub en_tns: f32,
     pub viol: usize,
     pub worst: &'a str,
 }
 
-/// A progress row as `printProgress` / `printFinalProgress` format it.
+/// A progress row as `printProgress` / `printFinalProgress` format it: the prefix through WNS,
+/// ` | StTNS` when it is shown, then TNS, Viol and the worst pin.
 pub fn progress_row(r: &Row<'_>, time_scale: f32) -> String {
-    format!(
-        "{: >9} | {: >7} | {: >7} | {: >8} | {: >6} | {: >5} | {: >+7.1}% | {: >8} | {: >10} | {: >10} | {: >6} | {}",
+    let prefix = format!(
+        "{: >9} | {: >7} | {: >7} | {: >8} | {: >6} | {: >5} | {: >+7.1}% | {: >8}",
         r.iter,
         r.removed,
         r.resized,
@@ -579,25 +592,24 @@ pub fn progress_row(r: &Row<'_>, time_scale: f32) -> String {
         r.cloned,
         r.swaps,
         r.area_growth_percent,
-        delay_as_string(r.wns, 3, time_scale),
-        delay_as_string(r.st_tns, 1, time_scale),
-        delay_as_string(r.en_tns, 1, time_scale),
-        r.viol,
-        r.worst
-    )
+        delay_as_string(r.wns, 3, time_scale)
+    );
+    let st = r.st_tns.map_or(String::new(), |t| format!(" | {: >10}", delay_as_string(t, 1, time_scale)));
+    format!("{prefix}{st} | {: >10} | {: >6} | {}", delay_as_string(r.en_tns, 1, time_scale), r.viol, r.worst)
 }
 
 /// The progress header and row 0 (`printProgress(0, …, '*')`): nothing moved yet, area unchanged.
-pub fn row0(endpoints: &[Point], violating_endpoints: usize, violating_startpoints: &[Point], time_scale: f32) -> Vec<String> {
-    row0_with(endpoints, violating_endpoints, violating_startpoints, time_scale, false)
+pub fn row0(endpoints: &[Point], violating_endpoints: usize, startpoints: &[Point], violating_startpoints: &[Point], time_scale: f32) -> Vec<String> {
+    row0_with(endpoints, violating_endpoints, startpoints, violating_startpoints, time_scale, false)
 }
 
-/// [`row0`]; with `use_startpoints`, the Worst column is `getWorstPin(true)`: the first violating
-/// startpoint of least slack (they are stable-sorted by slack; a strict `<` keeps the first).
-pub fn row0_with(endpoints: &[Point], violating_endpoints: usize, violating_startpoints: &[Point], time_scale: f32, use_startpoints: bool) -> Vec<String> {
+/// [`row0`]; with `use_startpoints` (the startpoint metrics), StTNS over every startpoint and the
+/// Worst column `getWorstPin(true)`: the first violating startpoint of least slack (they are
+/// stable-sorted by slack; a strict `<` keeps the first).
+pub fn row0_with(endpoints: &[Point], violating_endpoints: usize, startpoints: &[Point], violating_startpoints: &[Point], time_scale: f32, use_startpoints: bool) -> Vec<String> {
     let (wns, worst_end) = worst_slack(endpoints);
     let worst = if use_startpoints { violating_startpoints.first() } else { worst_end };
-    let mut lines = progress_header();
+    let mut lines = progress_header(use_startpoints);
     lines.push(progress_row(
         &Row {
             iter: "0*",
@@ -608,7 +620,7 @@ pub fn row0_with(endpoints: &[Point], violating_endpoints: usize, violating_star
             swaps: 0,
             area_growth_percent: 0.0,
             wns,
-            st_tns: startpoint_tns(violating_startpoints),
+            st_tns: use_startpoints.then(|| startpoint_tns(startpoints)),
             en_tns: total_negative_slack(endpoints),
             viol: violating_endpoints,
             worst: worst.map(|p| p.pin.as_str()).unwrap_or(""),
@@ -758,8 +770,24 @@ mod tests {
         assert_eq!(worst_slack(&ends).1.unwrap().pin, "b/D");
         let v = collect_violating(&ends, 0.0);
         assert_eq!(v.iter().map(|x| x.pin.as_str()).collect::<Vec<_>>(), ["b/D", "c/D", "a/D"]);
-        let row = row0(&ends, 3, &[], 1e-9);
-        assert_eq!(row[3], "       0* |       0 |       0 |        0 |      0 |     0 |    +0.0% |   -0.300 |        0.0 |       -0.7 |      3 | b/D");
+        let row = row0(&ends, 3, &[], &[], 1e-9);
+        assert_eq!(row[3], "       0* |       0 |       0 |        0 |      0 |     0 |    +0.0% |   -0.300 |       -0.7 |      3 | b/D");
+    }
+
+    /// Rules (`printProgressHeader`, `printProgress`, `getOverallStartpointTns`): without the
+    /// startpoint metrics the table has no StTNS column and its last header reads `Endpoint`;
+    /// with them, StTNS sums EVERY startpoint's negative slack in walk order — a startpoint with
+    /// slack between 0 and the margin adds nothing, the order is the walk's, not the slack sort's.
+    #[test]
+    fn the_progress_table_shows_sttns_only_for_startpoint_phases() {
+        assert_eq!(progress_header(false)[1].trim_end(), "          | Buffers |  Gates  | Buffers  |  Gates | Swaps |          |          |            | Endpts | Endpoint");
+        assert!(progress_header(true)[0].contains("|   StTNS    |    TNS     |"));
+        let ends = [p("a/D", -3e-10)];
+        let starts = [p("in1", 1e-10), p("r1/Q", -1e-10), p("r2/Q", -2e-10)];
+        let violating = collect_violating(&starts, 0.0);
+        let row = row0_with(&ends, 1, &starts, &violating, 1e-9, true);
+        assert_eq!(row[3], "       0* |       0 |       0 |        0 |      0 |     0 |    +0.0% |   -0.300 |       -0.3 |       -0.3 |      1 | r2/Q");
+        assert_eq!(startpoint_tns(&starts), -1e-10f32 + -2e-10f32);
     }
 
     /// Rules (`Optimizer::run`): an empty list errors with RSZ-0223; an unknown FIRST phase with

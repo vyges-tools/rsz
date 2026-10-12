@@ -298,12 +298,12 @@ impl Repair<'_, '_> {
         cells.into_iter().map(|cell| Candidate { kind: Move::VtSwap, cell }).collect()
     }
 
-    /// `SizeUpMtGenerator`: `isApplicable` (an instance not dont_touch, prepared), then
+    /// `SizeUpMtGenerator`: `isApplicable` (an instance not dont_touch, not fixed, prepared), then
     /// `findSizeUpOptions` — the swappable cells of the arc's cell in the same VT class whose
     /// output port drives no weaker — each kept when it preserves the fanin nets' max capacitance.
     pub(super) fn mt1_size_up_generate(&self, t: &Mt1Target) -> Vec<Candidate> {
         let Some(ad) = &t.arc_delay else { return Vec::new() };
-        if self.design.net_info().dont_touch_insts.contains(&t.inst) {
+        if self.design.net_info().dont_touch_insts.contains(&t.inst) || self.design.net_info().fixed_insts.contains(&t.inst) {
             return Vec::new();
         }
         let target = ad.target();

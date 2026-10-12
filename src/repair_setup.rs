@@ -1178,13 +1178,13 @@ struct SizeUp {
 }
 
 /// `SizeUpGenerator::generate` on the path's driver at `index`: `resolveDriverContext` (an
-/// instance pin, not dont_touch, a logic standard cell), `loadStageContext` (the driver's load,
+/// instance pin, not dont_touch, not fixed, a logic standard cell), `loadStageContext` (the driver's load,
 /// the input port the path entered by, the previous driver's drive resistance), `upsizeCell`, and
 /// the max-capacitance guard.
 fn size_up(ctx: &Ctx<'_>, design: &dyn Design, view: &PathView, index: usize) -> Result<Option<SizeUp>, Stop> {
     let st = &view.stages[index];
     let (Some(inst), Some(cell), Some(port)) = (&st.inst, &st.cell, &st.port) else { return Ok(None) };
-    if design.net_info().dont_touch_insts.contains(inst) || !ctx.sizing.masters.get(cell).is_some_and(|m| m.logic_std) {
+    if design.net_info().dont_touch_insts.contains(inst) || design.net_info().fixed_insts.contains(inst) || !ctx.sizing.masters.get(cell).is_some_and(|m| m.logic_std) {
         return Ok(None);
     }
     let Some(in_port) = &st.in_port else { return Ok(None) };
@@ -1367,17 +1367,16 @@ struct Repair<'c, 'd> {
     reroute_phase: bool,
     /// Inside a LEGACY_MT phase (`SetupLegacyMtPolicy`): prepared targets, the MT VtSwap / SizeUp.
     legacy_mt: bool,
-    /// `RepairSetupContext::progress_header_printed`: a legacy phase's preamble printed the
-    /// progress header; a policy without one (MEASURED_VT_SWAP) leaves it to the final report.
+    /// `RepairSetupContext::progress_header_printed`: a header has been printed (a legacy phase's
+    /// row 0 prints it; a policy without one, MEASURED_VT_SWAP, leaves it to the final report).
     progress_header_printed: bool,
+    /// The run starts with `SetupLegacyBase::start` (every policy but MEASURED_VT_SWAP, MT1 and
+    /// GLOBAL_SIZING alone).
+    legacy_start: bool,
+    /// `RepairSetupContext::progress_header_show_startpoint_metrics`: the layout the last header
+    /// printed — a phase that shows the other one prints the header again; the final row follows it.
+    progress_header_show_starts: bool,
 }
-
-/// `OptimizationPolicy::printProgressHeader`'s lines (no trailing blanks, unlike the legacy
-/// preamble's header).
-const POLICY_PROGRESS_HEADER: [&str; 2] = [
-    "   Iter   | Removed | Resized | Inserted | Cloned |  Pin  |   Area   |    WNS   |   StTNS    |   EnTNS    |  Viol  |  Worst",
-    "          | Buffers |  Gates  | Buffers  |  Gates | Swaps |          |          |            |            | Endpts | St/EnPt",
-];
 
 /// What `Resizer::swapPins` did.
 #[derive(Debug, Clone, PartialEq)]
@@ -1996,14 +1995,16 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
         legacy_mt: false,
         // Only a policy alone that has no legacy start (MEASURED_VT_SWAP, MT1) runs without the
         // legacy preamble.
-        progress_header_printed: !matches!(args.phases.as_deref().map(crate::repair_timing::phase_plan), Some(crate::repair_timing::PhasePlan::MeasuredVtSwap | crate::repair_timing::PhasePlan::Mt1 | crate::repair_timing::PhasePlan::GlobalSizing)),
+        progress_header_show_starts: false,
+        progress_header_printed: false,
+        legacy_start: !matches!(args.phases.as_deref().map(crate::repair_timing::phase_plan), Some(crate::repair_timing::PhasePlan::MeasuredVtSwap | crate::repair_timing::PhasePlan::Mt1 | crate::repair_timing::PhasePlan::GlobalSizing)),
     };
     // `SetupLegacyBase::start`: with the move tracker on, `captureInitialSlackDistribution` (and
     // `captureOriginalEndpointSlack`, read only by the level-2 profiles) after RSZ-0099.
     // A policy alone with no legacy start captures nothing here (MT1 captures in its own start;
     // MEASURED_VT_SWAP and GLOBAL_SIZING never do: "No initial slack data captured").
     if r.tracker_level() >= 1 {
-        if r.progress_header_printed {
+        if r.legacy_start {
             r.capture_initial_slack_distribution(true)?;
         } else {
             r.tracker = Some(move_tracker::Initial::default());
@@ -2555,11 +2556,16 @@ impl Repair<'_, '_> {
             self.collector_ends = ends.iter().map(|p| (p.pin.clone(), p.slack)).collect();
             ends.iter().map(|p| p.pin.clone()).collect()
         };
-        self.print_progress(self.opto_iteration, false)?;
         if points.is_empty() {
             self.debug("repair_setup", 1, format!("{phase} Phase: No violating {point_type}s, exiting"));
             return Ok(());
         }
+        // ENDPOINT_FANIN accepts a journal on the startpoints' TNS too: collected here, whatever
+        // the progress row shows; then the row.
+        if !use_starts {
+            self.collector_starts = collect_violating(&self.timing.starts, margin).iter().map(|p| p.pin.clone()).collect();
+        }
+        self.print_progress(self.opto_iteration, false)?;
         self.debug("repair_setup", 1, format!("{phase} Phase: Processing {} violating {point_type}s", points.len()));
         let mut processed = 0i64;
         for (point_index, point) in points.iter().enumerate() {
@@ -2620,7 +2626,7 @@ impl Repair<'_, '_> {
                 let better = fuzzy::greater(new_wns, prev_wns) || (fuzzy::equal(new_wns, prev_wns) && (fuzzy::greater(new_point_slack, prev_point_slack) || focused) && both_ok);
                 let improvement = new_point_slack - prev_point_slack;
                 let line = format!(
-                    "{phase} Phase: Threshold {pass_count}/3: {point_type} slack {} -> {} (imp: {}), WNS {} -> {}, EnTNS {} -> {}, StTNS {} -> {}{}",
+                    "{phase} Phase: Threshold {pass_count}/3: {point_type} slack {} -> {} (imp: {}), WNS {} -> {}, TNS {} -> {}, StTNS {} -> {}{}",
                     self.ds(prev_point_slack, 3),
                     self.ds(new_point_slack, 3),
                     self.ds(improvement, 3),
@@ -2670,17 +2676,11 @@ impl Repair<'_, '_> {
         }
     }
 
-    /// `getOverallStartpointTns(false)`: over the collector's startpoints as last collected,
-    /// their slacks now, the negative ones summed in `float`.
+    /// `getOverallStartpointTns(false)`: over every startpoint the collector cached (walk order),
+    /// their slacks now, the negative ones summed in `float` — [`startpoint_tns`]. Every reader
+    /// here comes after a `collectViolatingStartpoints`, so the cache is never empty when read.
     fn collector_start_tns(&self) -> f32 {
-        let mut tns = 0.0f32;
-        for pin in &self.collector_starts {
-            let s = self.point_slack(pin, true);
-            if s < 0.0 {
-                tns += s;
-            }
-        }
-        tns
+        startpoint_tns(&self.timing.starts)
     }
 
     /// `collectViolatorsByDirectionalTraversal`: an endpoint's fanin cone (`traverseFaninCone`
@@ -4041,6 +4041,10 @@ impl Repair<'_, '_> {
             self.debug("size_up_match_move", 2, format!("REJECT SizeUpMatchMove {}: {inst} is \"don't touch\"", st.pin));
             return Ok(None);
         }
+        if self.design.net_info().fixed_insts.contains(inst) {
+            self.debug("size_up_match_move", 2, format!("REJECT SizeUpMatchMove {}: {inst} is fixed", st.pin));
+            return Ok(None);
+        }
         let cell = st.cell.clone().unwrap_or_default();
         if !self.ctx.sizing.masters.get(&cell).is_some_and(|m| m.logic_std) {
             self.debug("size_up_match_move", 2, format!("REJECT SizeUpMatchMove {}: {inst} isn't logic std cell", st.pin));
@@ -4151,10 +4155,10 @@ impl Repair<'_, '_> {
         let mut candidates: Vec<(SdfLoad, String)> = Vec::new();
         for f in fanouts {
             // `resolveLoadContext`.
-            let (Some(_), Some(cell_name), Some(port)) = (f.inst.clone(), f.cell.clone(), f.port.clone()) else { continue };
+            let (Some(load_inst), Some(cell_name), Some(port)) = (f.inst.clone(), f.cell.clone(), f.port.clone()) else { continue };
             let Some(cell) = ctx.libs.link_cell(&cell_name) else { continue };
             // ⚠️ `dontTouch(load_inst)` is the instance's alone; this also reads the pin's net.
-            if self.design.pin_dont_touch(&f.pin) || !ctx.sizing.masters.get(&cell_name).is_some_and(|m| m.logic_std) {
+            if self.design.pin_dont_touch(&f.pin) || self.design.net_info().fixed_insts.contains(&load_inst) || !ctx.sizing.masters.get(&cell_name).is_some_and(|m| m.logic_std) {
                 continue;
             }
             let scene_cell = ctx.libs.scene_cell(0, &cell_name).unwrap_or(cell);
@@ -4586,24 +4590,40 @@ impl Repair<'_, '_> {
         }
     }
 
-    /// `SetupLegacyBase::printProgress`: the header at iteration 0; a row every
-    /// `print_interval_` iterations, or when forced. StTNS over the startpoints' slacks now; Viol
-    /// as the collector last counted.
+    /// `OptimizationPolicy::printProgressHeader`: the header for the layout `show` names, unless the
+    /// last one printed already had it.
+    fn print_progress_header(&mut self, show: bool) {
+        if self.progress_header_printed && self.progress_header_show_starts == show {
+            return;
+        }
+        self.progress_header_printed = true;
+        self.progress_header_show_starts = show;
+        for l in progress_header(show) {
+            self.report(l);
+        }
+    }
+
+    /// `SetupLegacyBase::printProgress`: the header at iteration 0, or when this phase shows the
+    /// other layout (`showStartpointMetrics`: a STARTPOINT_FANOUT phase); a row every
+    /// `print_interval_` iterations, or when forced. With the startpoint metrics the startpoints
+    /// are collected and StTNS (over every startpoint) printed; Viol as the collector last counted.
     fn print_progress(&mut self, iteration: i64, force: bool) -> Result<(), Stop> {
-        if iteration == 0 {
-            for l in progress_header() {
-                self.report(l);
-            }
+        let show = self.startpoint_rows;
+        let metrics_changed = self.progress_header_printed && self.progress_header_show_starts != show;
+        if iteration == 0 || metrics_changed {
+            self.print_progress_header(show);
         }
         if iteration % PRINT_INTERVAL != 0 && !force {
             return Ok(());
         }
-        // `collectViolatingStartpoints`, only when a row prints.
-        let starts = collect_violating(&self.timing.starts, self.ctx.margin);
-        self.collector_starts = starts.iter().map(|p| p.pin.clone()).collect();
+        // `collectViolatingStartpoints`, only with the startpoint metrics.
+        let starts = if show { collect_violating(&self.timing.starts, self.ctx.margin) } else { Vec::new() };
+        if show {
+            self.collector_starts = starts.iter().map(|p| p.pin.clone()).collect();
+        }
         let (wns, worst_end) = self.timing.worst();
         // `getWorstPin(use_startpoints)`: the first violating startpoint of least slack.
-        let worst = if self.startpoint_rows { starts.first().map(|p| p.pin.clone()) } else { worst_end };
+        let worst = if show { starts.first().map(|p| p.pin.clone()) } else { worst_end };
         let field = format!("{iteration}{}", self.phase.chars().last().unwrap_or('*'));
         let row = progress_row(
             &Row {
@@ -4616,7 +4636,7 @@ impl Repair<'_, '_> {
                 swaps: self.committer.total(Move::SwapPins),
                 area_growth_percent: self.area_growth_percent(),
                 wns,
-                st_tns: startpoint_tns(&starts),
+                st_tns: show.then(|| startpoint_tns(&self.timing.starts)),
                 en_tns: self.timing.tns(),
                 viol: self.collector_violating,
                 worst: worst.as_deref().unwrap_or(""),
@@ -4630,16 +4650,14 @@ impl Repair<'_, '_> {
     /// `OptimizationPolicy::finalizeAndReport`: a fresh collector's row, the closing rule, then
     /// `reportRepairSummary`.
     fn finalize_and_report(&mut self) -> Result<(), Stop> {
-        // `printFinalProgress` → `printProgressHeader`, unless a phase printed it.
+        // `printFinalProgress` → `printProgressHeader`, unless a phase printed it (this policy
+        // shows no startpoint metrics); the row then follows the layout last printed, and the
+        // final collector collects startpoints only for it.
         if !self.progress_header_printed {
-            self.progress_header_printed = true;
-            for l in POLICY_PROGRESS_HEADER {
-                self.report(l.to_string());
-            }
-            self.report("-".repeat(126));
+            self.print_progress_header(false);
         }
+        let show = self.progress_header_show_starts;
         let violating = collect_violating(&self.timing.ends, self.ctx.margin).len();
-        let starts = collect_violating(&self.timing.starts, self.ctx.margin);
         let (wns, worst) = self.timing.worst();
         let row = progress_row(
             &Row {
@@ -4652,7 +4670,7 @@ impl Repair<'_, '_> {
                 swaps: self.committer.total(Move::SwapPins),
                 area_growth_percent: self.area_growth_percent(),
                 wns,
-                st_tns: startpoint_tns(&starts),
+                st_tns: show.then(|| startpoint_tns(&self.timing.starts)),
                 en_tns: self.timing.tns(),
                 viol: violating,
                 worst: worst.as_deref().unwrap_or(""),

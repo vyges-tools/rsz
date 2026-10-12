@@ -1481,6 +1481,7 @@ fn net_info(db: &Db, nl: &vyges_sta::netlist::Netlist) -> Result<NetInfo, String
         }
     }
     info.dont_touch_insts = nl.insts.iter().filter(|(i, _)| db.inst_is_do_not_touch(i)).map(|(i, _)| i.clone()).collect();
+    info.fixed_insts = nl.insts.iter().filter(|(i, _)| db.inst_is_fixed(i)).map(|(i, _)| i.clone()).collect();
     Ok(info)
 }
 
@@ -2341,7 +2342,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 if !recover && !hold_only && !measured && violating.is_empty() {
                     timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": 0 }));
                 } else if let Some(why) = unmodelled.filter(|_| !hold_only && !recover) {
-                    lines.extend(rt::row0_with(&ends, violating.len(), &violating_starts, time_scale, startpoint_rows));
+                    lines.extend(rt::row0_with(&ends, violating.len(), &starts, &violating_starts, time_scale, startpoint_rows));
                     timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len() }));
                     timing_stop = Some(why);
                     break;
@@ -2409,7 +2410,7 @@ fn run(job: &Value) -> Result<Value, String> {
                             rb_sizes_store = match vyges_rsz::rebuffer::characterize(&ci, &buffers.cells) {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    lines.extend(rt::row0(&ends, violating.len(), &violating_starts, time_scale));
+                                    lines.extend(rt::row0(&ends, violating.len(), &starts, &violating_starts, time_scale));
                                     timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len() }));
                                     timing_stop = Some(format!("{e} (not modelled)"));
                                     break;
@@ -2587,7 +2588,7 @@ fn run(job: &Value) -> Result<Value, String> {
                         Err(Stop::Refused { msg, .. }) => {
                             // A step refused during the repair: scored, as a refusal before it is,
                             // on the preamble and the progress table's header and row 0.
-                            lines.extend(rt::row0(&ends, violating.len(), &violating_starts, time_scale));
+                            lines.extend(rt::row0(&ends, violating.len(), &starts, &violating_starts, time_scale));
                             timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len() }));
                             timing_stop = Some(format!("{msg} (not modelled)"));
                             break;

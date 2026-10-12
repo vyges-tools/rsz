@@ -272,6 +272,9 @@ pub struct NetInfo {
     pub dont_touch: std::collections::BTreeSet<String>,
     /// Instances marked dont_touch (`Resizer::dontTouch(inst)`).
     pub dont_touch_insts: std::collections::BTreeSet<String>,
+    /// Instances placed FIRM, LOCKED or COVER (`Resizer::isFixed(inst)` → `dbInst::isFixed`): they
+    /// keep their footprint — no size move resizes them; a VT swap (same footprint) still may.
+    pub fixed_insts: std::collections::BTreeSet<String>,
     pub abutment: std::collections::BTreeSet<String>,
 }
 

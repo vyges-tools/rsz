@@ -22,6 +22,8 @@ pub struct Driver<'a> {
     pub port: &'a str,
     /// `dontTouch(inst)`, and `isLogicStdCell(inst)`: a master of type CORE exactly.
     pub dont_touch: bool,
+    /// Placed FIRM / LOCKED / COVER: it keeps its master (buffering repairs the net).
+    pub fixed: bool,
     pub logic_std_cell: bool,
 }
 
@@ -52,7 +54,7 @@ fn check_driver_arc_slew(g: &Graph<'_>, inst: &str, from: &str, role: Role, arc:
 /// on the link cell — not the corner's models); the input slews are the corner's.
 #[allow(clippy::too_many_arguments)]
 pub fn repair_driver_slew(g: &Graph<'_>, corner: usize, d: &Driver<'_>, load_cap: f32, sizing: &Sizing<'_>, limits: &Limits, slew_margin: f64, clocks: &std::collections::BTreeSet<usize>, trace: &mut Trace) -> Result<Option<String>, Stop> {
-    if d.dont_touch || !d.logic_std_cell {
+    if d.dont_touch || d.fixed || !d.logic_std_cell {
         return Ok(None);
     }
     let equiv_cells = sizing.swappable_cells(d.cell)?;

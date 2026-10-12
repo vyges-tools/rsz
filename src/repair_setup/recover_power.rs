@@ -219,7 +219,7 @@ impl Recovery<'_, '_> {
     /// `downsizeDrvr(drvr_path, drvr_index, expanded, only_same_size_swap = true, path_slack)`:
     /// the driver's load, the input port the path entered by (none: nothing), the previous
     /// driver's drive resistance (its link port); unless the instance is dont_touch, the cell
-    /// `downsizeCell` picks, replaced (`replaceCell`).
+    /// `downsizeCell` picks — for a fixed driver only a VT equivalent — replaced (`replaceCell`).
     fn downsize_drvr(&mut self, view: &PathView, drvr_index: usize, path_slack: f32) -> Result<bool, Stop> {
         let st = &view.stages[drvr_index];
         let Some(in_port) = st.in_port.as_deref() else { return Ok(false) };
@@ -232,6 +232,10 @@ impl Recovery<'_, '_> {
             _ => 0.0,
         };
         let Some(downsize) = self.downsize_cell(in_port, cell, port, st.load_cap, prev_drive, view.scene, path_slack)? else { return Ok(false) };
+        // A fixed driver keeps its footprint: only a VT-equivalent downsize stands.
+        if self.design.net_info().fixed_insts.contains(inst) && !self.ctx.sizing.vt_equiv_cells(cell, self.ctx.vt_category_count).contains(&downsize) {
+            return Ok(false);
+        }
         self.debug(3, format!("resize {} {} -> {}", st.pin, cell, downsize));
         // `replaceCell(drvr, downsize, journal)`: `designAreaIncr(-area(old))`, the swap,
         // `designAreaIncr(area(new))`, each area narrowed to `float`.
