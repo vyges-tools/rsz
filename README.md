@@ -5,9 +5,9 @@ wire is too long, a driver sees too much capacitance or fans out too far, or a l
 is too slow — and a driver resized where its own transition is.
 
 ```sh
-vyges install loom
-vyges loom rsz repair_design job.json
-vyges loom rsz --describe
+vyges install physical
+vyges physical rsz repair_design job.json
+vyges physical rsz --describe
 ```
 
 Documentation: [`docs/src/rsz.md`](docs/src/rsz.md) (an mdBook; `mdbook build docs`), with the

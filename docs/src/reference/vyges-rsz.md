@@ -1,24 +1,27 @@
-# vyges loom rsz — CLI reference
+# vyges physical rsz — CLI reference
 
-_Generated from `vyges loom rsz --help` — this page is the tool's own output, verbatim._
+_Generated from `vyges physical rsz --help` — this page is the tool's own output, verbatim._
 
 ```text
-vyges loom rsz — electrical repair of a placed design: repeaters along each net's Steiner tree,
-drivers resized, where a wire is too long or a capacitance, fanout or transition limit is broken
+vyges physical rsz — electrical repair of a placed design: repeaters along each net's Steiner
+tree, drivers resized, where a wire is too long or a capacitance, fanout or transition limit is
+broken
 
 USAGE:
-  vyges loom rsz repair_design <job.json> [-o FILE]
-  vyges loom rsz buffer_ports <job.json> [-o FILE]     (the same job runner; a job may hold either)
-  vyges loom rsz --describe
-  vyges loom rsz --help
-  vyges loom rsz --version
+  vyges physical rsz repair_design <job.json> [-o FILE]
+  vyges physical rsz buffer_ports <job.json> [-o FILE]  (the same job runner; a job may hold either)
+  vyges physical rsz --describe
+  vyges physical rsz --help
+  vyges physical rsz --version
 
 JOB FIELDS:
   steps        required — the commands in order, each {"cmd": ..., "args": [...]}, as a flow
                script passes them:
                  read_lef, read_def, read_db, define_corners, read_liberty [-corner C],
                  read_sdc, set_dont_use, set_layer_rc, set_wire_rc, set_routing_alpha,
-                 estimate_parasitics -placement, set_propagated_clock, buffer_ports [options],
+                 set_routing_layers -signal LO-HI [-clock LO-HI], global_route,
+                 estimate_parasitics -placement | -global_routing, set_propagated_clock,
+                 buffer_ports [options],
                  repair_design [options], repair_timing [options]
                an estimate_parasitics step may carry "db": the database as the estimate saw it,
                when cells were moved between it and the repair
@@ -55,10 +58,19 @@ REPAIR_TIMING:
   RSZ-0132, RSZ-0032 and the buffers it inserts; -max_utilization or -max_buffer_percent reached
   ends it with RSZ-0050 / RSZ-0060 (status error).
   status repaired (the design changed), unrepaired (violations, nothing kept), up_to_date or
-  error. One clock, ideal or propagated, with its I/O delays. -setup and -hold together (or
-  neither): the setup repair, then refused. Refused before the lines: -phases other than
-  LEGACY, -recover_power, several corners, VT libraries, a latch, a virtual clock, clock
-  uncertainty / latency / transition, derates, path exceptions; refused during the repair:
+  error. Clocks (one or several, real or virtual), each ideal or propagated, with their I/O
+  delays; latches (time borrowing); VT libraries (VtSwapMove); pins tied to supply nets.
+  -setup and -hold together (or neither): the setup repair, then refused. Phases LEGACY, WNS,
+  TNS, ENDPOINT_FANIN, STARTPOINT_FANOUT, LAST_GASP, CRIT_VT_SWAP and REROUTE are modelled (an
+  empty list or an unknown first phase is the command's own error), on placement or global-route
+  parasitics (the live incremental router; a resistance-aware re-route reads the timer's net
+  slacks mid-update); the experimental policies
+  GLOBAL_SIZING, MT1 and MEASURED_VT_SWAP each alone (tunables from RSZ_* environment variables,
+  a setenv step), and LEGACY_MT as the first phase. -recover_power runs in full (RecoverPower: every row, the trace, the design; -match_cell_footprint
+  and global-route parasitics refused). Refused before the lines: an experimental policy with
+  other phases, LEGACY_MT after another phase or with SizeDownFanoutMove, parasitics other than -placement and -global_routing, setup clock
+  uncertainty, clock latency / transition, derates, false and multicycle paths, clock groups,
+  path delays other than the forms the timer models (see --describe); refused during the repair:
   -setup with -max_utilization, more than one repair per pass.
 
 CONSTRAINTS READ FROM SDC:

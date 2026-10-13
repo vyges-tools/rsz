@@ -2715,15 +2715,16 @@ fn run(job: &Value) -> Result<Value, String> {
 }
 
 const USAGE: &str = "\
-vyges loom rsz — electrical repair of a placed design: repeaters along each net's Steiner tree,
-drivers resized, where a wire is too long or a capacitance, fanout or transition limit is broken
+vyges physical rsz — electrical repair of a placed design: repeaters along each net's Steiner
+tree, drivers resized, where a wire is too long or a capacitance, fanout or transition limit is
+broken
 
 USAGE:
-  vyges loom rsz repair_design <job.json> [-o FILE]
-  vyges loom rsz buffer_ports <job.json> [-o FILE]     (the same job runner; a job may hold either)
-  vyges loom rsz --describe
-  vyges loom rsz --help
-  vyges loom rsz --version
+  vyges physical rsz repair_design <job.json> [-o FILE]
+  vyges physical rsz buffer_ports <job.json> [-o FILE]  (the same job runner; a job may hold either)
+  vyges physical rsz --describe
+  vyges physical rsz --help
+  vyges physical rsz --version
 
 JOB FIELDS:
   steps        required — the commands in order, each {\"cmd\": ..., \"args\": [...]}, as a flow
@@ -2827,7 +2828,7 @@ const DESCRIBE: &str = r#"{
   "openroad_pin": "@OPENROAD_PIN@",
   "name": "rsz",
   "summary": "electrical repair of a placed design: repeaters inserted along each net's Steiner tree for long wires, max capacitance and max slew; and port buffering",
-  "maturity": "experimental",
+  "maturity": "structured",
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "status is one of repaired, up_to_date, vacuous, refused or error. repaired means the design changed (buffers inserted or drivers resized); up_to_date means drivers were checked and none needed a change (nets_checked says how many; for a job with buffer_ports and no repair_design, ports_checked); vacuous means nothing was checked and is NOT a pass. The declared assertion passes on repaired or up_to_date. Exit status is 0 for repaired and up_to_date, 2 for vacuous and for error, 3 for refused.",
@@ -2991,6 +2992,17 @@ mod tests {
         let d: Value = serde_json::from_str(&describe()).expect("--describe must be valid JSON");
         assert_eq!(d["name"], "rsz");
         assert_eq!(d["assertion"]["pass_when"]["in"], serde_json::json!(["repaired", "up_to_date"]));
+    }
+
+    // ⛔ `maturity` has exactly THREE legal values — discovered, structured, workflow-validated —
+    // and the parser maps anything else to `discovered`, where the verdict is suppressed to
+    // `unknown`. This engine said `experimental`, which threw every verdict away.
+    #[test]
+    fn the_maturity_is_a_legal_rung() {
+        let d: Value = serde_json::from_str(&describe()).expect("--describe must be valid JSON");
+        let m = d["maturity"].as_str().expect("maturity is a string");
+        assert!(["discovered", "structured", "workflow-validated"].contains(&m), "{m}");
+        assert_eq!(m, "structured");
     }
 
     /// One port delay as (port, clock, delay[rf][min/max]).

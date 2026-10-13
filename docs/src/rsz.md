@@ -1,8 +1,9 @@
 # vyges-rsz — electrical repair of a placed design
 
-> **Part of the Vyges Loom suite.** Install once with `vyges install loom`, then run
-> `vyges loom rsz`. It's also a standalone `vyges-rsz` binary on your PATH (the
-> integration contract for flow authors).
+> **Physical construction — opt-in, and not part of `vyges install loom`.** Install the group with
+> `vyges install physical` (or just this engine with `vyges install rsz`), then run
+> `vyges physical rsz`. It is also a standalone `vyges-rsz` binary on your PATH, which is what the
+> dispatch calls and what a flow author targets directly.
 
 `vyges-rsz` answers: **after placement, which nets break an electrical rule, and what buffers or
 driver sizes fix them?** A wire that is too long, a driver that sees more capacitance than its
@@ -28,9 +29,9 @@ timer underneath is `vyges-sta`, on parasitics estimated by `vyges-est` from the
 ## Run it
 
 ```sh
-vyges install loom                                  # one-time
-vyges loom rsz repair_design job.json               # -> a JSON report
-vyges loom rsz repair_design job.json -o report.json
+vyges install physical                                  # one-time
+vyges physical rsz repair_design job.json               # -> a JSON report
+vyges physical rsz repair_design job.json -o report.json
 ```
 
 A job is the list of commands a flow script would run, in order, with the arguments as the script
@@ -145,8 +146,8 @@ fanout check off.
 ## buffer_ports
 
 A `buffer_ports` step puts a buffer after each input port and before each output port, so every
-port is driven by, or drives, one known cell (`vyges loom rsz buffer_ports job.json` runs the same
-job runner). Ports are walked in the database's order. A port is left alone when its net is
+port is driven by, or drives, one known cell (`vyges physical rsz buffer_ports job.json` runs the
+same job runner). Ports are walked in the database's order. A port is left alone when its net is
 dont-touch, special or has no instance pins, when an input is a clock source or its loads are all
 buffers (or one is dont-touch), and when an output's driver is tristate or dont-touch. The buffer
 is the weakest one the repair would choose, or `-buffer_cell`.
