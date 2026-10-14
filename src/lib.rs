@@ -32,6 +32,8 @@ pub mod clone;
 pub mod delay_estimator;
 pub mod design;
 pub mod driver_slew;
+#[cfg(feature = "cli")]
+pub mod env;
 pub mod fanout;
 pub mod max_wire_length;
 pub mod move_tracker;
