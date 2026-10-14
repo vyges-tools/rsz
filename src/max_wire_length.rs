@@ -166,7 +166,7 @@ pub fn cell_wire_delay(ctx: &Ctx<'_>, cell: &str, drvr_port: &str, load_port: &s
         let half = (wire_cap / 2.0) as f32;
         let par: HashMap<String, NetParasitics> = [(
             "wire".to_string(),
-            NetParasitics { node_names: vec![drvr_name.clone(), load_name.clone()], network: Network { node_caps: vec![half, half], resistors: vec![(0, 1, wire_res as f32)] }, port_pin_caps: None },
+            NetParasitics { node_names: vec![drvr_name.clone(), load_name.clone()], network: Network { node_caps: vec![half, half], resistors: vec![(0, 1, wire_res as f32)] }, port_pin_caps: None, pi: None, pi_rise_only: false },
         )]
         .into();
         let mut g = crate::repair_design::timer_graph(ctx.libs, k, &netlist, &sdc, ctx.master_pins)?;

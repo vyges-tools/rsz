@@ -169,6 +169,186 @@ fn clamp_loc_to_core(core: Option<(i32, i32, i32, i32)>, (w, h): (i32, i32), (x,
     (x.clamp(x0, x_max), y.clamp(y0, y_max))
 }
 
+/// `dbPlacementStatus::isPlaced`.
+fn is_placed(status: &str) -> bool {
+    matches!(status, "PLACED" | "LOCKED" | "FIRM" | "COVER" | "FIXED")
+}
+
+/// `Resizer::metersToDbu(separation)` as `repairTieFanout` calls it: `-separation` is microns
+/// (`distance_ui_sta` makes meters), then `lround(m · dbu_ · 1e6)` masked to a non-negative int.
+///
+/// ⛔ The call comes BEFORE `initDesignArea()`, and `dbu_` is 0 until some resizer command has run
+/// `initBlock` — so as the session's first resizer command the separation is 0 and ties land on
+/// their loads' pins (upstream's repair_tie2 golden shows exactly that). After `repair_design`, as
+/// LibreLane runs it, the database's units apply.
+fn separation_dbu(separation_um: f64, dbu: f64) -> i32 {
+    ((separation_um * 1e-6 * dbu * 1e6).round() as i64 & i64::from(i32::MAX)) as i32
+}
+
+/// `Resizer::tieLocation` for an instance pin at `(x, y)` on an instance with bounding box `b`
+/// (`[x_min, y_min, x_max, y_max]`): moved `separation` out through the side STRICTLY nearest the
+/// pin; a pin equally near two sides is not moved. A port's location is used as is.
+fn tie_location((x, y): (i32, i32), b: [i32; 4], separation: i32) -> (i32, i32) {
+    let (l, r, bo, t) = ((x - b[0]).abs(), (x - b[2]).abs(), (y - b[1]).abs(), (y - b[3]).abs());
+    let (mut tx, mut ty) = (x, y);
+    if l < r && l < bo && l < t {
+        tx -= separation;
+    }
+    if r < l && r < bo && r < t {
+        tx += separation;
+    }
+    if bo < l && bo < r && bo < t {
+        ty -= separation;
+    }
+    if t < l && t < r && t < bo {
+        ty += separation;
+    }
+    (tx, ty)
+}
+
+/// `repair_tie_fanout lib_port [-separation dist] [-max_fanout n] [-verbose]` —
+/// `Resizer::repairTieFanout`: every load of a tie cell's output gets a tie cell of its own.
+///
+/// The call sequence, as the reference makes it:
+///  1. the tie instances (`findCellInstances`): every instance of the port's cell, sorted by name;
+///  2. per tie, skipped when it is dont_touch, its pin has no net, or the net is dont_touch;
+///  3. its loads: every other pin on the net, sorted by path name — a dont_touch load stays on the
+///     original tie (`keep_tie`) and is not given one;
+///  4. per load (`createNewTieCellForLoadPin`): a tie named after the load's instance (the block's
+///     name for a port), uniquified `IF_NEEDED_WITH_UNDERSCORE`, source TIMING, placed at
+///     `tieLocation` clamped to the core, UNPLACED when the load is not placed; an instance pin is
+///     disconnected and hierarchically connected (connection "net"), a port is moved onto a new net
+///     "net" (uniquified `IF_NEEDED`) with the tie's output;
+///  5. unless kept (`deleteTieCellAndNet`): the original net destroyed, then the tie instance too
+///     when none of its other pins is on a signal net (a cell with both HI and LO keeps the other);
+///  6. `RSZ-0042` when any tie was inserted.
+///
+/// `-max_fanout` and `-verbose` are parsed and unused, as upstream's are. `block_inited`: whether an
+/// earlier resizer command in the session ran `initBlock` (see [`separation_dbu`]).
+fn repair_tie_fanout(db: &mut Db, libs: &Libs, args: &[String], block_inited: bool) -> Result<Value, String> {
+    let e = |x: vyges_opendb::Error| x.to_string();
+    let mut separation = 0.0f64;
+    let mut positional = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-separation" | "-max_fanout" => {
+                let v = args.get(i + 1).ok_or_else(|| format!("repair_tie_fanout {} needs a value", args[i]))?;
+                if args[i] == "-separation" {
+                    // `check_positive_float`: a double, and >= 0 (STA-0572 otherwise).
+                    separation = v.parse::<f64>().ok().filter(|x| *x >= 0.0).ok_or_else(|| format!("STA-0572: -separation '{v}' is not a positive float."))?;
+                }
+                i += 2;
+            }
+            "-verbose" => i += 1,
+            f if f.starts_with('-') => return Err(format!("repair_tie_fanout {f}: not modelled")),
+            _ => {
+                positional.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    let [lib_port] = positional.as_slice() else { return Err("repair_tie_fanout takes one lib_port".into()) };
+    let (cell, port) = lib_port.rsplit_once('/').ok_or_else(|| format!("repair_tie_fanout {lib_port}: not a cell/port (not modelled)"))?;
+    if [cell, port].iter().any(|x| x.contains(['*', '?'])) {
+        return Err(format!("repair_tie_fanout {lib_port}: a pattern (not modelled)"));
+    }
+    if !libs.link_cell(cell).is_some_and(|c| c.port(port).is_some()) {
+        return Err(format!("repair_tie_fanout {lib_port}: no such liberty pin (not modelled)"));
+    }
+    if !db.block_get_mod_insts().is_empty() {
+        return Err("repair_tie_fanout on a hierarchical design: not modelled".into());
+    }
+    let separation_dbu = separation_dbu(separation, if block_inited { f64::from(db.tech_get_db_units_per_micron()) } else { 0.0 });
+    let core = (db.block_get_core_area_x_min(), db.block_get_core_area_y_min(), db.block_get_core_area_x_max(), db.block_get_core_area_y_max());
+    let core = (core != (0, 0, 0, 0)).then_some(core);
+    let size = (db.master_get_width(cell) as i32, db.master_get_height(cell) as i32);
+    let block = db.block_name();
+
+    let mut insts: Vec<String> = db.block_get_insts().into_iter().filter(|i| db.inst_master(i) == cell).collect();
+    insts.sort();
+    let (mut tie_count, mut ties_checked) = (0usize, 0usize);
+    for tie in &insts {
+        if db.inst_is_do_not_touch(tie) {
+            continue;
+        }
+        let net = db.net_of(tie, port);
+        if net.is_empty() || db.net_is_do_not_touch(&net) {
+            continue;
+        }
+        ties_checked += 1;
+        let mut keep_tie = false;
+        let mut loads: Vec<(String, Option<(String, String)>)> = Vec::new();
+        for it in db.net_iterms(&net) {
+            let (inst, pin) = it.rsplit_once('/').ok_or("an instance pin")?;
+            if db.inst_is_do_not_touch(inst) {
+                keep_tie = true;
+                continue;
+            }
+            if inst == tie && pin == port {
+                continue;
+            }
+            loads.push((it.clone(), Some((inst.to_string(), pin.to_string()))));
+        }
+        for bt in db.net_bterms(&net) {
+            loads.push((bt, None));
+        }
+        loads.sort_by(|a, b| a.0.cmp(&b.0));
+        for (path, iterm) in &loads {
+            // `tieLocation`: the load pin's location, moved `separation` out of the nearest side
+            // of its instance (strictly nearest: a tie between two sides is not moved).
+            let (base, (lx, ly), placed) = match iterm {
+                Some((inst, pin)) => {
+                    let loc = db.iterm_avg_xy(inst, pin).unwrap_or((db.inst_get_origin_x(inst), db.inst_get_origin_y(inst)));
+                    (inst.clone(), loc, is_placed(&db.inst_get_placement_status(inst)))
+                }
+                None => (block.clone(), db.bterm_first_pin_location(path).unwrap_or((0, 0)), is_placed(&db.bterm_get_first_pin_placement_status(path))),
+            };
+            let (tx, ty) = match iterm {
+                Some((inst, _)) => {
+                    let b = db.inst_bbox(inst).map_err(e)?;
+                    tie_location((lx, ly), [b[0], b[1], b[2], b[3]], separation_dbu)
+                }
+                None => (lx, ly),
+            };
+            // `makeInstance`: named, TIMING, `setLocation` (clamped to the core, PLACED).
+            let name = db.make_new_inst_name(&base, "IF_NEEDED_WITH_UNDERSCORE").map_err(e)?;
+            db.create_inst(cell, &name).map_err(e)?;
+            db.inst_set_source_type(&name, "TIMING").map_err(e)?;
+            let at = clamp_loc_to_core(core, size, (tx, ty));
+            db.set_inst_location(&name, at.0, at.1).map_err(e)?;
+            if !placed {
+                db.inst_set_placement_status(&name, "UNPLACED").map_err(e)?;
+            }
+            match iterm {
+                Some((inst, pin)) => {
+                    db.disconnect(inst, pin).map_err(e)?;
+                    db.hierarchical_connect(&name, port, inst, pin, "net").map_err(e)?;
+                }
+                None => {
+                    let n = db.make_new_net_name("net", "IF_NEEDED").map_err(e)?;
+                    db.create_net(&n).map_err(e)?;
+                    db.connect(&name, port, &n).map_err(e)?;
+                    db.bterm_connect(path, &n).map_err(e)?;
+                }
+            }
+            tie_count += 1;
+        }
+        if !keep_tie {
+            db.destroy_net(&net).map_err(e)?;
+            let other = db.master_mterms(cell).map_err(e)?.into_iter().any(|(t, _)| {
+                let n = db.net_of(tie, &t);
+                t != port && !n.is_empty() && !matches!(db.net_get_sig_type(&n).as_str(), "POWER" | "GROUND")
+            });
+            if !other {
+                db.destroy_inst(tie).map_err(e)?;
+            }
+        }
+    }
+    let lines: Vec<Value> = if tie_count > 0 { vec![json!({ "code": "RSZ-0042", "message": format!("Inserted {tie_count} tie {cell} instances.") })] } else { Vec::new() };
+    Ok(json!({ "lib_port": lib_port, "tie_instances": insts.len(), "ties_checked": ties_checked, "inserted": tie_count, "lines": lines }))
+}
+
 /// `PatternMatch` without regexp: `*` matches any run of characters, `?` any one; the rest exactly.
 fn glob_match(pat: &str, s: &str) -> bool {
     let (p, t): (Vec<char>, Vec<char>) = (pat.chars().collect(), s.chars().collect());
@@ -235,6 +415,28 @@ fn sim_constants(db: &Db, liberty: &vyges_est::liberty::LibertyClocks) -> Result
         .collect())
 }
 
+/// The ports `[all_outputs]` / `[all_inputs …]` name. The reference's `allOutputs` keeps every
+/// top-level port whose direction is any output (output, bidirect, tristate); `allInputs(no_clks)`
+/// every any-input port (input, bidirect), less the clock-source pins under `-no_clocks`. Bus
+/// members are already single ports here; netlist order is kept. Each port then takes the setting
+/// exactly as `[get_ports …]` would. Err names an accessor flag not modelled.
+fn port_collection(accessor: &str, flags: &[String], ports: &[(String, vyges_sta::netlist::PortDir)], clock_sources: &std::collections::HashSet<&str>) -> Result<Vec<String>, String> {
+    use vyges_sta::netlist::PortDir;
+    let outputs = accessor == "all_outputs";
+    if let Some(f) = flags.iter().find(|f| f.as_str() != "-no_clocks" || outputs) {
+        return Err(f.clone());
+    }
+    let no_clocks = flags.iter().any(|f| f == "-no_clocks");
+    Ok(ports
+        .iter()
+        .filter(|(name, dir)| {
+            let any = if outputs { matches!(dir, PortDir::Output | PortDir::Inout) } else { matches!(dir, PortDir::Input | PortDir::Inout) };
+            any && !(no_clocks && clock_sources.contains(name.as_str()))
+        })
+        .map(|(name, _)| name.clone())
+        .collect())
+}
+
 fn sdc_env(s: &vyges_loom::sdc::Sdc, libs: &Libs, nl: &vyges_sta::netlist::Netlist) -> Result<vyges_sta::graph::SdcEnv, String> {
     let mut env = vyges_sta::graph::SdcEnv::default();
     // `set_driving_cell -lib_cell C -pin P [-from_pin F] [-input_transition_rise/-fall S]`: the
@@ -271,11 +473,20 @@ fn sdc_env(s: &vyges_loom::sdc::Sdc, libs: &Libs, nl: &vyges_sta::netlist::Netli
         }
         let mm = min_max_all(&e.flags);
         let rf = rise_fall(&e.flags);
-        match (e.cmd.as_str(), e.accessor.as_str()) {
+        let expanded;
+        let (accessor, objects) = match e.accessor.as_str() {
+            "all_outputs" | "all_inputs" => {
+                let clock_sources: std::collections::HashSet<&str> = s.clocks.iter().flat_map(|c| c.sources.iter().map(String::as_str)).collect();
+                expanded = port_collection(&e.accessor, &e.accessor_flags, &nl.ports, &clock_sources).map_err(|f| format!("{} [{} {f}]: not modelled", e.cmd, e.accessor))?;
+                ("get_ports", &expanded)
+            }
+            other => (other, &e.objects),
+        };
+        match (e.cmd.as_str(), accessor) {
             ("set_load", "get_nets") => {
                 let cap = (e.value * f64::from(lib0.cap_scale)) as f32;
                 let subtract = e.flags.iter().any(|f| f == "-subtract_pin_load");
-                for net in &e.objects {
+                for net in objects {
                     let n = nl.nets.iter().position(|x| &x.name == net).ok_or_else(|| format!("set_load: net {net} not found (not modelled)"))?;
                     for d in graph.vertices.iter().enumerate().filter(|(i, v)| v.is_driver && graph.vertex_net[*i] == Some(n)) {
                         let slot = env.net_wire_cap.entry(d.1.name.clone()).or_insert([None; 2]);
@@ -289,7 +500,7 @@ fn sdc_env(s: &vyges_loom::sdc::Sdc, libs: &Libs, nl: &vyges_sta::netlist::Netli
             }
             ("set_load", "get_ports") => {
                 let cap = (e.value * f64::from(lib0.cap_scale)) as f32;
-                for port in &e.objects {
+                for port in objects {
                     let slot = env.port_pin_cap.entry(port.clone()).or_insert([[None; 2]; 2]);
                     for r in 0..2 {
                         for k in 0..2 {
@@ -302,7 +513,7 @@ fn sdc_env(s: &vyges_loom::sdc::Sdc, libs: &Libs, nl: &vyges_sta::netlist::Netli
             }
             ("set_input_transition", "get_ports") if e.clock.is_none() => {
                 let slew = vyges_rsz::timing::user_time_to_sta(e.value, lib0.time_scale);
-                for port in &e.objects {
+                for port in objects {
                     let slot = env.input_slew.entry(port.clone()).or_insert([[None; 2]; 2]);
                     for r in 0..2 {
                         for k in 0..2 {
@@ -428,6 +639,8 @@ struct CliDesign<'a> {
     liberty: &'a vyges_est::liberty::LibertyClocks,
     libs: &'a Libs,
     clock_sources: &'a [String],
+    /// `Sim`'s constant pins (`inst/term` or port name), as the timer reads them.
+    constants: HashMap<String, bool>,
     /// The routing alpha in force while the repair runs.
     alpha: f32,
     /// Whether the estimator makes parasitics at all (not EST-0018).
@@ -1383,6 +1596,9 @@ impl buffer_ports::PortDesign for CliDesign<'_> {
     fn port_is_clock(&self, port: &str) -> bool {
         self.clock_sources.iter().any(|c| c == port)
     }
+    fn port_is_constant(&self, port: &str) -> bool {
+        self.constants.contains_key(port)
+    }
     fn insert_buffer_after_driver(&mut self, drvr: &str, cell: &str, reason: &str) -> Result<String, String> {
         let term = self.term(drvr);
         let inst = self.db.insert_buffer_after_driver(term, cell, None, reason, None, "ALWAYS").map_err(|e| e.to_string())?;
@@ -1805,6 +2021,10 @@ fn run(job: &Value) -> Result<Value, String> {
     // a later repair starts from it rather than from a fresh estimate.
     let mut carried: Option<Vec<HashMap<String, NetParasitics>>> = None;
     let mut buffered: Vec<buffer_ports::Outcome> = Vec::new();
+    // Each repair_tie_fanout's result. A later repair is refused: the ties' new nets would reach
+    // it through the estimator's callbacks, which are not modelled across this command.
+    let mut tie_runs: Vec<Value> = Vec::new();
+    let mut resizer_ran = false;
     // `set_propagated_clock` on the clock, and as the estimate saw it.
     let mut propagated = false;
     let mut estimate_propagated = false;
@@ -1829,6 +2049,9 @@ fn run(job: &Value) -> Result<Value, String> {
     for step in job["steps"].as_array().ok_or("steps")? {
         let cmd = step["cmd"].as_str().ok_or("cmd")?;
         let args: Vec<String> = step["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+        // Whether a resizer command before this one ran `initBlock` (each of these does, early).
+        let block_inited = resizer_ran;
+        resizer_ran |= matches!(cmd, "repair_design" | "buffer_ports" | "repair_timing" | "repair_tie_fanout");
         match cmd {
             "read_lef" => {
                 let path = args.last().ok_or("read_lef path")?;
@@ -2040,6 +2263,20 @@ fn run(job: &Value) -> Result<Value, String> {
                 sdc_path_delays = !s.path_delays.is_empty();
                 sdc = Some(s);
             }
+            "buffer_ports" | "repair_design" | "repair_timing" if !tie_runs.is_empty() => return Err(format!("{cmd} after repair_tie_fanout: not modelled")),
+            "repair_tie_fanout" if gr_estimated => return Err("repair_tie_fanout on global-route parasitics: not modelled".into()),
+            "repair_tie_fanout" => tie_runs.push(repair_tie_fanout(&mut db, &libs, &args, block_inited)?),
+            // `set_dont_touch`: each object an instance, else a net (dbInst / dbNet setDoNotTouch).
+            "set_dont_touch" => {
+                for o in &args {
+                    let (inst, net) = (db.block_get_insts().contains(o), db.block_get_nets().contains(o));
+                    match (inst, net) {
+                        (true, false) => db.inst_set_do_not_touch(o, true).map_err(|e| e.to_string())?,
+                        (false, true) => db.net_set_do_not_touch(o, true).map_err(|e| e.to_string())?,
+                        _ => return Err(format!("set_dont_touch {o}: not exactly one instance or net (not modelled)")),
+                    }
+                }
+            }
             "buffer_ports" if gr_estimated => return Err("buffer_ports on global-route parasitics: not modelled".into()),
             "repair_design" if gr_estimated => return Err("repair_design on global-route parasitics: not modelled".into()),
             "buffer_ports" => {
@@ -2060,10 +2297,9 @@ fn run(job: &Value) -> Result<Value, String> {
                     return Err("buffer_ports on a hierarchical design: not modelled".into());
                 }
                 let netlist = vyges_grt::timer::netlist(&db);
-                // `isConstant` holds nowhere: case analysis is refused at read_sdc, constant cells here.
-                if let Some(why) = vyges_rsz::timing::constant_cells(&libs.libs, &netlist) {
-                    return Err(format!("{why} (not modelled)"));
-                }
+                // `Sim`'s constants: a tie cell's output and what it holds (case analysis is refused
+                // at read_sdc, so tie cells are the only source).
+                let constants = sim_constants(&db, &liberty)?;
                 // selectBufferCell: the user's cell (a buffer), else findBuffers' weakest.
                 let weakest = match &o.buffer_cell {
                     Some(c) => {
@@ -2092,7 +2328,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 let core = (db.block_get_core_area_x_min(), db.block_get_core_area_y_min(), db.block_get_core_area_x_max(), db.block_get_core_area_y_max());
                 let core = (core != (0, 0, 0, 0)).then_some(core);
                 let port_caps = port_caps_at(step["sdc"].as_str(), sdc.as_ref(), &libs, &netlist)?;
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins: sdc.as_ref().map(sdc_cap_pins).unwrap_or_default(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr: None, gr_error: None, undoing: false };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins: sdc.as_ref().map(sdc_cap_pins).unwrap_or_default(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr: None, gr_error: None, undoing: false };
                 let r = buffer_ports::buffer_ports(&mut design, &o, &weakest);
                 let parasitics = std::mem::take(&mut design.parasitics);
                 match r {
@@ -2162,16 +2398,14 @@ fn run(job: &Value) -> Result<Value, String> {
                         vyges_rsz::buffered_net::WireRc { h_res: v[0], v_res: v[1], h_cap: v[2], v_cap: v[3] }
                     })
                     .collect();
-                if let Some(why) = vyges_rsz::timing::constant_cells(&libs.libs, &netlist) {
-                    return Err(format!("{why} (not modelled)"));
-                }
+                let constants = sim_constants(&db, &liberty)?;
                 let info = net_info(&db, &netlist)?;
                 let netlist_for_env = netlist.clone();
                 let mut env = match &sdc {
                     Some(s) => sdc_env(s, &libs, &netlist_for_env)?,
                     None => vyges_sta::graph::SdcEnv::default(),
                 };
-                env.constants = sim_constants(&db, &liberty)?;
+                env.constants = constants.clone();
                 let dbu = db.tech_get_db_units_per_micron();
                 let core = (db.block_get_core_area_x_min(), db.block_get_core_area_y_min(), db.block_get_core_area_x_max(), db.block_get_core_area_y_max());
                 let core = (core != (0, 0, 0, 0)).then_some(core);
@@ -2187,7 +2421,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 }
                 let port_caps = env.port_pin_cap.clone();
                 let limits_of_block = sizing_limits(&db)?;
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins: sdc.as_ref().map(sdc_cap_pins).unwrap_or_default(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr: None, gr_error: None, undoing: false };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins: sdc.as_ref().map(sdc_cap_pins).unwrap_or_default(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr: None, gr_error: None, undoing: false };
                 let inputs = Inputs { libs: &libs, masters: &m, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins, sizing_limits: limits_of_block };
                 outcome = Some(repair_design::repair_design(&inputs, &mut design, &a, &mut trace));
             }
@@ -2226,9 +2460,7 @@ fn run(job: &Value) -> Result<Value, String> {
                 let time_scale = lib0.time_scale;
                 let s = sdc.as_ref().ok_or("repair_timing without constraints: not modelled")?;
                 let netlist = vyges_grt::timer::netlist(&db);
-                if let Some(why) = vyges_rsz::timing::constant_cells(&libs.libs, &netlist) {
-                    return Err(format!("{why} (not modelled)"));
-                }
+                let constants = sim_constants(&db, &liberty)?;
                 let clock_sources: Vec<String> = s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect();
                 let parasitics = match carried.take() {
                     Some(p) => p,
@@ -2263,7 +2495,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     }
                 };
                 let mut env = sdc_env(s, &libs, &netlist)?;
-                env.constants = sim_constants(&db, &liberty)?;
+                env.constants = constants.clone();
                 let mpins = master_pins(&db)?;
                 let mut g = repair_design::timer_graph(&libs, 0, &netlist, &env, &mpins).map_err(|e| e.message().to_string())?;
                 let clock_propagated = propagated || sdc_propagated;
@@ -2495,7 +2727,7 @@ fn run(job: &Value) -> Result<Value, String> {
                     let core = (core != (0, 0, 0, 0)).then_some(core);
                     let port_caps = env.port_pin_cap.clone();
                     let sdc_nets: BTreeSet<String> = s.env.iter().filter(|e| e.cmd == "set_load" && e.accessor == "get_nets").flat_map(|e| e.objects.iter().cloned()).collect();
-                    let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated, journal: Vec::new(), sdc_nets, sdc_pins: sdc_cap_pins(s), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr, gr_error: None, undoing: false };
+                    let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), alpha: routing_alpha, estimating, netlist, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated, journal: Vec::new(), sdc_nets, sdc_pins: sdc_cap_pins(s), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr, gr_error: None, undoing: false };
                     if recover {
                         // `Resizer::recoverPower`: `resizePreamble`, then `RecoverPower::recoverPower`.
                         let max_area = match a.max_utilization.as_deref() {
@@ -2670,6 +2902,12 @@ fn run(job: &Value) -> Result<Value, String> {
                 r
             }
         },
+        // repair_tie_fanout alone: the ties it inserted, else the tie instances it CHECKED.
+        None if buffered.is_empty() && !tie_runs.is_empty() => {
+            let sum = |k: &str| -> u64 { tie_runs.iter().filter_map(|r| r[k].as_u64()).sum() };
+            let status = if sum("inserted") > 0 { "repaired" } else if sum("ties_checked") > 0 { "up_to_date" } else { "vacuous" };
+            json!({ "tool": "vyges-rsz", "status": status, "ties_checked": sum("ties_checked"), "inserted_ties": sum("inserted") })
+        }
         None if buffered.is_empty() => json!({ "tool": "vyges-rsz", "status": "vacuous", "reason": "no repair_design or buffer_ports step" }),
         // buffer_ports alone: the ports it walked are what it checked.
         None => {
@@ -2701,6 +2939,18 @@ fn run(job: &Value) -> Result<Value, String> {
     report["traced"] = json!(tags);
     if !timing_runs.is_empty() {
         report["repair_timing"] = json!(timing_runs);
+    }
+    if !tie_runs.is_empty() {
+        // A command that left nothing to do (or had nothing to check), then ties inserted: the
+        // design was changed. Ties checked after a vacuous command: a CHECKED nothing-to-do.
+        let inserted = tie_runs.iter().any(|r| r["inserted"].as_u64() > Some(0));
+        let checked = tie_runs.iter().any(|r| r["ties_checked"].as_u64() > Some(0));
+        if inserted && (report["status"] == "up_to_date" || report["status"] == "vacuous") {
+            report["status"] = json!("repaired");
+        } else if checked && report["status"] == "vacuous" {
+            report["status"] = json!("up_to_date");
+        }
+        report["repair_tie_fanout"] = json!(tie_runs);
     }
     if !buffered.is_empty() {
         report["buffer_ports"] = buffered
@@ -2986,6 +3236,36 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rules (`Resizer::tieLocation`): out through the strictly nearest side; a tie between two
+    /// sides stays on the pin. (`metersToDbu` before `initBlock`): no units yet, no separation.
+    #[test]
+    fn a_tie_moves_out_through_the_nearest_side_only() {
+        let b = [10000, 10000, 10760, 11400];
+        assert_eq!(tie_location((10125, 10612), b, 2000), (8125, 10612), "left side nearest");
+        assert_eq!(tie_location((10635, 10612), b, 2000), (12635, 10612), "right side nearest");
+        assert_eq!(tie_location((10380, 10100), b, 2000), (10380, 8100), "bottom nearest");
+        assert_eq!(tie_location((10380, 11300), b, 2000), (10380, 13300), "top nearest");
+        assert_eq!(tie_location((10100, 10100), b, 2000), (10100, 10100), "left and bottom tie: not moved");
+        assert_eq!(separation_dbu(2.0, 1000.0), 2000);
+        assert_eq!(separation_dbu(2.0, 0.0), 0, "the session's first resizer command: dbu_ is still 0");
+    }
+
+    /// Rules (`Sdc::allOutputs` / `Sdc::allInputs`): any-output = output or bidirect; any-input =
+    /// input or bidirect; `-no_clocks` drops clock-source ports only from `all_inputs`, and is not
+    /// a flag of `all_outputs`. Netlist order is kept.
+    #[test]
+    fn port_collections_expand_as_the_reference_does() {
+        use vyges_sta::netlist::PortDir::*;
+        let ports = [("clk".to_string(), Input), ("a".into(), Input), ("io".into(), Inout), ("y".into(), Output)];
+        let clk: std::collections::HashSet<&str> = ["clk"].into();
+        let none: &[String] = &[];
+        assert_eq!(port_collection("all_outputs", none, &ports, &clk).unwrap(), ["io", "y"]);
+        assert_eq!(port_collection("all_inputs", none, &ports, &clk).unwrap(), ["clk", "a", "io"]);
+        assert_eq!(port_collection("all_inputs", &["-no_clocks".into()], &ports, &clk).unwrap(), ["a", "io"]);
+        assert_eq!(port_collection("all_outputs", &["-no_clocks".into()], &ports, &clk), Err("-no_clocks".into()));
+        assert_eq!(port_collection("all_inputs", &["-level_sensitive".into()], &ports, &clk), Err("-level_sensitive".into()));
+    }
 
     #[test]
     fn the_descriptor_is_valid_json_and_names_the_engine() {

@@ -299,7 +299,10 @@ fn repair_driver(design: &mut dyn Design, drvr_name: &str, ctx: &mut NetCtx<'_, 
     let net = netlist.nets[n].name.clone();
     let clocks = timing::clock_pins(g0, ctx.inputs.clock_sources);
     let info = design.net_info();
-    if info.dont_touch.contains(&net) || info.abutment.contains(&net) || clocks.contains(&drvr) {
+    // `!sta_->isConstant(drvr_pin)` — "Exclude tie hi/low cells and supply nets": a driver the
+    // simulator holds constant (a tie cell's output) is passed over like a clock driver.
+    let constant = ctx.inputs.sdc.constants.contains_key(drvr_name);
+    if info.dont_touch.contains(&net) || info.abutment.contains(&net) || clocks.contains(&drvr) || constant {
         outcome.drivers_skipped += 1;
         return Ok(());
     }

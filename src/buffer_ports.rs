@@ -45,6 +45,9 @@ pub trait PortDesign: Design {
     fn net_drivers(&self, net: &str) -> Vec<(String, bool)>;
     /// `Sta::isClock(pin)` on a top-level port: whether the clock network holds it.
     fn port_is_clock(&self, port: &str) -> bool;
+    /// `Sta::isConstant(pin)` on a top-level port: whether the simulator holds it at a constant
+    /// (an output port on a tie cell's net).
+    fn port_is_constant(&self, port: &str) -> bool;
     /// `dbNet::insertBufferAfterDriver(drvr, master, nullptr, "input")` then
     /// `insertBufferPostProcess`. The callbacks mark both nets invalid. Returns the new instance.
     fn insert_buffer_after_driver(&mut self, drvr: &str, cell: &str, reason: &str) -> Result<String, String>;
@@ -147,7 +150,7 @@ pub fn buffer_inputs(design: &mut dyn PortDesign, o: &Options, weakest: &str, ou
         }
         // Rule: an input port on no net is not modelled (the reference reads the net unchecked).
         let net = design.port_net(&port).ok_or_else(|| Stop::refused("RSZ-REFUSED", format!("input port {port} is on no net: not modelled")))?;
-        // `isConstant` is refused at the command (no case analysis, no constant cells), so it
+        // `isConstant` on an input port needs case analysis, which is refused at read_sdc, so it
         // never holds here.
         if !design.net_dont_touch(&net) && !design.port_is_clock(&port) && !design.net_special(&net) && has_pins(design, &net) {
             // repair_design resizes it to the target slew.
@@ -238,6 +241,8 @@ pub fn buffer_outputs(design: &mut dyn PortDesign, o: &Options, weakest: &str, o
             && !design.net_special(&net)
             // DEF has no tristate output type, so the drivers say.
             && !has_tristate_or_dont_touch_driver(design, &net, out)
+            // `!sta_->isConstant(pin)`: an output a tie cell drives is not buffered.
+            && !design.port_is_constant(&port)
             && has_pins(design, &net)
         {
             buffer_output(design, &port, cell, o.verbose, out)?;

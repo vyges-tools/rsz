@@ -580,19 +580,6 @@ pub fn min_cap_load(libs: &[Library]) -> f32 {
     min
 }
 
-/// A cell the timer would hold constant (a tie cell's output), named — `Sim` propagates such
-/// constants through the logic, which is not modelled, so the design is refused.
-pub fn constant_cells(libs: &[Library], netlist: &vyges_sta::netlist::Netlist) -> Option<String> {
-    for (inst, master) in &netlist.insts {
-        if let Some(cell) = libs.iter().find_map(|l| l.cells.get(master)) {
-            if cell.ports.iter().any(|p| p.function.as_deref().is_some_and(vyges_sta::liberty::function_is_constant)) {
-                return Some(format!("{inst} ({master}) drives a constant: constant propagation is not modelled"));
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
