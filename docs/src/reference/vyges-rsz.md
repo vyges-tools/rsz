@@ -22,7 +22,12 @@ JOB FIELDS:
                  set_routing_layers -signal LO-HI [-clock LO-HI], global_route,
                  estimate_parasitics -placement | -global_routing, set_propagated_clock,
                  buffer_ports [options],
-                 repair_design [options], repair_timing [options]
+                 repair_design [options], repair_timing [options],
+                 clock_buffers CELL..., repair_clock_nets [-max_wire_length L]
+               clock_buffers states the resizer's clock buffer list as clock_tree_synthesis
+               left it in the session (its -buf_list); repair_clock_nets repairs long wires in
+               every clock network with it (L microns; without it, the length past which
+               buffering pays, RSZ-0058)
                an estimate_parasitics step may carry "db": the database as the estimate saw it,
                when cells were moved between it and the repair
                a buffer_ports step may carry "write_def": the design as it left it, as DEF

@@ -117,10 +117,45 @@ fn port_capacitance_max(c: &[[f32; 2]; 2]) -> f32 {
     c.iter().flatten().copied().fold(-1e30, crate::rebuffer::std_max)
 }
 
-/// `getBufferUse` with no `set_opt_config` clock-buffer pattern: a clock buffer is a cell with
-/// `is_clock_cell`, or whose name contains `CLKBUF` in any case.
-fn is_clock_buffer(cell: &Cell) -> bool {
-    cell.is_clock_cell || cell.name.to_ascii_uppercase().contains("CLKBUF")
+/// The resizer's clock-buffer pattern — `setClockBufferString` / `setClockBufferFootprint`
+/// (`set_cts_config -clock_buffer_string / -clock_buffer_footprint`); setting one clears the other.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum ClockPattern {
+    /// Neither set (or set to ""): the name test for `CLKBUF`.
+    #[default]
+    Default,
+    String(String),
+    Footprint(String),
+}
+
+impl ClockPattern {
+    /// The pattern a session holds from its string / footprint settings (an empty one is unset).
+    pub fn from_settings(string: Option<&str>, footprint: Option<&str>) -> ClockPattern {
+        match (string, footprint) {
+            (Some(s), _) if !s.is_empty() => ClockPattern::String(s.to_string()),
+            (_, Some(f)) if !f.is_empty() => ClockPattern::Footprint(f.to_string()),
+            _ => ClockPattern::Default,
+        }
+    }
+}
+
+/// `containsIgnoreCase`: `std::tolower` per byte (ASCII), and an empty pattern matches nothing.
+fn contains_ignore_case(s: &str, sub: &str) -> bool {
+    !sub.is_empty() && s.to_ascii_lowercase().contains(&sub.to_ascii_lowercase())
+}
+
+/// `Resizer::getBufferUse` == CLOCK: a cell with `is_clock_cell`; otherwise, by the pattern in
+/// force — the clock-buffer string in the cell NAME, else the footprint in the cell FOOTPRINT,
+/// else `CLKBUF` in the name — each case-insensitive.
+pub fn is_clock_buffer_with(cell: &Cell, pattern: &ClockPattern) -> bool {
+    if cell.is_clock_cell {
+        return true;
+    }
+    match pattern {
+        ClockPattern::String(s) => contains_ignore_case(&cell.name, s),
+        ClockPattern::Footprint(f) => contains_ignore_case(&cell.footprint, f),
+        ClockPattern::Default => contains_ignore_case(&cell.name, "CLKBUF"),
+    }
 }
 
 /// `Resizer::getBufferList` then `Resizer::findBuffers` (buffer pruning on, clock buffers
@@ -232,6 +267,11 @@ pub struct BufferList<'l> {
 /// category ([`vt_category`], numbered in this loop's order — the first to ask, as in the
 /// reference's `repair_timing`) then drive resistance, in libc++'s order for ties.
 pub fn get_buffer_list<'l>(libs: &'l Libs, masters: &BTreeMap<String, Master>, dont_use: &std::collections::BTreeSet<String>, exclude_clock_buffers: bool) -> Result<BufferList<'l>, Stop> {
+    get_buffer_list_with(libs, masters, dont_use, exclude_clock_buffers, &ClockPattern::Default)
+}
+
+/// [`get_buffer_list`] with the session's clock-buffer pattern (which buffers count as clock buffers).
+pub fn get_buffer_list_with<'l>(libs: &'l Libs, masters: &BTreeMap<String, Master>, dont_use: &std::collections::BTreeSet<String>, exclude_clock_buffers: bool, pattern: &ClockPattern) -> Result<BufferList<'l>, Stop> {
     let mut list: Vec<&Cell> = Vec::new();
     let mut by_site: BTreeMap<String, usize> = BTreeMap::new();
     let mut by_footprint: BTreeMap<String, usize> = BTreeMap::new();
@@ -241,7 +281,7 @@ pub fn get_buffer_list<'l>(libs: &'l Libs, masters: &BTreeMap<String, Master>, d
     let mut leakage: BTreeMap<VtCategory, (u32, f32)> = BTreeMap::new();
     for (li, lib) in libs.libs.iter().enumerate() {
         for cell in lib.cells.values().filter(|c| !c.dont_use && c.is_buffer()) {
-            if exclude_clock_buffers && is_clock_buffer(cell) {
+            if exclude_clock_buffers && is_clock_buffer_with(cell, pattern) {
                 continue;
             }
             if dont_use.contains(&cell.name) || cell.always_on || cell.is_isolation_cell || cell.is_level_shifter || !libs.is_link_cell(li, &cell.name) {
@@ -284,7 +324,12 @@ pub fn get_buffer_list<'l>(libs: &'l Libs, masters: &BTreeMap<String, Master>, d
 }
 
 pub fn find_buffers(libs: &Libs, masters: &BTreeMap<String, Master>, dont_use: &std::collections::BTreeSet<String>, exclude_clock_buffers: bool) -> Result<Buffers, Stop> {
-    let BufferList { cells: list, by_site, by_footprint, sorted_vt, vt } = get_buffer_list(libs, masters, dont_use, exclude_clock_buffers)?;
+    find_buffers_with(libs, masters, dont_use, exclude_clock_buffers, &ClockPattern::Default)
+}
+
+/// [`find_buffers`] with the session's clock-buffer pattern.
+pub fn find_buffers_with(libs: &Libs, masters: &BTreeMap<String, Master>, dont_use: &std::collections::BTreeSet<String>, exclude_clock_buffers: bool, pattern: &ClockPattern) -> Result<Buffers, Stop> {
+    let BufferList { cells: list, by_site, by_footprint, sorted_vt, vt } = get_buffer_list_with(libs, masters, dont_use, exclude_clock_buffers, pattern)?;
     // "Pick the second most leaky VT for multiple VTs"; the only one with one.
     let best_vt = match sorted_vt.len() {
         0 => None,
@@ -507,6 +552,32 @@ mod tests {
                 timing () {{ related_pin : "A" ; timing_sense : positive_unate ;
                   fall_transition (t) {{ values ("0, {r}", "0, {r}") ; }} }} }} }}"#
         )
+    }
+
+    /// `Resizer::getBufferUse`: `is_clock_cell` first; then the clock-buffer STRING in the cell
+    /// name, else the FOOTPRINT in the cell footprint, else `CLKBUF` in the name — each
+    /// case-insensitive (`containsIgnoreCase`). Witness: cts `clock_buffer_footprint`
+    /// (`-clock_buffer_footprint DLY` makes the delay cells clock buffers).
+    #[test]
+    fn get_buffer_use_follows_the_session_pattern() {
+        let l = library(&[
+            buf("CLKBUF_X1", 1.0, 0.001, ""),
+            buf("dlygate_1", 1.0, 0.001, "cell_footprint : \"DLY\" ;"),
+            buf("BUF_X1", 1.0, 0.001, "cell_footprint : \"buf\" ;"),
+            buf("CK_X1", 1.0, 0.001, "is_clock_cell : true ;"),
+        ]);
+        let c = |n: &str| l.libs[0].cells.get(n).unwrap();
+        let d = ClockPattern::Default;
+        assert!(is_clock_buffer_with(c("CLKBUF_X1"), &d) && !is_clock_buffer_with(c("dlygate_1"), &d));
+        let f = ClockPattern::from_settings(None, Some("dly"));
+        assert!(is_clock_buffer_with(c("dlygate_1"), &f), "footprint, case-insensitive");
+        assert!(!is_clock_buffer_with(c("CLKBUF_X1"), &f), "a pattern replaces the CLKBUF default");
+        let st = ClockPattern::from_settings(Some("buf_x"), None);
+        assert!(is_clock_buffer_with(c("BUF_X1"), &st) && !is_clock_buffer_with(c("dlygate_1"), &st));
+        assert_eq!(ClockPattern::from_settings(Some(""), None), ClockPattern::Default, "an empty string is unset");
+        for p in [&d, &f, &st] {
+            assert!(is_clock_buffer_with(c("CK_X1"), p), "is_clock_cell wins whatever the pattern");
+        }
     }
 
     fn library(cells: &[String]) -> Libs {

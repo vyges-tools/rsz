@@ -36,6 +36,8 @@ pub mod driver_slew;
 pub mod env;
 pub mod fanout;
 pub mod max_wire_length;
+#[cfg(feature = "cli")]
+pub mod odb_design;
 pub mod move_tracker;
 pub mod order;
 pub mod preamble;

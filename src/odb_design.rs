@@ -1,0 +1,1156 @@
+// SPDX-License-Identifier: Apache-2.0
+//! The design as the command-line engine edits it: an OpenDB database, the timer's netlist read
+//! from it, the estimator's per-net cache with its invalid set, the incremental timer's log, the
+//! journal levels, and — with global-route parasitics — the router alive across the repair. Shared
+//! with the engines that repair through this crate (clock tree synthesis's `-repair_clock_nets`).
+
+#![allow(clippy::too_many_arguments)]
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+use vyges_opendb::Db;
+use vyges_sta::graph::NetParasitics;
+
+use crate::env::{est_stt, net_parasitic, PortCaps};
+use crate::preamble::Libs;
+use crate::timing::NetInfo;
+use crate as vyges_rsz;
+use crate::buffer_ports;
+
+thread_local! {
+    static LUT: vyges_stt::flute::lut::Lut = vyges_stt::flute::lut::load_tables(vyges_stt::flute::lut::MAX_LUT_DEGREE).expect("flute tables");
+}
+
+/// The design as `repair_design` edits it: the database, the timer's netlist read from it, and
+/// the estimator's per-net cache with its invalid set (see [`vyges_rsz::design`]).
+pub struct CliDesign<'a> {
+    pub db: &'a mut Db,
+    pub rc: &'a vyges_est::rc::Rc,
+    pub liberty: &'a vyges_est::liberty::LibertyClocks,
+    pub libs: &'a Libs,
+    pub clock_sources: &'a [String],
+    /// `Sim`'s constant pins (`inst/term` or port name), as the timer reads them.
+    pub constants: HashMap<String, bool>,
+    /// The routing alpha in force while the repair runs.
+    pub alpha: f32,
+    /// Whether the estimator makes parasitics at all (not EST-0018).
+    pub estimating: bool,
+    pub netlist: vyges_sta::netlist::Netlist,
+    /// Per scene.
+    pub parasitics: Vec<HashMap<String, NetParasitics>>,
+    pub invalid: BTreeSet<String>,
+    pub info: NetInfo,
+    /// `core_` and `core_exists_`.
+    pub core: Option<(i32, i32, i32, i32)>,
+    /// The port loads in force while this command runs: what an estimate made now is reduced against.
+    pub port_caps: PortCaps,
+    /// `set_propagated_clock` in force: a re-estimated clock net is a propagated one.
+    pub propagated: bool,
+    /// Per open journal level (odb's eco), the estimator's state as the level found it: undoing
+    /// the level's edits restores the nets, and re-estimating a restored net gives back its old
+    /// estimate, so the old state is put back whole.
+    pub journal: Vec<JournalState>,
+    /// The nets an SDC `set_load` names (`Sdc::hasNetWireCap`, keyed by the net object): such a
+    /// net is constrained and is never merged away.
+    pub sdc_nets: BTreeSet<String>,
+    /// The instance pins an SDC `set_max_capacitance [get_pins …]` names (`Sdc::isConstrained(pin)`:
+    /// a pin limit no check reads, but a constrained buffer pin keeps its buffer).
+    pub sdc_pins: BTreeSet<String>,
+    /// The edits as the incremental timer receives them.
+    pub timer: TimerLog,
+    /// Per instance, the cell its output-to-output edges carry after equivalent-arcs swaps.
+    pub stale_out_arcs: BTreeMap<String, String>,
+    /// The global router alive across the repair, when the parasitics are global-route ones.
+    pub gr: Option<GrLive>,
+    /// A router callback this engine refuses (raised at the next parasitics update).
+    pub gr_error: Option<String>,
+    /// Inside a journal undo on global-route parasitics: the estimator's callbacks put the nets
+    /// the undo touched in its invalid set (`parasiticsInvalid`), the reference's only record of
+    /// them — the restored routes are the guides', not the ones the estimate was made on.
+    pub undoing: bool,
+}
+
+/// `IncrementalGRoute` over the repair: the router's state after `global_route` (its routes, its
+/// graphs, the nets it holds), the options it ran with, and `dirty_nets_` by name — marked by
+/// `GRouteDbCbk` from the database's callbacks, read in odb id order (a `PtrSet`).
+pub struct GrLive {
+    pub after: vyges_grt::global_route::AfterRoute,
+    pub opts: vyges_grt::global_route::RouteOptions,
+    pub dirty: BTreeSet<String>,
+    /// The detailed placer's grid (`opendp_->initMacrosAndGrid()` in the repair's preamble), which
+    /// `legalCellPos` snaps each new or resized instance to.
+    pub grid: vyges_dpl::grid::Grid,
+    /// What a buffered net on the route reads of the layers (`layerRC`, `viaResistance`).
+    pub layers: std::sync::Arc<vyges_rsz::buffered_net::LayerRc>,
+    /// The timer's net slacks for the next resistance-aware re-route (`set_route_slacks`).
+    pub slacks: Option<std::collections::HashMap<String, f32>>,
+}
+
+/// The estimator's per-layer table and the cut layers' resistances, by routing level, at the first
+/// corner — what `BufferedNet::wireRC` (on a layer) and `viaResistance` read.
+pub fn gr_layer_rc(db: &Db, rc: &vyges_est::rc::Rc) -> vyges_rsz::buffered_net::LayerRc {
+    let mut out = vyges_rsz::buffered_net::LayerRc::default();
+    for name in db.tech_get_layers() {
+        let level = db.layer_get_routing_level(&name);
+        if level <= 0 {
+            continue;
+        }
+        out.wire.insert(level, rc.layer_rc(db.layer_get_number(&name), 0));
+        let cut = db.layer_get_upper_layer(&name);
+        let res = (!cut.is_empty()).then(|| {
+            let table = rc.layer_rc(db.layer_get_number(&cut), 0).0;
+            if table == 0.0 { db.layer_get_resistance(&cut) } else { table }
+        });
+        out.cut_above.insert(level, res);
+    }
+    out
+}
+
+impl GrLive {
+    /// `GlobalRouter::addDirtyNet`, as `GRouteDbCbk` calls it: a net set and not special, marked
+    /// only when the router holds it.
+    pub fn mark(&mut self, db: &Db, net: &str) {
+        if !net.is_empty() && !db.net_is_special(net) && vyges_grt::global_route::holds(&self.after, net) {
+            self.dirty.insert(net.to_string());
+        }
+    }
+
+    /// `IncrementalGRoute::updateRoutes` → `updateDirtyRoutesFastRoute`: the dirty nets (odb id
+    /// order) whose pins moved are released and routed again from the graphs as they stand.
+    pub fn update_routes(&mut self, db: &mut Db) -> Result<(), String> {
+        if self.dirty.is_empty() {
+            return Ok(());
+        }
+        let order: Vec<String> = db.net_names().into_iter().filter(|n| self.dirty.contains(n)).collect();
+        self.dirty.clear();
+        gr_trace(&format!("VYGR|upd|enter|{}", order.iter().map(|n| format!("{n};")).collect::<String>()));
+        // A resistance-aware run's `updateSlacks` reads `sta_->slack(net)`: the timer's, handed
+        // over before the update (`set_route_slacks`). Without them (a re-route outside
+        // `updateParasitics`), a net a reroute marked is answered as constrained — which is all a
+        // lone routed net's slack decides — and any other, or a second net, is NaN: refused.
+        let slacks = self.slacks.take();
+        let res_aware = self.after.res_aware_nets.clone();
+        let asked = std::cell::Cell::new(0usize);
+        let slack = move |net: &str| {
+            let s = match &slacks {
+                Some(m) => m.get(net).copied().unwrap_or(f32::NAN),
+                None => {
+                    asked.set(asked.get() + 1);
+                    if asked.get() == 1 && res_aware.contains(net) { -1.0 } else { f32::NAN }
+                }
+            };
+            rrt_trace(&format!("VYGU|net|{net}|{}", c_hex(s)));
+            s
+        };
+        let routed = vyges_grt::global_route::update_dirty_routes_fast_route(db, &self.opts, &mut self.after, &order, &grt_stt, &grt_flutes, &mut |_, _| {}, true, Some(&slack)).map_err(|e| format!("incremental global route: {e}"))?;
+        gr_trace(&format!("VYGR|upd|route|{}", routed.iter().map(|n| format!("{n};")).collect::<String>()));
+        for net in &routed {
+            gr_trace(&format!("VYGR|upd|seg|{net}|{}", gr_segs(&self.after, net)));
+        }
+        Ok(())
+    }
+}
+
+/// A diagnostic: the net slacks a resistance-aware re-route read, appended to
+/// `VYGES_RSZ_RRT_TRACE` in the shape of the reference's instrumented trace (`rsz-rrt-patch.py`).
+pub fn rrt_trace(line: &str) {
+    if let Ok(path) = std::env::var("VYGES_RSZ_RRT_TRACE") {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes());
+        }
+    }
+}
+
+/// `%a` of a float as C prints it (the trace's raw values).
+pub fn c_hex(v: f32) -> String {
+    vyges_rsz::trace::c_hex(f64::from(v))
+}
+
+/// A route as the reference's trace prints it: `x0,y0,l0-x1,y1,l1;` per segment.
+pub fn gr_segs(a: &vyges_grt::global_route::AfterRoute, net: &str) -> String {
+    a.net_routes.iter().find(|r| r.name == net).map_or_else(String::new, |r| {
+        r.segments.iter().map(|g| format!("{},{},{}-{},{},{};", g.init_x, g.init_y, g.init_layer, g.final_x, g.final_y, g.final_layer)).collect()
+    })
+}
+
+/// A diagnostic: the router's and the estimator's calls inside the repair, appended to
+/// `VYGES_RSZ_GR_TRACE` in the shape of the reference's instrumented trace (`VYGR|…`).
+pub fn gr_trace(line: &str) {
+    if let Ok(path) = std::env::var("VYGES_RSZ_GR_TRACE") {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes());
+        }
+    }
+}
+
+/// The incremental timer's side of the edits: the database's callbacks as read, and the
+/// estimator's invalid set as ITS callbacks keep it (`parasitics_invalid_`) — apart from
+/// [`CliDesign::invalid`], which a journal undo restores whole, where the reference's undo
+/// invalidates every net it touches.
+#[derive(Default)]
+pub struct TimerLog {
+    pub on: bool,
+    pub events: Vec<String>,
+    pub est_invalid: BTreeSet<String>,
+    pub updated: Vec<String>,
+}
+
+/// What a journal level puts back on undo besides the database (the netlist is read from the
+/// database again, as the timer's network reads it live).
+pub struct JournalState {
+    pub parasitics: Vec<HashMap<String, NetParasitics>>,
+    pub invalid: BTreeSet<String>,
+    pub sdc_nets: BTreeSet<String>,
+}
+
+impl CliDesign<'_> {
+    /// After an edit: the timer's netlist and the pin order read again from the database.
+    pub fn refresh(&mut self) -> Result<(), String> {
+        self.netlist = vyges_grt::timer::netlist(self.db);
+        self.info = net_info(self.db, &self.netlist)?;
+        Ok(())
+    }
+
+    /// The database's callbacks since the last read, into the timer's log; the estimator's
+    /// callbacks (`est::OdbCallBack`) on its invalid set: a net created, an instance terminal
+    /// connected or disconnected, every net of a swapped instance → invalid; a net destroyed →
+    /// erased.
+    pub fn pull_edits(&mut self) {
+        if !self.timer.on {
+            return;
+        }
+        for ev in self.db.edit_log_take() {
+            let f: Vec<&str> = ev.split('|').collect();
+            // GlobalRouter's callbacks (`GRouteDbCbk`), in the order the database made them.
+            if let Some(gr) = self.gr.as_mut() {
+                match f.as_slice() {
+                    ["net_create", net] => {
+                        vyges_grt::global_route::add_net(self.db, &mut gr.after, net);
+                    }
+                    ["net_destroy", net, ..] => {
+                        gr.dirty.remove(*net);
+                        if let Err(e) = vyges_grt::global_route::remove_net(&mut gr.after, net) {
+                            self.gr_error.get_or_insert(e.to_string());
+                        }
+                    }
+                    ["iterm_connect" | "iterm_disconnect" | "bterm_connect" | "bterm_disconnect", _, net, ..] => gr.mark(self.db, net),
+                    // `inDbNetPostMerge(preserved, removed)` → `mergeNetsRouting`: before the removed
+                    // net's destruction, which follows it.
+                    ["net_merge", keep, gone] => match vyges_grt::global_route::merge_nets_routing(self.db, &gr.opts, &mut gr.after, keep, gone) {
+                        Ok(true) => {}
+                        Ok(false) => gr.mark(self.db, keep),
+                        Err(e) => {
+                            self.gr_error.get_or_insert(e.to_string());
+                        }
+                    },
+                    ["swap_after", _, terms] => {
+                        for net in terms.split(';').filter_map(|t| t.split('=').nth(1)) {
+                            gr.mark(self.db, net);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match f.as_slice() {
+                ["net_create", net] | ["iterm_connect" | "iterm_disconnect", _, net, _] if !net.is_empty() => {
+                    self.timer.est_invalid.insert(net.to_string());
+                    if self.undoing {
+                        self.invalid.insert(net.to_string());
+                    }
+                }
+                ["net_destroy", net, ..] => {
+                    self.timer.est_invalid.remove(*net);
+                    if self.undoing {
+                        // `inDbNetDestroy` → `eraseParasitics`: the network goes with the net.
+                        self.invalid.remove(*net);
+                        for map in self.parasitics.iter_mut() {
+                            map.remove(*net);
+                        }
+                    }
+                }
+                ["swap_after", _, terms] => {
+                    for net in terms.split(';').filter_map(|t| t.split('=').nth(1)).filter(|n| !n.is_empty()) {
+                        self.timer.est_invalid.insert(net.to_string());
+                        if self.undoing {
+                            self.invalid.insert(net.to_string());
+                        }
+                    }
+                }
+                _ => {}
+            }
+            self.timer.events.push(ev);
+        }
+    }
+
+    /// `GRouteDbCbk::inDbPostMoveInst` → `instItermsDirty`: every net on the moved instance's
+    /// terminals marked dirty. Called after each `setLocation` this engine makes (the edit log does
+    /// not carry moves).
+    pub fn gr_inst_moved(&mut self, inst: &str) {
+        if let Some(gr) = self.gr.as_mut() {
+            for (term, _) in self.db.master_mterms(&self.db.inst_master(inst)).unwrap_or_default() {
+                let net = self.db.net_of(inst, &term);
+                gr.mark(self.db, &net);
+            }
+        }
+    }
+
+    /// `opendp_->legalCellPos(inst)` under global-route parasitics, "for accurate parasitic
+    /// estimation": the instance moved to the nearest site and row when it is not on one (a MOVE:
+    /// the router marks its nets dirty).
+    pub fn gr_legal_cell_pos(&mut self, inst: &str) -> Result<(), String> {
+        let Some(gr) = self.gr.as_ref() else { return Ok(()) };
+        let master = self.db.inst_master(inst);
+        let (mut w, mut h) = (self.db.master_get_width(&master) as i32, self.db.master_get_height(&master) as i32);
+        // `getBbox`: width and height swapped for a quarter-turn orientation (`swapWidthHeight`).
+        if matches!(self.db.inst_get_orient(inst).as_str(), "R90" | "R270" | "MXR90" | "MYR90") {
+            std::mem::swap(&mut w, &mut h);
+        }
+        let (x, y) = self.db.inst_location(inst);
+        if let Some((nx, ny)) = gr.grid.legal_cell_pos(x, y, w, h) {
+            self.db.set_inst_location(inst, nx, ny).map_err(|e| e.to_string())?;
+            self.gr_inst_moved(inst);
+        }
+        Ok(())
+    }
+
+    /// `estimateGlobalRouteRC(db_net)` into every scene: the net's network from its route as the
+    /// router holds it now; a net with no route keeps what it had.
+    pub fn gr_estimate(&mut self, net: &str) {
+        let Some(gr) = self.gr.as_ref() else { return };
+        let segs = gr_segs(&gr.after, net);
+        gr_trace(&if segs.is_empty() { format!("VYGR|est|grc_none|{net}") } else { format!("VYGR|est|grc|{net}|{segs}") });
+        if let Some(n) = vyges_grt::global_route::routed_network(&gr.after, net) {
+            gr_trace(&format!("VYGR|est|cap|{net}|{:.9}", n.nodes.iter().map(|(_, c)| f64::from(*c)).sum::<f64>() * 1e12));
+            let mut p = vyges_grt::timer::timer_network(net, &n);
+            p.port_pin_caps = Some(self.port_caps.clone());
+            for map in self.parasitics.iter_mut() {
+                map.insert(net.to_string(), p.clone());
+            }
+        }
+    }
+
+    /// The router's state as a refused callback left it, or the incremental re-route.
+    pub fn gr_update_routes(&mut self) -> Result<(), String> {
+        if let Some(e) = self.gr_error.take() {
+            return Err(e);
+        }
+        match self.gr.as_mut() {
+            Some(gr) => gr.update_routes(self.db),
+            None => Ok(()),
+        }
+    }
+
+    /// `journalRestore` → `undoEco` on global-route parasitics. The database's undo with its
+    /// callbacks — the router's (dirty marks, nets made and destroyed) and the estimator's (each
+    /// net it touched invalid; a destroyed net's network erased) — then each guide the level
+    /// deleted created again (`inDbNetPostGuideRestore`: restore from guides, dirty). The estimate
+    /// is NOT put back: the next update re-estimates the invalid nets on the routes as they come
+    /// back (from the guides, not the routes the old estimate was made on).
+    pub fn restore_journal_gr(&mut self) -> Result<bool, String> {
+        self.pull_edits();
+        let had_changes = !self.db.eco_is_empty().map_err(|e| e.to_string())?;
+        self.db.eco_undo().map_err(|e| e.to_string())?;
+        let s = self.journal.pop().ok_or("undoEco without beginEco")?;
+        self.sdc_nets = s.sdc_nets;
+        self.refresh()?;
+        self.undoing = true;
+        self.pull_edits();
+        self.undoing = false;
+        if let Some(gr) = self.gr.as_mut() {
+            gr_trace(&format!("VYGR|eco|undo|levels_left={}", gr.after.eco.len()));
+            for net in vyges_grt::global_route::undo_eco(&mut gr.after) {
+                gr_trace(&format!("VYGR|cb|restore|{net}"));
+                gr.mark(self.db, &net);
+            }
+        }
+        Ok(had_changes)
+    }
+
+    /// `EstimateParasitics::parasiticsInvalid(net)` (the odb callbacks call it).
+    pub fn invalidate(&mut self, net: &str) {
+        if self.estimating && !net.is_empty() {
+            self.invalid.insert(net.to_string());
+        }
+    }
+
+    /// The net a load pin (`inst/pin` or a port) is on.
+    pub fn net_of_load(&self, load: &str) -> String {
+        match load.rsplit_once('/') {
+            Some((inst, pin)) if !self.netlist.ports.iter().any(|p| p.0 == load) => self.db.net_of(inst, pin),
+            _ => self.db.bterm_net(load),
+        }
+    }
+
+    pub fn clamp_loc_to_core(&self, loc: (i32, i32), master: &str) -> (i32, i32) {
+        clamp_loc_to_core(self.core, (self.db.master_get_width(master) as i32, self.db.master_get_height(master) as i32), loc)
+    }
+
+    /// `insertBufferBeforeLoads(net, loads, …)`: on `net`, else the first load's.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_before_loads(&mut self, net: Option<&str>, loads: &[String], cell: &str, loc: (i32, i32), reason: &str, loads_on_diff_nets: bool, uniquify: &str) -> Result<vyges_rsz::design::Repeater, String> {
+        let original = match net {
+            Some(n) => n.to_string(),
+            None => self.net_of_load(loads.first().ok_or("insertBufferBeforeLoads: no loads specified")?),
+        };
+        let mut iterms = Vec::new();
+        let mut bterms = Vec::new();
+        for l in loads {
+            match l.rsplit_once('/') {
+                Some((inst, pin)) if !self.netlist.ports.iter().any(|p| &p.0 == l) => iterms.push((inst.to_string(), pin.to_string())),
+                _ => bterms.push(l.clone()),
+            }
+        }
+        let inst = self.db.insert_buffer_before_loads(net, &iterms, &bterms, cell, Some(loc), reason, None, uniquify, loads_on_diff_nets).map_err(|e| e.to_string())?;
+        let at = self.clamp_loc_to_core(self.db.inst_location(&inst), cell);
+        self.db.set_inst_location(&inst, at.0, at.1).map_err(|e| e.to_string())?;
+        self.gr_inst_moved(&inst);
+        self.gr_legal_cell_pos(&inst)?;
+        let c = self.libs.link_cell(cell).ok_or_else(|| format!("{cell}: no liberty cell"))?;
+        let (input, output) = c.buffer_ports().ok_or_else(|| format!("{cell}: not a buffer"))?;
+        let in_net = self.db.net_of(&inst, &input.name);
+        let out_net = self.db.net_of(&inst, &output.name);
+        // A port load names the new net after the port and renames the original: the cache
+        // follows the net, not the name.
+        for map in self.parasitics.iter_mut() {
+            if in_net != original {
+                if let Some(p) = map.remove(&original) {
+                    map.insert(in_net.clone(), p);
+                }
+            }
+            map.remove(&out_net);
+            // `ConcreteParasitics::disconnectPinBefore` on each load moved off the original net:
+            // its pin node in that net's (stale) network becomes a fresh internal subnode — the
+            // resistors handed over, no ground capacitance, no pin. A connected pin adds nothing:
+            // until the net is estimated again, its new input pin has no node.
+            if let Some(p) = map.get_mut(&in_net) {
+                disconnect_pins(p, &in_net, loads);
+            }
+        }
+        self.invalidate(&in_net);
+        self.invalidate(&out_net);
+        self.refresh()?;
+        Ok(vyges_rsz::design::Repeater { input: format!("{inst}/{}", input.name), output: format!("{inst}/{}", output.name), inst, out_net })
+    }
+}
+
+impl vyges_rsz::design::Design for CliDesign<'_> {
+    fn netlist(&self) -> &vyges_sta::netlist::Netlist {
+        &self.netlist
+    }
+    fn parasitics(&self, scene: usize) -> &HashMap<String, NetParasitics> {
+        &self.parasitics[scene]
+    }
+    fn net_info(&self) -> &NetInfo {
+        &self.info
+    }
+
+    /// `ensureWireParasitic(drvr_pin, net)` under placement parasitics: re-estimated (at the alpha
+    /// in force now) only when invalid or with no pi model — no entry, here: every net with a
+    /// network has its pi model once `findAllArrivals` has run, and an edited net is invalid.
+    fn ensure_wire_parasitic(&mut self, net: &str) -> Result<(), String> {
+        // Estimated now and erased from the invalid set, with no delay invalidation.
+        self.pull_edits();
+        self.timer.est_invalid.remove(net);
+        if self.gr.is_some() {
+            // Under global-route parasitics: invalid or with no pi model (no network here — a net
+            // with a route has one) → the dirty nets re-routed, then this net from its route.
+            if self.invalid.contains(net) || !self.parasitics[0].contains_key(net) {
+                self.gr_update_routes()?;
+                self.gr_estimate(net);
+                self.invalid.remove(net);
+            }
+            return Ok(());
+        }
+        if !self.estimating || !(self.invalid.contains(net) || !self.parasitics[0].contains_key(net)) {
+            return Ok(());
+        }
+        let Some(drvr) = self.netlist.nets.iter().find(|n| n.name == net).and_then(|n| {
+            n.pins.iter().map(|c| self.netlist.pin_name(c)).find(|p| self.is_driver_pin(p))
+        }) else {
+            self.invalid.remove(net);
+            return Ok(());
+        };
+        let timing = vyges_est::placement::Timing { liberty: Some(self.liberty), clock_sources: self.clock_sources.to_vec(), propagated: self.propagated };
+        let e = vyges_est::placement::estimate_net(self.db, &timing, net, &drvr, self.alpha, &est_stt)?;
+        for k in 0..self.parasitics.len() {
+            match net_parasitic(self.db, self.rc, &e, k)? {
+                Some(mut p) => {
+                    p.port_pin_caps = Some(self.port_caps.clone());
+                    self.parasitics[k].insert(net.to_string(), p)
+                }
+                None => self.parasitics[k].remove(net),
+            };
+        }
+        self.invalid.remove(net);
+        Ok(())
+    }
+
+    /// `updateParasitics` under placement parasitics: each invalid net estimated again (the order
+    /// is the reference's set's; each net's estimate is its own, so it is no value).
+    fn update_parasitics(&mut self) -> Result<(), String> {
+        // The estimator's invalid nets: each estimated, then `delaysInvalidFromFanin` each, the
+        // set cleared.
+        self.pull_edits();
+        let updated = std::mem::take(&mut self.timer.est_invalid);
+        self.timer.updated.extend(updated);
+        if self.gr.is_some() {
+            // Under global-route parasitics the dirty nets are re-routed FIRST, whatever is
+            // invalid; then each invalid net from its route (a net with none keeps its network).
+            gr_trace(&format!("VYGR|est|update|src=2|{}", self.invalid.iter().map(|n| format!("{n};")).collect::<String>()));
+            self.gr_update_routes()?;
+            for net in std::mem::take(&mut self.invalid) {
+                self.gr_estimate(&net);
+            }
+            return Ok(());
+        }
+        let invalid: Vec<String> = self.invalid.iter().cloned().collect();
+        for net in invalid {
+            self.ensure_wire_parasitic(&net)?;
+        }
+        Ok(())
+    }
+
+    fn steiner(&self, net: &str, drvr_pin: &str) -> Option<vyges_rsz::buffered_net::Tree> {
+        steiner_tree(self.db, net, drvr_pin, self.alpha)
+    }
+
+    /// Under global-route parasitics `makeBufferedNetGroute` reads the router: the net's pins
+    /// (`getPinGridPositions`: as the router's last `updateNetPins` left them, each at its grid
+    /// point on its connection layer) and its route (`routes_`, empty when it has none).
+    fn net_shape(&self, net: &str, drvr_pin: &str) -> Option<vyges_rsz::buffered_net::NetShape> {
+        let Some(gr) = self.gr.as_ref() else { return self.steiner(net, drvr_pin).map(vyges_rsz::buffered_net::NetShape::Steiner) };
+        let a = &gr.after;
+        let n = &a.router_nets[vyges_grt::global_route::live_id(a, net)?];
+        let pins = n.net_pins.iter().map(|p| (p.name.clone(), p.on_grid.0, p.on_grid.1, p.connection_layer)).collect();
+        let segments = a.net_routes.iter().find(|r| r.name == net).map(|r| r.segments.iter().map(|g| (g.init_x, g.init_y, g.init_layer, g.final_x, g.final_y, g.final_layer)).collect()).unwrap_or_default();
+        Some(vyges_rsz::buffered_net::NetShape::Groute(vyges_rsz::buffered_net::GrouteNet { pins, drvr: drvr_pin.to_string(), segments, term_count: self.db.net_get_term_count(net) as usize, layers: gr.layers.clone() }))
+    }
+
+    /// `Resizer::insertBufferBeforeLoads(nullptr, loads, cell, &loc, reason)`: odb's own
+    /// `dbNet::insertBufferBeforeLoads` on the first load's net (new names `<reason><n>` /
+    /// `net<n>`, always uniquified), then `insertBufferPostProcess` (`setLocation`: clamped to
+    /// the core, PLACED). The odb callbacks invalidate the new net and the original one.
+    fn insert_repeater(&mut self, loads: &[String], cell: &str, loc: (i32, i32), reason: &str) -> Result<vyges_rsz::design::Repeater, String> {
+        self.insert_before_loads(None, loads, cell, loc, reason, false, "ALWAYS")
+    }
+
+    /// `Resizer::replaceCell` → `dbInst::swapMaster`; the callback invalidates the net on every
+    /// pin of the instance (not a tristate one).
+    fn swap_master(&mut self, inst: &str, cell: &str) -> Result<(), String> {
+        // `Sta::replaceCell`: with equivalent arcs, `replaceEquivCellBefore` swaps the arc sets of
+        // the edges leaving the INPUT pins only — an output-to-output edge keeps the cell it was
+        // made with (the first one, across further equivalent swaps); otherwise the instance's
+        // edges are made anew from the new cell.
+        let from = self.netlist.insts.iter().find(|(n, _)| n == inst).map(|(_, c)| c.clone());
+        if let Some(from) = from {
+            let equiv = matches!((self.libs.link_cell(&from), self.libs.link_cell(cell)), (Some(a), Some(b)) if vyges_sta::incr::equiv_cells_arcs(a, b));
+            if equiv {
+                self.stale_out_arcs.entry(inst.to_string()).or_insert(from);
+            } else {
+                self.stale_out_arcs.remove(inst);
+            }
+        }
+        if !self.db.swap_master(inst, cell).map_err(|e| e.to_string())? {
+            return Err(format!("swapMaster {inst} -> {cell} failed"));
+        }
+        // `Resizer::replaceCell`: "legalize the position of the instance in case it leaves the die".
+        self.gr_legal_cell_pos(inst)?;
+        self.refresh()?;
+        let nets: Vec<String> = self.netlist.nets.iter().filter(|n| n.pins.iter().any(|c| matches!(c, vyges_sta::netlist::Conn::Inst(i, _) if self.netlist.insts[*i].0 == inst))).map(|n| n.name.clone()).collect();
+        for n in nets {
+            self.invalidate(&n);
+        }
+        // `Sta::replace(Equiv)CellAfter` → `loadPinCapacitanceChanged` on each input pin: the
+        // reduced models of its net's drivers are deleted — a placement estimate IS one, so the
+        // net has no parasitic until `updateParasitics` estimates it again (it is invalid).
+        // Witness: SizeDownFanout's next round in the same batch reads the driver timed on its
+        // pin caps alone.
+        let lib_cell = self.libs.link_cell(cell);
+        let input_nets: Vec<String> = self
+            .netlist
+            .nets
+            .iter()
+            .filter(|n| {
+                n.pins.iter().any(|c| {
+                    matches!(c, vyges_sta::netlist::Conn::Inst(i, port) if self.netlist.insts[*i].0 == inst
+                        && lib_cell.and_then(|lc| lc.port(port)).is_some_and(|p| matches!(p.direction, vyges_sta::liberty::Direction::Input | vyges_sta::liberty::Direction::Bidirect)))
+                })
+            })
+            .map(|n| n.name.clone())
+            .collect();
+        if self.estimating {
+            for n in input_nets {
+                for k in 0..self.parasitics.len() {
+                    self.parasitics[k].remove(&n);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn inst_location(&self, inst: &str) -> (i32, i32) {
+        self.db.inst_location(inst)
+    }
+
+    fn stale_out_arcs(&self) -> Option<&BTreeMap<String, String>> {
+        Some(&self.stale_out_arcs)
+    }
+
+    fn pin_location(&self, pin: &str) -> (i32, i32) {
+        match pin.rsplit_once('/') {
+            Some((inst, term)) if !self.netlist.ports.iter().any(|p| p.0 == pin) => {
+                self.db.iterm_avg_xy(inst, term).unwrap_or_else(|| (self.db.inst_get_origin_x(inst), self.db.inst_get_origin_y(inst)))
+            }
+            _ => self.db.bterm_first_pin_location(pin).unwrap_or((0, 0)),
+        }
+    }
+
+    fn start_timer_edits(&mut self) -> Result<(), String> {
+        self.db.edit_log_start().map_err(|e| e.to_string())?;
+        self.timer = TimerLog { on: true, ..TimerLog::default() };
+        Ok(())
+    }
+
+    fn take_timer_edits(&mut self) -> vyges_rsz::design::TimerEdits {
+        self.pull_edits();
+        vyges_rsz::design::TimerEdits { events: std::mem::take(&mut self.timer.events), updated_nets: std::mem::take(&mut self.timer.updated) }
+    }
+
+    fn visit_connected_pins(&self, pin: &str) -> Vec<String> {
+        match pin.rsplit_once('/') {
+            Some((inst, term)) if !self.netlist.ports.iter().any(|p| p.0 == pin) => self
+                .db
+                .visit_connected_pins(inst, term)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|p| p.strip_prefix("I:").or_else(|| p.strip_prefix("B:")).map(String::from))
+                .collect(),
+            // A port driver: its flat net's pins (`net(term)`).
+            _ => {
+                let net = self.db.bterm_net(pin);
+                let mut pins = self.db.net_iterms(&net);
+                pins.extend(self.db.net_bterms(&net));
+                pins
+            }
+        }
+    }
+}
+
+impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
+    fn global_routed(&self) -> bool {
+        self.gr.is_some()
+    }
+
+    fn route_slacks_wanted(&mut self) -> bool {
+        self.pull_edits();
+        self.gr.as_ref().is_some_and(|g| g.after.resistance_aware && !g.dirty.is_empty())
+    }
+
+    fn set_route_slacks(&mut self, slacks: std::collections::HashMap<String, f32>) {
+        if let Some(g) = self.gr.as_mut() {
+            g.slacks = Some(slacks);
+        }
+    }
+
+    fn pin_net(&self, pin: &str) -> Option<(String, bool)> {
+        let net = self.net_of_load(pin);
+        (!net.is_empty()).then(|| (net.clone(), self.db.net_is_special(&net)))
+    }
+
+    fn net_res_aware(&self, net: &str) -> bool {
+        self.gr.as_ref().is_some_and(|gr| vyges_grt::global_route::is_net_res_aware(&gr.after, net))
+    }
+
+    fn net_resistances(&self, net: &str) -> (f32, f32) {
+        match self.gr.as_ref() {
+            Some(gr) => (vyges_grt::global_route::net_resistance_on_layer(&gr.after, net, None), vyges_grt::global_route::net_resistance_on_min_resistance_layer(&gr.after, net)),
+            None => (0.0, 0.0),
+        }
+    }
+
+    fn reroute_net(&mut self, net: &str) -> Result<(), String> {
+        let Some(gr) = self.gr.as_mut() else { return Err("rerouting needs global-route parasitics".into()) };
+        vyges_grt::global_route::set_resistance_aware(&mut gr.after);
+        gr.mark(self.db, net);
+        vyges_grt::global_route::set_net_res_aware(&mut gr.after, net);
+        // `parasiticsInvalid(db_net)`: re-estimated, and its delays invalidated, at the next update.
+        self.invalidate(net);
+        self.timer.est_invalid.insert(net.to_string());
+        Ok(())
+    }
+
+    /// `Resizer::computeDesignArea`: over the block's instances in order, each master's
+    /// `width × height` in m² (`dbuToMeters` each side) — 0 for a master that is not core
+    /// autoplaceable (`isCoreAutoPlaceable`) — fillers (`CORE SPACER`) left out.
+    fn design_area(&self) -> f64 {
+        design_area(self.db)
+    }
+
+    fn master_area(&self, cell: &str) -> f64 {
+        master_area(self.db, cell)
+    }
+
+    fn core_area(&self) -> f64 {
+        let dbu = f64::from(self.db.tech_get_db_units_per_micron());
+        self.core.map_or(0.0, |(x0, y0, x1, y1)| f64::from(x1 - x0) / (dbu * 1e6) * (f64::from(y1 - y0) / (dbu * 1e6)))
+    }
+
+    fn as_design(&self) -> &dyn vyges_rsz::design::Design {
+        self
+    }
+
+    fn begin_journal(&mut self) -> Result<(), String> {
+        self.db.eco_begin().map_err(|e| e.to_string())?;
+        if let Some(gr) = self.gr.as_mut() {
+            vyges_grt::global_route::begin_eco(&mut gr.after);
+            gr_trace(&format!("VYGR|eco|begin|{}", gr.after.eco.len()));
+        }
+        self.journal.push(JournalState { parasitics: self.parasitics.clone(), invalid: self.invalid.clone(), sdc_nets: self.sdc_nets.clone() });
+        Ok(())
+    }
+
+    fn commit_journal(&mut self) -> Result<(), String> {
+        self.db.eco_commit().map_err(|e| e.to_string())?;
+        if let Some(gr) = self.gr.as_mut() {
+            vyges_grt::global_route::commit_eco(&mut gr.after);
+            gr_trace(&format!("VYGR|eco|commit|{}", gr.after.eco.len()));
+        }
+        self.journal.pop();
+        Ok(())
+    }
+
+    fn restore_journal(&mut self) -> Result<bool, String> {
+        if self.gr.is_some() {
+            return self.restore_journal_gr();
+        }
+        let had_changes = !self.db.eco_is_empty().map_err(|e| e.to_string())?;
+        self.db.eco_undo().map_err(|e| e.to_string())?;
+        let s = self.journal.pop().ok_or("undoEco without beginEco")?;
+        self.parasitics = s.parasitics;
+        self.invalid = s.invalid;
+        self.sdc_nets = s.sdc_nets;
+        self.refresh()?;
+        Ok(had_changes)
+    }
+
+    /// `canRemoveBuffer(buffer, true)`'s database checks: the buffer neither dont_touch nor FIXED,
+    /// neither net dont_touch; then the net to go (the input net when the output net has a port,
+    /// else the output net): neither buffer pin a clock's source nor named by `set_max_capacitance`
+    /// (`Sdc::isConstrained(pin)`: the pin constraints an accepted SDC can put on an instance pin), the net to go not named by
+    /// `set_load` (`isConstrained(net)`), and that net mergeable into the other
+    /// (`dbNet::canMergeNet`), or absent.
+    fn can_remove_buffer(&self, inst: &str, in_pin: &str, out_pin: &str) -> bool {
+        if self.db.inst_is_do_not_touch(inst) || self.db.inst_is_fixed(inst) {
+            return false;
+        }
+        let in_net = self.db.net_of(inst, in_pin);
+        let out_net = self.db.net_of(inst, out_pin);
+        if [&in_net, &out_net].iter().any(|n| !n.is_empty() && self.db.net_is_do_not_touch(n)) {
+            return false;
+        }
+        let out_net_ports = !out_net.is_empty() && !self.db.net_bterms(&out_net).is_empty();
+        let (survivor, removed) = if out_net_ports { (out_net, in_net) } else { (in_net, out_net) };
+        let pins = [format!("{inst}/{in_pin}"), format!("{inst}/{out_pin}")];
+        if pins.iter().any(|p| self.clock_sources.contains(p) || self.sdc_pins.contains(p)) || self.sdc_nets.contains(&removed) {
+            return false;
+        }
+        if removed.is_empty() {
+            return true;
+        }
+        !survivor.is_empty() && self.db.net_can_merge(&survivor, &removed).unwrap_or(false)
+    }
+
+    /// `swapPins`: the pins' nets, the dont_touch check on each (pin 1's first), then the database
+    /// swap; the callbacks invalidate both nets.
+    fn swap_pins(&mut self, inst: &str, pin1: &str, pin2: &str) -> Result<vyges_rsz::repair_setup::PinSwap, String> {
+        use vyges_rsz::repair_setup::PinSwap;
+        let net1 = self.db.net_of(inst, pin1);
+        let net2 = self.db.net_of(inst, pin2);
+        if net1.is_empty() || net2.is_empty() {
+            return Ok(PinSwap::NoNet);
+        }
+        for n in [&net1, &net2] {
+            if self.db.net_is_do_not_touch(n) {
+                return Ok(PinSwap::DontTouch(n.clone()));
+            }
+        }
+        self.db.swap_pins(inst, pin1, pin2).map_err(|e| e.to_string())?;
+        self.invalidate(&net1);
+        self.invalidate(&net2);
+        self.refresh()
+            .map(|_| PinSwap::Swapped)
+    }
+
+    fn ok_to_buffer_net(&self, drvr_pin: &str) -> bool {
+        let (inst, term) = self.term(drvr_pin);
+        let tristate = inst.is_some_and(|i| self.libs.link_cell(&self.db.inst_master(i)).and_then(|c| c.ports.iter().find(|p| p.name == term)).is_some_and(|p| p.is_any_tristate()));
+        if tristate {
+            return false;
+        }
+        let net = match inst {
+            Some(i) => self.db.net_of(i, term),
+            None => self.db.bterm_net(term),
+        };
+        !net.is_empty() && !self.db.net_is_do_not_touch(&net) && !self.db.net_is_connected_by_abutment(&net) && !self.db.net_is_special(&net)
+    }
+
+    /// `applyClone` on the database: the instance (odb's "clone" name, TIMING source, placed and
+    /// clamped), each liberty INPUT pin of the driver in the master's terminal order connected to
+    /// the same net, the first output on a new "net", the moved loads disconnected and connected
+    /// to it. The callbacks invalidate every net touched.
+    fn clone_instance(&mut self, drvr_inst: &str, cell: &str, loc: (i32, i32), moved_loads: &[String]) -> Result<String, String> {
+        let e = |x: vyges_opendb::Error| x.to_string();
+        // `makeInstance(cell, "clone", parent_)`: named and created in the driver's module.
+        let name = self.db.make_new_inst_name_beside(drvr_inst, "clone", "ALWAYS").map_err(e)?;
+        self.db.create_inst_beside(cell, &name, drvr_inst).map_err(e)?;
+        self.db.inst_set_source_type(&name, "TIMING").map_err(e)?;
+        let at = self.clamp_loc_to_core(loc, cell);
+        self.db.set_inst_location(&name, at.0, at.1).map_err(e)?;
+        self.gr_inst_moved(&name);
+        self.gr_legal_cell_pos(&name)?;
+        let master = self.db.inst_master(drvr_inst);
+        let lc = self.libs.link_cell(&master).ok_or_else(|| format!("{master}: no liberty cell"))?.clone();
+        let terms: Vec<String> = self.db.master_mterms(&master).map_err(e)?.into_iter().filter(|(_, t)| t != "POWER" && t != "GROUND").map(|(n, _)| n).collect();
+        let mut touched = Vec::new();
+        for term in &terms {
+            if !lc.port(term).is_some_and(|p| p.direction == vyges_sta::liberty::Direction::Input) {
+                continue;
+            }
+            // `connectCloneInputs`: the flat net, then the hierarchical one (`iterm->connect(modnet)`).
+            let net = self.db.net_of(drvr_inst, term);
+            if !net.is_empty() {
+                self.db.connect(&name, term, &net).map_err(e)?;
+                touched.push(net);
+            }
+            self.db.connect_mod_net_of(&name, term, drvr_inst, term).map_err(e)?;
+        }
+        let clone_terms: Vec<String> = self.db.master_mterms(cell).map_err(e)?.into_iter().filter(|(_, t)| t != "POWER" && t != "GROUND").map(|(n, _)| n).collect();
+        let cc = self.libs.link_cell(cell).ok_or_else(|| format!("{cell}: no liberty cell"))?.clone();
+        let out = clone_terms.iter().find(|t| cc.port(t).is_some_and(|p| p.direction == vyges_sta::liberty::Direction::Output)).ok_or("Cannot find output pin of the clone instance")?;
+        // `makeNet(parent_)`: named in the driver's module.
+        let out_net = self.db.make_new_net_name_beside(drvr_inst, "net", "ALWAYS").map_err(e)?;
+        self.db.create_net(&out_net).map_err(e)?;
+        self.db.connect(&name, out, &out_net).map_err(e)?;
+        touched.push(out_net.clone());
+        // `moveLoads`: each load off its nets; in the clone's module onto the new net, in another
+        // through the hierarchy (`hierarchicalConnect(clone output, load)`, connection "net").
+        for load in moved_loads {
+            let (inst, term) = load.rsplit_once('/').ok_or("a load pin")?;
+            touched.push(self.db.net_of(inst, term));
+            self.db.disconnect(inst, term).map_err(e)?;
+            if self.db.same_owning_module(inst, drvr_inst).map_err(e)? {
+                // The net itself, by the clone's output (a cross-module load may have renamed it).
+                let cur = self.db.net_of(&name, out);
+                self.db.connect(inst, term, &cur).map_err(e)?;
+            } else {
+                self.db.hierarchical_connect(&name, out, inst, term, "net").map_err(e)?;
+            }
+        }
+        // A cross-module connection may rename the clone's flat net (after its highest modnet).
+        let out_net = self.db.net_of(&name, out);
+        touched.push(out_net);
+        for n in touched {
+            self.invalidate(&n);
+        }
+        self.refresh()?;
+        Ok(name)
+    }
+
+    fn buffer_to_inverters(&mut self, buffer: &str, in_pin: &str, out_pin: &str, inv_cell: &str, inv_in: &str, inv_out: &str, locs: [(i32, i32); 2]) -> Result<Option<(String, String)>, String> {
+        let e = |x: vyges_opendb::Error| x.to_string();
+        let (in_net, out_net) = (self.db.net_of(buffer, in_pin), self.db.net_of(buffer, out_pin));
+        // The database half, in the candidate's order (disconnect, deleteInstance, makeInstance ×2,
+        // makeNet, connectPin ×4, the module nets): inv1 takes the freed slot.
+        let Some((inv1, inv2, mid)) = self.db.buffer_to_inverters(buffer, in_pin, out_pin, inv_cell, inv_in, inv_out).map_err(e)? else { return Ok(None) };
+        // ⚠️ `makeInstance` places inv1 before inv2 exists; here both exist (inv2 unplaced) when
+        // inv1 is placed. Placement reads placed instances only, so the order cannot show.
+        for (name, loc) in [(&inv1, locs[0]), (&inv2, locs[1])] {
+            self.db.inst_set_source_type(name, "TIMING").map_err(e)?;
+            let at = self.clamp_loc_to_core(loc, inv_cell);
+            self.db.set_inst_location(name, at.0, at.1).map_err(e)?;
+            self.gr_inst_moved(name);
+            self.gr_legal_cell_pos(name)?;
+        }
+        for n in [in_net, mid, out_net] {
+            self.invalidate(&n);
+        }
+        self.refresh()?;
+        Ok(Some((inv1, inv2)))
+    }
+
+    fn inst_id(&self, inst: &str) -> u32 {
+        self.db.inst_id(inst).unwrap_or(u32::MAX)
+    }
+
+    fn pin_dont_touch(&self, pin: &str) -> bool {
+        let (inst, term) = self.term(pin);
+        let net = match inst {
+            Some(i) => self.db.net_of(i, term),
+            None => self.db.bterm_net(term),
+        };
+        inst.is_some_and(|i| self.db.inst_is_do_not_touch(i)) || (!net.is_empty() && self.db.net_is_do_not_touch(&net))
+    }
+
+    fn insert_buffer_before_loads(&mut self, net: Option<&str>, loads: &[String], cell: &str, loc: (i32, i32), reason: &str, loads_on_diff_nets: bool, uniquify: &str) -> Result<vyges_rsz::design::Repeater, String> {
+        self.insert_before_loads(net, loads, cell, loc, reason, loads_on_diff_nets, uniquify)
+    }
+
+    /// `removeBuffer`: the database edit (`remove_buffer`), then the odb callbacks on the
+    /// estimator — both nets were disconnected and the survivor took the other's pins (invalid),
+    /// the merged-away net destroyed (its parasitics erased). The cache is keyed by name, so both
+    /// old names go and the survivor is estimated afresh under its name now.
+    fn remove_buffer(&mut self, inst: &str, in_pin: &str, out_pin: &str) -> Result<vyges_rsz::repair_setup::RemovedBuffer, String> {
+        let in_net = self.db.net_of(inst, in_pin);
+        let out_net = self.db.net_of(inst, out_pin);
+        if in_net.is_empty() {
+            return Err(format!("The input pin of buffer '{inst}' is undriven. Do not remove the buffer."));
+        }
+        let survivor = self.db.remove_buffer(inst, in_pin, out_pin).map_err(|e| e.to_string())?;
+        for map in self.parasitics.iter_mut() {
+            map.remove(&in_net);
+            map.remove(&out_net);
+        }
+        self.invalid.remove(&in_net);
+        self.invalid.remove(&out_net);
+        self.invalidate(&survivor);
+        // A constrained net only ever survives: its constraint follows it to its name now.
+        if self.sdc_nets.remove(&in_net) | self.sdc_nets.remove(&out_net) {
+            self.sdc_nets.insert(survivor.clone());
+        }
+        self.refresh()?;
+        Ok(vyges_rsz::repair_setup::RemovedBuffer { in_net, out_net, survivor })
+    }
+}
+
+impl CliDesign<'_> {
+    /// A pin that drives its net: an instance output (or inout) pin, or an input port.
+    pub fn is_driver_pin(&self, pin: &str) -> bool {
+        match pin.rsplit_once('/') {
+            Some((inst, term)) if !self.netlist.ports.iter().any(|p| p.0 == pin) => matches!(self.db.iterm_get_io_type(inst, term).as_str(), "OUTPUT" | "INOUT"),
+            _ => matches!(self.db.bterm_get_io_type(pin).as_str(), "INPUT" | "INOUT"),
+        }
+    }
+}
+
+impl buffer_ports::PortDesign for CliDesign<'_> {
+    fn top_ports(&self) -> Vec<String> {
+        self.db.block_get_b_terms()
+    }
+    fn port_direction(&self, port: &str) -> String {
+        self.db.bterm_get_io_type(port)
+    }
+    fn port_net(&self, port: &str) -> Option<String> {
+        Some(self.db.bterm_net(port)).filter(|n| !n.is_empty())
+    }
+    fn net_dont_touch(&self, net: &str) -> bool {
+        self.db.net_is_do_not_touch(net)
+    }
+    fn net_special(&self, net: &str) -> bool {
+        self.db.net_is_special(net)
+    }
+    fn net_iterms(&self, net: &str) -> Vec<String> {
+        self.db.net_iterms(net)
+    }
+    fn net_bterms(&self, net: &str) -> Vec<String> {
+        self.db.net_bterms(net)
+    }
+    fn net_first_output(&self, net: &str) -> Option<String> {
+        Some(self.db.net_get_first_output(net)).filter(|t| !t.is_empty())
+    }
+    fn inst_dont_touch(&self, inst: &str) -> bool {
+        self.db.inst_is_do_not_touch(inst)
+    }
+    fn inst_is_buffer(&self, inst: &str) -> Option<bool> {
+        self.libs.link_cell(&self.db.inst_master(inst)).map(|c| c.is_buffer())
+    }
+    /// `Network::drivers(net)`: its output (or inout) instance terminals and its input (or inout)
+    /// ports; tristate when the liberty port is (`isAnyTristate`).
+    fn net_drivers(&self, net: &str) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        for it in self.db.net_iterms(net) {
+            if !self.is_driver_pin(&it) {
+                continue;
+            }
+            let (inst, term) = it.rsplit_once('/').expect("inst/pin");
+            let tristate = self
+                .libs
+                .link_cell(&self.db.inst_master(inst))
+                .and_then(|c| c.ports.iter().find(|p| p.name == term))
+                .is_some_and(|p| p.is_any_tristate());
+            out.push((it, tristate));
+        }
+        out.extend(self.db.net_bterms(net).into_iter().filter(|b| self.is_driver_pin(b)).map(|b| (b, false)));
+        out
+    }
+    /// A top-level port is in the clock network when it is a clock's source.
+    fn port_is_clock(&self, port: &str) -> bool {
+        self.clock_sources.iter().any(|c| c == port)
+    }
+    fn port_is_constant(&self, port: &str) -> bool {
+        self.constants.contains_key(port)
+    }
+    fn insert_buffer_after_driver(&mut self, drvr: &str, cell: &str, reason: &str) -> Result<String, String> {
+        let term = self.term(drvr);
+        let inst = self.db.insert_buffer_after_driver(term, cell, None, reason, None, "ALWAYS").map_err(|e| e.to_string())?;
+        self.insert_buffer_post_process(&inst, cell)?;
+        Ok(inst)
+    }
+    fn insert_buffer_before_load(&mut self, load: &str, cell: &str, reason: &str) -> Result<String, String> {
+        let term = self.term(load);
+        let inst = self.db.insert_buffer_before_load(term, cell, None, reason, None, "ALWAYS").map_err(|e| e.to_string())?;
+        self.insert_buffer_post_process(&inst, cell)?;
+        Ok(inst)
+    }
+}
+
+impl CliDesign<'_> {
+    /// A pin as the database addresses it: a port, or an instance's terminal.
+    pub fn term<'p>(&self, pin: &'p str) -> (Option<&'p str>, &'p str) {
+        match pin.rsplit_once('/') {
+            Some((inst, t)) if !self.netlist.ports.iter().any(|p| p.0 == pin) => (Some(inst), t),
+            _ => (None, pin),
+        }
+    }
+
+    /// `insertBufferPostProcess` (`setLocation`: clamped to the core, placed), and the odb
+    /// callbacks: the nets on the new buffer's input and output marked invalid.
+    pub fn insert_buffer_post_process(&mut self, inst: &str, cell: &str) -> Result<(), String> {
+        let at = self.clamp_loc_to_core(self.db.inst_location(inst), cell);
+        self.db.set_inst_location(inst, at.0, at.1).map_err(|e| e.to_string())?;
+        self.gr_inst_moved(inst);
+        self.gr_legal_cell_pos(inst)?;
+        let c = self.libs.link_cell(cell).ok_or_else(|| format!("{cell}: no liberty cell"))?;
+        let (input, output) = c.buffer_ports().ok_or_else(|| format!("{cell}: not a buffer"))?;
+        let in_net = self.db.net_of(inst, &input.name);
+        let out_net = self.db.net_of(inst, &output.name);
+        self.invalidate(&in_net);
+        self.invalidate(&out_net);
+        self.refresh()
+    }
+}
+
+/// `EstimateParasitics::makeSteinerTree(drvr_pin)`, as the resizer's buffered net reads it.
+pub fn steiner_tree(db: &Db, net: &str, drvr_pin: &str, alpha: f32) -> Option<vyges_rsz::buffered_net::Tree> {
+    let tree = vyges_est::placement::make_steiner_tree_for_driver(db, net, drvr_pin, alpha, &est_stt).ok()??;
+    Some(vyges_rsz::buffered_net::Tree {
+        deg: tree.tree.deg,
+        branch: tree.tree.branch.iter().map(|b| (b.x, b.y, b.n)).collect(),
+        pinlocs: tree.pinlocs.iter().map(|p| (p.name.clone(), p.x, p.y)).collect(),
+        drvr_pt: tree.drvr_pt,
+    })
+}
+
+pub fn to_rsmt(t: &vyges_stt::Tree) -> vyges_grt::RsmtTree {
+    vyges_grt::RsmtTree { deg: t.deg, length: t.length, branch: t.branch.iter().map(|b| vyges_grt::Branch { x: b.x, y: b.y, n: b.n }).collect() }
+}
+
+/// `SteinerTreeBuilder::makeSteinerTree(x, y, drvr, alpha)`, as the global router calls it.
+pub fn grt_stt(x: &[i32], y: &[i32], drvr: usize, alpha: f32) -> vyges_grt::RsmtTree {
+    LUT.with(|lut| to_rsmt(&vyges_stt::make_steiner_tree(lut, x, y, drvr, alpha).0.expect("a Steiner tree")))
+}
+
+/// FastRoute's pre-sorted FLUTE.
+pub fn grt_flutes(xs: &[i32], ys: &[i32], s: &[usize], acc: i32) -> vyges_grt::RsmtTree {
+    LUT.with(|lut| to_rsmt(&vyges_stt::flute::medium_degree::flutes_all_degree_acc(lut, xs.len(), xs, ys, s, acc).expect("flute")))
+}
+
+/// The pin order (`dbNetwork::id`, flat: ITerm id × 2, BTerm id × 2 + 1) of every net pin, and
+/// the nets `repairDriver` passes over (dont_touch, connected by abutment).
+pub fn net_info(db: &Db, nl: &vyges_sta::netlist::Netlist) -> Result<NetInfo, String> {
+    let mut info = NetInfo::default();
+    for net in &nl.nets {
+        for c in &net.pins {
+            let name = nl.pin_name(c);
+            let id = match c {
+                vyges_sta::netlist::Conn::Inst(i, pin) => u64::from(db.iterm_id(&nl.insts[*i].0, pin).map_err(|e| e.to_string())?) << 1,
+                vyges_sta::netlist::Conn::Port(_) => (u64::from(db.bterm_id(&name).map_err(|e| e.to_string())?) << 1) | 1,
+            };
+            info.pin_id.insert(name, id);
+        }
+        if db.net_is_do_not_touch(&net.name) {
+            info.dont_touch.insert(net.name.clone());
+        }
+        if db.net_is_connected_by_abutment(&net.name) {
+            info.abutment.insert(net.name.clone());
+        }
+    }
+    info.dont_touch_insts = nl.insts.iter().filter(|(i, _)| db.inst_is_do_not_touch(i)).map(|(i, _)| i.clone()).collect();
+    info.fixed_insts = nl.insts.iter().filter(|(i, _)| db.inst_is_fixed(i)).map(|(i, _)| i.clone()).collect();
+    Ok(info)
+}
+
+/// `Resizer::area(dbMaster)`: `dbuToMeters(width) × dbuToMeters(height)` (each side divided by
+/// `dbu × 1e6` in `double`), 0 when the master is not core autoplaceable.
+pub fn master_area(db: &Db, master: &str) -> f64 {
+    let dbu = f64::from(db.tech_get_db_units_per_micron());
+    let t = db.master_get_type(master).unwrap_or_default().replace(' ', "_");
+    let placeable = (t.starts_with("CORE") || t.starts_with("BLOCK") || t.starts_with("ENDCAP")) && !matches!(t.as_str(), "ENDCAP_TOPLEFT" | "ENDCAP_TOPRIGHT" | "ENDCAP_BOTTOMLEFT" | "ENDCAP_BOTTOMRIGHT");
+    if !placeable {
+        return 0.0;
+    }
+    f64::from(db.master_get_width(master)) / (dbu * 1e6) * (f64::from(db.master_get_height(master)) / (dbu * 1e6))
+}
+
+/// `ConcreteParasiticNetwork::disconnectPin` for each pin: its node is renamed to a subnode of the
+/// net (`<net>:<next id>`, no longer a pin) and its ground capacitance dropped.
+pub fn disconnect_pins(p: &mut NetParasitics, net: &str, pins: &[String]) {
+    for pin in pins {
+        if let Some(i) = p.node_names.iter().position(|n| n == pin) {
+            p.node_names[i] = format!("{net}:{}", p.node_names.len() + i);
+            p.network.node_caps[i] = 0.0;
+        }
+    }
+}
+
+/// `Resizer::computeDesignArea`: over the block's instances in order, each master's
+/// `width × height` in m² (`dbuToMeters` each side) — 0 for a master that is not core
+/// autoplaceable (`isCoreAutoPlaceable`) — fillers (`CORE SPACER`) left out.
+pub fn design_area(db: &Db) -> f64 {
+    let mut area = 0.0f64;
+    for inst in db.inst_names() {
+        let master = db.inst_master(&inst);
+        let t = db.master_get_type(&master).unwrap_or_default().replace(' ', "_");
+        if t == "CORE_SPACER" {
+            continue;
+        }
+        area += master_area(db, &master);
+    }
+    area
+}
+
+/// `Resizer::clampLocToCore`: with a core, the origin held inside it so the master fits — the
+/// upper bound is `max(core min, core max − master size)`, so a master wider than the core sits at
+/// the core's lower edge. No core (`core_exists_` false): unchanged.
+pub fn clamp_loc_to_core(core: Option<(i32, i32, i32, i32)>, (w, h): (i32, i32), (x, y): (i32, i32)) -> (i32, i32) {
+    let Some((x0, y0, x1, y1)) = core else { return (x, y) };
+    let x_max = x0.max(x1 - w);
+    let y_max = y0.max(y1 - h);
+    (x.clamp(x0, x_max), y.clamp(y0, y_max))
+}
+
+pub fn sizing_limits(db: &Db) -> Result<vyges_rsz::sizing::SizingLimits, String> {
+    let d = vyges_rsz::sizing::SizingLimits::default();
+    Ok(vyges_rsz::sizing::SizingLimits {
+        area: db.block_double_property("limit_sizing_area").map_err(|e| e.to_string())?.or(d.area),
+        leakage: db.block_double_property("limit_sizing_leakage").map_err(|e| e.to_string())?.or(d.leakage),
+        keep_site: db.block_bool_property("keep_sizing_site").map_err(|e| e.to_string())?.unwrap_or(false),
+        keep_vt: db.block_bool_property("keep_sizing_vt").map_err(|e| e.to_string())?.unwrap_or(false),
+    })
+}
+
+/// The instance pins a `set_max_capacitance` names (`pin_cap_limit_map_`).
+pub fn sdc_cap_pins(s: &vyges_loom::sdc::Sdc) -> BTreeSet<String> {
+    s.max_capacitance_objects.iter().filter(|(_, o)| o.accessor == "get_pins").flat_map(|(_, o)| o.names.iter().cloned()).collect()
+}
+
+/// Each port's `set_max_capacitance` (`Sdc::setCapacitanceLimit(port)`, the last command's value),
+/// in farads like the design's limit.
+pub fn sdc_port_cap_limits(s: &vyges_loom::sdc::Sdc, cap_scale: f32) -> BTreeMap<String, f32> {
+    let mut out = BTreeMap::new();
+    for (v, o) in s.max_capacitance_objects.iter().filter(|(_, o)| o.accessor == "get_ports") {
+        for port in &o.names {
+            out.insert(port.clone(), vyges_rsz::timing::user_cap_to_sta(*v, cap_scale));
+        }
+    }
+    out
+}

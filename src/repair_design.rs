@@ -53,6 +53,8 @@ pub struct Inputs<'a> {
     pub sizing_limits: crate::sizing::SizingLimits,
     /// Each master's signal terminals (the database's): the timer's pins are these.
     pub master_pins: HashMap<String, Vec<String>>,
+    /// The session's clock-buffer pattern: which buffers `findBuffers` leaves out as clock buffers.
+    pub clock_pattern: preamble::ClockPattern,
 }
 
 /// A run that reached its end.
@@ -129,7 +131,7 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
     // Resizer::resizePreamble
     let lib = inputs.libs.default_library().ok_or_else(|| Stop::error("RSZ-LIB", "no liberty library read".into()))?;
     let equiv = sizing::make_equiv_cells(inputs.libs);
-    let buffers = preamble::find_buffers(inputs.libs, inputs.masters, inputs.dont_use, true)?;
+    let buffers = preamble::find_buffers_with(inputs.libs, inputs.masters, inputs.dont_use, true, &inputs.clock_pattern)?;
     let (tgt_slews, tgt_scene, target_loads) = preamble::find_target_loads(inputs.libs, &buffers.cells, inputs.dont_use);
     // check_max_wire_length (the command's Tcl, before repair_design_cmd): the same buffer list and
     // target slews (findMaxWireLength runs findBuffers and findTargetLoads too).
@@ -206,12 +208,90 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
         r_strongest_buffer: r_strongest,
         buffer_lowest_drive: &buffers.lowest,
         pre: PreCheck::default(),
+        checks: NetChecks { slew: true, cap: true, resize_drvr: true },
     };
     trace.ran(&["drv"]);
     let mut outcome = Outcome { warnings, max_wire_lengths, ..Default::default() };
     for i in (0..drivers.len()).rev() {
         trace.push(format!("drv|{i}|{}", drivers[i]));
         repair_driver(design, &drivers[i], &mut ctx, &mut outcome, trace)?;
+    }
+    Ok(outcome)
+}
+
+/// `repairClkNets`' lines: RSZ-0047 / RSZ-0048, not `repairDesign`'s 0037 / 0038.
+impl Outcome {
+    pub fn clk_summary(&self) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        if self.length_violations > 0 {
+            out.push(("RSZ-0047", format!("Found {} long wires.", self.length_violations)));
+        }
+        if self.inserted_buffers > 0 {
+            out.push(("RSZ-0048", format!("Inserted {} buffers in {} nets.", self.inserted_buffers, self.nets_repaired)));
+        }
+        out
+    }
+}
+
+/// `Resizer::repairClkNets(max_wire_length)` → `RepairDesign::repairClkNets`: long wires in the
+/// clock network, nothing else.
+///
+/// `resizePreamble` works on the ORDINARY buffers (lowest drive, target loads, equivalents), then
+/// `buffer_cells_` is the CLOCK buffer list for the call — so `init`'s `r_strongest_buffer_` is
+/// over the clock buffers. Sizing area / leakage limits are lifted, the margins are 0, and per
+/// SDC clock (`clocks`: each clock's source pins, in SDC order), per pin of its clock NETWORK that
+/// is a driver — the `PinSet` order, `pin_order` (dbNetwork's pin id) — `repairNet` with slew, cap
+/// and fanout checks off and no driver resize. A special net (not in the timer) is passed over.
+#[allow(clippy::too_many_arguments)]
+pub fn repair_clk_nets(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers: &[String], clocks: &[Vec<String>], pin_order: &dyn Fn(&str) -> u64, max_wire_length: f64, trace: &mut Trace) -> Result<Outcome, Stop> {
+    // Resizer::resizePreamble
+    let lib = inputs.libs.default_library().ok_or_else(|| Stop::error("RSZ-LIB", "no liberty library read".into()))?;
+    let equiv = sizing::make_equiv_cells(inputs.libs);
+    let buffers = preamble::find_buffers_with(inputs.libs, inputs.masters, inputs.dont_use, true, &inputs.clock_pattern)?;
+    let (tgt_slews, tgt_scene, target_loads) = preamble::find_target_loads(inputs.libs, &buffers.cells, inputs.dont_use);
+    let slew_shape_factor = preamble::compute_slew_shape_factor(lib)?;
+    // RepairDesign::repairClkNets: init over buffer_cells_ = clk_buffers_.
+    let r_strongest = r_strongest_buffer(inputs, clk_buffers);
+    let args = Args { max_wire_length, slew_margin: 0.0, cap_margin: 0.0, pre_placement: false };
+    let lifted = crate::sizing::SizingLimits { area: None, leakage: None, ..inputs.sizing_limits };
+    let sizing = Sizing { libs: inputs.libs, masters: inputs.masters, dont_use: inputs.dont_use, equiv: &equiv, target_loads: &target_loads, tgt_slews, tgt_scene, limits: lifted };
+    let annotated: Vec<HashMap<String, f32>> = vec![HashMap::new(); inputs.libs.scene_count()];
+    let no_viol = HashMap::new();
+    let mut ctx = NetCtx {
+        inputs,
+        args: &args,
+        annotated: &annotated,
+        drvr_with_load_slew_viol: &no_viol,
+        min_cap_load: timing::min_cap_load(&inputs.libs.libs),
+        max_length: meters_to_dbu(max_wire_length, inputs.dbu),
+        sizing: &sizing,
+        slew_shape_factor,
+        r_strongest_buffer: r_strongest,
+        buffer_lowest_drive: &buffers.lowest,
+        pre: PreCheck::default(),
+        checks: NetChecks { slew: false, cap: false, resize_drvr: false },
+    };
+    let mut outcome = Outcome::default();
+    // Each clock's network pins are taken BEFORE its repair ("make a copy in case the set of pins
+    // is updated"); a later clock sees the buffers an earlier one inserted.
+    for sources in clocks {
+        let netlist = design.netlist().clone();
+        let graphs = current_graphs(inputs, &netlist, &annotated)?;
+        let g0 = &graphs[0];
+        let mut drivers: Vec<String> = timing::clock_pins(g0, sources).into_iter().filter(|&v| g0.vertices[v].is_driver).map(|v| g0.vertices[v].name.clone()).collect();
+        drivers.sort_by_key(|p| pin_order(p));
+        drop(graphs);
+        for name in drivers {
+            let netlist = design.netlist().clone();
+            let graphs = current_graphs(inputs, &netlist, &annotated)?;
+            let g0 = &graphs[0];
+            let Some(drvr) = g0.vertices.iter().position(|v| v.is_driver && v.name == name) else { continue };
+            let Some(n) = g0.vertex_net[drvr] else { continue };
+            let net = netlist.nets[n].name.clone();
+            let clock_set = timing::clock_pins(g0, inputs.clock_sources);
+            outcome.nets_checked += 1;
+            repair_net(design, graphs, drvr, &net, &clock_set, false, None, &mut ctx, &mut outcome, trace)?;
+        }
     }
     Ok(outcome)
 }
@@ -237,6 +317,17 @@ struct NetCtx<'a, 'b> {
     buffer_lowest_drive: &'b str,
     /// `PreChecks`, made once per `repairDesign` and kept across nets.
     pre: PreCheck,
+    /// `repairNet`'s `check_slew`, `check_cap`, `resize_drvr`: on for `repairDesign`, off for
+    /// `repairClkNets`. `makeFanoutRepeater` passes them on to the repeater's net unchanged.
+    checks: NetChecks,
+}
+
+/// The `repairNet` switches a caller holds for a whole run.
+#[derive(Debug, Clone, Copy)]
+struct NetChecks {
+    slew: bool,
+    cap: bool,
+    resize_drvr: bool,
 }
 
 /// The timer's graph over a netlist for scene `k` (its libraries' cells), with the SDC environment.
@@ -416,13 +507,16 @@ fn make_fanout_repeater(repeater_loads: &mut Vec<String>, repeater_inputs: &mut 
     Ok(())
 }
 
-/// `RepairDesign::repairNet(net, drvr_pin, …)` — check_slew, check_cap and check_fanout on,
-/// resizing the driver allowed, as `repairDesign` calls it. `drvr` is scene 0's vertex.
+/// `RepairDesign::repairNet(net, drvr_pin, …)`: check_slew, check_cap and resize_drvr from the
+/// run (`ctx.checks`), check_fanout per call. `drvr` is scene 0's vertex. With every check off
+/// (`repairClkNets`) it is: the wire parasitic, the driver's delays, the buffered net at the
+/// command scene, and the length test.
 #[allow(clippy::too_many_arguments)]
 fn repair_net(design: &mut dyn Design, graphs: Vec<Graph<'_>>, drvr: usize, net: &str, clocks: &BTreeSet<usize>, check_fanout: bool, corner_w_load_slew_viol: Option<usize>, ctx: &mut NetCtx<'_, '_>, outcome: &mut Outcome, trace: &mut Trace) -> Result<(), Stop> {
     let inputs = ctx.inputs;
     let name = graphs[0].vertices[drvr].name.clone();
-    trace.push(format!("net|{name}|true|true|{check_fanout}|{}|true", ctx.max_length));
+    let checks = ctx.checks;
+    trace.push(format!("net|{name}|{}|{}|{check_fanout}|{}|{}", checks.slew, checks.cap, ctx.max_length, checks.resize_drvr));
     trace.ran(&["net", "fo", "fanloads", "dslew", "lslew", "cap"]);
     // `corner`: the command scene, until a violation names one.
     let mut corner = 0usize;
@@ -471,10 +565,12 @@ fn repair_net(design: &mut dyn Design, graphs: Vec<Graph<'_>>, drvr: usize, net:
     design.ensure_wire_parasitic(&net_name).map_err(|e| Stop::error("RSZ-EST", e))?;
     find_all_delays(&mut graphs, &*design, &name)?;
 
-    // First the driver's slew: resize the driver, and if that does not fix it, derive the load
-    // cap that would, which then caps the buffered net.
     let mut max_cap = timing::INF;
     let mut repair_cap = false;
+    let mut repair_load_slew = false;
+    if checks.slew {
+    // First the driver's slew: resize the driver, and if that does not fix it, derive the load
+    // cap that would, which then caps the buffered net.
     let (mut slew1, mut max_slew1, mut slack1, mut corner1) = timing::repair_check_slew(&timing::Scenes::new(&graphs), drvr, &inputs.limits, clocks, ctx.args.slew_margin);
     trace.push(format!("dslew|{}|{}|{}", g9(f64::from(slew1.unwrap_or(0.0))), g9(f64::from(max_slew1)), g9(f64::from(slack1))));
     trace.ran(&["rds", "rdsc", "rdsel", "dresize", "dslew2", "slewcap", "slc0", "slc"]);
@@ -519,7 +615,7 @@ fn repair_net(design: &mut dyn Design, graphs: Vec<Graph<'_>>, drvr: usize, net:
     let annotated = viol_scene.is_some();
     let shown_slew = ls.slew.or(slew1).unwrap_or(0.0);
     trace.push(format!("lslew|{}|{}|{}|annot={annotated}", g9(f64::from(shown_slew)), g9(f64::from(ls.limit)), g9(f64::from(ls.slack))));
-    let repair_load_slew = ls.slack < 0.0 || annotated;
+    repair_load_slew = ls.slack < 0.0 || annotated;
     if repair_load_slew {
         slew_violation = true;
     }
@@ -533,8 +629,11 @@ fn repair_net(design: &mut dyn Design, graphs: Vec<Graph<'_>>, drvr: usize, net:
             corner = k;
         }
     }
+    }
 
     // Then the capacitance: the pre-check first (an unreasonably small limit is an error).
+    let sc = timing::Scenes::new(&graphs);
+    if checks.cap {
     let parasitics: Vec<HashMap<String, vyges_sta::graph::NetParasitics>> = (0..graphs.len()).map(|k| design.parasitics(k).clone()).collect();
     let (cap1, max_cap1, _cap_slack1, has_corner, cap_scene) = timing::check_capacitance(&sc, drvr, &parasitics, clocks, &inputs.limits);
     if max_cap1 > 0.0 && max_cap1 < ctx.min_cap_load {
@@ -550,6 +649,7 @@ fn repair_net(design: &mut dyn Design, graphs: Vec<Graph<'_>>, drvr: usize, net:
             outcome.cap_violations += 1;
             repair_cap = true;
         }
+    }
     }
 
     // makeBufferedNet(drvr_pin, corner) (placement parasitics: the Steiner tree); with none,
