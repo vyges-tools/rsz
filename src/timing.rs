@@ -148,28 +148,29 @@ pub fn max_input_slew_at(link_lib: &Library, scene_lib: &Library, direction: Dir
 }
 
 /// The timer over every scene: one graph per scene (its libraries' cells), over one netlist.
-/// Vertices are named alike in every graph; `at[k][v]` is scene `k`'s vertex for scene 0's `v`
+/// Vertices are named alike in every graph; [`Scenes::at`] maps scene 0's vertex to scene `k`'s
 /// (port order may differ between a scene's libraries). Scene 0 is the LINK view.
 pub struct Scenes<'s, 'a> {
     pub graphs: &'s [Graph<'a>],
-    at: Vec<Vec<usize>>,
+    /// Per scene, its vertices by (name, is driver) — built only for a scene whose vertex order
+    /// differs from scene 0's at a vertex asked for.
+    index: Vec<std::cell::OnceCell<std::collections::HashMap<(&'s str, bool), usize>>>,
 }
 
 impl<'s, 'a> Scenes<'s, 'a> {
     pub fn new(graphs: &'s [Graph<'a>]) -> Scenes<'s, 'a> {
-        let g0 = &graphs[0];
-        let at = graphs
-            .iter()
-            .map(|g| {
-                let index: std::collections::HashMap<(&str, bool), usize> = g.vertices.iter().enumerate().map(|(i, v)| ((v.name.as_str(), v.is_driver), i)).collect();
-                g0.vertices.iter().map(|v| index[&(v.name.as_str(), v.is_driver)]).collect()
-            })
-            .collect();
-        Scenes { graphs, at }
+        Scenes { graphs, index: graphs.iter().map(|_| std::cell::OnceCell::new()).collect() }
     }
-    /// Scene `k`'s vertex for scene 0's `v`.
+    /// Scene `k`'s vertex for scene 0's `v`: the vertex of the same name and direction — the same
+    /// index when the scene lists it there, as it does unless its libraries order ports otherwise.
     pub fn at(&self, k: usize, v: usize) -> usize {
-        self.at[k][v]
+        let (g0, g) = (&self.graphs[0], &self.graphs[k]);
+        let want = &g0.vertices[v];
+        if g.vertices.get(v).is_some_and(|x| x.is_driver == want.is_driver && x.name == want.name) {
+            return v;
+        }
+        let index = self.index[k].get_or_init(|| g.vertices.iter().enumerate().map(|(i, x)| ((x.name.as_str(), x.is_driver), i)).collect());
+        index[&(want.name.as_str(), want.is_driver)]
     }
     pub fn link(&self) -> &Graph<'a> {
         &self.graphs[0]
@@ -258,6 +259,22 @@ pub fn net_drivers(g: &Graph<'_>, load: usize) -> Vec<usize> {
         let name = g.netlist.pin_name(c);
         g.vertices.iter().position(|x| x.name == name && x.is_driver)
     }).collect()
+}
+
+/// Each driver vertex by its pin name — the first, as [`net_drivers`]' search finds it.
+pub fn driver_index<'g>(g: &'g Graph<'_>) -> std::collections::HashMap<&'g str, usize> {
+    let mut index = std::collections::HashMap::new();
+    for (i, v) in g.vertices.iter().enumerate().filter(|(_, v)| v.is_driver) {
+        index.entry(v.name.as_str()).or_insert(i);
+    }
+    index
+}
+
+/// [`net_drivers`] through a [`driver_index`]: the same drivers in the same order, without a
+/// search of every vertex for each pin of the net.
+pub fn net_drivers_in(g: &Graph<'_>, load: usize, drivers: &std::collections::HashMap<&str, usize>) -> Vec<usize> {
+    let Some(n) = g.vertex_net[load] else { return Vec::new() };
+    g.netlist.nets[n].pins.iter().filter_map(|c| drivers.get(g.netlist.pin_name(c).as_str()).copied()).collect()
 }
 
 // ---- repairNet's checks ----------------------------------------------------------------------
@@ -541,14 +558,14 @@ pub fn check_fanout(g: &Graph<'_>, info: &NetInfo, drvr: usize, limits: &Limits,
 /// slack INF, no scene.
 /// Over the scenes in order (each its scene port's limit and its own load cap), rise then fall:
 /// a FUZZILY smaller slack wins, a fuzzy tie with a lower transition index too. Returns the scene.
-pub fn check_capacitance(sc: &Scenes<'_, '_>, drvr: usize, parasitics: &[std::collections::HashMap<String, vyges_sta::graph::NetParasitics>], clocks: &std::collections::BTreeSet<usize>, limits: &Limits) -> (f32, f32, f32, bool, Option<usize>) {
+pub fn check_capacitance<P: std::borrow::Borrow<std::collections::HashMap<String, vyges_sta::graph::NetParasitics>>>(sc: &Scenes<'_, '_>, drvr: usize, parasitics: &[P], clocks: &std::collections::BTreeSet<usize>, limits: &Limits) -> (f32, f32, f32, bool, Option<usize>) {
     let mut best: Option<(f32, f32, f32, usize, usize)> = None;
     if !clocks.contains(&drvr) {
         for (k, g) in sc.graphs.iter().enumerate() {
             let vk = sc.at(k, drvr);
             let Some(limit) = find_cap_limit(g, vk, limits) else { continue };
             for rf in [RISE, FALL] {
-                let cap = g.load_cap(vk, &parasitics[k]);
+                let cap = g.load_cap(vk, std::borrow::Borrow::borrow(&parasitics[k]));
                 let slack = limit - cap;
                 let take = match &best {
                     None => true,
@@ -590,6 +607,29 @@ mod tests {
 
     fn port(name: &str, direction: Direction, max_cap: Option<f32>) -> vyges_sta::liberty::Port {
         vyges_sta::liberty::Port { name: name.into(), direction, is_clock: false, capacitance: [[0.0; 2]; 2], function: None, max_transition: None, max_capacitance: max_cap, fanout_load: None, max_fanout: None, three_state: None, is_clock_gate_clock: false }
+    }
+
+    // A scene's graph lists an instance's pins in ITS library's port order, so scene k's vertex
+    // for scene 0's is the one of the same name and direction — the same index when the orders
+    // agree (the common case, answered without an index), found by name when they do not.
+    #[test]
+    fn scene_vertex_is_found_by_name_when_port_order_differs() {
+        let cell = |ports: Vec<vyges_sta::liberty::Port>| vyges_sta::liberty::Cell { name: "c".into(), ports, ..Default::default() };
+        let lib = |c: vyges_sta::liberty::Cell| Library { cells: [("c".to_string(), c)].into_iter().collect(), ..Default::default() };
+        let ay = lib(cell(vec![port("A", Direction::Input, None), port("Y", Direction::Output, None)]));
+        let ya = lib(cell(vec![port("Y", Direction::Output, None), port("A", Direction::Input, None)]));
+        let nl = vyges_sta::netlist::Netlist { insts: vec![("u1".into(), "c".into())], ports: Vec::new(), nets: Vec::new() };
+        let (l0, l1) = (vec![ay], vec![ya]);
+        let same = [Graph::build(&l0, &nl).unwrap(), Graph::build(&l0, &nl).unwrap()];
+        let sc = Scenes::new(&same);
+        assert_eq!((sc.at(1, 0), sc.at(1, 1)), (0, 1));
+        let swapped = [Graph::build(&l0, &nl).unwrap(), Graph::build(&l1, &nl).unwrap()];
+        let sc = Scenes::new(&swapped);
+        for v in 0..2 {
+            let w = sc.at(1, v);
+            assert_eq!((&swapped[1].vertices[w].name, swapped[1].vertices[w].is_driver), (&swapped[0].vertices[v].name, swapped[0].vertices[v].is_driver));
+        }
+        assert_ne!(sc.at(1, 0), 0);
     }
 
     // Rule (CheckCapacitances::findLimit, Resizer::maxLoad): "default to top (design) limit",

@@ -180,12 +180,13 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
     let g0 = &graphs[0];
     let mut annotated: Vec<HashMap<String, f32>> = vec![HashMap::new(); graphs.len()];
     let mut drvr_with_load_slew_viol: HashMap<String, usize> = HashMap::new();
+    let driver_index = timing::driver_index(g0);
     for &v in &loads {
         for (k, anns) in per_scene.iter().enumerate() {
             if let Some(a) = anns.iter().find(|a| a.load == v) {
                 trace.push(format!("annot|{}|{}|{}", g0.vertices[v].name, inputs.libs.scene_name(k), g9(f64::from(a.limit))));
                 annotated[k].insert(g0.vertices[v].name.clone(), a.limit);
-                for d in timing::net_drivers(g0, v) {
+                for d in timing::net_drivers_in(g0, v, &driver_index) {
                     drvr_with_load_slew_viol.insert(g0.vertices[d].name.clone(), k);
                 }
             }
@@ -212,12 +213,34 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
     };
     trace.ran(&["drv"]);
     let mut outcome = Outcome { warnings, max_wire_lengths, ..Default::default() };
+    // 🔑 **The graphs are HELD across drivers and rebuilt only after an edit.** `repairNet` times
+    // its driver with `findDelays(drvr)` — that one driver, from the slews the graph holds — so
+    // rebuilding the whole graph and re-timing every vertex for each driver is the same answer at
+    // O(N) a driver: hours on a 10k-cell design (picorv32, 2026-10-15) where the reference takes
+    // seconds. Drivers run from the outputs back, so what a driver reads (its instance's input
+    // slews, upstream) is untouched by the nets already repaired (downstream); an edit changes the
+    // netlist, and the held graphs are rebuilt and re-timed whole before the next driver.
+    // ⚠️ `VYGES_RSZ_DCALC` (the delay-calculation dump) keeps the whole re-timing per driver.
+    let hold = std::env::var_os("VYGES_RSZ_DCALC").is_none();
+    let mut held_netlist = design.netlist().clone();
+    let mut held: Option<HeldGraphs<'_>> = None;
     for i in (0..drivers.len()).rev() {
         trace.push(format!("drv|{i}|{}", drivers[i]));
-        repair_driver(design, &drivers[i], &mut ctx, &mut outcome, trace)?;
+        if hold && (held.is_none() || *design.netlist() != held_netlist) {
+            drop(held.take());
+            held_netlist = design.netlist().clone();
+            let mut g = current_graphs(inputs, &held_netlist, &annotated)?;
+            find_all_delays(&mut g, &*design, "held")?;
+            let index = g[0].pin_index();
+            held = Some((g, index));
+        }
+        held = repair_driver(design, &drivers[i], &mut ctx, &mut outcome, trace, held.take())?;
     }
     Ok(outcome)
 }
+
+/// The graphs held across drivers, and their pin index.
+type HeldGraphs<'g> = (Vec<Graph<'g>>, HashMap<String, usize>);
 
 /// `repairClkNets`' lines: RSZ-0047 / RSZ-0048, not `repairDesign`'s 0037 / 0038.
 impl Outcome {
@@ -290,7 +313,7 @@ pub fn repair_clk_nets(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers
             let net = netlist.nets[n].name.clone();
             let clock_set = timing::clock_pins(g0, inputs.clock_sources);
             outcome.nets_checked += 1;
-            repair_net(design, graphs, drvr, &net, &clock_set, false, None, &mut ctx, &mut outcome, trace)?;
+            repair_net(design, graphs, drvr, &net, &clock_set, false, None, &mut ctx, &mut outcome, trace, None)?;
         }
     }
     Ok(outcome)
@@ -371,23 +394,51 @@ fn find_all_delays(graphs: &mut [Graph<'_>], design: &dyn Design, label: &str) -
     Ok(())
 }
 
+/// `GraphDelayCalc::findDelays(drvr)` on a graph timed whole before: the driver's own vertex, then
+/// each load its wires reach — as the whole pass would time them, since nothing upstream of the
+/// driver has changed (see the held graphs in [`repair_design`]).
+fn find_driver_delays(g: &mut Graph<'_>, drvr: usize, parasitics: &HashMap<String, vyges_sta::graph::NetParasitics>, index: &HashMap<String, usize>) -> Result<(), String> {
+    g.find_vertex_delays(drvr, parasitics, index, None)?;
+    let loads: Vec<usize> = g.out_edges[drvr].iter().map(|&e| g.edges[e].to).filter(|&l| !g.vertices[l].is_driver).collect();
+    for l in loads {
+        g.find_vertex_delays(l, parasitics, index, None)?;
+    }
+    Ok(())
+}
+
 /// `RepairDesign::repairDriver`: the driver's flat net, unless it is dont_touch, connected by
 /// abutment, a clock pin or a constant (constants are refused upstream).
-fn repair_driver(design: &mut dyn Design, drvr_name: &str, ctx: &mut NetCtx<'_, '_>, outcome: &mut Outcome, trace: &mut Trace) -> Result<(), Stop> {
-    let netlist = design.netlist().clone();
-    let graphs = current_graphs(ctx.inputs, &netlist, ctx.annotated)?;
+fn repair_driver<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut NetCtx<'_, '_>, outcome: &mut Outcome, trace: &mut Trace, held: Option<HeldGraphs<'g>>) -> Result<Option<HeldGraphs<'g>>, Stop> {
+    // The held graphs (timed whole after the last edit) are lent and handed back, else the
+    // design's own, timed later.
+    match held {
+        Some((graphs, index)) => {
+            let graphs = repair_driver_net(design, drvr_name, ctx, outcome, trace, graphs, Some(&index))?;
+            Ok(Some((graphs, index)))
+        }
+        None => {
+            let netlist = design.netlist().clone();
+            let graphs = current_graphs(ctx.inputs, &netlist, ctx.annotated)?;
+            repair_driver_net(design, drvr_name, ctx, outcome, trace, graphs, None)?;
+            Ok(None)
+        }
+    }
+}
+
+/// [`repair_driver`] on the graphs it was given, which it hands back.
+fn repair_driver_net<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut NetCtx<'_, '_>, outcome: &mut Outcome, trace: &mut Trace, graphs: Vec<Graph<'g>>, held_index: Option<&HashMap<String, usize>>) -> Result<Vec<Graph<'g>>, Stop> {
     let g0 = &graphs[0];
     let Some(drvr) = g0.vertices.iter().position(|v| v.is_driver && v.name == drvr_name) else {
         outcome.drivers_skipped += 1;
-        return Ok(());
+        return Ok(graphs);
     };
     // Special nets are not in the timer's netlist: a driver of one has no net here, and the
     // reference's repairNet passes it over.
     let Some(n) = g0.vertex_net[drvr] else {
         outcome.drivers_skipped += 1;
-        return Ok(());
+        return Ok(graphs);
     };
-    let net = netlist.nets[n].name.clone();
+    let net = g0.netlist.nets[n].name.clone();
     let clocks = timing::clock_pins(g0, ctx.inputs.clock_sources);
     let info = design.net_info();
     // `!sta_->isConstant(drvr_pin)` — "Exclude tie hi/low cells and supply nets": a driver the
@@ -395,11 +446,11 @@ fn repair_driver(design: &mut dyn Design, drvr_name: &str, ctx: &mut NetCtx<'_, 
     let constant = ctx.inputs.sdc.constants.contains_key(drvr_name);
     if info.dont_touch.contains(&net) || info.abutment.contains(&net) || clocks.contains(&drvr) || constant {
         outcome.drivers_skipped += 1;
-        return Ok(());
+        return Ok(graphs);
     }
     outcome.nets_checked += 1;
     let viol = ctx.drvr_with_load_slew_viol.get(drvr_name).copied();
-    repair_net(design, graphs, drvr, &net, &clocks, true, viol, ctx, outcome, trace)
+    repair_net(design, graphs, drvr, &net, &clocks, true, viol, ctx, outcome, trace, held_index)
 }
 
 /// `makeFanoutRepeater`'s `repairNet(out_net, repeater_out_pin, …)`: the new repeater's net, with
@@ -413,15 +464,19 @@ fn repair_driver(design: &mut dyn Design, drvr_name: &str, ctx: &mut NetCtx<'_, 
 fn repair_repeater_net(design: &mut dyn Design, in_pin: &str, out_pin: &str, out_net: &str, ctx: &mut NetCtx<'_, '_>, outcome: &mut Outcome, trace: &mut Trace) -> Result<(), Stop> {
     let netlist = design.netlist().clone();
     let mut graphs = current_graphs(ctx.inputs, &netlist, ctx.annotated)?;
-    for g in graphs.iter_mut() {
+    // Only the repeater's input is timed ahead of `repairNet`'s `findDelays(drvr)` — to its 0 —
+    // so that call times the driver and its loads alone, as the held graphs' drivers are.
+    let index = graphs[0].pin_index();
+    for (k, g) in graphs.iter_mut().enumerate() {
         if let Some(v) = g.vertices.iter().position(|v| !v.is_driver && v.name == in_pin) {
             g.slew_annotated.insert(v, 0.0);
+            g.find_vertex_delays(v, design.parasitics(k), &index, None).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
         }
     }
     let drvr = graphs[0].vertices.iter().position(|v| v.is_driver && v.name == out_pin).ok_or_else(|| Stop::error("RSZ-INSERT", format!("{out_pin}: not in the timing graph")))?;
     let clocks = timing::clock_pins(&graphs[0], ctx.inputs.clock_sources);
     let mut own = Outcome::default();
-    let r = repair_net(design, graphs, drvr, out_net, &clocks, false, None, ctx, &mut own, trace);
+    let r = repair_net(design, graphs, drvr, out_net, &clocks, false, None, ctx, &mut own, trace, Some(&index)).map(drop);
     // `inserted_buffer_count_` and `resize_count_` are members — they count across the nested
     // repair; its violation and repaired-net counts are its own locals.
     outcome.inserted_buffers += own.inserted_buffers;
@@ -512,7 +567,7 @@ fn make_fanout_repeater(repeater_loads: &mut Vec<String>, repeater_inputs: &mut 
 /// (`repairClkNets`) it is: the wire parasitic, the driver's delays, the buffered net at the
 /// command scene, and the length test.
 #[allow(clippy::too_many_arguments)]
-fn repair_net(design: &mut dyn Design, graphs: Vec<Graph<'_>>, drvr: usize, net: &str, clocks: &BTreeSet<usize>, check_fanout: bool, corner_w_load_slew_viol: Option<usize>, ctx: &mut NetCtx<'_, '_>, outcome: &mut Outcome, trace: &mut Trace) -> Result<(), Stop> {
+fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, net: &str, clocks: &BTreeSet<usize>, check_fanout: bool, corner_w_load_slew_viol: Option<usize>, ctx: &mut NetCtx<'_, '_>, outcome: &mut Outcome, trace: &mut Trace, held_index: Option<&HashMap<String, usize>>) -> Result<Vec<Graph<'g>>, Stop> {
     let inputs = ctx.inputs;
     let name = graphs[0].vertices[drvr].name.clone();
     let checks = ctx.checks;
@@ -526,36 +581,46 @@ fn repair_net(design: &mut dyn Design, graphs: Vec<Graph<'_>>, drvr: usize, net:
     let fanout_clocks;
     let resized_netlist;
     let resized_clocks;
-    let mut graphs = graphs;
+    // The graphs it was given are handed back; after an edit it reads its own (`gs!`).
+    let mut held_graphs = graphs;
+    let mut own_graphs: Option<Vec<Graph<'_>>> = None;
+    macro_rules! gs {
+        () => {
+            own_graphs.as_deref().unwrap_or(&held_graphs[..])
+        };
+    }
     let mut clocks = clocks;
     let mut drvr = drvr;
     let mut net_name = net.to_string();
+    // The fanout repair below rebuilds the graphs from the edited design: no longer the held ones.
+    let mut fanout_edited = false;
 
     // Fanout is addressed by creating region repeaters.
     if check_fanout {
-        let (fanout, max_fanout, fanout_slack) = timing::check_fanout(&graphs[0], design.net_info(), drvr, &inputs.limits, clocks);
+        let (fanout, max_fanout, fanout_slack) = timing::check_fanout(&gs!()[0], design.net_info(), drvr, &inputs.limits, clocks);
         trace.push(format!("fo|{}|{}|{}", g9(f64::from(fanout)), g9(f64::from(max_fanout)), g9(f64::from(fanout_slack))));
         if max_fanout > 0.0 && fanout_slack < 0.0 {
             outcome.fanout_violations += 1;
             repaired_net = true;
             // findLoadRegions(net, drvr_pin, max_fanout): the limit as an int.
             let max_fanout = max_fanout as i32;
-            let loads: Vec<String> = design.visit_connected_pins(&name).into_iter().filter(|p| graphs[0].vertices.iter().any(|v| &v.name == p && !v.is_driver)).collect();
+            let loads: Vec<String> = design.visit_connected_pins(&name).into_iter().filter(|p| gs!()[0].vertices.iter().any(|v| &v.name == p && !v.is_driver)).collect();
             trace.push(format!("fanloads|{name}|{max_fanout}|{}", loads.iter().map(|p| format!("{p},")).collect::<String>()));
             let mut region = {
                 let d: &dyn Design = &*design;
                 fanout::find_load_regions(loads, max_fanout, inputs.dbu, &|p| d.pin_location(p))
             };
-            make_region_repeaters(&mut region, max_fanout, &name, &graphs[0], design, ctx, outcome, trace)?;
+            make_region_repeaters(&mut region, max_fanout, &name, &gs!()[0], design, ctx, outcome, trace)?;
+            fanout_edited = true;
             // The design changed under the driver: its graphs again.
             fanout_netlist = design.netlist().clone();
-            graphs = current_graphs(inputs, &fanout_netlist, ctx.annotated)?;
-            drvr = graphs[0].vertices.iter().position(|v| v.is_driver && v.name == name).expect("the driver");
-            fanout_clocks = timing::clock_pins(&graphs[0], inputs.clock_sources);
+            own_graphs = Some(current_graphs(inputs, &fanout_netlist, ctx.annotated)?);
+            drvr = gs!()[0].vertices.iter().position(|v| v.is_driver && v.name == name).expect("the driver");
+            fanout_clocks = timing::clock_pins(&gs!()[0], inputs.clock_sources);
             clocks = &fanout_clocks;
             // The reference holds the net OBJECT: a repeater before a port load renames it, so
             // its name is read again from the driver.
-            if let Some(n) = graphs[0].vertex_net[drvr] {
+            if let Some(n) = gs!()[0].vertex_net[drvr] {
                 net_name = fanout_netlist.nets[n].name.clone();
             }
         }
@@ -563,7 +628,20 @@ fn repair_net(design: &mut dyn Design, graphs: Vec<Graph<'_>>, drvr: usize, net:
 
     // ensureWireParasitic(drvr_pin, net), then findDelays(drvr).
     design.ensure_wire_parasitic(&net_name).map_err(|e| Stop::error("RSZ-EST", e))?;
-    find_all_delays(&mut graphs, &*design, &name)?;
+    match held_index {
+        // Graphs held since the last edit and nothing changed here since: `findDelays(drvr)` —
+        // the driver, then its loads (an annotated load slew is applied at the load), from the
+        // slews the graphs hold.
+        Some(index) if !fanout_edited => {
+            for (k, g) in held_graphs.iter_mut().enumerate() {
+                find_driver_delays(g, drvr, design.parasitics(k), index).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+            }
+        }
+        _ => match own_graphs.as_mut() {
+            Some(own) => find_all_delays(own, &*design, &name)?,
+            None => find_all_delays(&mut held_graphs, &*design, &name)?,
+        },
+    }
 
     let mut max_cap = timing::INF;
     let mut repair_cap = false;
@@ -571,32 +649,32 @@ fn repair_net(design: &mut dyn Design, graphs: Vec<Graph<'_>>, drvr: usize, net:
     if checks.slew {
     // First the driver's slew: resize the driver, and if that does not fix it, derive the load
     // cap that would, which then caps the buffered net.
-    let (mut slew1, mut max_slew1, mut slack1, mut corner1) = timing::repair_check_slew(&timing::Scenes::new(&graphs), drvr, &inputs.limits, clocks, ctx.args.slew_margin);
+    let (mut slew1, mut max_slew1, mut slack1, mut corner1) = timing::repair_check_slew(&timing::Scenes::new(gs!()), drvr, &inputs.limits, clocks, ctx.args.slew_margin);
     trace.push(format!("dslew|{}|{}|{}", g9(f64::from(slew1.unwrap_or(0.0))), g9(f64::from(max_slew1)), g9(f64::from(slack1))));
     trace.ran(&["rds", "rdsc", "rdsel", "dresize", "dslew2", "slewcap", "slc0", "slc"]);
     let mut slew_violation = false;
     if slack1 < 0.0 {
         slew_violation = true;
         let c1 = corner1.expect("a violation has a scene");
-        if let Some(cell) = repair_driver_slew(&*design, &graphs, c1, drvr, ctx, trace)? {
+        if let Some(cell) = repair_driver_slew(&*design, gs!(), c1, drvr, ctx, trace)? {
             design.swap_master(&inst_of(&name), &cell).map_err(|e| Stop::error("RSZ-RESIZE", e))?;
             outcome.resized += 1;
             trace.push(format!("dresize|{cell}"));
             design.update_parasitics().map_err(|e| Stop::error("RSZ-EST", e))?;
             resized_netlist = design.netlist().clone();
-            graphs = current_graphs(inputs, &resized_netlist, ctx.annotated)?;
-            drvr = graphs[0].vertices.iter().position(|v| v.is_driver && v.name == name).expect("the resized driver");
-            resized_clocks = timing::clock_pins(&graphs[0], inputs.clock_sources);
+            own_graphs = Some(current_graphs(inputs, &resized_netlist, ctx.annotated)?);
+            drvr = gs!()[0].vertices.iter().position(|v| v.is_driver && v.name == name).expect("the resized driver");
+            resized_clocks = timing::clock_pins(&gs!()[0], inputs.clock_sources);
             clocks = &resized_clocks;
-            find_all_delays(&mut graphs, &*design, &name)?;
-            (slew1, max_slew1, slack1, corner1) = timing::repair_check_slew(&timing::Scenes::new(&graphs), drvr, &inputs.limits, clocks, ctx.args.slew_margin);
+            find_all_delays(own_graphs.as_mut().expect("just built"), &*design, &name)?;
+            (slew1, max_slew1, slack1, corner1) = timing::repair_check_slew(&timing::Scenes::new(gs!()), drvr, &inputs.limits, clocks, ctx.args.slew_margin);
             trace.push(format!("dslew2|{}|{}|{}", g9(f64::from(slew1.unwrap_or(0.0))), g9(f64::from(max_slew1)), g9(f64::from(slack1))));
         }
         // Still violating: the max cap that removes it, from the driver's (resized) LINK port, its
         // models at the violation's corner.
         if slack1 < 0.0 {
             let c1 = corner1.expect("a violation has a scene");
-            if let (Some(cell), Some(port)) = (graphs[0].vertices[drvr].cell.as_deref(), graphs[0].vertices[drvr].port.as_deref()) {
+            if let (Some(cell), Some(port)) = (gs!()[0].vertices[drvr].cell.as_deref(), gs!()[0].vertices[drvr].port.as_deref()) {
                 let link = inputs.libs.link_cell(cell).expect("a link cell");
                 let scene_cell = inputs.libs.scene_cell(c1, cell).expect("a scene cell");
                 max_cap = driver_slew::find_slew_load_cap(link, scene_cell, port, f64::from(max_slew1), ctx.sizing.tgt_slews, trace) as f32;
@@ -609,7 +687,7 @@ fn repair_net(design: &mut dyn Design, graphs: Vec<Graph<'_>>, drvr: usize, net:
 
     // Then the load slews (not a tristate driver: those are refused upstream). checkLoadSlews
     // writes the slew only when a load sets it; otherwise the driver check's stays.
-    let sc = timing::Scenes::new(&graphs);
+    let sc = timing::Scenes::new(gs!());
     let ls = timing::check_load_slews(&sc, design.net_info(), drvr, &inputs.limits, clocks, ctx.args.slew_margin);
     let viol_scene = corner_w_load_slew_viol;
     let annotated = viol_scene.is_some();
@@ -632,9 +710,9 @@ fn repair_net(design: &mut dyn Design, graphs: Vec<Graph<'_>>, drvr: usize, net:
     }
 
     // Then the capacitance: the pre-check first (an unreasonably small limit is an error).
-    let sc = timing::Scenes::new(&graphs);
+    let sc = timing::Scenes::new(gs!());
     if checks.cap {
-    let parasitics: Vec<HashMap<String, vyges_sta::graph::NetParasitics>> = (0..graphs.len()).map(|k| design.parasitics(k).clone()).collect();
+    let parasitics: Vec<&HashMap<String, vyges_sta::graph::NetParasitics>> = (0..gs!().len()).map(|k| design.parasitics(k)).collect();
     let (cap1, max_cap1, _cap_slack1, has_corner, cap_scene) = timing::check_capacitance(&sc, drvr, &parasitics, clocks, &inputs.limits);
     if max_cap1 > 0.0 && max_cap1 < ctx.min_cap_load {
         return Err(Stop::error("RSZ-0169", format!("Max cap for driver {name} is unreasonably small {max_cap1:e}F. Min buffer or inverter input cap is {:e}F", ctx.min_cap_load)));
@@ -655,14 +733,14 @@ fn repair_net(design: &mut dyn Design, graphs: Vec<Graph<'_>>, drvr: usize, net:
     // makeBufferedNet(drvr_pin, corner) (placement parasitics: the Steiner tree); with none,
     // makeBufferedNetSteiner is called a second time. The rest runs at `corner`'s timer.
     trace.ran(&["stdrvr", "st", "flags", "bn"]);
-    let g = &graphs[corner];
+    let g = &gs!()[corner];
     let dk = sc.at(corner, drvr);
     let bnet = make_buffered_net(&*design, g, dk, &net_name, corner, ctx, trace).or_else(|| make_buffered_net(&*design, g, dk, &net_name, corner, ctx, trace));
     let Some((mut bn, root)) = bnet else {
         if repaired_net {
             outcome.nets_repaired += 1;
         }
-        return Ok(());
+        return Ok(held_graphs);
     };
     let wire_length = bn.max_load_wire_length(root);
     let repair_wire = ctx.max_length > 0 && i64::from(wire_length) > ctx.max_length;
@@ -699,7 +777,7 @@ fn repair_net(design: &mut dyn Design, graphs: Vec<Graph<'_>>, drvr: usize, net:
     if repaired_net {
         outcome.nets_repaired += 1;
     }
-    Ok(())
+    Ok(held_graphs)
 }
 
 /// The instance of an instance pin (`inst/port`).
