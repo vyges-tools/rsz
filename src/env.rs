@@ -307,6 +307,23 @@ pub fn master_pins(db: &Db) -> Result<HashMap<String, Vec<String>>, String> {
 ///
 /// An I/O delay's flags place its value: `-max` / `-rise` / `-fall`; a `-min`-only delay bounds
 /// hold paths and is not a setup input; `-add_delay` is read; any other flag is refused.
+/// `[all_inputs]` / `[all_outputs]` in `set_input_delay` / `set_output_delay` as the ports they
+/// name (`Sdc::allInputs`: every input or bidirect port; `allOutputs`: every output or bidirect —
+/// the clock ports included, as without `-no_clocks`), in the netlist's port order. Other delays
+/// are kept as written. [`search_sdc`] reads only named ports; a caller with the netlist expands
+/// first.
+pub fn expand_io_delay_ports(s: &mut vyges_loom::sdc::Sdc, nl: &vyges_sta::netlist::Netlist) {
+    use vyges_sta::netlist::PortDir;
+    for (list, want) in [(&mut s.input_delays, PortDir::Input), (&mut s.output_delays, PortDir::Output)] {
+        let accessor = if want == PortDir::Input { "all_inputs" } else { "all_outputs" };
+        for d in list.iter_mut().filter(|d| d.accessor == accessor) {
+            d.ports = nl.ports.iter().filter(|(_, dir)| *dir == want || *dir == PortDir::Inout).map(|(n, _)| n.clone()).collect();
+            d.accessor = "get_ports".into();
+            d.default = false;
+        }
+    }
+}
+
 pub fn search_sdc(s: &vyges_loom::sdc::Sdc, time_scale: f32, propagated: bool, hold_repair: bool) -> Result<vyges_sta::sdc::Sdc, String> {
     use vyges_sta::sdc::{Clock, PortDelay};
     // The clocks in the order they were made (`Clock::index`): each on one source port, or virtual
