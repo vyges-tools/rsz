@@ -68,6 +68,55 @@ pub struct CliDesign<'a> {
     /// the undo touched in its invalid set (`parasiticsInvalid`), the reference's only record of
     /// them — the restored routes are the guides', not the ones the estimate was made on.
     pub undoing: bool,
+    /// The estimator's clock nets and constant pins, held across per-net estimates (see
+    /// [`HeldSkips`]); `None` until the next estimate computes them again.
+    pub skips: Option<HeldSkips>,
+    /// The database's edit log is recording for [`HeldSkips`] (the timer's log, when on, is the
+    /// same log).
+    pub skip_log: bool,
+}
+
+/// What `estimate_net` skips — the clock network and the constant pins — computed once and held:
+/// each is a whole-design walk, and a repair estimates one net per edit. An edit can change them
+/// only through a net already in them — a buffer inserted on a non-constant, non-clock net is itself
+/// neither, a resize keeps the function — so the held sets are dropped when an edit names one of
+/// `nets` (the clock nets and every constant pin's net), and on any journal undo.
+pub struct HeldSkips {
+    pub skips: vyges_est::placement::Skips,
+    pub nets: std::collections::HashSet<String>,
+}
+
+impl HeldSkips {
+    /// An edit-log line naming a held net in any field (`|`, `,`, `;`, `=` separate them): an
+    /// instance or pin name that equals a net name only costs a needless recompute.
+    fn touched_by(&self, ev: &str) -> bool {
+        edit_names_any(ev, &self.nets)
+    }
+}
+
+/// An edit-log line (`Db::edit_log_start`'s format) that names one of `nets` in any field.
+fn edit_names_any(ev: &str, nets: &std::collections::HashSet<String>) -> bool {
+    ev.split(['|', ',', ';', '=']).any(|t| nets.contains(t))
+}
+
+#[cfg(test)]
+mod held_skips_tests {
+    use super::edit_names_any;
+
+    /// The held skips are dropped by an edit naming a held net ANYWHERE in the line: as the
+    /// connected net, in a net's terminal list, or inside a swapped instance's `T=net=pins` terms.
+    #[test]
+    fn an_edit_naming_a_held_net_in_any_field_drops_the_skips() {
+        let nets = ["clk".to_string(), "const0".to_string()].into_iter().collect();
+        assert!(edit_names_any("iterm_disconnect|u1/A|clk|u1/A,u2/A", &nets));
+        assert!(edit_names_any("swap_after|u3|A=const0=u3/A,u9/Y;Y=n7=u3/Y", &nets));
+        assert!(edit_names_any("net_merge|n5|clk", &nets));
+        // A buffer on an ordinary net: the new net and its pins are neither clock nor constant.
+        assert!(!edit_names_any("net_create|net12", &nets));
+        assert!(!edit_names_any("iterm_connect|rebuffer1/A|n5|u4/Y,rebuffer1/A", &nets));
+        // A name that only CONTAINS a held net is not one.
+        assert!(!edit_names_any("iterm_connect|u1/A|clk_div|u1/A", &nets));
+    }
 }
 
 /// `IncrementalGRoute` over the repair: the router's state after `global_route` (its routes, its
@@ -216,10 +265,16 @@ impl CliDesign<'_> {
     /// connected or disconnected, every net of a swapped instance → invalid; a net destroyed →
     /// erased.
     pub fn pull_edits(&mut self) {
-        if !self.timer.on {
+        if !self.timer.on && !self.skip_log {
             return;
         }
         for ev in self.db.edit_log_take() {
+            if self.skips.as_ref().is_some_and(|h| h.touched_by(&ev)) {
+                self.skips = None;
+            }
+            if !self.timer.on {
+                continue;
+            }
             let f: Vec<&str> = ev.split('|').collect();
             // GlobalRouter's callbacks (`GRouteDbCbk`), in the order the database made them.
             if let Some(gr) = self.gr.as_mut() {
@@ -350,6 +405,8 @@ impl CliDesign<'_> {
         self.pull_edits();
         let had_changes = !self.db.eco_is_empty().map_err(|e| e.to_string())?;
         self.db.eco_undo().map_err(|e| e.to_string())?;
+        // An undo can bring back what the held skips no longer describe: computed again.
+        self.skips = None;
         let s = self.journal.pop().ok_or("undoEco without beginEco")?;
         self.sdc_nets = s.sdc_nets;
         self.refresh()?;
@@ -471,7 +528,18 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
             return Ok(());
         };
         let timing = vyges_est::placement::Timing { liberty: Some(self.liberty), clock_sources: self.clock_sources.to_vec(), propagated: self.propagated };
-        let e = vyges_est::placement::estimate_net(self.db, &timing, net, &drvr, self.alpha, &est_stt)?;
+        if self.skips.is_none() {
+            let skips = vyges_est::placement::skips(self.db, &timing)?;
+            let mut nets: std::collections::HashSet<String> = skips.clock_nets().iter().cloned().collect();
+            nets.extend(skips.constant_pins().iter().map(|p| self.net_of_load(p)).filter(|n| !n.is_empty()));
+            self.skips = Some(HeldSkips { skips, nets });
+            if !self.skip_log && !self.timer.on {
+                self.db.edit_log_start().map_err(|e| e.to_string())?;
+            }
+            self.skip_log = true;
+        }
+        let skips = &self.skips.as_ref().expect("computed above").skips;
+        let e = vyges_est::placement::estimate_net_with_skips(self.db, &timing, skips, net, &drvr, self.alpha, &est_stt)?;
         for k in 0..self.parasitics.len() {
             match net_parasitic(self.db, self.rc, &e, k)? {
                 Some(mut p) => {
@@ -606,6 +674,8 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
     }
 
     fn start_timer_edits(&mut self) -> Result<(), String> {
+        // Restarting clears the log: what the held skips have not yet read goes with it.
+        self.skips = None;
         self.db.edit_log_start().map_err(|e| e.to_string())?;
         self.timer = TimerLog { on: true, ..TimerLog::default() };
         Ok(())
@@ -725,6 +795,8 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
         }
         let had_changes = !self.db.eco_is_empty().map_err(|e| e.to_string())?;
         self.db.eco_undo().map_err(|e| e.to_string())?;
+        // An undo can bring back what the held skips no longer describe: computed again.
+        self.skips = None;
         let s = self.journal.pop().ok_or("undoEco without beginEco")?;
         self.parasitics = s.parasitics;
         self.invalid = s.invalid;
