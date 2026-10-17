@@ -646,6 +646,11 @@ fn run(job: &Value) -> Result<Value, String> {
             "read_sdc" => {
                 let path = args.last().ok_or("read_sdc path")?;
                 let s = vyges_loom::sdc::Sdc::load(path).map_err(|e| format!("{path}: {}", e.0))?;
+                // A command whose object query needs the design was not applied: refuse rather
+                // than repair against constraints the file did not mean.
+                if let Some(q) = s.unevaluated_queries.first() {
+                    return Err(format!("{path}: {q}: object query not evaluated, not modelled"));
+                }
                 // set_max_transition / set_max_fanout / set_max_capacitance on the design are
                 // modelled (the limits); on any other object they are not.
                 let unmodelled: Vec<&str> = s
