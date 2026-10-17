@@ -194,8 +194,23 @@ pub fn sdc_env(s: &vyges_loom::sdc::Sdc, libs: &Libs, nl: &vyges_sta::netlist::N
             return Err(format!("set_driving_cell -lib_cell {cell} -pin {pin}: no such cell port (not modelled)"));
         }
         let slews = [crate::timing::user_time_to_sta(d.input_transition[0], lib0.time_scale), crate::timing::user_time_to_sta(d.input_transition[1], lib0.time_scale)];
-        for port in &d.objects {
-            env.input_drive.insert(port.clone(), vyges_sta::graph::InputDrive { cell: cell.clone(), from_port: d.from_pin.clone(), to_port: pin.clone(), from_slews: slews });
+        // ⛔ `[all_inputs]` arrives as the collection `*INPUTS*`, not a port: inserted as a name
+        // it drove nothing. It is every input and bidirect port — the clocks included, as the
+        // reference applies it.
+        use vyges_sta::netlist::PortDir;
+        let ports: Vec<String> = d
+            .objects
+            .iter()
+            .flat_map(|o| -> Vec<String> {
+                if o == "*INPUTS*" {
+                    nl.ports.iter().filter(|(_, dir)| matches!(dir, PortDir::Input | PortDir::Inout)).map(|(n, _)| n.clone()).collect()
+                } else {
+                    vec![o.clone()]
+                }
+            })
+            .collect();
+        for port in ports {
+            env.input_drive.insert(port, vyges_sta::graph::InputDrive { cell: cell.clone(), from_port: d.from_pin.clone(), to_port: pin.clone(), from_slews: slews });
         }
     }
     if s.env.is_empty() {
