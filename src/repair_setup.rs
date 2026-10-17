@@ -2043,7 +2043,7 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
             // (its RSZ-2024 opens the preamble: first phase only).
             "LEGACY_MT" => {
                 if i != 0 {
-                    return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases: LEGACY_MT after another phase (its start's RSZ-2024 mid-run) is not modelled".into()));
+                    return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases: LEGACY_MT after another phase (its start's experimental-policy warning mid-run) is not modelled".into()));
                 }
                 if ctx.sequence.contains(&Move::SizeDownFanout) {
                     return Err(Stop::refused("RSZ-ABSENT", "LEGACY_MT with SizeDownFanoutMove (its batch commits every accepted candidate of a generation): not modelled".into()));

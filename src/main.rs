@@ -277,7 +277,7 @@ fn global_sizing_config(db: &Db) -> Result<vyges_rsz::repair_setup::GlobalSizing
             "disabled" => 0,
             "min_size_max_vt" => 1,
             "max_size_min_vt" => 2,
-            other => return Err(format!("gs_presize_mode '{other}' (RSZ-0413 warning): not modelled")),
+            other => return Err(format!("gs_presize_mode '{other}' (an invalid value, which the reference warns about and ignores): not modelled")),
         };
     }
     if let Some(v) = db.block_bool_property("gs_include_clock_network").map_err(|e| e.to_string())? {

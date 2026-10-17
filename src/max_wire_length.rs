@@ -99,7 +99,8 @@ pub fn find_max_wire_length(ctx: &Ctx<'_>, lengths: &mut Vec<(usize, String, f64
 /// the driver's, double while one wire is still faster than two halves and a buffer, then halve the
 /// bracket to 1%; the lower bound.
 pub fn find_max_wire_length_for(ctx: &Ctx<'_>, buffer: &str, rc: &WireRc) -> Result<f64, Stop> {
-    let cell = ctx.libs.link_cell(buffer).ok_or_else(|| Stop::error("RSZ-0070", format!("no liberty cell for {buffer}.")))?;
+    // ours: the reference's RSZ-0070 is a missing LEF master, a different lookup
+    let cell = ctx.libs.link_cell(buffer).ok_or_else(|| Stop::error("RSZ-ERROR", format!("no liberty cell for {buffer}.")))?;
     let (_, drvr_port) = cell.buffer_ports().ok_or_else(|| Stop::error("RSZ-MWL", format!("{buffer}: not a buffer")))?;
     let drvr_r = f64::from(cell.drive_resistance(&drvr_port.name));
     let mut low = 0.0f64;
