@@ -36,6 +36,17 @@ pub struct TimerEdits {
 pub trait Design {
     /// The netlist as the database holds it now (the timer's vertex order).
     fn netlist(&self) -> &Netlist;
+    /// [`Design::netlist`] to hold while the design is edited further (a timing graph borrows it).
+    /// A design that keeps its netlist shared hands out the share instead of a copy.
+    fn netlist_shared(&self) -> std::sync::Arc<Netlist> {
+        std::sync::Arc::new(self.netlist().clone())
+    }
+    /// A count that moves whenever the netlist changes, and only then: equal counts mean equal
+    /// netlists, so a holder can tell "still current" without comparing them. `None`: not kept —
+    /// compare the netlists.
+    fn netlist_generation(&self) -> Option<u64> {
+        None
+    }
     /// A scene's parasitic cache as the timer reads it now — an invalid net keeps its old entry
     /// until it is ensured (every scene is estimated together).
     fn parasitics(&self, scene: usize) -> &HashMap<String, NetParasitics>;

@@ -35,7 +35,11 @@ pub struct CliDesign<'a> {
     pub alpha: f32,
     /// Whether the estimator makes parasitics at all (not EST-0018).
     pub estimating: bool,
-    pub netlist: vyges_sta::netlist::Netlist,
+    /// Shared: a timing graph held across edits keeps the netlist it was built on (no copy).
+    pub netlist: std::sync::Arc<vyges_sta::netlist::Netlist>,
+    /// Moves on every refresh that changes [`CliDesign::netlist`], and only then
+    /// ([`Design::netlist_generation`]).
+    pub netlist_gen: u64,
     /// Per scene.
     pub parasitics: Vec<HashMap<String, NetParasitics>>,
     pub invalid: BTreeSet<String>,
@@ -255,7 +259,11 @@ pub struct JournalState {
 impl CliDesign<'_> {
     /// After an edit: the timer's netlist and the pin order read again from the database.
     pub fn refresh(&mut self) -> Result<(), String> {
-        self.netlist = vyges_grt::timer::netlist(self.db);
+        let nl = vyges_grt::timer::netlist(self.db);
+        if nl != *self.netlist {
+            self.netlist_gen += 1;
+        }
+        self.netlist = std::sync::Arc::new(nl);
         self.info = net_info(self.db, &self.netlist)?;
         Ok(())
     }
@@ -274,7 +282,7 @@ impl CliDesign<'_> {
         if std::env::var_os("VYGES_RSZ_FULL_REFRESH").is_some() {
             return self.refresh();
         }
-        let old = std::mem::take(&mut self.netlist);
+        let old = self.netlist.clone();
         let old_master: HashMap<&str, &str> = old.insts.iter().map(|(n, m)| (n.as_str(), m.as_str())).collect();
         let mut nl = Netlist::default();
         let mut inst_index: HashMap<String, usize> = HashMap::new();
@@ -354,12 +362,31 @@ impl CliDesign<'_> {
                 self.info.fixed_insts.insert(i.clone());
             }
         }
-        self.netlist = nl;
-        if std::env::var_os("VYGES_RSZ_CHECK_REFRESH").is_some() {
+        // Changed, read from what this refresh could change: the instance and net counts, the
+        // re-read instances' masters, and the touched nets' pins (an untouched net keeps its pins,
+        // re-indexed — the same pins while the instances are the same).
+        let changed = nl.insts.len() != old.insts.len()
+            || nl.nets.len() != old.nets.len()
+            || new_insts.iter().any(|i| old_master.get(i.as_str()).copied() != nl.insts.get(inst_index[i]).map(|(_, m)| m.as_str()))
+            || {
+                let new_nets: HashMap<&str, &Net> = nl.nets.iter().filter(|n| touched.contains(&n.name)).map(|n| (n.name.as_str(), n)).collect();
+                touched.iter().any(|t| old_nets.get(t.as_str()).map(|n| &n.pins) != new_nets.get(t.as_str()).map(|n| &n.pins))
+            };
+        let check = std::env::var_os("VYGES_RSZ_CHECK_REFRESH").is_some();
+        if check && changed != (nl != *old) {
+            return Err(format!("refresh_touched: change test says {changed}, the netlists say {}", nl != *old));
+        }
+        drop(old_nets);
+        drop(old_master);
+        if changed {
+            self.netlist_gen += 1;
+        }
+        self.netlist = std::sync::Arc::new(nl);
+        if check {
             let full = vyges_grt::timer::netlist(self.db);
             let info = net_info(self.db, &full)?;
-            if full != self.netlist || info != self.info {
-                return Err(format!("refresh_touched: differs from the full read (netlist {}, info {})", full == self.netlist, info == self.info));
+            if full != *self.netlist || info != self.info {
+                return Err(format!("refresh_touched: differs from the full read (netlist {}, info {})", full == *self.netlist, info == self.info));
             }
         }
         Ok(())
@@ -604,6 +631,12 @@ impl CliDesign<'_> {
 impl vyges_rsz::design::Design for CliDesign<'_> {
     fn netlist(&self) -> &vyges_sta::netlist::Netlist {
         &self.netlist
+    }
+    fn netlist_shared(&self) -> std::sync::Arc<vyges_sta::netlist::Netlist> {
+        self.netlist.clone()
+    }
+    fn netlist_generation(&self) -> Option<u64> {
+        Some(self.netlist_gen)
     }
     fn parasitics(&self, scene: usize) -> &HashMap<String, NetParasitics> {
         &self.parasitics[scene]

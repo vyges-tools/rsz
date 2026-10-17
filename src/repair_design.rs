@@ -161,7 +161,7 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
     trace.ran(&["pre", "buf", "lowest"]);
     // checkSlewsPreamble, checkCapacitancesPreamble, checkFanoutPreamble, searchPreamble,
     // findAllArrivals: the timing graphs (one per scene), levelized, their delays found.
-    let netlist = design.netlist().clone();
+    let netlist = design.netlist_shared();
     let (mut graphs, level) = timer_preambles(inputs, &netlist)?;
     if args.pre_placement {
         return Err(Stop::refused("RSZ-ABSENT", "the early sizing round (-pre_placement / -buffer_gain) is not modelled".into()));
@@ -241,13 +241,21 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
     // slews, upstream) is untouched by the nets already repaired (downstream); an edit changes the
     // netlist, and the held graphs are rebuilt and re-timed whole before the next driver.
     // ⚠️ `VYGES_RSZ_DCALC` (the delay-calculation dump) keeps the whole re-timing per driver.
-    let mut held_netlist = design.netlist().clone();
+    let mut held_netlist = design.netlist_shared();
+    let mut held_gen = design.netlist_generation();
     let mut held: Option<HeldGraphs<'_>> = None;
     for i in (0..drivers.len()).rev() {
         trace.push(format!("drv|{i}|{}", drivers[i]));
-        if hold && (held.is_none() || *design.netlist() != held_netlist) {
+        // Changed since the graphs were made: the design's change count when it keeps one (equal
+        // counts are equal netlists), else the netlists compared.
+        let stale = match (held_gen, design.netlist_generation()) {
+            (Some(a), Some(b)) => a != b,
+            _ => *design.netlist() != *held_netlist,
+        };
+        if hold && (held.is_none() || stale) {
             drop(held.take());
-            held_netlist = design.netlist().clone();
+            held_netlist = design.netlist_shared();
+            held_gen = design.netlist_generation();
             // The graphs over the edited design, holding the timer's state: nothing is re-timed
             // between drivers (the reference times only what each driver's repair asks for).
             let g = timer_graphs(inputs, design, &held_netlist, &annotated, ctx.timer.as_mut().expect("held graphs run on the timer"))?;
@@ -260,7 +268,7 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
 }
 
 /// The graphs held across drivers, and their pin index.
-type HeldGraphs<'g> = (Vec<Graph<'g>>, HashMap<String, usize>);
+type HeldGraphs<'g> = (Vec<Graph<'g>>, std::sync::Arc<HashMap<String, usize>>);
 
 /// `repairClkNets`' lines: RSZ-0047 / RSZ-0048, not `repairDesign`'s 0037 / 0038.
 impl Outcome {
@@ -319,14 +327,14 @@ pub fn repair_clk_nets(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers
     // Each clock's network pins are taken BEFORE its repair ("make a copy in case the set of pins
     // is updated"); a later clock sees the buffers an earlier one inserted.
     for sources in clocks {
-        let netlist = design.netlist().clone();
+        let netlist = design.netlist_shared();
         let graphs = current_graphs(inputs, &netlist, &annotated)?;
         let g0 = &graphs[0];
         let mut drivers: Vec<String> = timing::clock_pins(g0, sources).into_iter().filter(|&v| g0.vertices[v].is_driver).map(|v| g0.vertices[v].name.clone()).collect();
         drivers.sort_by_key(|p| pin_order(p));
         drop(graphs);
         for name in drivers {
-            let netlist = design.netlist().clone();
+            let netlist = design.netlist_shared();
             let graphs = current_graphs(inputs, &netlist, &annotated)?;
             let g0 = &graphs[0];
             let Some(drvr) = g0.vertices.iter().position(|v| v.is_driver && v.name == name) else { continue };
@@ -392,7 +400,14 @@ fn current_graphs<'n>(inputs: &'n Inputs<'_>, netlist: &'n vyges_sta::netlist::N
     (0..inputs.libs.scene_count())
         .map(|k| {
             let mut g = timer_graph(inputs.libs, k, netlist, &inputs.sdc, &inputs.master_pins)?;
-            g.slew_annotated = g.vertices.iter().enumerate().filter_map(|(i, v)| annotated[k].get(&v.name).map(|&l| (i, l))).collect();
+            // by the name index (the caller asks for it next anyway), not a scan of every vertex —
+            // unless a name is shared (a bidirect pin's two vertices), where the scan takes both
+            let index = g.index();
+            g.slew_annotated = if index.len() == g.vertices.len() {
+                annotated[k].iter().filter_map(|(name, &l)| index.get(name).map(|&i| (i, l))).collect()
+            } else {
+                g.vertices.iter().enumerate().filter_map(|(i, v)| annotated[k].get(&v.name).map(|&l| (i, l))).collect()
+            };
             Ok(g)
         })
         .collect()
@@ -466,7 +481,7 @@ fn repair_driver<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut NetCtx<
             Ok(Some((graphs, index)))
         }
         None => {
-            let netlist = design.netlist().clone();
+            let netlist = design.netlist_shared();
             let graphs = current_graphs(ctx.inputs, &netlist, ctx.annotated)?;
             repair_driver_net(design, drvr_name, ctx, outcome, trace, graphs, None)?;
             Ok(None)
@@ -511,7 +526,7 @@ fn repair_driver_net<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut Net
 /// the input slews the graph holds — and nothing has timed the new repeater's input pin yet: its
 /// slew is the vertex's initial 0 (its driver is timed again only by the outer `repairNet`).
 fn repair_repeater_net(design: &mut dyn Design, in_pin: &str, out_pin: &str, out_net: &str, ctx: &mut NetCtx<'_, '_>, outcome: &mut Outcome, trace: &mut Trace) -> Result<(), Stop> {
-    let netlist = design.netlist().clone();
+    let netlist = design.netlist_shared();
     if let Some(incs) = ctx.timer.as_mut() {
         // On the timer the new input pin has no state: its slew reads 0 until a queue reaches it.
         let graphs = timer_graphs(ctx.inputs, design, &netlist, ctx.annotated, incs)?;
@@ -674,7 +689,7 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
             make_region_repeaters(&mut region, max_fanout, &name, &gs!()[0], design, ctx, outcome, trace)?;
             fanout_edited = true;
             // The design changed under the driver: its graphs again.
-            fanout_netlist = design.netlist().clone();
+            fanout_netlist = design.netlist_shared();
             own_graphs = Some(match ctx.timer.as_mut() {
                 Some(incs) => timer_graphs(inputs, design, &fanout_netlist, ctx.annotated, incs)?,
                 None => current_graphs(inputs, &fanout_netlist, ctx.annotated)?,
@@ -735,7 +750,7 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
             outcome.resized += 1;
             trace.push(format!("dresize|{cell}"));
             design.update_parasitics().map_err(|e| Stop::error("RSZ-EST", e))?;
-            resized_netlist = design.netlist().clone();
+            resized_netlist = design.netlist_shared();
             own_graphs = Some(match ctx.timer.as_mut() {
                 Some(incs) => timer_graphs(inputs, design, &resized_netlist, ctx.annotated, incs)?,
                 None => current_graphs(inputs, &resized_netlist, ctx.annotated)?,
