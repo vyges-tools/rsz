@@ -260,6 +260,111 @@ impl CliDesign<'_> {
         Ok(())
     }
 
+    /// [`CliDesign::refresh`] after an edit that touched only `touched` nets and added `new_insts`:
+    /// the same netlist and pin order, read again only where they can have changed.
+    ///
+    /// ⛔ The full read cost one terminal lookup BY NAME per pin of the design on every edit —
+    /// O(design) per repeater, O(design²) over a repair (picorv32 `repair_design`: 13 min, 4 of 8
+    /// samples in `dbBlock::findInst` under `net_info`). The order is still the database's own (one
+    /// bulk read of the instance and net names), untouched nets keep their pins re-indexed, and the
+    /// touched nets are read as the full read reads them. `VYGES_RSZ_CHECK_REFRESH=1` also runs the
+    /// full read and fails on any difference; `VYGES_RSZ_FULL_REFRESH=1` uses it instead.
+    pub fn refresh_touched(&mut self, new_insts: &[String], touched: &BTreeSet<String>) -> Result<(), String> {
+        use vyges_sta::netlist::{Conn, Net, Netlist};
+        if std::env::var_os("VYGES_RSZ_FULL_REFRESH").is_some() {
+            return self.refresh();
+        }
+        let old = std::mem::take(&mut self.netlist);
+        let old_master: HashMap<&str, &str> = old.insts.iter().map(|(n, m)| (n.as_str(), m.as_str())).collect();
+        let mut nl = Netlist::default();
+        let mut inst_index: HashMap<String, usize> = HashMap::new();
+        for inst in self.db.inst_names() {
+            let master = match old_master.get(inst.as_str()) {
+                Some(m) if !new_insts.contains(&inst) => m.to_string(),
+                _ => self.db.inst_master(&inst),
+            };
+            inst_index.insert(inst.clone(), nl.insts.len());
+            nl.insts.push((inst, master));
+        }
+        nl.ports = old.ports.clone();
+        let port_index: HashMap<&str, usize> = nl.ports.iter().enumerate().map(|(i, (n, _))| (n.as_str(), i)).collect();
+        let old_nets: HashMap<&str, &Net> = old.nets.iter().map(|n| (n.name.as_str(), n)).collect();
+        let net_names = self.db.net_names();
+        for net in &net_names {
+            if touched.contains(net) {
+                if self.db.net_is_special(net) {
+                    continue;
+                }
+                let mut pins = Vec::new();
+                for iterm in self.db.net_iterms(net) {
+                    let (inst, term) = iterm.rsplit_once('/').unwrap_or((&iterm, ""));
+                    if let Some(&i) = inst_index.get(inst) {
+                        pins.push(Conn::Inst(i, term.to_string()));
+                    }
+                }
+                for bterm in self.db.net_bterms(net) {
+                    if let Some(&p) = port_index.get(bterm.as_str()) {
+                        pins.push(Conn::Port(p));
+                    }
+                }
+                if !pins.is_empty() {
+                    nl.nets.push(Net { name: net.clone(), pins });
+                }
+            } else if let Some(n) = old_nets.get(net.as_str()) {
+                let pins = n
+                    .pins
+                    .iter()
+                    .map(|c| match c {
+                        Conn::Inst(i, p) => Conn::Inst(inst_index[&old.insts[*i].0], p.clone()),
+                        Conn::Port(p) => Conn::Port(*p),
+                    })
+                    .collect();
+                nl.nets.push(Net { name: net.clone(), pins });
+            }
+        }
+        // the pin order and the per-net / per-instance flags: only what the edit can have changed
+        let live: BTreeSet<&str> = net_names.iter().map(String::as_str).collect();
+        self.info.dont_touch.retain(|n| live.contains(n.as_str()));
+        self.info.abutment.retain(|n| live.contains(n.as_str()));
+        for net in nl.nets.iter().filter(|n| touched.contains(&n.name)) {
+            for c in &net.pins {
+                let name = nl.pin_name(c);
+                let id = match c {
+                    Conn::Inst(i, pin) => u64::from(self.db.iterm_id(&nl.insts[*i].0, pin).map_err(|e| e.to_string())?) << 1,
+                    Conn::Port(_) => (u64::from(self.db.bterm_id(&name).map_err(|e| e.to_string())?) << 1) | 1,
+                };
+                self.info.pin_id.insert(name, id);
+            }
+            if self.db.net_is_do_not_touch(&net.name) {
+                self.info.dont_touch.insert(net.name.clone());
+            } else {
+                self.info.dont_touch.remove(&net.name);
+            }
+            if self.db.net_is_connected_by_abutment(&net.name) {
+                self.info.abutment.insert(net.name.clone());
+            } else {
+                self.info.abutment.remove(&net.name);
+            }
+        }
+        for i in new_insts {
+            if self.db.inst_is_do_not_touch(i) {
+                self.info.dont_touch_insts.insert(i.clone());
+            }
+            if self.db.inst_is_fixed(i) {
+                self.info.fixed_insts.insert(i.clone());
+            }
+        }
+        self.netlist = nl;
+        if std::env::var_os("VYGES_RSZ_CHECK_REFRESH").is_some() {
+            let full = vyges_grt::timer::netlist(self.db);
+            let info = net_info(self.db, &full)?;
+            if full != self.netlist || info != self.info {
+                return Err(format!("refresh_touched: differs from the full read (netlist {}, info {})", full == self.netlist, info == self.info));
+            }
+        }
+        Ok(())
+    }
+
     /// The database's callbacks since the last read, into the timer's log; the estimator's
     /// callbacks (`est::OdbCallBack`) on its invalid set: a net created, an instance terminal
     /// connected or disconnected, every net of a swapped instance → invalid; a net destroyed →
@@ -449,6 +554,10 @@ impl CliDesign<'_> {
             Some(n) => n.to_string(),
             None => self.net_of_load(loads.first().ok_or("insertBufferBeforeLoads: no loads specified")?),
         };
+        // every net the insertion can change: the original, each load's (they may differ), then
+        // the buffer's input and output nets
+        let mut touched: BTreeSet<String> = loads.iter().map(|l| self.net_of_load(l)).filter(|n| !n.is_empty()).collect();
+        touched.insert(original.clone());
         let mut iterms = Vec::new();
         let mut bterms = Vec::new();
         for l in loads {
@@ -485,7 +594,9 @@ impl CliDesign<'_> {
         }
         self.invalidate(&in_net);
         self.invalidate(&out_net);
-        self.refresh()?;
+        touched.insert(in_net.clone());
+        touched.insert(out_net.clone());
+        self.refresh_touched(std::slice::from_ref(&inst), &touched)?;
         Ok(vyges_rsz::design::Repeater { input: format!("{inst}/{}", input.name), output: format!("{inst}/{}", output.name), inst, out_net })
     }
 }

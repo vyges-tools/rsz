@@ -281,7 +281,7 @@ pub fn net_drivers_in(g: &Graph<'_>, load: usize, drivers: &std::collections::Ha
 
 /// What the checks read about the netlist besides the graph: each pin's id order and the nets
 /// `repairDriver` passes over.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct NetInfo {
     /// `dbNetwork::id(pin)` on a flat netlist: an instance pin's ITerm id × 2, a port's BTerm
     /// id × 2 + 1. A `PinSet` iterates in this order.
