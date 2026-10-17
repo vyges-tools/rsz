@@ -309,15 +309,27 @@ pub fn master_pins(db: &Db) -> Result<HashMap<String, Vec<String>>, String> {
 /// hold paths and is not a setup input; `-add_delay` is read; any other flag is refused.
 /// `[all_inputs]` / `[all_outputs]` in `set_input_delay` / `set_output_delay` as the ports they
 /// name (`Sdc::allInputs`: every input or bidirect port; `allOutputs`: every output or bidirect —
-/// the clock ports included, as without `-no_clocks`), in the netlist's port order. Other delays
+/// the clock ports included, as without `-no_clocks` — less the delay's own clock's source ports,
+/// which the reference skips), in the netlist's port order. Other delays
 /// are kept as written. [`search_sdc`] reads only named ports; a caller with the netlist expands
 /// first.
 pub fn expand_io_delay_ports(s: &mut vyges_loom::sdc::Sdc, nl: &vyges_sta::netlist::Netlist) {
     use vyges_sta::netlist::PortDir;
+    // the source ports of each clock, by name
+    let sources: std::collections::HashMap<String, Vec<String>> = s.clocks.iter().map(|c| (c.name.clone(), c.sources.clone())).collect();
     for (list, want) in [(&mut s.input_delays, PortDir::Input), (&mut s.output_delays, PortDir::Output)] {
         let accessor = if want == PortDir::Input { "all_inputs" } else { "all_outputs" };
         for d in list.iter_mut().filter(|d| d.accessor == accessor) {
-            d.ports = nl.ports.iter().filter(|(_, dir)| *dir == want || *dir == PortDir::Inout).map(|(n, _)| n.clone()).collect();
+            // ⛔ A delay relative to a clock is not applied to that clock's own source port — the
+            // reference skips it (STA-0441, "set_input_delay relative to a clock defined on the
+            // same port/pin not allowed"); expanded with it, the clock port got a data arrival.
+            let own: &[String] = d.clock.as_ref().and_then(|c| sources.get(c)).map(Vec::as_slice).unwrap_or(&[]);
+            d.ports = nl
+                .ports
+                .iter()
+                .filter(|(n, dir)| (*dir == want || *dir == PortDir::Inout) && !own.contains(n))
+                .map(|(n, _)| n.clone())
+                .collect();
             d.accessor = "get_ports".into();
             d.default = false;
         }
