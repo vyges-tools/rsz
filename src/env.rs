@@ -186,8 +186,29 @@ pub fn sdc_env(s: &vyges_loom::sdc::Sdc, libs: &Libs, nl: &vyges_sta::netlist::N
         if d.library.is_some() {
             return Err("set_driving_cell -library: not modelled".into());
         }
-        let (Some(cell), Some(pin)) = (&d.lib_cell, &d.pin) else {
-            return Err("set_driving_cell without -lib_cell and -pin: not modelled".into());
+        let Some(cell) = &d.lib_cell else {
+            return Err("set_driving_cell without -lib_cell: not modelled".into());
+        };
+        // Without `-pin` the reference takes the cell's ONE output port (output, tristate or
+        // bidirect); a cell with several is its error 456, "-pin argument required".
+        let inferred;
+        let pin = match &d.pin {
+            Some(p) => p,
+            None => {
+                use vyges_sta::liberty::Direction;
+                let outs: Vec<&str> = libs
+                    .link_cell(cell)
+                    .map(|c| c.ports.iter().filter(|p| matches!(p.direction, Direction::Output | Direction::Tristate | Direction::Bidirect)).map(|p| p.name.as_str()).collect())
+                    .unwrap_or_default();
+                match outs.as_slice() {
+                    [one] => {
+                        inferred = one.to_string();
+                        &inferred
+                    }
+                    [] => return Err(format!("set_driving_cell -lib_cell {cell}: no output port (not modelled)")),
+                    _ => return Err(format!("set_driving_cell -lib_cell {cell}: -pin argument required for cells with multiple outputs")),
+                }
+            }
         };
         let lib0 = libs.default_library().ok_or("set_driving_cell before any liberty library")?;
         if libs.link_cell(cell).and_then(|c| c.port(pin)).is_none() {
