@@ -253,7 +253,7 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
             _ => *design.netlist() != *held_netlist,
         };
         if hold && (held.is_none() || stale) {
-            drop(held.take());
+            recycle_held(held.take());
             held_netlist = design.netlist_shared();
             held_gen = design.netlist_generation();
             // The graphs over the edited design, holding the timer's state: nothing is re-timed
@@ -269,6 +269,20 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
 
 /// The graphs held across drivers, and their pin index.
 type HeldGraphs<'g> = (Vec<Graph<'g>>, std::sync::Arc<HashMap<String, usize>>);
+
+/// Graphs done with: their allocations go to the next build (`Graph::recycle`) — a repair
+/// rebuilds the graph after every edit, and most of a build is the pins it did not change.
+fn recycle(graphs: Option<Vec<Graph<'_>>>) {
+    graphs.into_iter().flatten().for_each(Graph::recycle);
+}
+
+/// [`recycle`] for held graphs: the index is let go first, so the next build can take it over.
+fn recycle_held(held: Option<HeldGraphs<'_>>) {
+    if let Some((graphs, index)) = held {
+        drop(index);
+        recycle(Some(graphs));
+    }
+}
 
 /// `repairClkNets`' lines: RSZ-0047 / RSZ-0048, not `repairDesign`'s 0037 / 0038.
 impl Outcome {
@@ -360,7 +374,7 @@ pub fn repair_clk_nets(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers
                 _ => *design.netlist() != *held_netlist,
             };
             if held.is_none() || stale {
-                drop(held.take());
+                recycle_held(held.take());
                 held_netlist = design.netlist_shared();
                 held_gen = design.netlist_generation();
                 let mut g = current_graphs(inputs, &held_netlist, &annotated)?;
@@ -529,7 +543,12 @@ fn repair_driver<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut NetCtx<
 /// [`repair_driver`] on the graphs it was given, which it hands back.
 fn repair_driver_net<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut NetCtx<'_, '_>, outcome: &mut Outcome, trace: &mut Trace, graphs: Vec<Graph<'g>>, held_index: Option<&HashMap<String, usize>>) -> Result<Vec<Graph<'g>>, Stop> {
     let g0 = &graphs[0];
-    let Some(drvr) = g0.vertices.iter().position(|v| v.is_driver && v.name == drvr_name) else {
+    // by the held index when every name is its vertex's alone (the first match, as the scan)
+    let found = match held_index {
+        Some(ix) if ix.len() == g0.vertices.len() => ix.get(drvr_name).copied().filter(|&v| g0.vertices[v].is_driver),
+        _ => g0.vertices.iter().position(|v| v.is_driver && v.name == drvr_name),
+    };
+    let Some(drvr) = found else {
         outcome.drivers_skipped += 1;
         return Ok(graphs);
     };
@@ -571,7 +590,10 @@ fn repair_repeater_net(design: &mut dyn Design, in_pin: &str, out_pin: &str, out
         let drvr = graphs[0].vertices.iter().position(|v| v.is_driver && v.name == out_pin).ok_or_else(|| Stop::error("RSZ-INSERT", format!("{out_pin}: not in the timing graph")))?;
         let clocks = timing::clock_pins(&graphs[0], ctx.inputs.clock_sources);
         let mut own = Outcome::default();
-        let r = repair_net(design, graphs, drvr, out_net, &clocks, false, None, ctx, &mut own, trace, Some(&index)).map(drop);
+        let r = repair_net(design, graphs, drvr, out_net, &clocks, false, None, ctx, &mut own, trace, Some(&index));
+        // the index let go first, so the next build can take it over
+        drop(index);
+        let r = r.map(|g| recycle(Some(g)));
         outcome.inserted_buffers += own.inserted_buffers;
         outcome.resized += own.resized;
         return r;
@@ -589,7 +611,9 @@ fn repair_repeater_net(design: &mut dyn Design, in_pin: &str, out_pin: &str, out
     let drvr = graphs[0].vertices.iter().position(|v| v.is_driver && v.name == out_pin).ok_or_else(|| Stop::error("RSZ-INSERT", format!("{out_pin}: not in the timing graph")))?;
     let clocks = timing::clock_pins(&graphs[0], ctx.inputs.clock_sources);
     let mut own = Outcome::default();
-    let r = repair_net(design, graphs, drvr, out_net, &clocks, false, None, ctx, &mut own, trace, Some(&index)).map(drop);
+    let r = repair_net(design, graphs, drvr, out_net, &clocks, false, None, ctx, &mut own, trace, Some(&index));
+    drop(index);
+    let r = r.map(|g| recycle(Some(g)));
     // `inserted_buffer_count_` and `resize_count_` are members — they count across the nested
     // repair; its violation and repaired-net counts are its own locals.
     outcome.inserted_buffers += own.inserted_buffers;
@@ -881,6 +905,7 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
         if repaired_net {
             outcome.nets_repaired += 1;
         }
+        recycle(own_graphs.take());
         return Ok(held_graphs);
     };
     let wire_length = bn.max_load_wire_length(root);
@@ -918,6 +943,7 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
     if repaired_net {
         outcome.nets_repaired += 1;
     }
+    recycle(own_graphs.take());
     Ok(held_graphs)
 }
 
