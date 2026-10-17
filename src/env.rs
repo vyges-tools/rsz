@@ -566,6 +566,37 @@ pub fn path_delays(s: &vyges_loom::sdc::Sdc, time_scale: f32) -> Result<Vec<vyge
     Ok(out)
 }
 
+/// The design as an SDC object query sees it — the database's ports, instances and instance pins
+/// (direction from the Liberty port, net from the database), for `Sdc::load_with`.
+pub fn sdc_design(db: &vyges_opendb::Db, libs: &Libs) -> vyges_loom::sdc::SdcDesign {
+    use vyges_sta::liberty::Direction;
+    use vyges_sta::netlist::{Conn, PortDir};
+    let nl = vyges_grt::timer::netlist(db);
+    let dir_name = |d: &Direction| match d {
+        Direction::Input => "input",
+        Direction::Output => "output",
+        Direction::Tristate => "tristate",
+        Direction::Bidirect => "bidirect",
+        Direction::Internal => "internal",
+        Direction::Unknown => "unknown",
+    };
+    let ports = nl
+        .ports
+        .iter()
+        .map(|(n, d)| (n.clone(), match d { PortDir::Input => "input", PortDir::Output => "output", PortDir::Inout => "bidirect" }.to_string()))
+        .collect();
+    let mut pins = Vec::new();
+    for net in &nl.nets {
+        for c in &net.pins {
+            if let Conn::Inst(i, p) = c {
+                let dir = libs.link_cell(&nl.insts[*i].1).and_then(|cell| cell.port(p)).map_or("unknown", |port| dir_name(&port.direction));
+                pins.push((*i, p.clone(), dir.to_string(), Some(net.name.clone())));
+            }
+        }
+    }
+    vyges_loom::sdc::SdcDesign { ports, insts: nl.insts.clone(), pins }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,3 +617,4 @@ mod tests {
         assert_eq!(port_collection("all_inputs", &["-level_sensitive".into()], &ports, &clk), Err("-level_sensitive".into()));
     }
 }
+

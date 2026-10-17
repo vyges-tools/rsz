@@ -645,9 +645,16 @@ fn run(job: &Value) -> Result<Value, String> {
             // The design's constraints as the reference held them when repair_design ran.
             "read_sdc" => {
                 let path = args.last().ok_or("read_sdc path")?;
-                let s = vyges_loom::sdc::Sdc::load(path).map_err(|e| format!("{path}: {}", e.0))?;
-                // A command whose object query needs the design was not applied: refuse rather
-                // than repair against constraints the file did not mean.
+                // Read against the linked design, as the reference does: object queries
+                // (-filter, -of_objects) select from the database's ports, instances and pins.
+                let s = if db.inst_names().is_empty() {
+                    vyges_loom::sdc::Sdc::load(path)
+                } else {
+                    vyges_loom::sdc::Sdc::load_with(path, &vyges_rsz::env::sdc_design(&db, &libs))
+                }
+                .map_err(|e| format!("{path}: {}", e.0))?;
+                // A command whose object query could still not be evaluated was not applied:
+                // refuse rather than repair against constraints the file did not mean.
                 if let Some(q) = s.unevaluated_queries.first() {
                     return Err(format!("{path}: {q}: object query not evaluated, not modelled"));
                 }
