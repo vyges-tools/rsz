@@ -324,6 +324,15 @@ pub fn repair_clk_nets(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers
         timer: None,
     };
     let mut outcome = Outcome::default();
+    // 🔑 `sta_->findDelays()` once, then `repairNet`'s `findDelays(drvr)` per clock driver: the
+    // graphs are HELD across drivers, timed whole when made, and made again only after an edit
+    // (as `repair_design` holds them). Rebuilding and re-timing the design for each driver gave
+    // the same answer at O(N) a driver: minutes for a few hundred clock nets.
+    // ⚠️ `VYGES_RSZ_DCALC` (the delay-calculation dump) keeps the whole re-timing per driver.
+    let hold = std::env::var_os("VYGES_RSZ_DCALC").is_none();
+    let mut held_netlist = design.netlist_shared();
+    let mut held_gen = design.netlist_generation();
+    let mut held: Option<HeldGraphs<'_>> = None;
     // Each clock's network pins are taken BEFORE its repair ("make a copy in case the set of pins
     // is updated"); a later clock sees the buffers an earlier one inserted.
     for sources in clocks {
@@ -334,15 +343,43 @@ pub fn repair_clk_nets(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers
         drivers.sort_by_key(|p| pin_order(p));
         drop(graphs);
         for name in drivers {
-            let netlist = design.netlist_shared();
-            let graphs = current_graphs(inputs, &netlist, &annotated)?;
+            if !hold {
+                let netlist = design.netlist_shared();
+                let graphs = current_graphs(inputs, &netlist, &annotated)?;
+                let g0 = &graphs[0];
+                let Some(drvr) = g0.vertices.iter().position(|v| v.is_driver && v.name == name) else { continue };
+                let Some(n) = g0.vertex_net[drvr] else { continue };
+                let net = netlist.nets[n].name.clone();
+                let clock_set = timing::clock_pins(g0, inputs.clock_sources);
+                outcome.nets_checked += 1;
+                repair_net(design, graphs, drvr, &net, &clock_set, false, None, &mut ctx, &mut outcome, trace, None)?;
+                continue;
+            }
+            let stale = match (held_gen, design.netlist_generation()) {
+                (Some(a), Some(b)) => a != b,
+                _ => *design.netlist() != *held_netlist,
+            };
+            if held.is_none() || stale {
+                drop(held.take());
+                held_netlist = design.netlist_shared();
+                held_gen = design.netlist_generation();
+                let mut g = current_graphs(inputs, &held_netlist, &annotated)?;
+                find_all_delays(&mut g, &*design, &name)?;
+                let index = g[0].pin_index();
+                held = Some((g, index));
+            }
+            let (graphs, index) = held.take().expect("held graphs");
             let g0 = &graphs[0];
-            let Some(drvr) = g0.vertices.iter().position(|v| v.is_driver && v.name == name) else { continue };
-            let Some(n) = g0.vertex_net[drvr] else { continue };
-            let net = netlist.nets[n].name.clone();
+            let found = g0.vertices.iter().position(|v| v.is_driver && v.name == name).and_then(|d| g0.vertex_net[d].map(|n| (d, n)));
+            let Some((drvr, n)) = found else {
+                held = Some((graphs, index));
+                continue;
+            };
+            let net = held_netlist.nets[n].name.clone();
             let clock_set = timing::clock_pins(g0, inputs.clock_sources);
             outcome.nets_checked += 1;
-            repair_net(design, graphs, drvr, &net, &clock_set, false, None, &mut ctx, &mut outcome, trace, None)?;
+            let graphs = repair_net(design, graphs, drvr, &net, &clock_set, false, None, &mut ctx, &mut outcome, trace, Some(&index))?;
+            held = Some((graphs, index));
         }
     }
     Ok(outcome)
