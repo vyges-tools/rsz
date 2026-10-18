@@ -1354,7 +1354,7 @@ impl Repair<'_, '_> {
                     }
                 }
             }
-            let old = imported_tree_buffers(self.design.as_design().netlist(), &|c| self.ctx.libs.link_cell(c), &pin, &tree_loads);
+            let old = imported_tree_buffers(self.design.as_design().netlist(), &|c| self.ctx.libs.link_cell(c), &self.design.net_info().pin_id, &pin, &tree_loads);
             let net = self.design.as_design().netlist().nets.iter().find(|n| n.pins.iter().any(|c| self.design.as_design().netlist().pin_name(c) == pin)).map(|n| n.name.clone()).ok_or_else(|| Stop::error("RSZ-REBUFFER", format!("{pin}: no net")))?;
             let mut count = 0i64;
             let mut inputs: HashMap<usize, String> = HashMap::new();
@@ -1391,13 +1391,17 @@ impl Repair<'_, '_> {
 
 /// `collectImportedTreeBufferInstances`: from the driver's net, every buffer whose input is not a
 /// load of the unbuffered tree, then the nets behind it (a stack); `(instance, input, output)`.
-fn imported_tree_buffers<'a>(nl: &vyges_sta::netlist::Netlist, link: &dyn Fn(&str) -> Option<&'a vyges_sta::liberty::Cell>, drvr_pin: &str, tree_loads: &BTreeSet<String>) -> Vec<(String, String, String)> {
+fn imported_tree_buffers<'a>(nl: &vyges_sta::netlist::Netlist, link: &dyn Fn(&str) -> Option<&'a vyges_sta::liberty::Cell>, pin_id: &HashMap<String, u64>, drvr_pin: &str, tree_loads: &BTreeSet<String>) -> Vec<(String, String, String)> {
     let net_of = |pin: &str| nl.nets.iter().find(|n| n.pins.iter().any(|c| nl.pin_name(c) == pin)).map(|n| n.name.clone());
     let mut insts: Vec<(String, String, String)> = Vec::new();
     let mut queue: Vec<String> = net_of(drvr_pin).into_iter().collect();
     while let Some(net) = queue.pop() {
         let Some(nn) = nl.nets.iter().find(|n| n.name == net) else { continue };
-        for c in &nn.pins {
+        // `connectedPinIterator(net)`: a PinSet, in pin id order (ITerm id × 2, BTerm id × 2 + 1)
+        // — not the net's terminal list (odb reuses freed slots: neither creation nor name order)
+        let mut pins: Vec<&vyges_sta::netlist::Conn> = nn.pins.iter().collect();
+        pins.sort_by_key(|c| pin_id.get(&nl.pin_name(c)).copied().unwrap_or(u64::MAX));
+        for c in pins {
             let name = nl.pin_name(c);
             let vyges_sta::netlist::Conn::Inst(i, _) = c else { continue };
             // `isBuffer()`: an inverter has buffer ports too, and is not collected
@@ -2687,6 +2691,7 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
     r.out.resized = r.committer.committed(Move::SizeUp) + r.committer.committed(Move::SizeDownFanout) + r.committer.committed(Move::SizeUpMatch) + r.committer.committed(Move::VtSwap);
     r.out.removed = r.committer.committed(Move::Unbuffer);
     r.out.inserted = r.committer.committed(Move::Buffer);
+    r.out.levels = r.timer.inc[0].levels.iter().map(|(k, v)| (k.clone(), *v)).collect();
     Ok(r.out)
 }
 
@@ -5446,7 +5451,28 @@ mod tests {
         };
         let link = |c: &str| lib.cells.get(c);
         let loads: BTreeSet<String> = ["b3/A".to_string()].into_iter().collect();
-        let got: Vec<String> = imported_tree_buffers(&nl, &link, "d/ZN", &loads).into_iter().map(|x| x.0).collect();
+        let got: Vec<String> = imported_tree_buffers(&nl, &link, &HashMap::new(), "d/ZN", &loads).into_iter().map(|x| x.0).collect();
+        assert_eq!(got, vec!["b1", "b2"]);
+    }
+
+    // Rule (Rebuffer::collectImportedTreeBufferInstances over `Network::connectedPinIterator`):
+    // a net's pins are visited as a PinSet, in pin id order (ITerm id × 2, BTerm id × 2 + 1), not
+    // in the net's terminal list order — the buffers are removed in that order, and the placer's
+    // callbacks swap-pop its cells and nets in it.
+    #[test]
+    fn imported_tree_buffers_visit_a_net_in_pin_id_order() {
+        const LIB: &str = r#"library (t) { time_unit : "1ns"; capacitive_load_unit (1, pf);
+          cell (buf) { pin (A) { direction : input; capacitance : 0.001; } pin (X) { direction : output; function : "A"; } } }"#;
+        let lib = vyges_sta::liberty::Library::read(&vyges_sta::liberty_parse::parse(LIB).unwrap()).unwrap();
+        use vyges_sta::netlist::{Conn, Net, Netlist};
+        let nl = Netlist {
+            insts: vec![("d".into(), "buf".into()), ("b1".into(), "buf".into()), ("b2".into(), "buf".into())],
+            ports: Vec::new(),
+            nets: vec![Net { name: "n0".into(), pins: vec![Conn::Inst(0, "X".into()), Conn::Inst(2, "A".into()), Conn::Inst(1, "A".into())] }],
+        };
+        let link = |c: &str| lib.cells.get(c);
+        let ids: HashMap<String, u64> = [("d/X", 2), ("b1/A", 6), ("b2/A", 10)].into_iter().map(|(p, i)| (p.to_string(), i)).collect();
+        let got: Vec<String> = imported_tree_buffers(&nl, &link, &ids, "d/X", &BTreeSet::new()).into_iter().map(|x| x.0).collect();
         assert_eq!(got, vec!["b1", "b2"]);
     }
 

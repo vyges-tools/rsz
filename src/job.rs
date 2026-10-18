@@ -1525,6 +1525,10 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     if let Some(path) = job["timing_trace"].as_str() {
                         std::fs::write(path, o.trace.join("\n") + "\n").map_err(|e| format!("{path}: {e}"))?;
                     }
+                    // A carried timer (global placement's reweight) keeps the levels the repair left.
+                    if sta_levels.is_some() {
+                        sta_levels = Some(o.levels.clone());
+                    }
                     // The preamble's own lines from the repair (the move tracker's capture) print
                     // right after RSZ-0099, before RSZ-0221.
                     if let Some(k) = lines.iter().position(|l| l.starts_with("[INFO RSZ-0099]")) {

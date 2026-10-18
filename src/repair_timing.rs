@@ -179,6 +179,12 @@ impl Args {
                     a.repair_tns_end_percent = v / 100.0;
                     i += 1;
                 }
+                // Global placement's repair pass: the fraction as the placer holds it (`percent /
+                // 100.0f`, a float), not the command's double division.
+                "-vyges_repair_tns_fraction" => {
+                    a.repair_tns_end_percent = value(i)?.parse().map_err(|_| "repair_timing -vyges_repair_tns_fraction: not a number".to_string())?;
+                    i += 1;
+                }
                 "-sequence" => {
                     a.sequence = parse_move_sequence(&value(i)?)?;
                     i += 1;
