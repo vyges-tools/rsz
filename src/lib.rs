@@ -53,6 +53,7 @@ pub mod swap_pins;
 pub mod timing;
 pub mod trace;
 pub mod unbuffer;
+pub mod virtual_cts;
 pub mod walk;
 
 /// Why a run stopped short of a result.

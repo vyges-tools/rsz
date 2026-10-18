@@ -433,8 +433,55 @@ pub fn search_sdc(s: &vyges_loom::sdc::Sdc, time_scale: f32, propagated: bool, h
     if s.setup_uncertainty != 0.0 || (s.hold_uncertainty != 0.0 && hold_repair) {
         return Err("set_clock_uncertainty: not modelled".into());
     }
-    if s.clock_latency != 0.0 || !s.clock_latencies.is_empty() || s.late_derate.is_some() || s.early_derate.is_some() || !s.exceptions.is_empty() || !s.async_groups.is_empty() {
-        return Err("clock latency, derates, timing exceptions or clock groups: not modelled".into());
+    if s.late_derate.is_some() || s.early_derate.is_some() || !s.exceptions.is_empty() || !s.async_groups.is_empty() {
+        return Err("derates, timing exceptions or clock groups: not modelled".into());
+    }
+    // `set_clock_latency` on pins (`Sdc::setClockLatency(clk | null, pin)`): an ideal clock's network
+    // latency from that pin on. On clocks, `-source`, `-early` / `-late`, or on a propagated clock
+    // (where the pin would turn it ideal) — refused.
+    for l in &s.clock_latencies {
+        if l.accessor != "get_pins" {
+            return Err(format!("set_clock_latency on [{} …]: not modelled (pins are)", l.accessor));
+        }
+        if let Some(f) = l.flags.iter().find(|f| !matches!(f.as_str(), "-rise" | "-fall" | "-min" | "-max")) {
+            return Err(format!("set_clock_latency {f}: not modelled"));
+        }
+        let rfs: Vec<usize> = match (l.flags.iter().any(|f| f == "-rise"), l.flags.iter().any(|f| f == "-fall")) {
+            (true, false) => vec![0],
+            (false, true) => vec![1],
+            _ => vec![0, 1],
+        };
+        let mms: Vec<usize> = match (l.flags.iter().any(|f| f == "-min"), l.flags.iter().any(|f| f == "-max")) {
+            (true, false) => vec![0],
+            (false, true) => vec![1],
+            _ => vec![0, 1],
+        };
+        let targets: Vec<usize> = match &l.clock {
+            Some(name) => vec![s.clocks.iter().position(|c| &c.name == name).ok_or_else(|| format!("set_clock_latency -clock {name}: no such clock"))?],
+            None => (0..clocks.len()).collect(),
+        };
+        let v = vyges_sta::sdc::user_to_sta(l.value, time_scale);
+        for k in targets {
+            let c: &mut Clock = &mut clocks[k];
+            if c.propagated {
+                return Err("set_clock_latency on a pin of a propagated clock: not modelled".into());
+            }
+            for pin in &l.objects {
+                let specific = l.clock.is_some();
+                let i = match c.pin_latencies.iter().position(|x| &x.pin == pin && x.specific == specific) {
+                    Some(i) => i,
+                    None => {
+                        c.pin_latencies.push(vyges_sta::sdc::PinLatency { pin: pin.clone(), specific, delay: [[None; 2]; 2] });
+                        c.pin_latencies.len() - 1
+                    }
+                };
+                for &rf in &rfs {
+                    for &mm in &mms {
+                        c.pin_latencies[i].delay[rf][mm] = Some(v);
+                    }
+                }
+            }
+        }
     }
     // Per side (input, output): each delay by `[rf][min/max]` as set so far, keyed by port and
     // clock (`Sdc::findInputDelay` / `findOutputDelay`), in the order made. Without `-add_delay`,
@@ -533,6 +580,21 @@ pub fn search_sdc(s: &vyges_loom::sdc::Sdc, time_scale: f32, propagated: bool, h
         output_delays: outputs(&delays[1])?,
         path_delays: path_delays(s, time_scale)?,
     })
+}
+
+/// Global placement's virtual clock tree: each `(clock, pin, latency)` as
+/// `setClockLatency(clk, pin, riseFall, all)` — a latency given with the clock, every transition
+/// and min/max.
+pub fn add_virtual_latencies(sdc: &mut vyges_sta::sdc::Sdc, latencies: &[(String, String, f32)]) -> Result<(), String> {
+    for (clock, pin, d) in latencies {
+        let c = sdc.clocks.iter_mut().find(|c| &c.name == clock).ok_or_else(|| format!("virtual clock latency on clock {clock}: no such clock"))?;
+        if c.propagated {
+            return Err("a virtual clock latency on a propagated clock: not modelled".into());
+        }
+        c.pin_latencies.retain(|l| !(l.specific && &l.pin == pin));
+        c.pin_latencies.push(vyges_sta::sdc::PinLatency { pin: pin.clone(), specific: true, delay: [[Some(*d); 2]; 2] });
+    }
+    Ok(())
 }
 
 /// Every `set_max_delay` / `set_min_delay` as the reference's `write_sdc` writes it:

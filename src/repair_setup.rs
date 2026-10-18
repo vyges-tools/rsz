@@ -880,9 +880,10 @@ fn probe_rebuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[
             // edgeFromSlew: an ideal clock pin's clock-to-output edge reads the ideal slew, 0.
             let ideal_clk = set.role == Role::RegClkToQ && gk.ideal_clock.contains(&prev.vertex);
             let from_slew = if ideal_clk { 0.0 } else { gk.slew[prev.vertex][arc.from_rf][MAX] };
-            // clkPathArrival for a clock path: the ideal clock's edge, else its arrival.
+            // clkPathArrival for a clock path: the ideal clock's `(insertion + edge) + latency`
+            // (no insertion here), else its arrival.
             let prev_arrival = match dp.tag.clk_edge.and_then(|e| ctx.ssdc.clocks.get(e / 2).map(|c| (e, c))) {
-                Some((e, c)) if dp.tag.is_clock && !c.propagated => c.edge_time(e % 2),
+                Some((e, c)) if dp.tag.is_clock && !c.propagated => c.edge_time(e % 2) + f32::from_bits(dp.tag.latency),
                 _ => dp.arrival,
             };
             Some(rebuffer::DriverArc { model: arc.model.clone(), from_slew, prev_arrival, arrival: ap.arrival })
@@ -1101,7 +1102,7 @@ fn full_probe(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTre
             let ideal_clk = set.role == Role::RegClkToQ && gk.ideal_clock.contains(&prev.vertex);
             let from_slew = if ideal_clk { 0.0 } else { gk.slew[prev.vertex][arc.from_rf][MAX] };
             let prev_arrival = match dp.tag.clk_edge.and_then(|e| ctx.ssdc.clocks.get(e / 2).map(|c| (e, c))) {
-                Some((e, c)) if dp.tag.is_clock && !c.propagated => c.edge_time(e % 2),
+                Some((e, c)) if dp.tag.is_clock && !c.propagated => c.edge_time(e % 2) + f32::from_bits(dp.tag.latency),
                 _ => dp.arrival,
             };
             Some(rebuffer::DriverArc { model: arc.model.clone(), from_slew, prev_arrival, arrival: ap.arrival })

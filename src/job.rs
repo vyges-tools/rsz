@@ -457,6 +457,13 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
         _ => None,
     };
     let mut repair_design_edited = false;
+    // `clock_latencies`: global placement's virtual clock tree for this reweight (`virtual_cts`'s
+    // result, set in the timer as `setClockLatency(clk, pin)` before every timing step).
+    let virtual_latencies: Vec<(String, String, f32)> = job["clock_latencies"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| Some((x["clock"].as_str()?.to_string(), x["pin"].as_str()?.to_string(), x["delay"].as_f64()? as f32))).collect())
+        .unwrap_or_default();
+    let mut virtual_cts_report: Option<Value> = None;
     // `global_route`: the router's result (its routes, and the parasitics
     // `estimate_parasitics -global_routing` builds from them); `gr_estimated` when that estimate is
     // the one in force (`estimated` stays for the placement estimate's).
@@ -1015,6 +1022,50 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
             // `Resizer::resizeSlackPreamble` (global placement's timing-driven mode, at its start):
             // `findMaxWireLength1(issue_error = true)` — a warning per corner whose wire signal
             // resistance is not positive, the error when none is left.
+            // `ClockBase::executeVirtualCts` (global placement's `-virtual_cts`, at a reweight): per
+            // clock (finite positive period, a source), its register clock pins at their placed
+            // instances' origins, each without a user latency given the tree's latency. Reported
+            // for the next job of the reweight to carry; nothing is set here.
+            "virtual_cts" => {
+                let fraction: f32 = args.first().ok_or("virtual_cts needs the skew fraction")?.parse().map_err(|_| "virtual_cts: the skew fraction is not a number".to_string())?;
+                let mut out = Vec::new();
+                let mut clock_count = 0;
+                if let Some(s) = sdc.as_ref() {
+                    let lib0 = libs.default_library().ok_or("virtual_cts before any liberty library")?;
+                    let ssdc = search_sdc(s, lib0.time_scale, propagated || sdc_propagated, false)?;
+                    clock_count = ssdc.clocks.len();
+                    if clock_count > 0 {
+                        let netlist = vyges_grt::timer::netlist(&db);
+                        let mpins = master_pins(&db)?;
+                        let mut env = sdc_env(s, &libs, &netlist)?;
+                        env.constants = sim_constants(&db, &liberty)?;
+                        let g = repair_design::timer_graph(&libs, 0, &netlist, &env, &mpins).map_err(|e| e.message().to_string())?;
+                        let info = net_info(&db, &netlist)?;
+                        for c in &ssdc.clocks {
+                            if c.period <= 0.0 || c.period.is_infinite() || c.source.is_empty() {
+                                continue;
+                            }
+                            let mut sinks: Vec<(String, (i32, i32))> = Vec::new();
+                            for p in crate::virtual_cts::register_clk_pins(&g, &c.source, &info.pin_id) {
+                                let Some((inst, _)) = p.rsplit_once('/') else { continue };
+                                if is_placed(&db.inst_get_placement_status(inst)) {
+                                    sinks.push((p.clone(), db.inst_location(inst)));
+                                }
+                            }
+                            let locs: Vec<(i32, i32)> = sinks.iter().map(|x| x.1).collect();
+                            let Some(l) = crate::virtual_cts::latencies(&locs, fraction, c.period) else { continue };
+                            for (i, (p, _)) in sinks.iter().enumerate() {
+                                // `hasUserClockLatency`: any transition and min/max set on the pin
+                                if (0..2).any(|rf| (0..2).any(|mm| c.pin_latency(p, rf, mm).is_some())) {
+                                    continue;
+                                }
+                                out.push(json!({ "clock": c.name, "pin": p, "delay": l[i] }));
+                            }
+                        }
+                    }
+                }
+                virtual_cts_report = Some(json!({ "clocks": clock_count, "latencies": out }));
+            }
             "resize_slack_preamble" => {
                 let mut sorted = rc.clone();
                 sorted.sort_clk_and_signal_layers();
@@ -1119,8 +1170,8 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 let mut g = repair_design::timer_graph(&libs, 0, &netlist, &env, &mpins).map_err(|e| e.message().to_string())?;
                 let clock_propagated = propagated || sdc_propagated;
                 let clocks = crate::timing::clock_pins(&g, &clock_sources);
-                if s.ignored.iter().any(|c| c == "set_clock_transition") || !s.clock_latencies.is_empty() {
-                    return Err("set_clock_transition / set_clock_latency: not modelled".into());
+                if s.ignored.iter().any(|c| c == "set_clock_transition") {
+                    return Err("set_clock_transition: not modelled".into());
                 }
                 // An ideal clock's network (`ClkNetwork::isIdealClock`): its registers read the
                 // ideal clock slew, 0.
@@ -1137,7 +1188,8 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 } else {
                     g.find_delays(&parasitics[0], None)?;
                 }
-                let ssdc = search_sdc(s, time_scale, clock_propagated, a.hold)?;
+                let mut ssdc = search_sdc(s, time_scale, clock_propagated, a.hold)?;
+                crate::env::add_virtual_latencies(&mut ssdc, &virtual_latencies)?;
                 let mut search = vyges_sta::search::Search::in_graph_order(&g, &ssdc);
                 search.constraints_modelled()?;
                 search.find_arrivals()?;
@@ -1630,6 +1682,9 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
     }
     if let Some(l) = sta_levels {
         report["sta_levels"] = json!(l);
+    }
+    if let Some(v) = virtual_cts_report {
+        report["virtual_cts"] = v;
     }
     if !repair_progress.is_empty() {
         report["repair_design_progress"] = json!(repair_progress);
