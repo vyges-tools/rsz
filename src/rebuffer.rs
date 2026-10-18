@@ -134,6 +134,9 @@ pub enum Kind {
     Via { r: usize, ref_layer: i32 },
 }
 
+/// `makeSteinerTree(root, sinks)` over points (`resteiner`), from the caller.
+pub type SteinerOverPoints<'a> = &'a dyn Fn((i32, i32), &[(i32, i32)]) -> Option<crate::buffered_net::Tree>;
+
 /// One `BufferedNet` node with the rebuffer annotations; an arena index is its identity, and a
 /// subtree is shared by every option built on it (the reference's `shared_ptr`s).
 #[derive(Debug, Clone, PartialEq)]
@@ -1374,6 +1377,238 @@ impl Rebuf<'_> {
             return Err(e.clone());
         }
         bnet.map(Some).ok_or_else(|| "RSZ-2022: failed area recovery".into())
+    }
+
+    /// `Rebuffer::bufferDelay(cell, rf, load)` for any buffer cell (an imported tree's buffers
+    /// need not be characterized sizes): over the transitions, the largest gate delay at its
+    /// arrival path's scene.
+    fn buffer_delay_cell(&self, cell: &str, rf: Option<Rfs>, load: f32) -> FixedDelay {
+        let mut delay = FixedDelay::ZERO;
+        if let Some(rf) = rf {
+            for &k in rf.range() {
+                let c = self.ctx.scene_cell(self.probe.arc_scenes[k], cell);
+                let Some((_, out)) = c.buffer_ports() else { continue };
+                let (d, _) = gate_delays(c, &out.name, load, self.ctx.tgt_slews);
+                delay = delay.max(FixedDelay::from_secs(d[k]));
+            }
+        }
+        delay
+    }
+
+    /// `annotateTiming`: bottom-up over an imported tree — a junction the combined transition, the
+    /// worse slack, the summed cap, the tighter slew limit; a wire its `R·(C/2 + Cload)` delay off
+    /// the slack and its slew degradation off the limit (nothing for no length); a via its
+    /// resistance times the load; a buffer its gate delay at the load. Loads keep their slacks.
+    pub fn annotate_timing(&mut self, n: usize) {
+        match self.nodes[n].kind.clone() {
+            Kind::Load { .. } => {}
+            Kind::Junction { r: p, r2: q } => {
+                self.annotate_timing(p);
+                self.annotate_timing(q);
+                let (a, b) = (&self.nodes[p], &self.nodes[q]);
+                let (rf, slack, cap, mls) = (combined(a.slack_rf, b.slack_rf), a.slack.min(b.slack), a.cap + b.cap, a.max_load_slew.min(b.max_load_slew));
+                let nd = &mut self.nodes[n];
+                nd.slack_rf = rf;
+                nd.slack = slack;
+                nd.cap = cap;
+                nd.max_load_slew = mls;
+            }
+            Kind::Wire { r: p } => {
+                self.annotate_timing(p);
+                let (layer_res, layer_cap, len) = self.wire_rc_of(self.loc(n), p, self.nodes[n].layer);
+                let wire_length = self.ctx.dbu_to_meters(len);
+                let (mut wire_res, mut wire_cap) = (wire_length * layer_res, wire_length * layer_cap);
+                let pc = f64::from(self.nodes[p].cap);
+                let mut wire_delay = FixedDelay::from_secs((wire_res * (wire_cap / 2.0 + pc)) as f32);
+                if len == 0 {
+                    wire_res = 0.0;
+                    wire_cap = 0.0;
+                    wire_delay = FixedDelay::ZERO;
+                }
+                let (ps, prf, pml) = (self.nodes[p].slack, self.nodes[p].slack_rf, self.nodes[p].max_load_slew);
+                let nd = &mut self.nodes[n];
+                nd.delay = wire_delay;
+                nd.slack = ps - wire_delay;
+                nd.slack_rf = prf;
+                nd.max_load_slew = (f64::from(pml) - wire_res * (wire_cap / 2.0 + pc) * f64::from(self.ctx.slew_shape_factor)) as f32;
+            }
+            Kind::Via { r: p, .. } => {
+                self.annotate_timing(p);
+                // `viaResistance`: placement parasitics carry no vias
+                let (ps, prf) = (self.nodes[p].slack, self.nodes[p].slack_rf);
+                let nd = &mut self.nodes[n];
+                nd.delay = FixedDelay::ZERO;
+                nd.slack = ps;
+                nd.slack_rf = prf;
+            }
+            Kind::Buffer { cell, r: p } => {
+                self.annotate_timing(p);
+                let (prf, pcap, ps) = (self.nodes[p].slack_rf, self.nodes[p].cap, self.nodes[p].slack);
+                let d = self.buffer_delay_cell(&cell, prf, pcap);
+                let nd = &mut self.nodes[n];
+                nd.delay = d;
+                nd.slack = ps - d;
+                nd.slack_rf = prf;
+            }
+        }
+    }
+
+    /// `stripTreeBuffers`: the tree rebuilt without its buffers — each wire and junction made
+    /// again (the constructors' cap, fanout, slew limit and area), a load kept as it is.
+    pub fn strip_tree_buffers(&mut self, n: usize) -> usize {
+        match self.nodes[n].kind.clone() {
+            Kind::Load { .. } => n,
+            Kind::Buffer { r, .. } => self.strip_tree_buffers(r),
+            Kind::Wire { r } => {
+                let inner = self.strip_tree_buffers(r);
+                self.new_wire(self.loc(n), inner, self.nodes[n].layer)
+            }
+            Kind::Via { r, ref_layer } => {
+                let inner = self.strip_tree_buffers(r);
+                let p = self.nodes[inner].clone();
+                let node = Node { kind: Kind::Via { r: inner, ref_layer }, x: self.nodes[n].x, y: self.nodes[n].y, layer: self.nodes[n].layer, cap: p.cap, fanout: p.fanout, max_load_slew: p.max_load_slew, area: p.area, slack_rf: None, slack: FixedDelay::ZERO, delay: FixedDelay::ZERO, arrival: FixedDelay::ZERO };
+                self.push(node)
+            }
+            Kind::Junction { r, r2 } => {
+                let (a, b) = (self.strip_tree_buffers(r), self.strip_tree_buffers(r2));
+                self.new_junction(self.loc(n), a, b)
+            }
+        }
+    }
+
+    /// The junction constructor (`BufferedNet(junction, …)`): the summed cap, fanout and area, the
+    /// tighter slew limit; no timing.
+    fn new_junction(&mut self, at: (i32, i32), p: usize, q: usize) -> usize {
+        let (a, b) = (&self.nodes[p], &self.nodes[q]);
+        let node = Node { kind: Kind::Junction { r: p, r2: q }, x: at.0, y: at.1, layer: crate::buffered_net::NULL_LAYER, cap: a.cap + b.cap, fanout: a.fanout + b.fanout, max_load_slew: a.max_load_slew.min(b.max_load_slew), area: a.area + b.area, slack_rf: None, slack: FixedDelay::ZERO, delay: FixedDelay::ZERO, arrival: FixedDelay::ZERO };
+        self.push(node)
+    }
+
+    /// The sinks `resteiner` re-routes: each load, and each buffer kept (with its own subtree
+    /// re-steinered) — in visit order.
+    fn resteiner_sinks(&mut self, n: usize, steiner: SteinerOverPoints<'_>, sinks: &mut Vec<usize>) {
+        match self.nodes[n].kind.clone() {
+            Kind::Wire { r } | Kind::Via { r, .. } => self.resteiner_sinks(r, steiner, sinks),
+            Kind::Junction { r, r2 } => {
+                self.resteiner_sinks(r, steiner, sinks);
+                self.resteiner_sinks(r2, steiner, sinks);
+            }
+            Kind::Load { .. } => sinks.push(n),
+            Kind::Buffer { cell, r } => {
+                let inner = self.resteiner(r, steiner);
+                let cell_name = cell.clone();
+                let mut b = self.nodes[n].clone();
+                b.kind = Kind::Buffer { cell, r: inner.unwrap_or(r) };
+                b.area = self.nodes[inner.unwrap_or(r)].area + self.ctx.cell(&cell_name).area;
+                b.slack_rf = None;
+                b.slack = FixedDelay::ZERO;
+                b.delay = FixedDelay::ZERO;
+                let k = self.push(b);
+                sinks.push(k);
+            }
+        }
+    }
+
+    /// `resteiner`: a Steiner tree from the tree's root over its sinks' locations
+    /// (`makeBufferedNetSteinerOverBnets`), the sinks stitched in at their points.
+    pub fn resteiner(&mut self, n: usize, steiner: SteinerOverPoints<'_>) -> Option<usize> {
+        let mut sinks = Vec::new();
+        self.resteiner_sinks(n, steiner, &mut sinks);
+        let root = self.loc(n);
+        let points: Vec<(i32, i32)> = sinks.iter().map(|&k| self.loc(k)).collect();
+        let mut sink_map: std::collections::BTreeMap<(i32, i32), Vec<usize>> = std::collections::BTreeMap::new();
+        for &k in &sinks {
+            sink_map.entry(self.loc(k)).or_default().push(k);
+        }
+        let tree = steiner(root, &points)?;
+        let drvr_pt = tree.drvr_pt?;
+        let branch_count = tree.branch.len();
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); branch_count];
+        for i in 0..branch_count {
+            let j = tree.branch[i].2;
+            if j != i {
+                adj[i].push(j);
+                adj[j].push(i);
+            }
+        }
+        let mut visited = std::collections::BTreeSet::new();
+        self.stitch_tree2(&tree, None, drvr_pt, &adj, &mut visited, &sink_map)
+    }
+
+    /// `makeBufferedNetFromTree2`: at a point the sinks there (the first visit only), joined in
+    /// order; each other adjacent point's subtree joined after; a wire up to the parent point
+    /// unless it is the same location.
+    fn stitch_tree2(&mut self, tree: &crate::buffered_net::Tree, from: Option<usize>, to: usize, adj: &[Vec<usize>], visited: &mut std::collections::BTreeSet<(i32, i32)>, sink_map: &std::collections::BTreeMap<(i32, i32), Vec<usize>>) -> Option<usize> {
+        let at = |k: usize| (tree.branch[k].0, tree.branch[k].1);
+        let to_loc = at(to);
+        let mut bnet: Option<usize> = None;
+        if let Some(list) = sink_map.get(&to_loc) {
+            if visited.insert(to_loc) {
+                for &sink in list {
+                    bnet = Some(match bnet {
+                        Some(b) => self.new_junction(to_loc, b, sink),
+                        None => sink,
+                    });
+                }
+            }
+        }
+        for &k in &adj[to] {
+            if Some(k) != from {
+                if let Some(b1) = self.stitch_tree2(tree, Some(to), k, adj, visited, sink_map) {
+                    bnet = Some(match bnet {
+                        Some(b) => self.new_junction(at(to), b, b1),
+                        None => b1,
+                    });
+                }
+            }
+        }
+        match (bnet, from) {
+            (Some(b), Some(f)) if at(to) != at(f) => Some(self.new_wire(at(f), b, crate::buffered_net::NULL_LAYER)),
+            _ => bnet,
+        }
+    }
+
+    /// `fullyRebuffer`'s passes on one driver's imported tree (`self.probe.root`, its loads'
+    /// slacks annotated): timing annotated; the tree's slack error against the timer's
+    /// (`sta_slack`); buffers stripped and the tree re-steinered; three timing passes (topology
+    /// rewrite allowed; RSZ-2005 when none fits); the area target — a quarter of the projected
+    /// slack less the model's optimism, plus 1% of the critical delay — and five area passes.
+    /// `Ok(None)` when no timing solution was found; `Err` where the reference stops (RSZ-2004).
+    pub fn fully_rebuffer_tree(&mut self, sta_slack: f32, steiner: SteinerOverPoints<'_>) -> Result<Option<(usize, usize)>, String> {
+        let original = self.probe.root;
+        self.annotate_timing(original);
+        let slack = self.slack_at_driver_pin(original).to_secs();
+        let error = slack - sta_slack;
+        let stripped = self.strip_tree_buffers(original);
+        let Some(unbuffered) = self.resteiner(stripped, steiner) else { return Err("resteiner: no Steiner tree".into()) };
+        let mut timing = Some(unbuffered);
+        for i in 0..3 {
+            timing = self.buffer_for_timing(timing.expect("a tree"), true);
+            if timing.is_none() {
+                let line = format!("[WARNING RSZ-2005] cannot find a viable buffering solution on pin {} after {} rounds of buffering (no solution meets design rules)", self.pin, i + 1);
+                self.warn(line);
+                break;
+            }
+        }
+        let Some(t) = timing else { return Ok(None) };
+        let (gate_delay, _, _) = self.drvr_pin_timing(t);
+        let mut target = -FixedDelay::inf();
+        if self.nodes[t].slack_rf.is_some() {
+            let relaxation = std_max(0.0, self.slack_at_driver_pin(t).to_secs() - std_min(error, 0.0)) / 4.0 + (std_max(gate_delay, 0.0) + self.critical_path_delay(t).to_secs()) * RELAXATION_FACTOR;
+            target = self.slack_at_driver_pin(t) - FixedDelay::from_secs(relaxation);
+        }
+        let mut area = Some(t);
+        for i in 0..5 {
+            let Some(a) = area else { break };
+            area = self.recover_area(a, target, (1 + i) as f32 / 5.0);
+        }
+        if let Some(e) = &self.failed {
+            return Err(e.clone());
+        }
+        match area {
+            Some(a) => Ok(Some((a, unbuffered))),
+            None => Err("RSZ-2004: failed area recovery".into()),
+        }
     }
 
     /// The export order (`exportBufferTree`): each buffer, bottom-up, with the loads it drives —

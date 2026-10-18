@@ -44,7 +44,7 @@ pub struct PowerOutcome {
 /// `Resizer::recoverPower` after `resizePreamble`: `RecoverPower::recoverPower(percent, verbose)`.
 pub fn recover_power(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, pa: &PowerArgs) -> Result<PowerOutcome, Stop> {
     // Every scene timed (`Sta::slack`, `worstSlack`, `vertexWorstSlackPath` read them all).
-    let mut timer = Timer::new(design, ctx.libs.scene_count())?;
+    let mut timer = Timer::new(design, ctx.libs.scene_count(), None)?;
     let edits = design.take_timer_edits();
     let timing = snapshot(ctx, design.as_design(), &[], &mut timer, edits)?;
     // `init`: `initial_design_area_`; `Resizer::init` (the preamble) set `design_area_` too.

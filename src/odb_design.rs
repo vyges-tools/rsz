@@ -851,6 +851,18 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
 }
 
 impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
+    fn steiner_points(&self, root: (i32, i32), sinks: &[(i32, i32)]) -> Option<vyges_rsz::buffered_net::Tree> {
+        vyges_rsz::env::steiner_over_points(root, sinks, self.alpha)
+    }
+
+    fn net_is_plain_signal(&self, net: &str) -> bool {
+        self.db.net_get_sig_type(net) == "SIGNAL" && !self.db.net_is_special(net)
+    }
+
+    fn net_is_special(&self, net: &str) -> bool {
+        self.db.net_is_special(net)
+    }
+
     fn global_routed(&self) -> bool {
         self.gr.is_some()
     }

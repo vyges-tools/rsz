@@ -57,6 +57,10 @@ pub struct Args {
     pub skip_crit_vt_swap: bool,
     pub match_cell_footprint: bool,
     pub allow_setup_violations: bool,
+    /// The timer's levels as an earlier call left them (a session the caller carries across
+    /// calls, as the reference's one timer does): the levels its incremental relevelization had
+    /// reached, which a fresh levelization need not give. `None`: levelize from scratch.
+    pub sta_levels: Option<std::collections::BTreeMap<String, i32>>,
 }
 
 /// `MoveType`, by the name `moveName` prints.
@@ -157,6 +161,7 @@ impl Args {
             skip_crit_vt_swap: false,
             match_cell_footprint: false,
             allow_setup_violations: false,
+            sta_levels: None,
         };
         let mut i = 0;
         while i < args.len() {

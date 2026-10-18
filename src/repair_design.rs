@@ -32,6 +32,9 @@ pub struct Args {
     pub cap_margin: f64,
     /// `-pre_placement` (or the deprecated `-buffer_gain`): the early sizing round.
     pub pre_placement: bool,
+    /// `Resizer::findResizeSlacks`' call (global placement's timing-driven mode): the max wire
+    /// length is `resizeSlackPreamble`'s `findMaxWireLength1()` and no Tcl-level check runs.
+    pub resize_slack: bool,
 }
 
 /// What the repair reads besides the arguments and the design it edits.
@@ -81,6 +84,9 @@ pub struct Outcome {
     pub warnings: Vec<(&'static str, String)>,
     /// `check_max_wire_length`'s per-buffer lengths: (scene, buffer, meters), in computed order.
     pub max_wire_lengths: Vec<(usize, String, f64)>,
+    /// The levelized drivers the repair walked (`driver_vertices.size()`: the progress table's
+    /// "Remaining" at row 0).
+    pub drivers: usize,
 }
 
 impl Outcome {
@@ -137,9 +143,18 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
     // check_max_wire_length (the command's Tcl, before repair_design_cmd): the same buffer list and
     // target slews (findMaxWireLength runs findBuffers and findTargetLoads too).
     let mwl = crate::max_wire_length::Ctx { libs: inputs.libs, buffers: &buffers.cells, tgt_slews, wire_rc: &inputs.wire_rc, master_pins: &inputs.master_pins };
-    let check = crate::max_wire_length::check_max_wire_length(&mwl, args.max_wire_length)?;
-    let warnings: Vec<(&'static str, String)> = check.warning.into_iter().collect();
-    let max_wire_lengths = check.lengths;
+    let (max_wire_length, warnings, max_wire_lengths) = if args.resize_slack {
+        // `findMaxWireLength1()` (errors when no scene has a wire resistance: RSZ-0089)
+        let mut lengths = Vec::new();
+        let l = crate::max_wire_length::find_max_wire_length(&mwl, &mut lengths)?;
+        if l == f64::NEG_INFINITY {
+            return Err(Stop::error("RSZ-0089", "Could not find a resistance value for any corner. Cannot evaluate max wire length for buffer. Check over your `set_wire_rc` configuration".into()));
+        }
+        (l, Vec::new(), lengths)
+    } else {
+        let check = crate::max_wire_length::check_max_wire_length(&mwl, args.max_wire_length)?;
+        (args.max_wire_length, check.warning.into_iter().collect::<Vec<(&'static str, String)>>(), check.lengths)
+    };
     let slew_shape_factor = preamble::compute_slew_shape_factor(lib)?;
 
     // RepairDesign::repairDesign
@@ -222,7 +237,7 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
         annotated: &annotated,
         drvr_with_load_slew_viol: &drvr_with_load_slew_viol,
         min_cap_load: timing::min_cap_load(&inputs.libs.libs),
-        max_length: meters_to_dbu(args.max_wire_length, inputs.dbu),
+        max_length: meters_to_dbu(max_wire_length, inputs.dbu),
         sizing: &sizing,
         slew_shape_factor,
         r_strongest_buffer: r_strongest,
@@ -232,7 +247,7 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
         timer,
     };
     trace.ran(&["drv"]);
-    let mut outcome = Outcome { warnings, max_wire_lengths, ..Default::default() };
+    let mut outcome = Outcome { warnings, max_wire_lengths, drivers: drivers.len(), ..Default::default() };
     // 🔑 **The graphs are HELD across drivers and rebuilt only after an edit.** `repairNet` times
     // its driver with `findDelays(drvr)` — that one driver, from the slews the graph holds — so
     // rebuilding the whole graph and re-timing every vertex for each driver is the same answer at
@@ -317,7 +332,7 @@ pub fn repair_clk_nets(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers
     let slew_shape_factor = preamble::compute_slew_shape_factor(lib)?;
     // RepairDesign::repairClkNets: init over buffer_cells_ = clk_buffers_.
     let r_strongest = r_strongest_buffer(inputs, clk_buffers);
-    let args = Args { max_wire_length, slew_margin: 0.0, cap_margin: 0.0, pre_placement: false };
+    let args = Args { max_wire_length, slew_margin: 0.0, cap_margin: 0.0, pre_placement: false, resize_slack: false };
     let lifted = crate::sizing::SizingLimits { area: None, leakage: None, ..inputs.sizing_limits };
     let sizing = Sizing { libs: inputs.libs, masters: inputs.masters, dont_use: inputs.dont_use, equiv: &equiv, target_loads: &target_loads, tgt_slews, tgt_scene, limits: lifted };
     let annotated: Vec<HashMap<String, f32>> = vec![HashMap::new(); inputs.libs.scene_count()];

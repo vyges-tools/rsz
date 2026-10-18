@@ -363,10 +363,14 @@ struct Timer {
 }
 
 impl Timer {
-    fn new(design: &mut dyn SetupDesign, scenes: usize) -> Result<Timer, Stop> {
+    fn new(design: &mut dyn SetupDesign, scenes: usize, levels: Option<&BTreeMap<String, i32>>) -> Result<Timer, Stop> {
         design.start_timer_edits().map_err(timer_stop)?;
         let mut inc = IncTimer::default();
         inc.track_netlist(design.netlist());
+        // a carried session: its levels stand until an edit relevelizes them
+        if let Some(l) = levels {
+            inc.levels = l.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        }
         Ok(Timer { inc: vec![inc; scenes], trace_at: 0, driver_arrivals: false })
     }
 }
@@ -478,6 +482,46 @@ fn slack_over_scenes(gs: &[Graph<'_>], ss: &[Search<'_, '_>], v: usize, mm: usiz
 /// arrivals and requireds in full — the reference's `findRequireds`), every scene on its own
 /// libraries and parasitics; `read` run over the scenes' graphs, searches and clock pins.
 fn timed_all<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits: TimerEdits, read: impl FnOnce(&[Graph<'_>], &[Search<'_, '_>], &[BTreeSet<usize>]) -> Result<R, Stop>) -> Result<R, Stop> {
+    timed_levels(ctx, design, timer, edits, &Levels::ALL, read)
+}
+
+/// How far one timer pass goes (`findDelays(level)`, `findArrivals(level)`, `findRequireds(level)`):
+/// every level, none, the deepest level of some pins, or down to one pin's level.
+#[derive(Debug, Clone)]
+enum Upto {
+    All,
+    Skip,
+    MaxOfPins(Vec<String>),
+    DownToPin(String),
+}
+
+/// The three passes of one timer update and how far each goes.
+#[derive(Debug, Clone)]
+struct Levels {
+    delays: Upto,
+    arrivals: Upto,
+    requireds: Upto,
+}
+
+impl Levels {
+    const ALL: Levels = Levels { delays: Upto::All, arrivals: Upto::All, requireds: Upto::All };
+}
+
+/// A pass's level limit on the timer's levels: `None` for every level, `Some(None)` for no pass.
+fn upto_level(u: &Upto, levels: &HashMap<String, i32>) -> Option<Option<i32>> {
+    let level = |p: &String| levels.get(p).copied().unwrap_or(0);
+    match u {
+        Upto::All => Some(None),
+        Upto::Skip => None,
+        Upto::MaxOfPins(pins) => Some(Some(pins.iter().map(level).max().unwrap_or(0))),
+        Upto::DownToPin(p) => Some(Some(level(p))),
+    }
+}
+
+/// [`timed_all`] with each pass limited as `lv` says — what the reference times between
+/// rebufferings: the delays and arrivals up to the deepest load of the tree it rewrote, the
+/// requireds down to the next driver; a value past a limit stays as the last pass left it.
+fn timed_levels<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits: TimerEdits, lv: &Levels, read: impl FnOnce(&[Graph<'_>], &[Search<'_, '_>], &[BTreeSet<usize>]) -> Result<R, Stop>) -> Result<R, Stop> {
     let netlist = design.netlist();
     let mut graphs = Vec::with_capacity(timer.inc.len());
     let mut all_clocks = Vec::with_capacity(timer.inc.len());
@@ -496,7 +540,13 @@ fn timed_all<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits: Ti
     }
     // `findDelays()`: one queue over every scene (the reference's one graph).
     let pars: Vec<&HashMap<String, vyges_sta::graph::NetParasitics>> = (0..graphs.len()).map(|k| design.parasitics(k)).collect();
-    vyges_sta::incr::find_delays_scenes(&mut timer.inc, &mut graphs, &pars, None).map_err(timer_stop)?;
+    // `ensureLevelized`: the levels the limits are read on
+    for (inc, gk) in timer.inc.iter_mut().zip(&graphs) {
+        inc.relevelize(gk).map_err(timer_stop)?;
+    }
+    if let Some(to) = upto_level(&lv.delays, &timer.inc[0].levels) {
+        vyges_sta::incr::find_delays_scenes(&mut timer.inc, &mut graphs, &pars, to).map_err(timer_stop)?;
+    }
     for (inc, gk) in timer.inc.iter_mut().zip(&graphs) {
         inc.export(gk);
     }
@@ -518,8 +568,12 @@ fn timed_all<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits: Ti
     }
     // One queue over every scene for arrivals, then for requireds (a vertex's tag group holds
     // every scene's paths).
-    vyges_sta::incr::find_arrivals_scenes(&mut timer.inc, &mut searches, None).map_err(timer_stop)?;
-    vyges_sta::incr::find_requireds_scenes(&mut timer.inc, &mut searches, None).map_err(timer_stop)?;
+    if let Some(to) = upto_level(&lv.arrivals, &timer.inc[0].levels) {
+        vyges_sta::incr::find_arrivals_scenes(&mut timer.inc, &mut searches, to).map_err(timer_stop)?;
+    }
+    if let Some(to) = upto_level(&lv.requireds, &timer.inc[0].levels) {
+        vyges_sta::incr::find_requireds_scenes(&mut timer.inc, &mut searches, to).map_err(timer_stop)?;
+    }
     inc_trace(&timer.inc[0], timer.trace_at);
     let search = &searches[0];
     // A diagnostic: every instance pin's max slack per transition after this update, in fs
@@ -855,6 +909,510 @@ fn probe_rebuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[
         pin: vx.name.clone(),
         warnings,
     }))
+}
+
+/// One driver's imported tree for `fullyRebuffer`, or why there is none.
+enum FullProbe {
+    /// No vertex for the pin.
+    Skip,
+    /// `importBufferTree` found no tree; the reference's error when the driver has fanout
+    /// (RSZ-2001), else nothing.
+    NoTree { fanout: bool, fanout_limit: f32, drvr_pin_max_slew: f32 },
+    /// The tree with its loads annotated, the timer's slack at the driver (`sta_slack`).
+    Ready(Box<rebuffer::Probe>, f32),
+}
+
+/// `Rebuffer::importBufferTree`: the driver's buffered net, each load that is the input of a
+/// removable logic buffer (not a port buffer, `canRemoveBuffer(inst, true)`) replaced by that
+/// buffer and the tree imported behind it. Nodes appended to `nodes`; the root's index.
+#[allow(clippy::too_many_arguments)]
+fn import_buffer_tree(ctx: &Ctx<'_>, g: &Graph<'_>, index: &HashMap<(&str, bool), usize>, design: &dyn Design, removable: &dyn Fn(&str, &str, &str) -> bool, drvr: usize, nodes: &mut Vec<rebuffer::Node>, failed: &mut Option<String>) -> Option<usize> {
+    let vx = &g.vertices[drvr];
+    let net = g.vertex_net[drvr]?;
+    let net_name = &g.netlist.nets[net].name;
+    let bctx = crate::buffered_net::Ctx { graph: g, libs: ctx.libs, sdc: ctx.env, limits: ctx.limits, dbu: ctx.dbu, rc: ctx.wire_rc };
+    let (bn, root) = design.net_shape(net_name, &vx.name).and_then(|shape| crate::buffered_net::make_buffered_net(&bctx, &shape).ok().flatten())?;
+    let base = nodes.len();
+    for n in &bn.nodes {
+        let kind = match n.kind {
+            crate::buffered_net::Kind::Load { pin } => rebuffer::Kind::Load { pin: g.vertices[pin].name.clone() },
+            crate::buffered_net::Kind::Junction { r, r2 } => rebuffer::Kind::Junction { r: r + base, r2: r2 + base },
+            crate::buffered_net::Kind::Wire { r } => rebuffer::Kind::Wire { r: r + base },
+            crate::buffered_net::Kind::Via { r, ref_layer } => rebuffer::Kind::Via { r: r + base, ref_layer },
+        };
+        nodes.push(rebuffer::Node { kind, x: n.x, y: n.y, layer: n.layer, cap: n.cap, fanout: n.fanout, max_load_slew: n.max_load_slew, area: 0.0, slack_rf: None, slack: rebuffer::FixedDelay::ZERO, delay: rebuffer::FixedDelay::ZERO, arrival: rebuffer::FixedDelay::ZERO });
+    }
+    for k in base..base + bn.nodes.len() {
+        let rebuffer::Kind::Load { pin } = nodes[k].kind.clone() else { continue };
+        let Some(&v) = index.get(&(pin.as_str(), false)) else { continue };
+        let lv = &g.vertices[v];
+        let (Some(cell_name), Some(port)) = (lv.cell.as_deref(), lv.port.as_deref()) else { continue };
+        // `!cell->isBuffer()`: an inverter has buffer ports too, and stays a load
+        let Some(cell) = ctx.libs.link_cell(cell_name).filter(|c| c.is_buffer()) else { continue };
+        let Some((in_port, out_port)) = cell.buffer_ports() else { continue };
+        if in_port.name != port {
+            continue;
+        }
+        let Some((inst, _)) = pin.rsplit_once('/') else { continue };
+        if !ctx.sizing.masters.get(cell_name).is_some_and(|m| m.logic_std) || is_port_buffer(g, inst) || !removable(inst, &in_port.name, &out_port.name) {
+            continue;
+        }
+        let out_pin = format!("{inst}/{}", out_port.name);
+        let Some(&bd) = index.get(&(out_pin.as_str(), true)) else { continue };
+        match import_buffer_tree(ctx, g, index, design, removable, bd, nodes, failed) {
+            Some(inner) => {
+                let nd = &mut nodes[k];
+                nd.kind = rebuffer::Kind::Buffer { cell: cell_name.to_string(), r: inner };
+            }
+            None => {
+                let fanout = g.out_edges[bd].iter().any(|&e| matches!(g.edges[e].kind, EdgeKind::Wire));
+                if fanout && failed.is_none() {
+                    *failed = Some(format!("failed bnet construction for {pin}"));
+                }
+            }
+        }
+    }
+    Some(root + base)
+}
+
+/// The imported tree's areas, bottom-up as the constructors make them: a buffer its cell's area
+/// over its subtree's, a wire or via its subtree's, a junction the sum.
+fn import_areas(ctx: &Ctx<'_>, nodes: &mut [rebuffer::Node], n: usize) -> f32 {
+    let a = match nodes[n].kind.clone() {
+        rebuffer::Kind::Load { .. } => 0.0,
+        rebuffer::Kind::Buffer { cell, r } => import_areas(ctx, nodes, r) + ctx.libs.link_cell(&cell).map_or(0.0, |c| c.area),
+        rebuffer::Kind::Wire { r } | rebuffer::Kind::Via { r, .. } => import_areas(ctx, nodes, r),
+        rebuffer::Kind::Junction { r, r2 } => import_areas(ctx, nodes, r) + import_areas(ctx, nodes, r2),
+    };
+    nodes[n].area = a;
+    a
+}
+
+/// `isPortBuffer`: a buffer with a terminal on a net that has exactly one instance pin and a port.
+fn is_port_buffer(g: &Graph<'_>, inst: &str) -> bool {
+    let prefix = format!("{inst}/");
+    g.netlist.nets.iter().any(|n| {
+        let on = n.pins.iter().any(|c| g.netlist.pin_name(c).starts_with(&prefix) && matches!(c, vyges_sta::netlist::Conn::Inst(..)));
+        let insts = n.pins.iter().filter(|c| matches!(c, vyges_sta::netlist::Conn::Inst(..))).count();
+        let ports = n.pins.iter().any(|c| matches!(c, vyges_sta::netlist::Conn::Port(_)));
+        on && insts == 1 && ports
+    })
+}
+
+/// `annotateLoadSlacks` over an imported tree's loads (below its buffers too), each walked back
+/// to the root driver.
+#[allow(clippy::too_many_arguments)]
+fn annotate_import_slacks(gs: &[Graph<'_>], ss: &[Search<'_, '_>], nodes: &mut [rebuffer::Node], n: usize, drvr: &str, arrival_paths: &mut [Option<(usize, vyges_sta::search::Path)>; 2], warnings: &mut Vec<String>) {
+    match nodes[n].kind.clone() {
+        rebuffer::Kind::Wire { r } | rebuffer::Kind::Via { r, .. } | rebuffer::Kind::Buffer { r, .. } => annotate_import_slacks(gs, ss, nodes, r, drvr, arrival_paths, warnings),
+        rebuffer::Kind::Junction { r, r2 } => {
+            annotate_import_slacks(gs, ss, nodes, r, drvr, arrival_paths, warnings);
+            annotate_import_slacks(gs, ss, nodes, r2, drvr, arrival_paths, warnings);
+        }
+        rebuffer::Kind::Load { pin } => {
+            let mut req: Option<(usize, usize, vyges_sta::search::Path)> = None;
+            let mut min_slack = INF;
+            for (k, (g, search)) in gs.iter().zip(ss).enumerate() {
+                let Some(v) = g.vertices.iter().position(|x| x.name == pin && !x.is_driver) else { continue };
+                for p in search.paths[v].iter().filter(|p| p.tag.mm == MAX) {
+                    let s = p.required - p.arrival;
+                    if fuzzy::less(s, min_slack) {
+                        min_slack = s;
+                        req = Some((k, v, *p));
+                    }
+                }
+            }
+            let mut arrival = req.map(|(_, _, p)| p);
+            if let Some((k, v, _)) = req {
+                let (g, search) = (&gs[k], &ss[k]);
+                let mut at = v;
+                while let Some(a) = arrival {
+                    if g.vertices[at].name == drvr && g.vertices[at].is_driver {
+                        break;
+                    }
+                    arrival = a.prev.and_then(|pv| {
+                        at = pv.vertex;
+                        search.paths[pv.vertex].iter().find(|q| q.tag == pv.tag).copied()
+                    });
+                    if arrival.is_none() {
+                        warnings.push(format!("[WARNING RSZ-2006] failed to trace timing path for load {pin} when buffering {drvr}"));
+                    }
+                }
+            }
+            match (req, arrival) {
+                (Some((k, _, r)), Some(a)) => {
+                    nodes[n].slack_rf = Some(rebuffer::Rfs::of(r.tag.rf));
+                    nodes[n].slack = rebuffer::FixedDelay::from_secs(r.required - a.arrival);
+                    if arrival_paths[r.tag.rf].is_none() {
+                        arrival_paths[r.tag.rf] = Some((k, a));
+                    }
+                }
+                _ => {
+                    nodes[n].slack_rf = None;
+                    nodes[n].slack = rebuffer::FixedDelay::inf();
+                }
+            }
+        }
+    }
+}
+
+/// `fullyRebuffer`'s per-driver read of the timer: `setPin`'s limits, `importBufferTree`,
+/// `annotateLoadSlacks` (the original tree), the driver arcs, and the timer's own slack at the
+/// driver (`vertexWorstSlackPath(drvr, max)`: required less arrival, INF without one).
+#[allow(clippy::too_many_arguments)]
+fn full_probe(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet<usize>], design: &dyn Design, removable: &dyn Fn(&str, &str, &str) -> bool, drvr_name: &str) -> FullProbe {
+    let g = &gs[0];
+    let ideal: BTreeSet<usize> = if ctx.ideal_clock { cs[0].clone() } else { BTreeSet::new() };
+    let index: HashMap<(&str, bool), usize> = g.vertices.iter().enumerate().map(|(i, v)| ((v.name.as_str(), v.is_driver), i)).collect();
+    let Some(&drvr) = index.get(&(drvr_name, true)) else { return FullProbe::Skip };
+    let vx = &g.vertices[drvr];
+    let (Some(cell_name), Some(port)) = (vx.cell.as_deref(), vx.port.as_deref()) else { return FullProbe::Skip };
+    let Some(cell) = vx.lib.and_then(|l| g.libs[l].cells.get(cell_name)) else { return FullProbe::Skip };
+    let link = ctx.libs.link_cell(cell_name).unwrap_or(cell);
+    let (_, max_fanout, _) = crate::timing::check_fanout(g, design.net_info(), drvr, ctx.limits, &ideal);
+    let fanout_limit = if max_fanout > 0.0 { max_fanout } else { INF };
+    let lib = ctx.libs.scene_library(0, cell_name).unwrap_or(&g.libs[vx.lib.expect("an instance pin")]);
+    let p = ctx.libs.scene_cell(0, cell_name).unwrap_or(link).port(port);
+    let (max_slew, exists) = crate::timing::find_slew_limit(lib, p.map_or(vyges_sta::liberty::Direction::Output, |p| p.direction), p.and_then(|p| p.max_transition), ctx.limits);
+    let drvr_pin_max_slew = if exists { (f64::from(max_slew) * (1.0 - 20.0 / 100.0)) as f32 } else { INF };
+    let mut nodes = Vec::new();
+    let mut failed = None;
+    let Some(root) = import_buffer_tree(ctx, g, &index, design, removable, drvr, &mut nodes, &mut failed) else {
+        let fanout = g.out_edges[drvr].iter().any(|&e| matches!(g.edges[e].kind, EdgeKind::Wire));
+        return FullProbe::NoTree { fanout, fanout_limit, drvr_pin_max_slew };
+    };
+    if failed.is_some() {
+        return FullProbe::NoTree { fanout: true, fanout_limit, drvr_pin_max_slew };
+    }
+    import_areas(ctx, &mut nodes, root);
+    let mut arrival_paths: [Option<(usize, vyges_sta::search::Path)>; 2] = [None, None];
+    let mut warnings = Vec::new();
+    annotate_import_slacks(gs, ss, &mut nodes, root, &vx.name, &mut arrival_paths, &mut warnings);
+    let mut arcs: [Option<Option<rebuffer::DriverArc>>; 2] = [None, None];
+    let mut arc_scenes = [0usize; 2];
+    for rf in 0..2 {
+        let Some((k, ap)) = arrival_paths[rf] else { continue };
+        arc_scenes[rf] = k;
+        let (gk, sk) = (&gs[k], &ss[k]);
+        arcs[rf] = Some(ap.prev.and_then(|prev| {
+            let dp = sk.paths[prev.vertex].iter().find(|q| q.tag == prev.tag)?;
+            let set = edge_arc_set(gk, prev.edge)?;
+            let arc = &set.arcs[prev.arc];
+            let ideal_clk = set.role == Role::RegClkToQ && gk.ideal_clock.contains(&prev.vertex);
+            let from_slew = if ideal_clk { 0.0 } else { gk.slew[prev.vertex][arc.from_rf][MAX] };
+            let prev_arrival = match dp.tag.clk_edge.and_then(|e| ctx.ssdc.clocks.get(e / 2).map(|c| (e, c))) {
+                Some((e, c)) if dp.tag.is_clock && !c.propagated => c.edge_time(e % 2),
+                _ => dp.arrival,
+            };
+            Some(rebuffer::DriverArc { model: arc.model.clone(), from_slew, prev_arrival, arrival: ap.arrival })
+        }));
+    }
+    // the timer's slack at the driver: its worst max path over every scene
+    let mut sta_slack = INF;
+    for (gk, sk) in gs.iter().zip(ss) {
+        let Some(u) = gk.vertices.iter().position(|x| x.name == vx.name && x.is_driver) else { continue };
+        for q in sk.paths[u].iter().filter(|q| q.tag.mm == MAX) {
+            let x = q.required - q.arrival;
+            if fuzzy::less(x, sta_slack) {
+                sta_slack = x;
+            }
+        }
+    }
+    FullProbe::Ready(
+        Box::new(rebuffer::Probe { nodes, root, arcs, arc_scenes, drvr_port_cap: port_capacitance(link, port).unwrap_or(0.0), drvr_resistance: link.drive_resistance(port), fanout_limit, drvr_pin_max_slew, pin: vx.name.clone(), warnings }),
+        sta_slack,
+    )
+}
+
+/// `Resizer::fullyRebuffer` (`rsz::fully_rebuffer`, and global placement's timing-driven
+/// iterations after repair_design): every eligible driver, outputs first — or one pin — its net
+/// re-buffered from scratch (the buffers it had stripped, the tree re-steinered, the timing and
+/// area passes), the new tree exported as `place` instances and the old buffers removed; the
+/// progress table.
+pub fn fully_rebuffer(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args, user_pin: Option<&str>) -> Result<Outcome, Stop> {
+    let mut r = Repair::new(ctx, design, args)?;
+    r.fully_rebuffer(user_pin)?;
+    r.out.levels = r.timer.inc[0].levels.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    Ok(r.out)
+}
+
+/// Each net's slack, and the timer's levels the call left (see [`Args::sta_levels`]).
+pub type SlacksAndLevels = (BTreeMap<String, f32>, BTreeMap<String, i32>);
+
+/// `Resizer::findResizeSlacks1`: per levelized driver, from the last, its net's slack at the
+/// driver (`Sta::slack(drvr, max)`: the fuzzily least over every scene's max paths, INF without
+/// one) — not a constant pin, a special net or a clock pin. By net; a later (lower) driver of a
+/// net overwrites.
+pub fn resize_slacks(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) -> Result<SlacksAndLevels, Stop> {
+    let mut r = Repair::new(ctx, design, args)?;
+    let slacks = resize_slacks_on(&mut r)?;
+    Ok((slacks, r.timer.inc[0].levels.iter().map(|(k, v)| (k.clone(), *v)).collect()))
+}
+
+/// [`fully_rebuffer`], then [`resize_slacks`] on the SAME timer — `Resizer::findResizeSlacks`:
+/// `findResizeSlacks1` reads `Sta::slack` on the timer the rebuffering left (its incremental
+/// state, not a fresh timing: the two can differ in the last bit).
+pub fn fully_rebuffer_with_slacks(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args, user_pin: Option<&str>) -> Result<(Outcome, BTreeMap<String, f32>), Stop> {
+    let mut r = Repair::new(ctx, design, args)?;
+    r.fully_rebuffer(user_pin)?;
+    let slacks = resize_slacks_on(&mut r)?;
+    r.out.levels = r.timer.inc[0].levels.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    Ok((r.out, slacks))
+}
+
+/// `findResizeSlacks1` on the repair's timer: each `Sta::slack(drvr)` brings the delays and the
+/// arrivals up to date and the requireds down to the driver; from the last driver down, that is
+/// one whole update.
+fn resize_slacks_on(r: &mut Repair<'_, '_>) -> Result<BTreeMap<String, f32>, Stop> {
+    let ctx = r.ctx;
+    let special: BTreeSet<String> = r.design.as_design().netlist().nets.iter().map(|n| n.name.clone()).filter(|n| r.design.net_is_special(n)).collect();
+    let edits = r.design.take_timer_edits();
+    timed_all(ctx, r.design.as_design(), &mut r.timer, edits, |_, _, _| Ok(()))?;
+    let levels = r.timer.inc[0].levels.clone();
+    let slacks = timed_all(ctx, r.design.as_design(), &mut r.timer, TimerEdits::default(), |gs, ss, cs| {
+        let g = &gs[0];
+        // `levelizedDrvrVertices`: on the timer's (incremental) levels
+        let level: Vec<i32> = g.vertices.iter().map(|v| levels.get(&v.name).copied().unwrap_or(0)).collect();
+        let drvrs = crate::timing::levelized_drvr_vertices(g, &level);
+        let mut out = BTreeMap::new();
+        for &d in drvrs.iter().rev() {
+            let vx = &g.vertices[d];
+            let Some(net) = g.vertex_net[d].map(|k| g.netlist.nets[k].name.clone()) else { continue };
+            if ctx.env.constants.contains_key(&vx.name) || special.contains(&net) || cs[0].contains(&d) {
+                continue;
+            }
+            let mut slack = INF;
+            for (gk, sk) in gs.iter().zip(ss) {
+                let Some(u) = gk.vertices.iter().position(|x| x.name == vx.name && x.is_driver) else { continue };
+                for q in sk.paths[u].iter().filter(|q| q.tag.mm == MAX) {
+                    let x = q.required - q.arrival;
+                    if fuzzy::less(x, slack) {
+                        slack = x;
+                    }
+                }
+            }
+            out.insert(net, slack);
+        }
+        Ok(out)
+    })?;
+    Ok(slacks)
+}
+
+/// fmt's `{}` for a float: the shortest form, an exponent from 1e16 or below 1e-4.
+fn fmt_float(v: f32) -> String {
+    let a = v.abs();
+    if v != 0.0 && !(1e-4..1e16).contains(&a) {
+        let s = format!("{v:e}");
+        let (m, e) = s.split_once('e').unwrap_or((&s, "0"));
+        let e: i32 = e.parse().unwrap_or(0);
+        return format!("{m}e{}{:02}", if e < 0 { '-' } else { '+' }, e.abs());
+    }
+    format!("{v}")
+}
+
+impl Repair<'_, '_> {
+    /// `fullyRebuffer`'s driver filter, over the levelized drivers: a flat net that is not
+    /// dont_touch, not connected by abutment, SIGNAL and not special; the pin not a clock pin, a
+    /// clock source, a constant or a tristate driver; an instance with a liberty cell that is not
+    /// a buffer — or not a logic cell, or a port buffer.
+    fn fully_rebuffer_drivers(&mut self) -> Result<Vec<String>, Stop> {
+        let plain: BTreeSet<String> = self.design.as_design().netlist().nets.iter().map(|n| n.name.clone()).filter(|n| self.design.net_is_plain_signal(n)).collect();
+        let info = self.design.net_info().clone();
+        let edits = self.design.take_timer_edits();
+        let ctx = self.ctx;
+        // `levelizedDrvrVertices` after `ensureLevelized`: on the timer's (incremental) levels
+        timed_all(ctx, self.design.as_design(), &mut self.timer, edits, |_, _, _| Ok(()))?;
+        let levels = self.timer.inc[0].levels.clone();
+        timed_all(ctx, self.design.as_design(), &mut self.timer, TimerEdits::default(), |gs, _ss, cs| {
+            let g = &gs[0];
+            let level: Vec<i32> = g.vertices.iter().map(|v| levels.get(&v.name).copied().unwrap_or(0)).collect();
+            let mut out = Vec::new();
+            for d in crate::timing::levelized_drvr_vertices(g, &level) {
+                let vx = &g.vertices[d];
+                let Some(net) = g.vertex_net[d].map(|k| g.netlist.nets[k].name.clone()) else { continue };
+                if info.dont_touch.contains(&net) || info.abutment.contains(&net) || !plain.contains(&net) {
+                    continue;
+                }
+                if cs[0].contains(&d) || ctx.clock_sources.contains(&vx.name) || ctx.env.constants.contains_key(&vx.name) {
+                    continue;
+                }
+                let (Some(cell_name), Some(port)) = (vx.cell.as_deref(), vx.port.as_deref()) else { continue };
+                let Some(cell) = ctx.libs.link_cell(cell_name) else { continue };
+                if cell.port(port).is_some_and(|p| p.is_any_tristate()) {
+                    continue;
+                }
+                let Some((inst, _)) = vx.name.rsplit_once('/') else { continue };
+                let logic = ctx.sizing.masters.get(cell_name).is_some_and(|m| m.logic_std);
+                if !cell.is_buffer() || !logic || is_port_buffer(g, inst) {
+                    out.push(vx.name.clone());
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// `printProgress`: the header at the start, a row every interval (or forced, or at the end
+    /// as `final`), the closing rule at the end.
+    #[allow(clippy::too_many_arguments)]
+    fn fr_progress(&mut self, iteration: i64, force: bool, end: bool, remaining: i64, interval: i64, initial_area: f64, removed: i64, inserted: i64) {
+        if iteration == 0 && !end {
+            self.report("   Iter   |    Area   | Removed | Inserted |   Pins".into());
+            self.report("          |           | Buffers | Buffers  | Remaining".into());
+            self.report("-------------------------------------------------------".into());
+        }
+        if iteration % interval == 0 || force || end {
+            let area = self.design.design_area();
+            let pct = if initial_area.abs() > 0.0 { (area - initial_area) / initial_area * 100.0 } else { f64::INFINITY };
+            let label = if end { "final".to_string() } else { iteration.to_string() };
+            self.report(format!("{label:>9} | {pct:>+8.1}% | {removed:>7} | {inserted:>8} | {remaining:>9}"));
+        }
+        if end {
+            self.report("-------------------------------------------------------".into());
+        }
+    }
+
+    fn fully_rebuffer(&mut self, user_pin: Option<&str>) -> Result<(), Stop> {
+        let rctx = self.ctx.rebuffer.ok_or_else(|| Stop::refused("RSZ-ABSENT", "fully_rebuffer without characterized buffers".into()))?;
+        let mut pins = self.fully_rebuffer_drivers()?;
+        pins.reverse();
+        if let Some(p) = user_pin {
+            pins = vec![p.to_string()];
+        }
+        let initial_area = self.design.design_area();
+        let n = pins.len() as i64;
+        let mut interval = (n / 10).max(1);
+        if interval >= 1000 {
+            interval = interval / 100 * 100;
+        } else if interval >= 100 {
+            interval = interval / 10 * 10;
+        }
+        let (mut removed, mut inserted) = (0i64, 0i64);
+        // `sta_->findRequireds()`: the whole timer, once, before the drivers
+        let edits = self.design.take_timer_edits();
+        timed_all(self.ctx, self.design.as_design(), &mut self.timer, edits, |_, _, _| Ok(()))?;
+        for iter in 0..n {
+            self.fr_progress(iter, false, false, n - iter, interval, initial_area, removed, inserted);
+            let pin = pins[iter as usize].clone();
+            let edits = self.design.take_timer_edits();
+            let ctx = self.ctx;
+            let design = &*self.design;
+            let removable = |i: &str, a: &str, b: &str| design.can_remove_buffer(i, a, b);
+            // `search_->findRequireds(drvr->level())`: the requireds only, down to the driver; its
+            // slacks are read off the paths as they stand (`vertexWorstSlackPath`: no preamble)
+            let head = Levels { delays: Upto::Skip, arrivals: Upto::Skip, requireds: Upto::DownToPin(pin.clone()) };
+            let probe = timed_levels(ctx, design.as_design(), &mut self.timer, edits, &head, |gs, ss, cs| Ok(full_probe(ctx, gs, ss, cs, design.as_design(), &removable, &pin)))?;
+            let (limit, max_slew) = match &probe {
+                FullProbe::Skip => continue,
+                FullProbe::NoTree { fanout_limit, drvr_pin_max_slew, .. } => (*fanout_limit, *drvr_pin_max_slew),
+                FullProbe::Ready(p, _) => (p.fanout_limit, p.drvr_pin_max_slew),
+            };
+            let line = format!("[iter {iter}] buffering pin {pin} max_fanout={} max_slew={}", fmt_float(limit), self.ds(max_slew, 3));
+            self.debug("rebuffer", 1, line);
+            let (probe, sta_slack) = match probe {
+                FullProbe::Skip => continue,
+                FullProbe::NoTree { fanout: true, .. } => return Err(Stop::error("RSZ-2001", format!("failed bnet construction for {pin}"))),
+                FullProbe::NoTree { .. } => continue,
+                FullProbe::Ready(p, s) => (p, s),
+            };
+            for w in &probe.warnings {
+                self.report(w.clone());
+            }
+            let mut rb = rebuffer::Rebuf::new(rctx, &probe);
+            let design = &*self.design;
+            let res = rb.fully_rebuffer_tree(sta_slack, &|root, sinks| design.steiner_points(root, sinks));
+            for (level, line) in std::mem::take(&mut rb.trace) {
+                match level {
+                    Some(l) => self.debug("rebuffer", l, line),
+                    None => self.report(line),
+                }
+            }
+            if let Some(r) = rb.refused.take() {
+                return Err(Stop::refused("RSZ-ORDER", r));
+            }
+            let (area_tree, unbuffered) = match res {
+                Ok(Some(t)) => t,
+                Ok(None) => continue,
+                Err(e) if e.starts_with("RSZ-2004") => {
+                    self.fr_progress(iter, true, false, n - iter - 1, interval, initial_area, removed, inserted);
+                    return Err(Stop::error("RSZ-2004", "failed area recovery".into()));
+                }
+                Err(e) => return Err(Stop::error("RSZ-REBUFFER", e)),
+            };
+            // `collectImportedTreeBufferInstances`: from the driver's net, every buffer whose input
+            // is not a load of the unbuffered tree, and the nets behind it (a stack).
+            let mut tree_loads = BTreeSet::new();
+            let mut stack = vec![unbuffered];
+            while let Some(k) = stack.pop() {
+                match &rb.nodes[k].kind {
+                    rebuffer::Kind::Wire { r } | rebuffer::Kind::Buffer { r, .. } | rebuffer::Kind::Via { r, .. } => stack.push(*r),
+                    rebuffer::Kind::Junction { r, r2 } => {
+                        stack.push(*r);
+                        stack.push(*r2);
+                    }
+                    rebuffer::Kind::Load { pin } => {
+                        tree_loads.insert(pin.clone());
+                    }
+                }
+            }
+            let old = imported_tree_buffers(self.design.as_design().netlist(), &|c| self.ctx.libs.link_cell(c), &pin, &tree_loads);
+            let net = self.design.as_design().netlist().nets.iter().find(|n| n.pins.iter().any(|c| self.design.as_design().netlist().pin_name(c) == pin)).map(|n| n.name.clone()).ok_or_else(|| Stop::error("RSZ-REBUFFER", format!("{pin}: no net")))?;
+            let mut count = 0i64;
+            let mut inputs: HashMap<usize, String> = HashMap::new();
+            let mut loads = Vec::new();
+            let mut net = net;
+            self.export_buffer_tree(&rb, area_tree, &mut net, &mut loads, &mut count, &mut inputs, "place")?;
+            inserted += count;
+            for (inst, ip, op) in &old {
+                self.design.remove_buffer(inst, ip, op).map_err(|e| Stop::error("RSZ-0168", e))?;
+                removed += 1;
+            }
+            // `updateParasitics`, then `findDelays(max_level)` and `findArrivals(max_level)`: up to
+            // the deepest load of the unbuffered tree, the requireds left for the next driver
+            if self.design.route_slacks_wanted() {
+                self.retime(&[])?;
+            } else {
+                self.design.update_parasitics().map_err(timer_stop)?;
+                let edits = self.design.take_timer_edits();
+                self.timer.trace_at = self.out.trace.len();
+                let loads: Vec<String> = tree_loads.iter().cloned().collect();
+                let after = Levels { delays: Upto::MaxOfPins(loads.clone()), arrivals: Upto::MaxOfPins(loads), requireds: Upto::Skip };
+                timed_levels(self.ctx, self.design.as_design(), &mut self.timer, edits, &after, |_, _, _| Ok(()))?;
+            }
+            self.debug("rebuffer", 2, "-------------------------------".into());
+        }
+        self.fr_progress(n, false, true, 0, interval, initial_area, removed, inserted);
+        self.debug("rebuffer", 1, "Time spent".into());
+        self.debug("rebuffer", 1, "----------".into());
+        self.out.inserted = inserted;
+        self.out.removed = removed;
+        Ok(())
+    }
+}
+
+/// `collectImportedTreeBufferInstances`: from the driver's net, every buffer whose input is not a
+/// load of the unbuffered tree, then the nets behind it (a stack); `(instance, input, output)`.
+fn imported_tree_buffers<'a>(nl: &vyges_sta::netlist::Netlist, link: &dyn Fn(&str) -> Option<&'a vyges_sta::liberty::Cell>, drvr_pin: &str, tree_loads: &BTreeSet<String>) -> Vec<(String, String, String)> {
+    let net_of = |pin: &str| nl.nets.iter().find(|n| n.pins.iter().any(|c| nl.pin_name(c) == pin)).map(|n| n.name.clone());
+    let mut insts: Vec<(String, String, String)> = Vec::new();
+    let mut queue: Vec<String> = net_of(drvr_pin).into_iter().collect();
+    while let Some(net) = queue.pop() {
+        let Some(nn) = nl.nets.iter().find(|n| n.name == net) else { continue };
+        for c in &nn.pins {
+            let name = nl.pin_name(c);
+            let vyges_sta::netlist::Conn::Inst(i, _) = c else { continue };
+            // `isBuffer()`: an inverter has buffer ports too, and is not collected
+            let Some(cell) = link(&nl.insts[*i].1).filter(|c| c.is_buffer()) else { continue };
+            let Some((ip, op)) = cell.buffer_ports() else { continue };
+            let Some((inst, port)) = name.rsplit_once('/') else { continue };
+            if port == ip.name && !tree_loads.contains(&name) {
+                insts.push((inst.to_string(), ip.name.clone(), op.name.clone()));
+                if let Some(on) = net_of(&format!("{inst}/{}", op.name)) {
+                    queue.push(on);
+                }
+            }
+        }
+    }
+    insts
 }
 
 /// `collectFanoutSlacks` (CloneMove) / `collectRankedFanoutSlacks` (SplitLoadMove, `split`): at
@@ -1314,6 +1872,8 @@ pub struct Outcome {
     pub removed: i64,
     /// Buffers inserted (BufferMove).
     pub inserted: i64,
+    /// The timer's levels when the call ended (see [`crate::repair_timing::Args::sta_levels`]).
+    pub levels: BTreeMap<String, i32>,
 }
 
 struct Repair<'c, 'd> {
@@ -1449,6 +2009,18 @@ pub trait SetupDesign: Design {
     /// `Resizer::insertBufferBeforeLoads(net, loads, cell, loc, base, "net", ALWAYS, diff_nets)`.
     #[allow(clippy::too_many_arguments)]
     fn insert_buffer_before_loads(&mut self, net: Option<&str>, loads: &[String], cell: &str, loc: (i32, i32), reason: &str, loads_on_diff_nets: bool, uniquify: &str) -> Result<crate::design::Repeater, String>;
+    /// `EstimateParasitics::makeSteinerTree(root, sinks)` (`resteiner`): none by default.
+    fn steiner_points(&self, _root: (i32, i32), _sinks: &[(i32, i32)]) -> Option<crate::buffered_net::Tree> {
+        None
+    }
+    /// The net is SIGNAL and not special (fully_rebuffer's driver filter); every net by default.
+    fn net_is_plain_signal(&self, _net: &str) -> bool {
+        true
+    }
+    /// The net is special (`dbNet::isSpecial`); none by default.
+    fn net_is_special(&self, _net: &str) -> bool {
+        false
+    }
     /// Global-route parasitics are in force (a global router alive over the repair).
     fn global_routed(&self) -> bool {
         false
@@ -1485,7 +2057,7 @@ pub trait SetupDesign: Design {
 /// with no edit before the full pass that follows it).
 pub fn repair_hold(ctx: &Ctx<'_>, hctx: &crate::repair_hold::HoldCtx<'_>, design: &mut dyn SetupDesign, ha: &crate::repair_hold::HoldArgs) -> Result<crate::repair_hold::HoldOutcome, Stop> {
     // Every scene timed (`Sta::slack`, `worstSlack`, `vertexWorstSlackPath` read them all).
-    let timer = Timer::new(design, ctx.libs.scene_count())?;
+    let timer = Timer::new(design, ctx.libs.scene_count(), None)?;
     let initial_area = design.design_area();
     // `setMaxUtilization`: the core area times the fraction; 0 (no limit) without one.
     let max_area = ha.max_utilization.map_or(0.0, |u| design.core_area() * u);
@@ -1958,54 +2530,62 @@ fn resize_to_target_slew(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, r: &crate:
 }
 
 /// `Optimizer::run` for the LEGACY phase: the phase, then the final report.
+impl<'c, 'd> Repair<'c, 'd> {
+    /// `RepairSetupContext` over the design: the timer, the first timing, the area and TNS before
+    /// any move.
+    fn new(ctx: &'c Ctx<'c>, design: &'d mut dyn SetupDesign, args: &'c Args) -> Result<Repair<'c, 'd>, Stop> {
+        let mut timer = Timer::new(design, ctx.libs.scene_count(), args.sta_levels.as_ref())?;
+        let timing = snapshot(ctx, design.as_design(), &[], &mut timer, TimerEdits::default())?;
+        // RepairSetupContext: the area and TNS before any move.
+        let initial_design_area = design.design_area();
+        let initial_tns = timing.tns();
+        Ok(Repair {
+            ctx,
+            args,
+            design,
+            timing,
+            phase: format!("LEGACY{}", PHASE_MARKERS[0]),
+            sequence: ctx.sequence.to_vec(),
+            timer,
+            committer: Committer::default(),
+            out: Outcome::default(),
+            initial_design_area,
+            opto_iteration: 0,
+            initial_tns,
+            prev_tns: initial_tns,
+            num_viols: 0,
+            max_end_count: 0,
+            end_index: 0,
+            fix_rate_threshold: INC_FIX_RATE_THRESHOLD,
+            prev_termination: false,
+            two_cons_terminations: false,
+            min_viol: 0.0,
+            max_viol: 0.0,
+            collector_violating: 0,
+            tracker: None,
+            moves: None,
+            wns_visited: BTreeSet::new(),
+            collector_ends: Vec::new(),
+            collector_starts: Vec::new(),
+            current_endpoint: None,
+            startpoint_rows: false,
+            target_slack: 0.0,
+            reroute_phase: false,
+            legacy_mt: false,
+            // Only a policy alone that has no legacy start (MEASURED_VT_SWAP, MT1) runs without the
+            // legacy preamble.
+            progress_header_show_starts: false,
+            progress_header_printed: false,
+            legacy_start: !matches!(args.phases.as_deref().map(crate::repair_timing::phase_plan), Some(crate::repair_timing::PhasePlan::MeasuredVtSwap | crate::repair_timing::PhasePlan::Mt1 | crate::repair_timing::PhasePlan::GlobalSizing)),
+        })
+    }
+}
+
 pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) -> Result<Outcome, Stop> {
     if args.max_utilization.is_some() {
         return Err(Stop::refused("RSZ-ABSENT", "repair_timing -max_utilization: not modelled".into()));
     }
-    let mut timer = Timer::new(design, ctx.libs.scene_count())?;
-    let timing = snapshot(ctx, design.as_design(), &[], &mut timer, TimerEdits::default())?;
-    // RepairSetupContext: the area and TNS before any move.
-    let initial_design_area = design.design_area();
-    let initial_tns = timing.tns();
-    let mut r = Repair {
-        ctx,
-        args,
-        design,
-        timing,
-        phase: format!("LEGACY{}", PHASE_MARKERS[0]),
-        sequence: ctx.sequence.to_vec(),
-        timer,
-        committer: Committer::default(),
-        out: Outcome::default(),
-        initial_design_area,
-        opto_iteration: 0,
-        initial_tns,
-        prev_tns: initial_tns,
-        num_viols: 0,
-        max_end_count: 0,
-        end_index: 0,
-        fix_rate_threshold: INC_FIX_RATE_THRESHOLD,
-        prev_termination: false,
-        two_cons_terminations: false,
-        min_viol: 0.0,
-        max_viol: 0.0,
-        collector_violating: 0,
-        tracker: None,
-        moves: None,
-        wns_visited: BTreeSet::new(),
-        collector_ends: Vec::new(),
-        collector_starts: Vec::new(),
-        current_endpoint: None,
-        startpoint_rows: false,
-        target_slack: 0.0,
-        reroute_phase: false,
-        legacy_mt: false,
-        // Only a policy alone that has no legacy start (MEASURED_VT_SWAP, MT1) runs without the
-        // legacy preamble.
-        progress_header_show_starts: false,
-        progress_header_printed: false,
-        legacy_start: !matches!(args.phases.as_deref().map(crate::repair_timing::phase_plan), Some(crate::repair_timing::PhasePlan::MeasuredVtSwap | crate::repair_timing::PhasePlan::Mt1 | crate::repair_timing::PhasePlan::GlobalSizing)),
-    };
+    let mut r = Repair::new(ctx, design, args)?;
     // `SetupLegacyBase::start`: with the move tracker on, `captureInitialSlackDistribution` (and
     // `captureOriginalEndpointSlack`, read only by the level-2 profiles) after RSZ-0099.
     // A policy alone with no legacy start captures nothing here (MT1 captures in its own start;
@@ -3988,7 +4568,8 @@ impl Repair<'_, '_> {
         let mut count = 0i64;
         let mut inputs: HashMap<usize, String> = HashMap::new();
         let mut loads = Vec::new();
-        self.export_buffer_tree(&rb, root, &net, &mut loads, &mut count, &mut inputs)?;
+        let mut net = net;
+        self.export_buffer_tree(&rb, root, &mut net, &mut loads, &mut count, &mut inputs, "rebuffer")?;
         self.debug("rebuffer", 2, "-------------------------------".into());
         Ok(count)
     }
@@ -3996,12 +4577,15 @@ impl Repair<'_, '_> {
     /// `exportBufferTree`'s bottom-up insertion: a load (not dont_touch) is a terminal of the
     /// parent; a buffer is inserted before its subtree's loads (on the ORIGINAL driver net, loads
     /// on other nets allowed) and its input becomes the parent's load.
-    fn export_buffer_tree(&mut self, rb: &rebuffer::Rebuf<'_>, n: usize, net: &str, current: &mut Vec<String>, count: &mut i64, inputs: &mut HashMap<usize, String>) -> Result<(), Stop> {
+    #[allow(clippy::too_many_arguments)]
+    /// `net`: the original driver net (the reference's `Net*`), its name as it stands — a buffer
+    /// before a port load names the new net after the port and renames this one.
+    fn export_buffer_tree(&mut self, rb: &rebuffer::Rebuf<'_>, n: usize, net: &mut String, current: &mut Vec<String>, count: &mut i64, inputs: &mut HashMap<usize, String>, base: &str) -> Result<(), Stop> {
         match rb.nodes[n].kind.clone() {
-            rebuffer::Kind::Wire { r } | rebuffer::Kind::Via { r, .. } => self.export_buffer_tree(rb, r, net, current, count, inputs),
+            rebuffer::Kind::Wire { r } | rebuffer::Kind::Via { r, .. } => self.export_buffer_tree(rb, r, net, current, count, inputs, base),
             rebuffer::Kind::Junction { r, r2 } => {
-                self.export_buffer_tree(rb, r, net, current, count, inputs)?;
-                self.export_buffer_tree(rb, r2, net, current, count, inputs)
+                self.export_buffer_tree(rb, r, net, current, count, inputs, base)?;
+                self.export_buffer_tree(rb, r2, net, current, count, inputs, base)
             }
             rebuffer::Kind::Load { pin } => {
                 if self.design.pin_dont_touch(&pin) {
@@ -4013,7 +4597,7 @@ impl Repair<'_, '_> {
             }
             rebuffer::Kind::Buffer { cell, r } => {
                 let mut child = Vec::new();
-                self.export_buffer_tree(rb, r, net, &mut child, count, inputs)?;
+                self.export_buffer_tree(rb, r, net, &mut child, count, inputs, base)?;
                 if child.is_empty() {
                     return Ok(());
                 }
@@ -4022,8 +4606,15 @@ impl Repair<'_, '_> {
                 let info = self.design.net_info().clone();
                 child.sort_by_key(|p| id(p, &info));
                 let at = (rb.nodes[n].x, rb.nodes[n].y);
-                let rep = self.design.insert_buffer_before_loads(Some(net), &child, &cell, at, "rebuffer", true, "ALWAYS").map_err(|e| Stop::error("RSZ-INSERT", e))?;
+                let rep = self.design.insert_buffer_before_loads(Some(net.as_str()), &child, &cell, at, base, true, "ALWAYS").map_err(|e| Stop::error("RSZ-INSERT", e))?;
                 *count += 1;
+                // the buffer's input is on the original net: its name now (renamed for a port load)
+                let nl = self.design.as_design().netlist();
+                if let Some(now) = nl.nets.iter().find(|x| x.pins.iter().any(|c| nl.pin_name(c) == rep.input)) {
+                    if now.name != *net {
+                        *net = now.name.clone();
+                    }
+                }
                 self.debug("rebuffer", 3, format!("insert {} ({cell}) -> {} loads", rep.inst, child.len()));
                 for p in &child {
                     self.debug("rebuffer", 3, format!("  load pin: {p}"));
@@ -4833,6 +5424,31 @@ fn path_improved(end_slack: f32, worst_slack: f32, prev_end_slack: f32, prev_wor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Rule (Rebuffer::collectImportedTreeBufferInstances): a pin is collected when its cell
+    // `isBuffer()` — an inverter has buffer ports and is not one — and its input is not a load of
+    // the unbuffered tree; the walk continues through each collected buffer's output net.
+    #[test]
+    fn imported_tree_buffers_skips_inverters_and_tree_loads() {
+        const LIB: &str = r#"library (t) { time_unit : "1ns"; capacitive_load_unit (1, pf);
+          cell (buf) { pin (A) { direction : input; capacitance : 0.001; } pin (X) { direction : output; function : "A"; } }
+          cell (inv) { pin (A) { direction : input; capacitance : 0.001; } pin (ZN) { direction : output; function : "!A"; } } }"#;
+        let lib = vyges_sta::liberty::Library::read(&vyges_sta::liberty_parse::parse(LIB).unwrap()).unwrap();
+        use vyges_sta::netlist::{Conn, Net, Netlist};
+        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins };
+        let nl = Netlist {
+            insts: vec![("d".into(), "inv".into()), ("b1".into(), "buf".into()), ("i1".into(), "inv".into()), ("b2".into(), "buf".into()), ("b3".into(), "buf".into())],
+            ports: Vec::new(),
+            nets: vec![
+                net("n0", vec![Conn::Inst(0, "ZN".into()), Conn::Inst(1, "A".into()), Conn::Inst(2, "A".into()), Conn::Inst(4, "A".into())]),
+                net("n1", vec![Conn::Inst(1, "X".into()), Conn::Inst(3, "A".into())]),
+            ],
+        };
+        let link = |c: &str| lib.cells.get(c);
+        let loads: BTreeSet<String> = ["b3/A".to_string()].into_iter().collect();
+        let got: Vec<String> = imported_tree_buffers(&nl, &link, "d/ZN", &loads).into_iter().map(|x| x.0).collect();
+        assert_eq!(got, vec!["b1", "b2"]);
+    }
 
     fn stage(pin: &str, is_driver: bool, top_port: bool, load_delay: f32) -> Stage {
         Stage {

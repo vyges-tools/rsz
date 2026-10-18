@@ -23,6 +23,25 @@ pub fn est_stt(x: &[i32], y: &[i32], drvr: usize, alpha: f32) -> vyges_est::plac
     })
 }
 
+/// `EstimateParasitics::makeSteinerTree(drvr_location, sink_locations)`: the sinks sorted by
+/// (x, y), the driver appended last, FLUTE at `alpha`; the driver point the first branch point at
+/// the driver's location. None without a sink.
+pub fn steiner_over_points(root: (i32, i32), sinks: &[(i32, i32)], alpha: f32) -> Option<crate::buffered_net::Tree> {
+    if sinks.is_empty() {
+        return None;
+    }
+    let mut pts = sinks.to_vec();
+    pts.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    let drvr_idx = pts.len();
+    pts.push(root);
+    let x: Vec<i32> = pts.iter().map(|p| p.0).collect();
+    let y: Vec<i32> = pts.iter().map(|p| p.1).collect();
+    let t = est_stt(&x, &y, drvr_idx, alpha);
+    let branch: Vec<(i32, i32, usize)> = t.branch.iter().map(|b| (b.x, b.y, b.n)).collect();
+    let drvr_pt = branch.iter().position(|b| (b.0, b.1) == root);
+    Some(crate::buffered_net::Tree { deg: t.deg, branch, pinlocs: Vec::new(), drvr_pt })
+}
+
 /// Whether the signal wire capacitance is zero or unset (EST-0018): the estimator then makes no
 /// parasitics at all, and every net is timed lumped — as the router's timer does.
 pub fn no_signal_cap(db: &Db, rc: &vyges_est::rc::Rc) -> bool {
