@@ -401,6 +401,8 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
     // `set_routing_alpha` (the Steiner builder's; 0.3 by default): the estimate reads the value
     // in force when it ran, the repair's trees the value in force when repair_design does.
     let mut routing_alpha = 0.3f32;
+    // `set_global_routing_layer_adjustment * F`: the capacity every routing layer keeps back
+    let mut routing_adjustment = 0.0f32;
     let mut estimate_alpha = routing_alpha;
     // The design the estimate saw, when it differs from the one repaired (a job's `db` on the
     // estimate step: the reference keeps an estimate across a later cell MOVE — est has no callback
@@ -602,6 +604,16 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 let level: i64 = level.parse().map_err(|_| format!("set_debug_level {level}: not an integer"))?;
                 debug_levels.insert((tool.clone(), group.clone()), level);
             }
+            // `set_global_routing_layer_adjustment * F`: every routing layer's capacity reduced by
+            // the fraction F, as the router's global adjustment. One layer's own adjustment (a layer
+            // name in place of `*`) is not modelled.
+            "set_global_routing_layer_adjustment" => {
+                let [layers, v] = args.as_slice() else { return Err(format!("set_global_routing_layer_adjustment {}: needs layers and a value", args.join(" "))) };
+                if layers != "*" {
+                    return Err(format!("set_global_routing_layer_adjustment {layers}: one layer's adjustment is not modelled (all layers, `*`, is)"));
+                }
+                routing_adjustment = v.parse::<f32>().map_err(|_| format!("set_global_routing_layer_adjustment {v}: not a number"))?;
+            }
             // `set_routing_layers -signal lo-hi [-clock lo-hi]`: the block's routing layer range.
             "set_routing_layers" => {
                 let mut i = 0;
@@ -645,6 +657,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 let mut opts = vyges_grt::global_route::RouteOptions::new();
                 opts.liberty = Some(liberty.clone());
                 opts.alpha = routing_alpha;
+                opts.adjustment = routing_adjustment;
                 (opts.layer_rc, opts.via_rc) = grt_layer_rc(&db, &rc);
                 if let Some(s) = sdc.as_ref() {
                     let lib0 = libs.default_library().ok_or("global_route before any liberty library")?;
