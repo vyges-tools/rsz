@@ -369,10 +369,19 @@ pub fn master_pins(db: &Db) -> Result<HashMap<String, Vec<String>>, String> {
 /// are kept as written. [`search_sdc`] reads only named ports; a caller with the netlist expands
 /// first.
 pub fn expand_io_delay_ports(s: &mut vyges_loom::sdc::Sdc, nl: &vyges_sta::netlist::Netlist) {
+    let [i, o] = expanded_io_delays(s, nl);
+    (s.input_delays, s.output_delays) = (i, o);
+}
+
+/// The input and output delays with `[all_inputs]` / `[all_outputs]` expanded, as
+/// [`expand_io_delay_ports`] leaves them, the constraints themselves untouched.
+pub fn expanded_io_delays(s: &vyges_loom::sdc::Sdc, nl: &vyges_sta::netlist::Netlist) -> [Vec<vyges_loom::sdc::IoDelay>; 2] {
     use vyges_sta::netlist::PortDir;
     // the source ports of each clock, by name
     let sources: std::collections::HashMap<String, Vec<String>> = s.clocks.iter().map(|c| (c.name.clone(), c.sources.clone())).collect();
-    for (list, want) in [(&mut s.input_delays, PortDir::Input), (&mut s.output_delays, PortDir::Output)] {
+    let mut out = [s.input_delays.clone(), s.output_delays.clone()];
+    let [ins, outs] = &mut out;
+    for (list, want) in [(ins, PortDir::Input), (outs, PortDir::Output)] {
         let accessor = if want == PortDir::Input { "all_inputs" } else { "all_outputs" };
         for d in list.iter_mut().filter(|d| d.accessor == accessor) {
             // ⛔ A delay relative to a clock is not applied to that clock's own source port — the
@@ -389,9 +398,35 @@ pub fn expand_io_delay_ports(s: &mut vyges_loom::sdc::Sdc, nl: &vyges_sta::netli
             d.default = false;
         }
     }
+    out
+}
+
+/// [`search_sdc`] on the design's ports: `[all_inputs]` / `[all_outputs]` in an I/O delay first
+/// expanded to the ports they name ([`expand_io_delay_ports`]), as every caller with a netlist
+/// must — read unexpanded, a flow's own `set_input_delay … [all_inputs]` stopped repair_timing.
+pub fn search_sdc_on(
+    s: &vyges_loom::sdc::Sdc,
+    nl: &vyges_sta::netlist::Netlist,
+    time_scale: f32,
+    propagated: bool,
+    hold_repair: bool,
+) -> Result<vyges_sta::sdc::Sdc, String> {
+    let [i, o] = expanded_io_delays(s, nl);
+    search_sdc_with(s, [&i, &o], time_scale, propagated, hold_repair)
 }
 
 pub fn search_sdc(s: &vyges_loom::sdc::Sdc, time_scale: f32, propagated: bool, hold_repair: bool) -> Result<vyges_sta::sdc::Sdc, String> {
+    search_sdc_with(s, [&s.input_delays, &s.output_delays], time_scale, propagated, hold_repair)
+}
+
+/// [`search_sdc`] with the input and output delays given (`io`: inputs, outputs).
+fn search_sdc_with(
+    s: &vyges_loom::sdc::Sdc,
+    io: [&[vyges_loom::sdc::IoDelay]; 2],
+    time_scale: f32,
+    propagated: bool,
+    hold_repair: bool,
+) -> Result<vyges_sta::sdc::Sdc, String> {
     use vyges_sta::sdc::{Clock, PortDelay};
     // The clocks in the order they were made (`Clock::index`): each on one source port, or virtual
     // (no source — its edges launch input delays and close output delays). None: every path
@@ -489,7 +524,7 @@ pub fn search_sdc(s: &vyges_loom::sdc::Sdc, time_scale: f32, propagated: bool, h
     // names; with it, merges them — a max kept if larger, a min if smaller (`mergeValue`).
     type Delays = Vec<(String, usize, [[Option<f32>; 2]; 2])>;
     let mut delays: [Delays; 2] = [Vec::new(), Vec::new()];
-    for (side, list) in [(0, &s.input_delays), (1, &s.output_delays)] {
+    for (side, list) in [(0, io[0]), (1, io[1])] {
         let cmd = ["set_input_delay", "set_output_delay"][side];
         for d in list {
             if !d.value_read {
@@ -681,6 +716,23 @@ pub fn sdc_design(db: &vyges_opendb::Db, libs: &Libs) -> vyges_loom::sdc::SdcDes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The constraints a flow generates — every input and output delayed through `[all_inputs]` /
+    /// `[all_outputs]` — read for the timing search: expanded to the design's ports, the clock's
+    /// own port skipped (STA-0441). Read unexpanded they stopped repair_timing with an error.
+    #[test]
+    fn io_delays_on_all_inputs_and_outputs_reach_the_search() {
+        use vyges_sta::netlist::{Netlist, PortDir::*};
+        let sdc = vyges_loom::sdc::Sdc::parse(
+            "create_clock -name clk -period 25 [get_ports {clk}]\nset_input_delay 5.0 -clock clk [all_inputs]\nset_output_delay 5.0 -clock clk [all_outputs]\n",
+        )
+        .unwrap();
+        let nl = Netlist { insts: vec![], ports: vec![("clk".into(), Input), ("a".into(), Input), ("y".into(), Output)], nets: vec![] };
+        assert!(search_sdc(&sdc, 1e-9, false, false).is_err(), "the plain reader reads only named ports");
+        let ss = search_sdc_on(&sdc, &nl, 1e-9, false, false).unwrap();
+        assert_eq!(ss.input_delays.iter().map(|d| d.port.as_str()).collect::<Vec<_>>(), ["a"]);
+        assert_eq!(ss.output_delays.iter().map(|d| d.port.as_str()).collect::<Vec<_>>(), ["y"]);
+    }
 
     /// Rules (`Sdc::allOutputs` / `Sdc::allInputs`): any-output = output or bidirect; any-input =
     /// input or bidirect; `-no_clocks` drops clock-source ports only from `all_inputs`, and is not

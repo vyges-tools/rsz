@@ -14,7 +14,7 @@ use crate::buffer_ports;
 use crate::preamble::Libs;
 use crate::repair_design::{self, Args, Inputs};
 use crate::trace::Trace;
-use crate::env::{estimate_state, master_pins, masters, no_signal_cap, port_caps_at, sdc_env, search_sdc, sim_constants};
+use crate::env::{estimate_state, master_pins, masters, no_signal_cap, port_caps_at, sdc_env, search_sdc_on, sim_constants};
 use crate::Stop;
 use crate::odb_design::{clamp_loc_to_core, gr_layer_rc, grt_flutes, grt_stt, net_info, sdc_cap_pins, sdc_port_cap_limits, sizing_limits, CliDesign, GrLive, TimerLog};
 use crate::timing::{user_time_to_sta, Limits};
@@ -649,7 +649,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 if let Some(s) = sdc.as_ref() {
                     let lib0 = libs.default_library().ok_or("global_route before any liberty library")?;
                     opts.clock_sources = s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect();
-                    let ssdc = search_sdc(s, lib0.time_scale, propagated || sdc_propagated, false)?;
+                    let ssdc = search_sdc_on(s, &vyges_grt::timer::netlist(&db), lib0.time_scale, propagated || sdc_propagated, false)?;
                     opts.timing = Some(vyges_grt::timer::Timing { libs: libs.libs.clone(), constraints: Default::default(), sdc: Some(ssdc) });
                 }
                 let res = vyges_grt::global_route::route_design(&mut db, &opts, &grt_stt, &grt_flutes).map_err(|e| format!("global_route: {e}"))?;
@@ -1032,7 +1032,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 let mut clock_count = 0;
                 if let Some(s) = sdc.as_ref() {
                     let lib0 = libs.default_library().ok_or("virtual_cts before any liberty library")?;
-                    let ssdc = search_sdc(s, lib0.time_scale, propagated || sdc_propagated, false)?;
+                    let ssdc = search_sdc_on(s, &vyges_grt::timer::netlist(&db), lib0.time_scale, propagated || sdc_propagated, false)?;
                     clock_count = ssdc.clocks.len();
                     if clock_count > 0 {
                         let netlist = vyges_grt::timer::netlist(&db);
@@ -1188,7 +1188,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 } else {
                     g.find_delays(&parasitics[0], None)?;
                 }
-                let mut ssdc = search_sdc(s, time_scale, clock_propagated, a.hold)?;
+                let mut ssdc = search_sdc_on(s, &netlist, time_scale, clock_propagated, a.hold)?;
                 crate::env::add_virtual_latencies(&mut ssdc, &virtual_latencies)?;
                 let mut search = vyges_sta::search::Search::in_graph_order(&g, &ssdc);
                 search.constraints_modelled()?;
