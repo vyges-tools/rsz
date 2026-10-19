@@ -302,7 +302,12 @@ pub fn move_sequence(a: &Args, has_vt_swap_cells: bool) -> Vec<Move> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Point {
     pub pin: String,
+    /// `Sta::slack(vertex)`: what the repair ranks and tests the point by
     pub slack: f32,
+    /// `Search::wnsSlacks`: what the point counts toward the worst and the total negative slack —
+    /// an endpoint with fanout (an asynchronous reset: its recovery check, and the clear arc on)
+    /// its own path ends' only; otherwise [`Point::slack`]
+    pub wns_slack: f32,
 }
 
 /// Several scenes' points merged: in scene 0's order, each point's slack the fuzzily least over
@@ -311,14 +316,17 @@ pub fn least_over_scenes(scenes: Vec<&[Point]>) -> Result<Vec<Point>, String> {
     let Some((first, rest)) = scenes.split_first() else { return Ok(Vec::new()) };
     let mut out: Vec<Point> = first.to_vec();
     for other in rest {
-        let by_pin: std::collections::HashMap<&str, f32> = other.iter().map(|p| (p.pin.as_str(), p.slack)).collect();
+        let by_pin: std::collections::HashMap<&str, (f32, f32)> = other.iter().map(|p| (p.pin.as_str(), (p.slack, p.wns_slack))).collect();
         if by_pin.len() != out.len() {
             return Err("the scenes' timing points differ: not modelled".into());
         }
         for p in out.iter_mut() {
-            let s = *by_pin.get(p.pin.as_str()).ok_or_else(|| format!("{}: a timing point in one scene only (not modelled)", p.pin))?;
+            let (s, w) = *by_pin.get(p.pin.as_str()).ok_or_else(|| format!("{}: a timing point in one scene only (not modelled)", p.pin))?;
             if fuzzy::less(s, p.slack) {
                 p.slack = s;
+            }
+            if fuzzy::less(w, p.wns_slack) {
+                p.wns_slack = w;
             }
         }
     }
@@ -536,8 +544,8 @@ pub fn worst_slack(endpoints: &[Point]) -> (f32, Option<&Point>) {
     let mut worst = SLACK_INIT;
     let mut at = None;
     for p in endpoints {
-        if !fuzzy::equal(p.slack, SLACK_INIT) && fuzzy::less(p.slack, worst) {
-            worst = p.slack;
+        if !fuzzy::equal(p.wns_slack, SLACK_INIT) && fuzzy::less(p.wns_slack, worst) {
+            worst = p.wns_slack;
             at = Some(p);
         }
     }
@@ -548,8 +556,8 @@ pub fn worst_slack(endpoints: &[Point]) -> (f32, Option<&Point>) {
 pub fn total_negative_slack(endpoints: &[Point]) -> f32 {
     let mut tns = 0.0f64;
     for p in endpoints {
-        if fuzzy::less(p.slack, 0.0) {
-            tns += f64::from(p.slack);
+        if fuzzy::less(p.wns_slack, 0.0) {
+            tns += f64::from(p.wns_slack);
         }
     }
     tns as f32
@@ -658,8 +666,10 @@ pub fn row0_with(endpoints: &[Point], violating_endpoints: usize, startpoints: &
 /// register outputs that are not clock pins, `walkStartpoints`), each with its slack.
 ///
 /// An endpoint (`Search::isEndpoint`): a vertex with fanin that has timing checks, carries an
-/// output delay, or has no fanout. ⚠️ One WITH fanout times its slack through the path ends
-/// downstream (`wnsSlacks`), which is not modelled: refused.
+/// output delay, or has no fanout. One WITH fanout (an asynchronous reset pin: its recovery check,
+/// and the clear arc on to the register's output) ranks by its vertex slack, the ends downstream
+/// included, and counts toward the worst and total negative slack by its own ends'
+/// (`Search::wnsSlacks`).
 pub fn timing_points(g: &vyges_sta::graph::Graph<'_>, search: &vyges_sta::search::Search<'_, '_>, libs: &crate::preamble::Libs, clocks: &std::collections::BTreeSet<usize>) -> Result<(Vec<Point>, Vec<Point>), String> {
     let mut ends = Vec::new();
     let mut starts = Vec::new();
@@ -668,18 +678,15 @@ pub fn timing_points(g: &vyges_sta::graph::Graph<'_>, search: &vyges_sta::search
         // `Search::isEndpoint` (a path delay's internal pins included); an end whose fanout the
         // search still walks is refused — a path delay's internal `-to` pin breaks it.
         if search.is_endpoint(v) {
-            // A gated clock enable's fanout continues as data into the clock network: no end there.
-            if search.has_fanout(v) && !search.is_path_delay_internal_to_break(v) && !search.fanout_only_latch_d_to_q(v) && !search.is_gated_clk_enable(v) {
-                return Err(format!("endpoint {} has fanout: its slack through the path ends downstream is not modelled", vx.name));
-            }
-            ends.push(Point { pin: vx.name.clone(), slack: search.vertex_slack(v) });
+            ends.push(Point { pin: vx.name.clone(), slack: search.vertex_slack(v), wns_slack: search.wns_slack(v, true) });
         }
         if clocks.contains(&v) || !vx.is_driver {
             continue;
         }
         let register = vx.cell.as_deref().and_then(|c| libs.link_cell(c)).is_some_and(|c| !c.sequentials.is_empty() || c.has_seq_bank);
         if port || register {
-            starts.push(Point { pin: vx.name.clone(), slack: search.vertex_slack(v) });
+            let slack = search.vertex_slack(v);
+            starts.push(Point { pin: vx.name.clone(), slack, wns_slack: slack });
         }
     }
     Ok((ends, starts))
@@ -690,7 +697,7 @@ mod tests {
     use super::*;
 
     fn p(pin: &str, slack: f32) -> Point {
-        Point { pin: pin.into(), slack }
+        Point { pin: pin.into(), slack, wns_slack: slack }
     }
 
     /// Rules (proc repair_timing, buildMainMoveSequence): neither flag means both; the default

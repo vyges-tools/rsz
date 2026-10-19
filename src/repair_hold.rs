@@ -211,7 +211,7 @@ pub fn print_progress(ctx: &HoldCtx<'_>, ends: &[HoldEnd], p: &Progress, iterati
         out.report("-".repeat(86));
     }
     if iteration % PRINT_INTERVAL == 0 || force || end {
-        let points: Vec<Point> = ends.iter().map(|e| Point { pin: e.pin.clone(), slack: e.hold_slack }).collect();
+        let points: Vec<Point> = ends.iter().map(|e| Point { pin: e.pin.clone(), slack: e.hold_slack, wns_slack: e.hold_slack }).collect();
         let (wns, at) = worst_slack(&points);
         let tns = total_negative_slack(&points);
         let field = if end { "final".to_string() } else { iteration.to_string() };
