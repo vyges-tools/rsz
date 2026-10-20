@@ -311,6 +311,17 @@ mod tests {
     }
 
 
+    /// Rule (`GlobalRouter::globalRoute` → `isCongested`): overflow left after the congestion
+    /// loop, without `-allow_congestion`, is error GRT-0116 — the reference stops, so a run that
+    /// reaches it is an ERROR (as the reference's is), never a refusal of something unmodelled.
+    #[test]
+    fn global_route_overflow_is_the_references_error() {
+        assert_eq!(global_route_verdict(0), Ok(()));
+        let e = global_route_verdict(3).unwrap_err();
+        assert!(e.starts_with("GRT-0116: Global routing finished with congestion"), "{e}");
+        assert!(!e.contains("not modelled"), "an error, not a refusal: {e}");
+    }
+
     #[test]
     fn the_descriptor_is_valid_json_and_names_the_engine() {
         let d: Value = serde_json::from_str(&describe()).expect("--describe must be valid JSON");

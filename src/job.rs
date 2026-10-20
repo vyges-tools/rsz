@@ -303,6 +303,16 @@ pub fn global_sizing_config(db: &Db) -> Result<crate::repair_setup::GlobalSizing
     Ok(c)
 }
 
+/// `global_route` (no options) after its congestion loop: overflow left is the reference's own
+/// error — GRT-0116 unless `-allow_congestion` (refused here as an option), so the run stops.
+pub fn global_route_verdict(total_overflow: i32) -> Result<(), String> {
+    let mut log = Vec::new();
+    if vyges_grt::congestion_verdict(total_overflow > 0, false, false, &mut log) {
+        return Ok(());
+    }
+    Err("GRT-0116: Global routing finished with congestion. Check the congestion regions in the DRC Viewer.".into())
+}
+
 /// The checks of repair_design / buffer_ports read the LINK library through scene 0: a first
 /// library read for another corner is refused there.
 pub fn link_corner_is_first(libs: &Libs) -> Result<(), String> {
@@ -666,9 +676,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     opts.timing = Some(vyges_grt::timer::Timing { libs: libs.libs.clone(), constraints: Default::default(), sdc: Some(ssdc) });
                 }
                 let res = vyges_grt::global_route::route_design(&mut db, &opts, &grt_stt, &grt_flutes).map_err(|e| format!("global_route: {e}"))?;
-                if res.total_overflow > 0 {
-                    return Err("global_route left overflow (GRT-0116): not modelled".into());
-                }
+                global_route_verdict(res.total_overflow)?;
                 groute = Some(res);
                 groute_opts = Some(opts);
             }
