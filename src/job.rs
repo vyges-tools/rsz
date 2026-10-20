@@ -735,7 +735,6 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 }
             }
             "buffer_ports" if gr_estimated => return Err("buffer_ports on global-route parasitics: not modelled".into()),
-            "repair_design" if gr_estimated => return Err("repair_design on global-route parasitics: not modelled".into()),
             "buffer_ports" => {
                 if sdc_propagated {
                     return Err("set_propagated_clock: not modelled for buffer_ports".into());
@@ -836,17 +835,32 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 };
                 let clock_sources: Vec<String> = sdc.as_ref().map(|s| s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect()).unwrap_or_default();
                 let netlist = vyges_grt::timer::netlist(&db);
-                if !estimated {
-                    return Err("repair_design without estimate_parasitics -placement: not modelled".into());
+                if !estimated && !gr_estimated {
+                    return Err("repair_design without estimate_parasitics: not modelled".into());
                 }
-                // The estimate runs at the alpha in force when estimate_parasitics did.
                 rc.sort_clk_and_signal_layers();
-                let mut est_rc = estimate_rc.clone().expect("estimated");
-                est_rc.sort_clk_and_signal_layers();
                 // The estimator's state as an earlier edit (buffer_ports) left it, else the estimate.
                 let parasitics = match carried.take() {
                     Some(p) => p,
+                    // `estimateGlobalRouteRC`: every routed net's network from its route.
+                    None if gr_estimated => {
+                        let caps = port_caps_at(None, sdc.as_ref(), &libs, &netlist)?;
+                        let res = groute.as_ref().expect("estimated from routes");
+                        let map: HashMap<String, NetParasitics> = res
+                            .routed_parasitics
+                            .iter()
+                            .map(|(net, n)| {
+                                let mut p = vyges_grt::timer::timer_network(net, n);
+                                p.port_pin_caps = Some(caps.clone());
+                                (net.clone(), p)
+                            })
+                            .collect();
+                        vec![map]
+                    }
+                    // The estimate runs at the alpha in force when estimate_parasitics did.
                     None => {
+                        let mut est_rc = estimate_rc.clone().expect("estimated");
+                        est_rc.sort_clk_and_signal_layers();
                         let caps = port_caps_at(estimate_sdc.as_deref(), sdc.as_ref(), &libs, &netlist)?;
                         estimate_state(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, estimate_propagated, estimate_alpha, libs.scene_count(), &caps)?
                     }
@@ -868,7 +882,20 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 let dbu = db.tech_get_db_units_per_micron();
                 let core = (db.block_get_core_area_x_min(), db.block_get_core_area_y_min(), db.block_get_core_area_x_max(), db.block_get_core_area_y_max());
                 let core = (core != (0, 0, 0, 0)).then_some(core);
-                let estimating = !no_signal_cap(&db, &rc);
+                // Global-route parasitics are estimated whatever the wire RC says.
+                let estimating = gr_estimated || !no_signal_cap(&db, &rc);
+                // `IncrementalParasiticsGuard` on a global-route source: the router alive over the
+                // repair (`IncrementalGRoute`), from the state `global_route` left.
+                let gr = match (gr_estimated, groute.as_ref(), groute_opts.as_ref()) {
+                    (true, Some(r), Some(o)) => {
+                        // `initMacrosAndGrid`: `importDb`, `initGrid`, `setFixedGridCells`.
+                        let grid = vyges_dpl::grid::Grid::build(&db)?;
+                        let fixed = vyges_dpl::grid::FixedCells::build(&db, &grid)?;
+                        let layers = std::sync::Arc::new(gr_layer_rc(&db, &rc));
+                        Some(GrLive { after: r.after.clone(), opts: o.clone(), dirty: BTreeSet::new(), grid, fixed, layers, slacks: None })
+                    }
+                    _ => None,
+                };
                 // A diagnostic: the timer's delay calculation over the design as read, one line per
                 // DMP gate call and per load (`Graph::find_delays`' trace), before any repair.
                 let mpins = master_pins(&db)?;
@@ -880,7 +907,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 }
                 let port_caps = env.port_pin_cap.clone();
                 let limits_of_block = sizing_limits(&db)?;
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), alpha: routing_alpha, estimating, netlist: std::sync::Arc::new(netlist), netlist_gen: 0, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins: sdc.as_ref().map(sdc_cap_pins).unwrap_or_default(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr: None, gr_error: None, undoing: false, skips: None, skip_log: false };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), alpha: routing_alpha, estimating, netlist: std::sync::Arc::new(netlist), netlist_gen: 0, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins: sdc.as_ref().map(sdc_cap_pins).unwrap_or_default(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr, gr_error: None, undoing: false, skips: None, skip_log: false };
                 let inputs = Inputs { libs: &libs, masters: &m, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins, sizing_limits: limits_of_block, clock_pattern: Default::default() };
                 let area0 = crate::odb_design::design_area(design.db);
                 let r = repair_design::repair_design(&inputs, &mut design, &a, &mut trace);

@@ -910,12 +910,15 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
     }
     }
 
-    // makeBufferedNet(drvr_pin, corner) (placement parasitics: the Steiner tree); with none,
-    // makeBufferedNetSteiner is called a second time. The rest runs at `corner`'s timer.
+    // makeBufferedNet(drvr_pin, corner) (the Steiner tree under placement parasitics, the route
+    // under global-route ones); with none, makeBufferedNetSteiner. The rest runs at `corner`'s timer.
     trace.ran(&["stdrvr", "st", "flags", "bn"]);
     let g = &gs!()[corner];
     let dk = sc.at(corner, drvr);
-    let bnet = make_buffered_net(&*design, g, dk, &net_name, corner, ctx, trace).or_else(|| make_buffered_net(&*design, g, dk, &net_name, corner, ctx, trace));
+    let bnet = match make_buffered_net(&*design, g, dk, &net_name, corner, ctx, trace).map_err(|e| Stop::error("RSZ-0074", e))? {
+        Some(b) => Some(b),
+        None => make_buffered_net_steiner(&*design, g, dk, &net_name, corner, ctx, trace),
+    };
     let Some((mut bn, root)) = bnet else {
         if repaired_net {
             outcome.nets_repaired += 1;
@@ -990,13 +993,52 @@ fn repair_driver_slew(design: &dyn Design, graphs: &[Graph<'_>], corner: usize, 
     driver_slew::repair_driver_slew(g, corner, &d, load_cap, ctx.sizing, &ctx.inputs.limits, ctx.args.slew_margin, &clocks, trace)
 }
 
+/// `Resizer::makeBufferedNet(drvr_pin, corner)`: by the parasitics source — the Steiner tree
+/// (`makeBufferedNetSteiner`, printed) or the global route (`makeBufferedNetGroute`; none for a
+/// one-terminal net, an error for a route that misses a load).
+fn make_buffered_net(design: &dyn Design, g: &Graph<'_>, drvr: usize, net: &str, corner: usize, ctx: &NetCtx<'_, '_>, trace: &mut Trace) -> Result<Option<(buffered_net::BufferedNet, usize)>, String> {
+    let shape = design.net_shape(net, &g.vertices[drvr].name);
+    match (builder_of(shape.as_ref()), shape) {
+        (Builder::Groute, Some(buffered_net::NetShape::Groute(route))) => {
+            let bctx = buffered_net::Ctx { graph: g, libs: ctx.inputs.libs, sdc: &ctx.inputs.sdc, limits: &ctx.inputs.limits, dbu: ctx.inputs.dbu, rc: ctx.inputs.wire_rc[corner] };
+            buffered_net::make_buffered_net_groute(&bctx, &route)
+        }
+        (Builder::Steiner, Some(buffered_net::NetShape::Steiner(tree))) => Ok(steiner_buffered_net(&tree, g, drvr, corner, ctx, trace)),
+        _ => Ok(None),
+    }
+}
+
+/// Which builder `Resizer::makeBufferedNet` takes for a net's shape.
+#[derive(Debug, PartialEq, Eq)]
+enum Builder {
+    /// `makeBufferedNetSteiner` (placement parasitics).
+    Steiner,
+    /// `makeBufferedNetGroute` (global-route parasitics) — never the Steiner tree.
+    Groute,
+    /// Nothing to build from.
+    None,
+}
+
+fn builder_of(shape: Option<&buffered_net::NetShape>) -> Builder {
+    match shape {
+        Some(buffered_net::NetShape::Steiner(_)) => Builder::Steiner,
+        Some(buffered_net::NetShape::Groute(_)) => Builder::Groute,
+        None => Builder::None,
+    }
+}
+
 /// `Resizer::makeBufferedNetSteiner(drvr_pin, corner)`: the driver net's Steiner tree, printed,
 /// then the buffered net built from it at the corner (`g` is its timer).
-fn make_buffered_net(design: &dyn Design, g: &Graph<'_>, drvr: usize, net: &str, corner: usize, ctx: &NetCtx<'_, '_>, trace: &mut Trace) -> Option<(buffered_net::BufferedNet, usize)> {
+fn make_buffered_net_steiner(design: &dyn Design, g: &Graph<'_>, drvr: usize, net: &str, corner: usize, ctx: &NetCtx<'_, '_>, trace: &mut Trace) -> Option<(buffered_net::BufferedNet, usize)> {
     let tree = design.steiner(net, &g.vertices[drvr].name)?;
-    buffered_net::trace_steiner(&tree, &g.vertices[drvr].name, &mut trace.lines);
+    steiner_buffered_net(&tree, g, drvr, corner, ctx, trace)
+}
+
+/// A Steiner tree, printed, as a buffered net at the corner (`g` is its timer).
+fn steiner_buffered_net(tree: &buffered_net::Tree, g: &Graph<'_>, drvr: usize, corner: usize, ctx: &NetCtx<'_, '_>, trace: &mut Trace) -> Option<(buffered_net::BufferedNet, usize)> {
+    buffered_net::trace_steiner(tree, &g.vertices[drvr].name, &mut trace.lines);
     let bctx = buffered_net::Ctx { graph: g, libs: ctx.inputs.libs, sdc: &ctx.inputs.sdc, limits: &ctx.inputs.limits, dbu: ctx.inputs.dbu, rc: ctx.inputs.wire_rc[corner] };
-    buffered_net::make_buffered_net_steiner(&bctx, &tree)
+    buffered_net::make_buffered_net_steiner(&bctx, tree)
 }
 
 /// The timer's preambles: the graph over the netlist, its levels (`ensureLevelized`), refused
@@ -1013,6 +1055,18 @@ fn timer_preambles<'n>(inputs: &'n Inputs<'_>, netlist: &'n vyges_sta::netlist::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Rule (Resizer::makeBufferedNet): the buffered net is built from the parasitics' own source
+    // — a Steiner tree under placement, the global route under global-route parasitics (no
+    // Steiner tree is made or printed then).
+    #[test]
+    fn the_buffered_net_is_built_from_the_parasitics_source() {
+        let route = buffered_net::GrouteNet { pins: Vec::new(), drvr: "u/Z".into(), segments: Vec::new(), term_count: 2, layers: Default::default() };
+        assert_eq!(builder_of(Some(&buffered_net::NetShape::Groute(route))), Builder::Groute);
+        let tree = buffered_net::Tree { deg: 0, branch: Vec::new(), pinlocs: Vec::new(), drvr_pt: None };
+        assert_eq!(builder_of(Some(&buffered_net::NetShape::Steiner(tree))), Builder::Steiner);
+        assert_eq!(builder_of(None), Builder::None);
+    }
 
     // Rules (the status word): a changed design is `repaired`; checked drivers with nothing to
     // change are `up_to_date`; nothing checked is `vacuous` — never a pass word.
