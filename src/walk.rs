@@ -60,6 +60,12 @@ fn g(x: f64) -> String {
     g9(x)
 }
 
+/// `repairNetVia`'s max load slew: the ref's, less the via's RC slew — `float r_via`, so the
+/// double resistance is narrowed first and the product is float throughout.
+fn via_max_load_slew(ref_max_load_slew: f32, r_via: f64, ref_cap: f32, slew_shape_factor: f32) -> f32 {
+    ref_max_load_slew - (r_via as f32) * ref_cap * slew_shape_factor
+}
+
 impl Walk<'_, '_> {
     fn graph(&self) -> &Graph<'_> {
         self.ctx.graph
@@ -97,9 +103,19 @@ impl Walk<'_, '_> {
             Kind::Wire { r } => self.repair_net_wire(bn, n, r, level, st, trace),
             Kind::Junction { r, r2 } => self.repair_net_junc(bn, n, r, r2, level, st, trace),
             Kind::Load { pin } => self.repair_net_load(bn, n, pin, level, st, trace),
-            // `repairNetVia`: only on a global route, where repair_design is refused.
-            Kind::Via { .. } => Err(Stop::refused("RSZ-GR", "repairNetVia (a global route's buffered net) is not modelled".into())),
+            Kind::Via { r, .. } => self.repair_net_via(bn, n, r, level, st, trace),
         }
+    }
+
+    /// `repairNetVia` (a global route's buffered net): its ref repaired, the ref's cap and fanout
+    /// taken, its max load slew less the via's own RC slew — float throughout (`float r_via`).
+    fn repair_net_via(&self, bn: &mut BufferedNet, n: usize, r: usize, level: usize, st: &mut State<'_>, trace: &mut Trace) -> Result<Down, Stop> {
+        let down = self.repair_net(bn, r, level + 1, st, trace)?;
+        bn.nodes[n].cap = bn.nodes[r].cap;
+        bn.nodes[n].fanout = bn.nodes[r].fanout;
+        let r_via = bn.via_resistance(n).map_err(|e| Stop::error("RSZ-0093", e))?;
+        bn.nodes[n].max_load_slew = via_max_load_slew(bn.nodes[r].max_load_slew, r_via, bn.nodes[r].cap, self.slew_shape_factor);
+        Ok(down)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -443,6 +459,18 @@ mod tests {
         assert_eq!(f("default_fanout_load : 2 ;", "fanout_load : 3 ;"), 3.0);
         assert_eq!(f("default_fanout_load : 2 ;", ""), 2.0);
         assert_eq!(f("", ""), 0.0);
+    }
+
+    // Rule (repairNetVia: `float r_via = bnet->viaResistance(...)`): the via resistance is
+    // narrowed to float, and `maxLoadSlew - r_via * cap * slew_shape_factor_` is float arithmetic —
+    // in double, these inputs land one ulp lower.
+    #[test]
+    fn a_vias_slew_is_taken_off_in_float() {
+        let (mls, r_via, cap) = (1.6378709499775823e-10_f64 as f32, 30.875086493095175, 7.075775783436239e-14_f64 as f32);
+        let shape = 0.932027698_f64 as f32;
+        assert_eq!(via_max_load_slew(mls, r_via, cap, shape).to_bits(), 0x2f31_d8d8);
+        let in_double = (f64::from(mls) - r_via * f64::from(cap) * f64::from(shape)) as f32;
+        assert_eq!(in_double.to_bits(), 0x2f31_d8d7);
     }
 
     // Rule (repairNetWire: `length -= buf_dist`): an int less a double, back to int — truncated,
