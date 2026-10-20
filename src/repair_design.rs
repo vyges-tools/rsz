@@ -460,12 +460,21 @@ pub fn timer_graph<'n>(libs: &'n Libs, k: usize, netlist: &'n vyges_sta::netlist
     Ok(g)
 }
 
+/// Scene `k`'s graph as repair_design times it: its clocks are ideal (a propagated clock is
+/// refused), so a register's clock-to-output arc reads the clock's own slew, 0, not its pin's —
+/// which a clock wire's parasitics (global-route ones) make non-zero.
+fn scene_graph<'n>(inputs: &'n Inputs<'_>, k: usize, netlist: &'n vyges_sta::netlist::Netlist) -> Result<Graph<'n>, Stop> {
+    let mut g = timer_graph(inputs.libs, k, netlist, &inputs.sdc, &inputs.master_pins)?;
+    g.ideal_clock = timing::clock_pins(&g, inputs.clock_sources).into_iter().collect();
+    Ok(g)
+}
+
 /// The timing graphs (one per scene) over the design as it is NOW, each with its scene's
 /// forward-pass annotations applied.
 fn current_graphs<'n>(inputs: &'n Inputs<'_>, netlist: &'n vyges_sta::netlist::Netlist, annotated: &[HashMap<String, f32>]) -> Result<Vec<Graph<'n>>, Stop> {
     (0..inputs.libs.scene_count())
         .map(|k| {
-            let mut g = timer_graph(inputs.libs, k, netlist, &inputs.sdc, &inputs.master_pins)?;
+            let mut g = scene_graph(inputs, k, netlist)?;
             // by the name index (the caller asks for it next anyway), not a scan of every vertex —
             // unless a name is shared (a bidirect pin's two vertices), where the scan takes both
             let index = g.index();
@@ -1047,7 +1056,7 @@ fn timer_preambles<'n>(inputs: &'n Inputs<'_>, netlist: &'n vyges_sta::netlist::
     if let Some(why) = timing::unlevelable(&inputs.libs.libs, netlist) {
         return Err(Stop::refused("RSZ-LEVELS", why));
     }
-    let graphs = (0..inputs.libs.scene_count()).map(|k| timer_graph(inputs.libs, k, netlist, &inputs.sdc, &inputs.master_pins)).collect::<Result<Vec<_>, _>>()?;
+    let graphs = (0..inputs.libs.scene_count()).map(|k| scene_graph(inputs, k, netlist)).collect::<Result<Vec<_>, _>>()?;
     let level = graphs[0].levels().map_err(|e| Stop::refused("RSZ-TIMER", e))?;
     Ok((graphs, level))
 }
@@ -1066,6 +1075,41 @@ mod tests {
         let tree = buffered_net::Tree { deg: 0, branch: Vec::new(), pinlocs: Vec::new(), drvr_pt: None };
         assert_eq!(builder_of(Some(&buffered_net::NetShape::Steiner(tree))), Builder::Steiner);
         assert_eq!(builder_of(None), Builder::None);
+    }
+
+    // Rule (ClkNetwork::isIdealClock, GraphDelayCalc): repair_design's clocks are ideal (it refuses
+    // a propagated one), so every graph it times holds the clock network's pins as ideal — the
+    // register then reads the clock's slew, 0, not its CK pin's wire slew (non-zero once the clock
+    // net has global-route parasitics).
+    #[test]
+    fn every_repair_design_graph_holds_its_clock_pins_ideal() {
+        const LIB: &str = r#"library (t) { time_unit : "1ns"; capacitive_load_unit (1, pf);
+          cell (dff) { ff (IQ, IQN) { clocked_on : "CK"; next_state : "D"; }
+            pin (D) { direction : input; capacitance : 0.001; }
+            pin (CK) { direction : input; clock : true; capacitance : 0.001; }
+            pin (Q) { direction : output; function : "IQ"; } } }"#;
+        use vyges_sta::netlist::{Conn, Net, Netlist, PortDir};
+        let libs = Libs { libs: vec![vyges_sta::liberty::Library::read(&vyges_sta::liberty_parse::parse(LIB).unwrap()).unwrap()], ..Default::default() };
+        let netlist = Netlist {
+            insts: vec![("r".into(), "dff".into())],
+            ports: vec![("clk".into(), PortDir::Input), ("d".into(), PortDir::Input), ("q".into(), PortDir::Output)],
+            nets: vec![
+                Net { name: "clk".into(), pins: vec![Conn::Port(0), Conn::Inst(0, "CK".into())] },
+                Net { name: "d".into(), pins: vec![Conn::Port(1), Conn::Inst(0, "D".into())] },
+                Net { name: "q".into(), pins: vec![Conn::Inst(0, "Q".into()), Conn::Port(2)] },
+            ],
+        };
+        let (masters, dont_use) = (BTreeMap::new(), BTreeSet::new());
+        let sources = ["clk".to_string()];
+        let master_pins: HashMap<String, Vec<String>> = [("dff".to_string(), vec!["D".into(), "CK".into(), "Q".into()])].into();
+        let inputs = Inputs { libs: &libs, masters: &masters, dont_use: &dont_use, limits: Limits::default(), clock_sources: &sources, dbu: 1000, wire_rc: vec![WireRc::default()], sdc: SdcEnv::default(), sizing_limits: Default::default(), master_pins, clock_pattern: Default::default() };
+        let (graphs, _) = timer_preambles(&inputs, &netlist).unwrap();
+        let ck = graphs[0].vertices.iter().position(|v| v.name == "r/CK").unwrap();
+        let d = graphs[0].vertices.iter().position(|v| v.name == "r/D").unwrap();
+        assert!(graphs[0].ideal_clock.contains(&ck), "the register's clock pin is ideal");
+        assert!(!graphs[0].ideal_clock.contains(&d), "a data pin is not");
+        let again = current_graphs(&inputs, &netlist, &[HashMap::new()]).unwrap();
+        assert!(again[0].ideal_clock.contains(&ck), "and in every graph rebuilt during the repair");
     }
 
     // Rules (the status word): a changed design is `repaired`; checked drivers with nothing to
