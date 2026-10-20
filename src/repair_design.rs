@@ -712,7 +712,7 @@ fn make_fanout_repeater(repeater_loads: &mut Vec<String>, repeater_inputs: &mut 
     };
     let mut loads = repeater_loads.clone();
     let mut st = State { design, pre: std::mem::take(&mut ctx.pre), inserted: 0, last: None };
-    let made = walk.make_repeater("fanout", x, y, ctx.buffer_lowest_drive, false, 1, &mut loads, &mut st, trace);
+    let made = walk.make_repeater("fanout", x, y, ctx.buffer_lowest_drive, false, 1, &mut loads, None, &mut st, trace);
     ctx.pre = st.pre;
     outcome.inserted_buffers += st.inserted;
     made?;

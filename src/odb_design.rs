@@ -742,6 +742,10 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
         steiner_tree(self.db, net, drvr_pin, self.alpha)
     }
 
+    fn global_routing_parasitics(&self) -> bool {
+        self.gr.is_some()
+    }
+
     /// Under global-route parasitics `makeBufferedNetGroute` reads the router: the net's pins
     /// (`getPinGridPositions`: as the router's last `updateNetPins` left them, each at its grid
     /// point on its connection layer) and its route (`routes_`, empty when it has none).

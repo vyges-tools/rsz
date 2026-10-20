@@ -201,7 +201,8 @@ impl Walk<'_, '_> {
             let buf_x = (f64::from(to_x) + d * dx) as i32;
             let buf_y = (f64::from(to_y) + d * dy) as i32;
             trace.push(format!("wbuf|{level}|buf_dist={}|{buf_x}|{buf_y}", g(buf_dist)));
-            let (repeater_cap, repeater_fanout, repeater_max_slew) = self.make_repeater("wire", buf_x, buf_y, &buffer_cell, true, level, &mut load_pins, st, trace)?;
+            let hint = wire_load_cap_hint(buf_dist, self.ctx.dbu, wire_cap, ref_cap);
+            let (repeater_cap, repeater_fanout, repeater_max_slew) = self.make_repeater("wire", buf_x, buf_y, &buffer_cell, true, level, &mut load_pins, Some(hint), st, trace)?;
             max_load_slew = repeater_max_slew;
             // Update for the next round (`length -= buf_dist`: an int minus a double, truncated).
             length = shorten(length, buf_dist);
@@ -291,11 +292,11 @@ impl Walk<'_, '_> {
         // makeRepeater writes the branch's cap, fanout and slew limit (its by-reference outputs).
         let reason_s = reason.unwrap_or("-");
         if repeater_left {
-            (cap_left, fanout_left, max_load_slew_left) = self.make_repeater(reason_s, x, y, &buffer_cell, true, level, &mut loads_left, st, trace)?;
+            (cap_left, fanout_left, max_load_slew_left) = self.make_repeater(reason_s, x, y, &buffer_cell, true, level, &mut loads_left, Some(cap_left), st, trace)?;
             wire_length_left = 0;
         }
         if repeater_right {
-            (cap_right, fanout_right, max_load_slew_right) = self.make_repeater(reason_s, x, y, &buffer_cell, true, level, &mut loads_right, st, trace)?;
+            (cap_right, fanout_right, max_load_slew_right) = self.make_repeater(reason_s, x, y, &buffer_cell, true, level, &mut loads_right, Some(cap_right), st, trace)?;
             wire_length_right = 0;
         }
         let wire_length = wire_length_left.max(wire_length_right);
@@ -321,12 +322,12 @@ impl Walk<'_, '_> {
     /// become its input; returns its input cap, fanout load and slew limit (and records the
     /// repeater in `st.last`).
     #[allow(clippy::too_many_arguments)]
-    pub fn make_repeater(&self, reason: &str, x: i32, y: i32, buffer_cell: &str, resize: bool, level: usize, load_pins: &mut Vec<String>, st: &mut State<'_>, trace: &mut Trace) -> Result<(f32, f32, f32), Stop> {
+    pub fn make_repeater(&self, reason: &str, x: i32, y: i32, buffer_cell: &str, resize: bool, level: usize, load_pins: &mut Vec<String>, load_cap_hint: Option<f32>, st: &mut State<'_>, trace: &mut Trace) -> Result<(f32, f32, f32), Stop> {
         let loads: String = load_pins.iter().map(|p| format!("{p},")).collect();
         trace.push(format!("rep|{level}|{reason}|{x}|{y}|{buffer_cell}|{loads}"));
         let r = st.design.insert_repeater(load_pins, buffer_cell, (x, y), reason).map_err(|e| Stop::error("RSZ-INSERT", e))?;
         st.inserted += 1;
-        let cell = if resize { self.resize_to_target_slew(&r, buffer_cell, st, trace)? } else { buffer_cell.to_string() };
+        let cell = if resize { self.resize_to_target_slew(&r, buffer_cell, load_cap_hint, st, trace)? } else { buffer_cell.to_string() };
         let (input, repeater_cap, repeater_fanout, repeater_max_slew) = repeater_values(self.sizing.libs, &cell, self.ctx.limits, self.corner).expect("a repeater is a liberty buffer");
         let (lx, ly) = st.design.inst_location(&r.inst);
         trace.push(format!("repd|{}|{}|{cell}|{lx}|{ly}|{}|{}|{}", r.inst, r.out_net, g(f64::from(repeater_cap)), g(f64::from(repeater_fanout)), g(f64::from(repeater_max_slew))));
@@ -335,20 +336,14 @@ impl Walk<'_, '_> {
         Ok((repeater_cap, repeater_fanout, repeater_max_slew))
     }
 
-    /// `Resizer::resizeToTargetSlew(repeater output)` under placement parasitics: the new net's
-    /// parasitic ensured, its load (`loadCap`) at the target-slew corner, `findTargetCell`, and a
-    /// master swap when the target differs.
-    fn resize_to_target_slew(&self, r: &crate::design::Repeater, cell: &str, st: &mut State<'_>, trace: &mut Trace) -> Result<String, Stop> {
-        st.design.ensure_wire_parasitic(&r.out_net).map_err(|e| Stop::error("RSZ-EST", e))?;
-        let nl = st.design.netlist().clone();
-        // `loadCap(drvr_pin, tgt_slew_corner_, max)`: the target-slew corner's timer and parasitics.
-        let k = self.sizing.tgt_scene;
-        let par = st.design.parasitics(k).clone();
-        let graph = crate::repair_design::timer_graph(self.sizing.libs, k, &nl, self.sdc, self.master_pins)?;
-        let v = graph.vertices.iter().position(|x| x.name == r.output).ok_or_else(|| Stop::error("RSZ-INSERT", format!("{}: not in the timing graph", r.output)))?;
-        let (pin_cap, wire_cap, has_pi) = graph.load_cap_parts(v, &par, RISE);
-        trace.push(format!("rtsd|{}|pin={}|wire={}|pi={has_pi}", r.output, g(f64::from(pin_cap)), g(f64::from(wire_cap))));
-        let load_cap = graph.load_cap(v, &par);
+    /// `Resizer::resizeToTargetSlew(repeater output, load_cap_hint)`: its load the caller's hint
+    /// under global-route parasitics, else the new net's parasitic ensured and its load (`loadCap`)
+    /// at the target-slew corner; `findTargetCell`, and a master swap when the target differs.
+    fn resize_to_target_slew(&self, r: &crate::design::Repeater, cell: &str, load_cap_hint: Option<f32>, st: &mut State<'_>, trace: &mut Trace) -> Result<String, Stop> {
+        let load_cap = match hinted_load(load_cap_hint, st.design.global_routing_parasitics()) {
+            Some(hint) => hint,
+            None => self.estimated_load_cap(r, st, trace)?,
+        };
         let mut current = cell.to_string();
         if load_cap > 0.0 {
             let target = self.sizing.find_target_cell(cell, load_cap, false)?;
@@ -359,6 +354,20 @@ impl Walk<'_, '_> {
             }
         }
         Ok(current)
+    }
+
+    /// `ensureWireParasitic(drvr_pin)` then `loadCap(drvr_pin, tgt_slew_corner_, max_)`.
+    fn estimated_load_cap(&self, r: &crate::design::Repeater, st: &mut State<'_>, trace: &mut Trace) -> Result<f32, Stop> {
+        st.design.ensure_wire_parasitic(&r.out_net).map_err(|e| Stop::error("RSZ-EST", e))?;
+        let nl = st.design.netlist().clone();
+        // `loadCap(drvr_pin, tgt_slew_corner_, max)`: the target-slew corner's timer and parasitics.
+        let k = self.sizing.tgt_scene;
+        let par = st.design.parasitics(k).clone();
+        let graph = crate::repair_design::timer_graph(self.sizing.libs, k, &nl, self.sdc, self.master_pins)?;
+        let v = graph.vertices.iter().position(|x| x.name == r.output).ok_or_else(|| Stop::error("RSZ-INSERT", format!("{}: not in the timing graph", r.output)))?;
+        let (pin_cap, wire_cap, has_pi) = graph.load_cap_parts(v, &par, RISE);
+        trace.push(format!("rtsd|{}|pin={}|wire={}|pi={has_pi}", r.output, g(f64::from(pin_cap)), g(f64::from(wire_cap))));
+        Ok(graph.load_cap(v, &par))
     }
 
     /// `PreChecks::checkSlewLimit(ref_cap, max_load_slew)`: the best slew any swappable size of
@@ -382,6 +391,18 @@ impl Walk<'_, '_> {
         }
         Ok(())
     }
+}
+
+/// `resizeToTargetSlew`: the caller's hint is the load only under global-route parasitics (it
+/// skips `ensureWireParasitic`, an incremental re-route per buffer); otherwise none.
+fn hinted_load(load_cap_hint: Option<f32>, global_routing: bool) -> Option<f32> {
+    load_cap_hint.filter(|_| global_routing)
+}
+
+/// repairNetWire's hint for the repeater it inserts: the downstream wire (`buf_dist` long) and
+/// `ref_cap`, in double, the sum converted to float.
+fn wire_load_cap_hint(buf_dist: f64, dbu: i32, wire_cap: f64, ref_cap: f64) -> f32 {
+    (buf_dist / (f64::from(dbu) * 1e6) * wire_cap + ref_cap) as f32
 }
 
 /// `length -= buf_dist`: an `int` less a `double`, converted back to `int` — truncated toward zero.
@@ -471,6 +492,27 @@ mod tests {
         assert_eq!(via_max_load_slew(mls, r_via, cap, shape).to_bits(), 0x2f31_d8d8);
         let in_double = (f64::from(mls) - r_via * f64::from(cap) * f64::from(shape)) as f32;
         assert_eq!(in_double.to_bits(), 0x2f31_d8d7);
+    }
+
+    // Rule (resizeToTargetSlew: `load_cap_hint.has_value() && getParasiticsSrc() ==
+    // kGlobalRouting`): the hint replaces the estimate under global-route parasitics only; under
+    // placement the repeater is sized from its net's own estimate, hint or not.
+    #[test]
+    fn a_load_hint_counts_only_on_global_routes() {
+        assert_eq!(hinted_load(Some(5.8e-14), true), Some(5.8e-14));
+        assert_eq!(hinted_load(Some(5.8e-14), false), None);
+        assert_eq!(hinted_load(None, true), None);
+    }
+
+    // Rule (repairNetWire: `buffer_load_cap = static_cast<float>(buf_dist / (dbu_ * 1e+6) *
+    // wire_cap + ref_cap)`): the hint is summed in double and narrowed once; in float these
+    // inputs land one ulp lower.
+    #[test]
+    fn a_wire_repeaters_hint_is_summed_in_double() {
+        let (buf_dist, wire_cap, ref_cap) = (34086.0, 1.5101380514788433e-10, 5.004807362210216e-14);
+        assert_eq!(wire_load_cap_hint(buf_dist, 2000, wire_cap, ref_cap).to_bits(), 0x296c_fccf);
+        let in_float = (buf_dist as f32 / (2000.0_f64 * 1e6) as f32) * wire_cap as f32 + ref_cap as f32;
+        assert_eq!(in_float.to_bits(), 0x296c_fcce);
     }
 
     // Rule (repairNetWire: `length -= buf_dist`): an int less a double, back to int — truncated,
