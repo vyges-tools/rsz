@@ -133,6 +133,9 @@ pub struct GrLive {
     /// The detailed placer's grid (`opendp_->initMacrosAndGrid()` in the repair's preamble), which
     /// `legalCellPos` snaps each new or resized instance to.
     pub grid: vyges_dpl::grid::Grid,
+    /// The fixed nodes `initMacrosAndGrid` painted into that grid (`setFixedGridCells`), which
+    /// `legalCellPos`' `pointOffMacro` reads to move a cell off a block.
+    pub fixed: vyges_dpl::grid::FixedCells,
     /// What a buffered net on the route reads of the layers (`layerRC`, `viaResistance`).
     pub layers: std::sync::Arc<vyges_rsz::buffered_net::LayerRc>,
     /// The timer's net slacks for the next resistance-aware re-route (`set_route_slacks`).
@@ -486,6 +489,9 @@ impl CliDesign<'_> {
     /// the router marks its nets dirty).
     pub fn gr_legal_cell_pos(&mut self, inst: &str) -> Result<(), String> {
         let Some(gr) = self.gr.as_ref() else { return Ok(()) };
+        if self.db.inst_is_fixed(inst) {
+            return Ok(());
+        }
         let master = self.db.inst_master(inst);
         let (mut w, mut h) = (self.db.master_get_width(&master) as i32, self.db.master_get_height(&master) as i32);
         // `getBbox`: width and height swapped for a quarter-turn orientation (`swapWidthHeight`).
@@ -493,7 +499,17 @@ impl CliDesign<'_> {
             std::mem::swap(&mut w, &mut h);
         }
         let (x, y) = self.db.inst_location(inst);
-        if let Some((nx, ny)) = gr.grid.legal_cell_pos(x, y, w, h) {
+        // A diagnostic: each instance `pointOffMacro` moves off a block (`<inst> <x> <y> -> <core-
+        // relative point>`), appended to `VYGES_RSZ_POM_TRACE` — the witness that the rule fired.
+        if let Ok(path) = std::env::var("VYGES_RSZ_POM_TRACE") {
+            let init = (x - gr.grid.core.0, y - gr.grid.core.1);
+            if let Some(pt) = gr.grid.point_off_macro(&gr.fixed, init, w, h).filter(|&pt| pt != init) {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).map_err(|e| format!("{path}: {e}"))?;
+                writeln!(f, "{inst} {x} {y} -> {} {}", pt.0, pt.1).map_err(|e| format!("{path}: {e}"))?;
+            }
+        }
+        if let Some((nx, ny)) = gr.grid.legal_cell_pos(&gr.fixed, x, y, w, h) {
             self.db.set_inst_location(inst, nx, ny).map_err(|e| e.to_string())?;
             self.gr_inst_moved(inst);
         }

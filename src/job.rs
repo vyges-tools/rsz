@@ -1396,13 +1396,11 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     // the repair (`IncrementalGRoute`), from the state `global_route` left.
                     let gr = match (gr_estimated, groute.as_ref(), groute_opts.as_ref()) {
                         (true, Some(r), Some(o)) => {
-                            // `pointOffMacro` reads the grid's block pixels: not modelled.
-                            if let Some(i) = db.inst_names().into_iter().find(|i| db.master_is_block(&db.inst_master(i))) {
-                                return Err(format!("{i}: a block instance under global-route parasitics — legalCellPos' pointOffMacro is not modelled"));
-                            }
+                            // `initMacrosAndGrid`: `importDb`, `initGrid`, `setFixedGridCells`.
                             let grid = vyges_dpl::grid::Grid::build(&db)?;
+                            let fixed = vyges_dpl::grid::FixedCells::build(&db, &grid)?;
                             let layers = std::sync::Arc::new(gr_layer_rc(&db, &rc));
-                            Some(GrLive { after: r.after.clone(), opts: o.clone(), dirty: BTreeSet::new(), grid, layers, slacks: None })
+                            Some(GrLive { after: r.after.clone(), opts: o.clone(), dirty: BTreeSet::new(), grid, fixed, layers, slacks: None })
                         }
                         _ => None,
                     };
