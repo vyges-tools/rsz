@@ -3,8 +3,6 @@
 //! driver that fits the limit, else the one that violates least) and, when the violation stays,
 //! `RepairDesign::findSlewLoadCap` (the load the driver may see, which then caps the buffered net).
 
-use std::cmp::Ordering;
-
 use vyges_sta::graph::Graph;
 use vyges_sta::liberty::{Cell, Model, Role, MAX};
 
@@ -84,14 +82,10 @@ pub fn repair_driver_slew(g: &Graph<'_>, corner: usize, d: &Driver<'_>, load_cap
         trace.push(format!("rdsc|{size_cell}|{limit_exists}|{}|{}|{}", g9(f64::from(if limit_exists { limit } else { 0.0 })), g9(f64::from(violation)), g9(f64::from(c.area))));
         sizes.push((violation, size_cell, c.area));
     }
-    order::std_sort_by(&mut sizes, |a, b| {
-        if a.0 == 0.0 && b.0 == 0.0 {
-            a.2.partial_cmp(&b.2).unwrap_or(Ordering::Equal)
-        } else {
-            a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal)
-        }
-    })
-    .map_err(|t| Stop::refused("RSZ-ORDER", format!("repairDriverSlew: {} sizes with a tie the reference's introsort orders by its partitioning", t.len)))?;
+    // `std::ranges::sort` over `pair<float, LibertyCell*>`: libc++'s introsort, so a tie in a
+    // longer list is ordered by its partitioning, not by input order.
+    order::libcxx_sort_by(&mut sizes, |a, b| if a.0 == 0.0 && b.0 == 0.0 { a.2 < b.2 } else { a.0 < b.0 })
+        .map_err(|h| Stop::refused("RSZ-ORDER", format!("repairDriverSlew: {} sizes reach the sort's heap fallback, which is not modelled", h.len)))?;
     let selected = sizes[0].1;
     trace.push(format!("rdsel|{selected}"));
     Ok((selected != d.cell).then(|| selected.to_string()))

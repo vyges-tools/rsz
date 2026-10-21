@@ -54,8 +54,10 @@ REPAIR_DESIGN OPTIONS:
   -max_wire_length L    the longest wire, microns (0: none)
   -slew_margin P        percent taken off every slew limit
   -cap_margin P         percent taken off every capacitance limit
+  -reroute              before resizing or buffering a slew violation, move the net to its least
+                        resistive layer (global-route parasitics only; a no-op on placement ones)
   -verbose              accepted
-  refused: -pre_placement / -buffer_gain, -match_cell_footprint, -reroute, -max_utilization
+  refused: -pre_placement / -buffer_gain, -match_cell_footprint, -max_utilization
 
 BUFFER_PORTS OPTIONS:
   -inputs / -outputs    which side (neither: both) — a buffer after each input port, before
@@ -138,7 +140,7 @@ const DESCRIBE: &str = r#"{
   "provenance_limitations": [
     "input_hash covers the argument vector, not the content of the job file or of the design files it names.",
     "status is one of repaired, up_to_date, vacuous, refused or error. repaired means the design changed (buffers inserted or drivers resized); up_to_date means drivers were checked and none needed a change (nets_checked says how many; for a job with buffer_ports and no repair_design, ports_checked); vacuous means nothing was checked and is NOT a pass. The declared assertion passes on repaired or up_to_date. Exit status is 0 for repaired and up_to_date, 2 for vacuous and for error, 3 for refused.",
-    "Modelled: placement parasitics, one or more corners, flat and hierarchical netlists, the default buffer selection, the SDC constraints the usage lists, buffer_ports before the repair (the estimate it leaves carried into it). Global-route parasitics (set_routing_layers, global_route with no options on one corner, estimate_parasitics -global_routing): repair_timing -hold on them in full, with the router alive over the repair (the dirty nets re-routed before each estimate, new nets added, each new instance legalized to a site and row); -setup on them in full (every move, RerouteMove and the REROUTE phase; a journal undo restores the routes from their guides; a resistance-aware re-route reads the timer's net slacks mid-update); repair_design on them from each net's route (its buffered net from the route, not a Steiner tree, a via taken off the slew budget as repairNetVia does; -reroute refused); a design with a block instance and buffer_ports on them are refused; overflow global_route leaves is its error, GRT-0116. Refused rather than guessed: the early sizing round, footprint matching, any other netlist edit between the estimate and the repair, buffer_ports on a hierarchical design, a tristate driver or a bidirect pin on a net, and any other timing-affecting SDC command.",
+    "Modelled: placement parasitics, one or more corners, flat and hierarchical netlists, the default buffer selection, the SDC constraints the usage lists, buffer_ports before the repair (the estimate it leaves carried into it). Global-route parasitics (set_routing_layers, global_route with no options on one corner, estimate_parasitics -global_routing): repair_timing -hold on them in full, with the router alive over the repair (the dirty nets re-routed before each estimate, new nets added, each new instance legalized to a site and row); -setup on them in full (every move, RerouteMove and the REROUTE phase; a journal undo restores the routes from their guides; a resistance-aware re-route reads the timer's net slacks mid-update); repair_design on them from each net's route (its buffered net from the route, not a Steiner tree, a via taken off the slew budget as repairNetVia does; -reroute in full: a constrained driver's net longer than three gcells moved to its least resistive layer when that at least halves its resistance, before the driver is resized or its net buffered); a design with a block instance and buffer_ports on them are refused; overflow global_route leaves is its error, GRT-0116. Refused rather than guessed: the early sizing round, footprint matching, any other netlist edit between the estimate and the repair, buffer_ports on a hierarchical design, a tristate driver or a bidirect pin on a net, and any other timing-affecting SDC command.",
     "repair_timing -setup is modelled for every move of the default sequence and VtSwapMove in the LEGACY, WNS, TNS, ENDPOINT_FANIN, STARTPOINT_FANOUT, LAST_GASP, CRIT_VT_SWAP and REROUTE phases (RerouteMove too) on placement or global-route parasitics, the experimental policies GLOBAL_SIZING, MT1 and MEASURED_VT_SWAP each alone and LEGACY_MT as the first phase, and repair_timing -hold alone and repair_timing -recover_power in full (ending with RSZ-0050 / RSZ-0060 / RSZ-0125 as the command does): every progress row, the summary and the design left, for one or several clocks (real or virtual, each ideal or propagated), latches with time borrowing, VT libraries, pins tied to supply nets, set_max_delay / set_min_delay in the forms the timer models, over one corner or several; -setup with -hold runs the setup part and is refused after it; GLOBAL_SIZING, MT1 or MEASURED_VT_SWAP with other phases, LEGACY_MT after another phase or with SizeDownFanoutMove, setup clock uncertainty, clock latency or transition, derates, false and multicycle paths and clock groups are refused before the lines."
   ],
   "invocation": {
@@ -456,6 +458,7 @@ mod tests {
     fn repair_design_arguments() {
         let a = parse_args(&["-max_wire_length".into(), "800".into(), "-buffer_gain".into(), "4".into()]).unwrap();
         assert_eq!((a.max_wire_length, a.pre_placement), (800.0 * f64::from(1e-6f32), true));
-        assert!(parse_args(&["-reroute".into()]).unwrap_err().contains("not modelled"));
+        assert!(parse_args(&["-reroute".into()]).unwrap().reroute);
+        assert!(parse_args(&["-match_cell_footprint".into()]).unwrap_err().contains("not modelled"));
     }
 }

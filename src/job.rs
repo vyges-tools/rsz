@@ -383,7 +383,8 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
             // internal: `findResizeSlacks`' repair (global placement's timing-driven mode)
             "-vyges_resize_slack" => a.resize_slack = true,
             "-verbose" => {}
-            f @ ("-match_cell_footprint" | "-reroute" | "-max_utilization") => return Err(format!("repair_design {f}: not modelled")),
+            "-reroute" => a.reroute = true,
+            f @ ("-match_cell_footprint" | "-max_utilization") => return Err(format!("repair_design {f}: not modelled")),
             other => return Err(format!("repair_design argument {other}: not modelled")),
         }
         i += 1;
@@ -811,7 +812,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 if sdc_path_delays {
                     return Err("set_max_delay / set_min_delay: not modelled for repair_design".into());
                 }
-                let a = parse_args(&args)?;
+                let mut a = parse_args(&args)?;
                 // dont_use_: every liberty dont_use cell (copyDontUseFromLiberty), then set_dont_use.
                 let mut dont_use = set_dont_use.clone();
                 for lib in &libs.libs {
@@ -820,11 +821,8 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 let m = masters(&db)?;
                 let lib0 = libs.default_library().ok_or("repair_design before any liberty library")?;
                 // The SDC's times are in the first library's unit (`user_time_to_sta`, here and in
-                // `sdc_env`). Witnessed in another unit only by global placement's reweight (an
-                // asap7 ps run); the command on its own keeps the refusal until a case shows it.
-                if lib0.time_scale != 1e-9f32 && !a.resize_slack {
-                    return Err("a library time unit other than 1ns: user-unit conversion is not modelled".into());
-                }
+                // `sdc_env`, `search_sdc_on`): witnessed in ps by global placement's reweight and by
+                // repair_design on asap7 global-route parasitics.
                 let limits = Limits {
                     design_max_transition: sdc.as_ref().and_then(|s| s.max_transition).map(|v| user_time_to_sta(v, lib0.time_scale)),
                     // `set_max_fanout` takes a float, unscaled.
@@ -907,6 +905,13 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 }
                 let port_caps = env.port_pin_cap.clone();
                 let limits_of_block = sizing_limits(&db)?;
+                // `-reroute` under global-route parasitics: `tryRerouteNet` asks the driver's max
+                // slack, so the repair searches on the constraints (ideal clocks: a propagated one
+                // is refused above). With no SDC every slack is INF and nothing is rerouted.
+                if a.reroute && gr_estimated {
+                    let none = vyges_loom::sdc::Sdc::default();
+                    a.search_sdc = Some(search_sdc_on(sdc.as_ref().unwrap_or(&none), &netlist, lib0.time_scale, false, false)?);
+                }
                 let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), alpha: routing_alpha, estimating, netlist: std::sync::Arc::new(netlist), netlist_gen: 0, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins: sdc.as_ref().map(sdc_cap_pins).unwrap_or_default(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr, gr_error: None, undoing: false, skips: None, skip_log: false };
                 let inputs = Inputs { libs: &libs, masters: &m, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins, sizing_limits: limits_of_block, clock_pattern: Default::default() };
                 let area0 = crate::odb_design::design_area(design.db);

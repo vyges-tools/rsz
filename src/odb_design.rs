@@ -618,22 +618,17 @@ impl CliDesign<'_> {
         let (input, output) = c.buffer_ports().ok_or_else(|| format!("{cell}: not a buffer"))?;
         let in_net = self.db.net_of(&inst, &input.name);
         let out_net = self.db.net_of(&inst, &output.name);
-        // A port load names the new net after the port and renames the original: the cache
-        // follows the net, not the name.
+        // `ConcreteParasitics::disconnectPinBefore` on each load moved off the original net
+        // deletes its drivers' reduced models, and the estimator keeps no network once it has
+        // reduced one (`reduceParasitic`, then `deleteParasiticNetwork`): the buffer's input net
+        // (the original, or its renamed self when a port load names the new net after the port)
+        // is timed on its pin caps alone until it is estimated again, as is the new output net.
+        // Witness: a resistance-aware route update's mid-update slacks read the driver of a net a
+        // repeater was just inserted on (repair_design -reroute on global-route parasitics).
         for map in self.parasitics.iter_mut() {
-            if in_net != original {
-                if let Some(p) = map.remove(&original) {
-                    map.insert(in_net.clone(), p);
-                }
-            }
+            map.remove(&original);
+            map.remove(&in_net);
             map.remove(&out_net);
-            // `ConcreteParasitics::disconnectPinBefore` on each load moved off the original net:
-            // its pin node in that net's (stale) network becomes a fresh internal subnode — the
-            // resistors handed over, no ground capacitance, no pin. A connected pin adds nothing:
-            // until the net is estimated again, its new input pin has no node.
-            if let Some(p) = map.get_mut(&in_net) {
-                disconnect_pins(p, &in_net, loads);
-            }
         }
         self.invalidate(&in_net);
         self.invalidate(&out_net);
@@ -744,6 +739,59 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
 
     fn global_routing_parasitics(&self) -> bool {
         self.gr.is_some()
+    }
+
+    fn route_slacks_wanted(&mut self) -> bool {
+        self.pull_edits();
+        self.gr.as_ref().is_some_and(|g| g.after.resistance_aware && !g.dirty.is_empty())
+    }
+
+    fn set_route_slacks(&mut self, slacks: std::collections::HashMap<String, f32>) {
+        if let Some(g) = self.gr.as_mut() {
+            g.slacks = Some(slacks);
+        }
+    }
+
+    fn ensure_routes(&mut self, net: &str) -> bool {
+        self.pull_edits();
+        self.gr.is_some() && (self.invalid.contains(net) || !self.parasitics[0].contains_key(net))
+    }
+
+    fn pin_net(&self, pin: &str) -> Option<(String, bool)> {
+        let net = self.net_of_load(pin);
+        (!net.is_empty()).then(|| (net.clone(), self.db.net_is_special(&net)))
+    }
+
+    fn net_res_aware(&self, net: &str) -> bool {
+        self.gr.as_ref().is_some_and(|gr| vyges_grt::global_route::is_net_res_aware(&gr.after, net))
+    }
+
+    fn net_resistances(&self, net: &str) -> (f32, f32) {
+        match self.gr.as_ref() {
+            Some(gr) => (vyges_grt::global_route::net_resistance_on_layer(&gr.after, net, None), vyges_grt::global_route::net_resistance_on_min_resistance_layer(&gr.after, net)),
+            None => (0.0, 0.0),
+        }
+    }
+
+    fn reroute_net(&mut self, net: &str) -> Result<(), String> {
+        let Some(gr) = self.gr.as_mut() else { return Err("rerouting needs global-route parasitics".into()) };
+        vyges_grt::global_route::set_resistance_aware(&mut gr.after);
+        gr.mark(self.db, net);
+        vyges_grt::global_route::set_net_res_aware(&mut gr.after, net);
+        // `parasiticsInvalid(db_net)`: re-estimated, and its delays invalidated, at the next update.
+        self.invalidate(net);
+        self.timer.est_invalid.insert(net.to_string());
+        Ok(())
+    }
+
+    fn net_route_gcells(&self, net: &str) -> Option<(i32, i32)> {
+        let a = &self.gr.as_ref()?.after;
+        if a.tile_size <= 0 {
+            return None;
+        }
+        let route = a.net_routes.iter().find(|r| r.name == net)?;
+        let segs: Vec<(i32, i32, i32, i32)> = route.segments.iter().map(|g| (g.init_x, g.init_y, g.final_x, g.final_y)).collect();
+        Some((vyges_rsz::repair_design::route_gcell_length(&segs, a.tile_size), a.tile_size))
     }
 
     /// Under global-route parasitics `makeBufferedNetGroute` reads the router: the net's pins
@@ -887,43 +935,6 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
         self.gr.is_some()
     }
 
-    fn route_slacks_wanted(&mut self) -> bool {
-        self.pull_edits();
-        self.gr.as_ref().is_some_and(|g| g.after.resistance_aware && !g.dirty.is_empty())
-    }
-
-    fn set_route_slacks(&mut self, slacks: std::collections::HashMap<String, f32>) {
-        if let Some(g) = self.gr.as_mut() {
-            g.slacks = Some(slacks);
-        }
-    }
-
-    fn pin_net(&self, pin: &str) -> Option<(String, bool)> {
-        let net = self.net_of_load(pin);
-        (!net.is_empty()).then(|| (net.clone(), self.db.net_is_special(&net)))
-    }
-
-    fn net_res_aware(&self, net: &str) -> bool {
-        self.gr.as_ref().is_some_and(|gr| vyges_grt::global_route::is_net_res_aware(&gr.after, net))
-    }
-
-    fn net_resistances(&self, net: &str) -> (f32, f32) {
-        match self.gr.as_ref() {
-            Some(gr) => (vyges_grt::global_route::net_resistance_on_layer(&gr.after, net, None), vyges_grt::global_route::net_resistance_on_min_resistance_layer(&gr.after, net)),
-            None => (0.0, 0.0),
-        }
-    }
-
-    fn reroute_net(&mut self, net: &str) -> Result<(), String> {
-        let Some(gr) = self.gr.as_mut() else { return Err("rerouting needs global-route parasitics".into()) };
-        vyges_grt::global_route::set_resistance_aware(&mut gr.after);
-        gr.mark(self.db, net);
-        vyges_grt::global_route::set_net_res_aware(&mut gr.after, net);
-        // `parasiticsInvalid(db_net)`: re-estimated, and its delays invalidated, at the next update.
-        self.invalidate(net);
-        self.timer.est_invalid.insert(net.to_string());
-        Ok(())
-    }
 
     /// `Resizer::computeDesignArea`: over the block's instances in order, each master's
     /// `width × height` in m² (`dbuToMeters` each side) — 0 for a master that is not core
@@ -1337,17 +1348,6 @@ pub fn master_area(db: &Db, master: &str) -> f64 {
         return 0.0;
     }
     f64::from(db.master_get_width(master)) / (dbu * 1e6) * (f64::from(db.master_get_height(master)) / (dbu * 1e6))
-}
-
-/// `ConcreteParasiticNetwork::disconnectPin` for each pin: its node is renamed to a subnode of the
-/// net (`<net>:<next id>`, no longer a pin) and its ground capacitance dropped.
-pub fn disconnect_pins(p: &mut NetParasitics, net: &str, pins: &[String]) {
-    for pin in pins {
-        if let Some(i) = p.node_names.iter().position(|n| n == pin) {
-            p.node_names[i] = format!("{net}:{}", p.node_names.len() + i);
-            p.network.node_caps[i] = 0.0;
-        }
-    }
 }
 
 /// `Resizer::computeDesignArea`: over the block's instances in order, each master's

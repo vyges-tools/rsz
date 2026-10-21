@@ -2030,30 +2030,6 @@ pub trait SetupDesign: Design {
     fn global_routed(&self) -> bool {
         false
     }
-    /// The next `updateParasitics` re-routes nets resistance-aware: its `updateSlacks` reads the
-    /// timer's net slacks mid-update (the edits pulled first, so the router's dirty nets are known).
-    fn route_slacks_wanted(&mut self) -> bool {
-        false
-    }
-    /// Those slacks (`sta_->slack(net, max)` per net), for the next `updateParasitics` only.
-    fn set_route_slacks(&mut self, _slacks: HashMap<String, f32>) {}
-    /// The net a pin is on, by name (`flatNet`), and whether it is special.
-    fn pin_net(&self, _pin: &str) -> Option<(String, bool)> {
-        None
-    }
-    /// `GlobalRouter::isNetResAware(db_net)`.
-    fn net_res_aware(&self, _net: &str) -> bool {
-        false
-    }
-    /// `getFRNetResistance` and `getFRNetResistanceOnMinResistanceLayer` of a net.
-    fn net_resistances(&self, _net: &str) -> (f32, f32) {
-        (0.0, 0.0)
-    }
-    /// `RerouteCandidate::apply`: `setResistanceAware(true)`, `addDirtyNet`, `setNetIsResAware`,
-    /// `parasiticsInvalid` — the net routed again, resistance-aware, at the next update.
-    fn reroute_net(&mut self, _net: &str) -> Result<(), String> {
-        Err("rerouting needs global-route parasitics".into())
-    }
 }
 
 /// `Resizer::repairHold` → `RepairHold::repairHold`: the hold buffer, then the passes over the

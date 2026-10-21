@@ -35,6 +35,12 @@ pub struct Args {
     /// `Resizer::findResizeSlacks`' call (global placement's timing-driven mode): the max wire
     /// length is `resizeSlackPreamble`'s `findMaxWireLength1()` and no Tcl-level check runs.
     pub resize_slack: bool,
+    /// `-reroute`: `tryRerouteNet` before the driver is resized or buffered (global-route
+    /// parasitics only).
+    pub reroute: bool,
+    /// The search constraints `tryRerouteNet`'s `sta_->slack(drvr, max)` reads: set by the caller
+    /// when `reroute` is on under global-route parasitics.
+    pub search_sdc: Option<vyges_sta::sdc::Sdc>,
 }
 
 /// What the repair reads besides the arguments and the design it edits.
@@ -78,6 +84,8 @@ pub struct Outcome {
     pub fanout_violations: usize,
     pub length_violations: usize,
     pub resized: usize,
+    /// `rerouted_nets_`: nets `tryRerouteNet` marked to be routed again, resistance-aware.
+    pub rerouted: usize,
     /// Drivers `repairDriver` passed over: no net, dont_touch, connected by abutment, a clock.
     pub drivers_skipped: usize,
     /// Warnings the command writes before it repairs (`check_max_wire_length`: RSZ-0065).
@@ -91,10 +99,10 @@ pub struct Outcome {
 
 impl Outcome {
     /// The status word, settled in one place: `repaired` when the design changed (a buffer
-    /// inserted or a driver resized); `up_to_date` when drivers were checked and none needed a
-    /// change (the count is the evidence); `vacuous` when no driver was checked at all.
+    /// inserted, a driver resized, or a net rerouted); `up_to_date` when drivers were checked and
+    /// none needed a change (the count is the evidence); `vacuous` when no driver was checked at all.
     pub fn settle(&self) -> &'static str {
-        if self.inserted_buffers + self.resized > 0 {
+        if self.inserted_buffers + self.resized + self.rerouted > 0 {
             "repaired"
         } else if self.nets_checked > 0 {
             "up_to_date"
@@ -120,6 +128,9 @@ impl Outcome {
         }
         if self.resized > 0 {
             out.push(("RSZ-0039", format!("Resized {} instances.", self.resized)));
+        }
+        if self.rerouted > 0 {
+            out.push(("RSZ-0044", format!("Rerouted {} nets.", self.rerouted)));
         }
         if self.inserted_buffers > 0 {
             out.push(("RSZ-0038", format!("Inserted {} buffers in {} nets.", self.inserted_buffers, self.nets_repaired)));
@@ -245,6 +256,7 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
         pre: PreCheck::default(),
         checks: NetChecks { slew: true, cap: true, resize_drvr: true },
         timer,
+        max_slacks: HashMap::new(),
     };
     trace.ran(&["drv"]);
     let mut outcome = Outcome { warnings, max_wire_lengths, drivers: drivers.len(), ..Default::default() };
@@ -332,7 +344,7 @@ pub fn repair_clk_nets(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers
     let slew_shape_factor = preamble::compute_slew_shape_factor(lib)?;
     // RepairDesign::repairClkNets: init over buffer_cells_ = clk_buffers_.
     let r_strongest = r_strongest_buffer(inputs, clk_buffers);
-    let args = Args { max_wire_length, slew_margin: 0.0, cap_margin: 0.0, pre_placement: false, resize_slack: false };
+    let args = Args { max_wire_length, ..Args::default() };
     let lifted = crate::sizing::SizingLimits { area: None, leakage: None, ..inputs.sizing_limits };
     let sizing = Sizing { libs: inputs.libs, masters: inputs.masters, dont_use: inputs.dont_use, equiv: &equiv, target_loads: &target_loads, tgt_slews, tgt_scene, limits: lifted };
     let annotated: Vec<HashMap<String, f32>> = vec![HashMap::new(); inputs.libs.scene_count()];
@@ -351,6 +363,7 @@ pub fn repair_clk_nets(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers
         pre: PreCheck::default(),
         checks: NetChecks { slew: false, cap: false, resize_drvr: false },
         timer: None,
+        max_slacks: HashMap::new(),
     };
     let mut outcome = Outcome::default();
     // 🔑 `sta_->findDelays()` once, then `repairNet`'s `findDelays(drvr)` per clock driver: the
@@ -443,6 +456,8 @@ struct NetCtx<'a, 'b> {
     /// `findDelays(drvr)` (one vertex) and `Sta::findDelays(drvr)` (the queue up to its level).
     /// `None`: every edit re-times the graphs whole (`repairClkNets`, the `VYGES_RSZ_DCALC` dump).
     timer: Option<Vec<IncTimer>>,
+    /// `tryRerouteNet`'s driver max slacks, by pin, from the last full search ([`driver_max_slack`]).
+    max_slacks: HashMap<String, f32>,
 }
 
 /// The `repairNet` switches a caller holds for a whole run.
@@ -742,6 +757,12 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
     let fanout_clocks;
     let resized_netlist;
     let resized_clocks;
+    let rerouted_netlist;
+    let rerouted_clocks;
+    let annot_netlist;
+    let annot_clocks;
+    let mid_netlist;
+    let mid_clocks;
     // The graphs it was given are handed back; after an edit it reads its own (`gs!`).
     let mut held_graphs = graphs;
     let mut own_graphs: Option<Vec<Graph<'_>>> = None;
@@ -753,8 +774,55 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
     let mut clocks = clocks;
     let mut drvr = drvr;
     let mut net_name = net.to_string();
-    // The fanout repair below rebuilds the graphs from the edited design: no longer the held ones.
+    // The fanout repair below (or a mid-update timing before the ensure) rebuilds the graphs from
+    // the edited design: no longer the held ones.
     let mut fanout_edited = false;
+    // After an edit that `updateParasitics` estimated (a resize, a reroute): the graphs again,
+    // then `Sta::findDelays(drvr)` — levelized, then the queue up to the driver's level.
+    macro_rules! retime_driver {
+        ($netlist:ident, $clocks:ident, $what:literal) => {
+            $netlist = design.netlist_shared();
+            own_graphs = Some(match ctx.timer.as_mut() {
+                Some(incs) => timer_graphs(inputs, design, &$netlist, ctx.annotated, incs)?,
+                None => current_graphs(inputs, &$netlist, ctx.annotated)?,
+            });
+            drvr = gs!()[0].vertices.iter().position(|v| v.is_driver && v.name == name).expect($what);
+            $clocks = timing::clock_pins(&gs!()[0], inputs.clock_sources);
+            clocks = &$clocks;
+            match ctx.timer.as_mut() {
+                Some(incs) => {
+                    let own = own_graphs.as_mut().expect("just built");
+                    for (inc, g) in incs.iter_mut().zip(own.iter()) {
+                        inc.relevelize(g).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+                    }
+                    let level = incs[0].levels.get(&name).copied();
+                    let pars: Vec<&HashMap<String, vyges_sta::graph::NetParasitics>> = (0..incs.len()).map(|k| design.parasitics(k)).collect();
+                    vyges_sta::incr::find_delays_scenes(incs, own, &pars, level).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+                }
+                None => find_all_delays(own_graphs.as_mut().expect("just built"), &*design, &name)?,
+            }
+        };
+    }
+    // `updateParasitics()`; under a resistance-aware router its route update first reads the
+    // timer's net slacks (`set_mid_update_slacks`).
+    macro_rules! update_parasitics {
+        () => {
+            if design.route_slacks_wanted() {
+                set_mid_update_slacks(inputs, design, ctx)?;
+            }
+            design.update_parasitics().map_err(|e| Stop::error("RSZ-EST", e))?;
+        };
+    }
+    // `rerouteEnabled() && tryRerouteNet(drvr_pin)` on the current graphs.
+    macro_rules! try_reroute {
+        () => {
+            ctx.args.reroute
+                && match own_graphs.as_mut() {
+                    Some(own) => try_reroute_net(design, own, &name, ctx, trace)?,
+                    None => try_reroute_net(design, &mut held_graphs, &name, ctx, trace)?,
+                }
+        };
+    }
 
     // Fanout is addressed by creating region repeaters.
     if check_fanout {
@@ -790,8 +858,26 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
         }
     }
 
-    // ensureWireParasitic(drvr_pin, net), then findDelays(drvr).
+    // ensureWireParasitic(drvr_pin, net), then findDelays(drvr). A route update it makes under a
+    // resistance-aware router reads the timer's net slacks first, timing the whole design: the
+    // graphs are made again from that state after.
+    let mid_update = design.ensure_routes(&net_name) && design.route_slacks_wanted();
+    if mid_update {
+        set_mid_update_slacks(inputs, design, ctx)?;
+    }
     design.ensure_wire_parasitic(&net_name).map_err(|e| Stop::error("RSZ-EST", e))?;
+    if mid_update {
+        mid_netlist = design.netlist_shared();
+        own_graphs = Some(match ctx.timer.as_mut() {
+            Some(incs) => timer_graphs(inputs, design, &mid_netlist, ctx.annotated, incs)?,
+            None => current_graphs(inputs, &mid_netlist, ctx.annotated)?,
+        });
+        drvr = gs!()[0].vertices.iter().position(|v| v.is_driver && v.name == name).expect("the driver");
+        mid_clocks = timing::clock_pins(&gs!()[0], inputs.clock_sources);
+        clocks = &mid_clocks;
+        // As after the fanout repair: the held graphs are no longer the ones the timer is at.
+        fanout_edited = true;
+    }
     match (ctx.timer.as_mut(), held_index) {
         // On the timer: `findDelays(drvr)` — the driver alone (`findVertexDelay`), from the slews
         // the graphs hold; the loads whose slews it changed stay queued.
@@ -826,50 +912,46 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
     let (mut slew1, mut max_slew1, mut slack1, mut corner1) = timing::repair_check_slew(&timing::Scenes::new(gs!()), drvr, &inputs.limits, clocks, ctx.args.slew_margin);
     trace.push(format!("dslew|{}|{}|{}", g9(f64::from(slew1.unwrap_or(0.0))), g9(f64::from(max_slew1)), g9(f64::from(slack1))));
     trace.ran(&["rds", "rdsc", "rdsel", "dresize", "dslew2", "slewcap", "slc0", "slc"]);
+    if ctx.args.reroute {
+        trace.ran(&["rr", "rrs", "rrg", "rrr", "rrok", "dslewr"]);
+    }
     let mut slew_violation = false;
     if slack1 < 0.0 {
         slew_violation = true;
-        let c1 = corner1.expect("a violation has a scene");
-        if let Some(cell) = repair_driver_slew(&*design, gs!(), c1, drvr, ctx, trace)? {
-            design.swap_master(&inst_of(&name), &cell).map_err(|e| Stop::error("RSZ-RESIZE", e))?;
-            outcome.resized += 1;
-            trace.push(format!("dresize|{cell}"));
-            design.update_parasitics().map_err(|e| Stop::error("RSZ-EST", e))?;
-            resized_netlist = design.netlist_shared();
-            own_graphs = Some(match ctx.timer.as_mut() {
-                Some(incs) => timer_graphs(inputs, design, &resized_netlist, ctx.annotated, incs)?,
-                None => current_graphs(inputs, &resized_netlist, ctx.annotated)?,
-            });
-            drvr = gs!()[0].vertices.iter().position(|v| v.is_driver && v.name == name).expect("the resized driver");
-            resized_clocks = timing::clock_pins(&gs!()[0], inputs.clock_sources);
-            clocks = &resized_clocks;
-            match ctx.timer.as_mut() {
-                // `Sta::findDelays(drvr)`: levelized, then the queue up to the driver's level.
-                Some(incs) => {
-                    let own = own_graphs.as_mut().expect("just built");
-                    for (inc, g) in incs.iter_mut().zip(own.iter()) {
-                        inc.relevelize(g).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
-                    }
-                    let level = incs[0].levels.get(&name).copied();
-                    let pars: Vec<&HashMap<String, vyges_sta::graph::NetParasitics>> = (0..incs.len()).map(|k| design.parasitics(k)).collect();
-                    vyges_sta::incr::find_delays_scenes(incs, own, &pars, level).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
-                }
-                None => find_all_delays(own_graphs.as_mut().expect("just built"), &*design, &name)?,
-            }
+        // First a reroute to a less resistive layer: it may fix the slew without a resize or a
+        // buffer.
+        if try_reroute!() {
+            outcome.rerouted += 1;
+            update_parasitics!();
+            retime_driver!(rerouted_netlist, rerouted_clocks, "the rerouted driver");
             (slew1, max_slew1, slack1, corner1) = timing::repair_check_slew(&timing::Scenes::new(gs!()), drvr, &inputs.limits, clocks, ctx.args.slew_margin);
-            trace.push(format!("dslew2|{}|{}|{}", g9(f64::from(slew1.unwrap_or(0.0))), g9(f64::from(max_slew1)), g9(f64::from(slack1))));
+            trace.push(format!("dslewr|{}|{}|{}", g9(f64::from(slew1.unwrap_or(0.0))), g9(f64::from(max_slew1)), g9(f64::from(slack1))));
         }
-        // Still violating: the max cap that removes it, from the driver's (resized) LINK port, its
-        // models at the violation's corner.
+        // Still violating: the driver resized, and if that does not fix it, the load cap that
+        // would.
         if slack1 < 0.0 {
             let c1 = corner1.expect("a violation has a scene");
-            if let (Some(cell), Some(port)) = (gs!()[0].vertices[drvr].cell.as_deref(), gs!()[0].vertices[drvr].port.as_deref()) {
-                let link = inputs.libs.link_cell(cell).expect("a link cell");
-                let scene_cell = inputs.libs.scene_cell(c1, cell).expect("a scene cell");
-                max_cap = driver_slew::find_slew_load_cap(link, scene_cell, port, f64::from(max_slew1), ctx.sizing.tgt_slews, trace) as f32;
-                trace.push(format!("slewcap|{}|{}", g9(f64::from(max_cap)), g9(f64::from(max_slew1))));
-                corner = c1;
-                repair_cap = true;
+            if let Some(cell) = repair_driver_slew(&*design, gs!(), c1, drvr, ctx, trace)? {
+                design.swap_master(&inst_of(&name), &cell).map_err(|e| Stop::error("RSZ-RESIZE", e))?;
+                outcome.resized += 1;
+                trace.push(format!("dresize|{cell}"));
+                update_parasitics!();
+                retime_driver!(resized_netlist, resized_clocks, "the resized driver");
+                (slew1, max_slew1, slack1, corner1) = timing::repair_check_slew(&timing::Scenes::new(gs!()), drvr, &inputs.limits, clocks, ctx.args.slew_margin);
+                trace.push(format!("dslew2|{}|{}|{}", g9(f64::from(slew1.unwrap_or(0.0))), g9(f64::from(max_slew1)), g9(f64::from(slack1))));
+            }
+            // Still violating: the max cap that removes it, from the driver's (resized) LINK port, its
+            // models at the violation's corner.
+            if slack1 < 0.0 {
+                let c1 = corner1.expect("a violation has a scene");
+                if let (Some(cell), Some(port)) = (gs!()[0].vertices[drvr].cell.as_deref(), gs!()[0].vertices[drvr].port.as_deref()) {
+                    let link = inputs.libs.link_cell(cell).expect("a link cell");
+                    let scene_cell = inputs.libs.scene_cell(c1, cell).expect("a scene cell");
+                    max_cap = driver_slew::find_slew_load_cap(link, scene_cell, port, f64::from(max_slew1), ctx.sizing.tgt_slews, trace) as f32;
+                    trace.push(format!("slewcap|{}|{}", g9(f64::from(max_cap)), g9(f64::from(max_slew1))));
+                    corner = c1;
+                    repair_cap = true;
+                }
             }
         }
     }
@@ -882,6 +964,17 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
     let annotated = viol_scene.is_some();
     let shown_slew = ls.slew.or(slew1).unwrap_or(0.0);
     trace.push(format!("lslew|{}|{}|{}|annot={annotated}", g9(f64::from(shown_slew)), g9(f64::from(ls.limit)), g9(f64::from(ls.slack))));
+    // A violation the annotation hides (the load slew clamped to its limit, slack 0): a reroute
+    // before the buffering — unverifiable while the annotation stands, but a better parasitic
+    // needs fewer buffers.
+    // The reference's `else if`: not a violation (NaN included), and annotated.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
+    let hidden = !(ls.slack < 0.0) && annotated;
+    if hidden && try_reroute!() {
+        outcome.rerouted += 1;
+        update_parasitics!();
+        retime_driver!(annot_netlist, annot_clocks, "the rerouted driver");
+    }
     repair_load_slew = ls.slack < 0.0 || annotated;
     if repair_load_slew {
         slew_violation = true;
@@ -972,6 +1065,200 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
     }
     recycle(own_graphs.take());
     Ok(held_graphs)
+}
+
+/// `kShortNetGCellThreshold`: a route at most this many gcells long is not rerouted.
+const SHORT_NET_GCELLS: i32 = 3;
+/// `kMinResistanceReduction`: the least fraction of its resistance a reroute must save.
+const MIN_RESISTANCE_REDUCTION: f32 = 0.50;
+
+/// `Resizer::tryRerouteNet(drvr_pin)`, in its order: global-route parasitics only; the driver's
+/// net present, neither it nor the driver's instance dont_touch, the net not special and not
+/// already resistance-aware; the driver constrained (max slack not INF); its route longer than
+/// [`SHORT_NET_GCELLS`]; the least resistive layer saving at least [`MIN_RESISTANCE_REDUCTION`];
+/// then the net marked to be routed again, resistance-aware, at the next `updateParasitics`.
+/// `graphs` are the current ones.
+fn try_reroute_net(design: &mut dyn Design, graphs: &mut [Graph<'_>], drvr_pin: &str, ctx: &mut NetCtx<'_, '_>, trace: &mut Trace) -> Result<bool, Stop> {
+    trace.push(format!("rr|{drvr_pin}"));
+    if !design.global_routing_parasitics() {
+        return Ok(false);
+    }
+    // `network_->net(drvr_pin)`: none for a top-level port (`dbNetwork::net` answers nothing for
+    // a BTerm), so a port's net is never rerouted.
+    if is_top_port(design.netlist(), drvr_pin) {
+        return Ok(false);
+    }
+    let Some((net, special)) = design.pin_net(drvr_pin) else { return Ok(false) };
+    // `dontTouch(pin)`: its instance (a port has none) or its net.
+    let info = design.net_info();
+    if drvr_pin.rsplit_once('/').is_some_and(|(inst, _)| info.dont_touch_insts.contains(inst)) || info.dont_touch.contains(&net) {
+        return Ok(false);
+    }
+    if special || design.net_res_aware(&net) {
+        return Ok(false);
+    }
+    let slack = driver_max_slack(design, graphs, drvr_pin, ctx)?;
+    trace.push(format!("rrs|{}", if slack >= timing::INF { "inf" } else { "finite" }));
+    if slack >= timing::INF {
+        return Ok(false);
+    }
+    if let Some((gcells, tile_size)) = design.net_route_gcells(&net) {
+        trace.push(format!("rrg|{gcells}|{tile_size}"));
+        if short_route(gcells) {
+            return Ok(false);
+        }
+    }
+    let (resistance, estimated) = design.net_resistances(&net);
+    let ratio = resistance_reduction(resistance, estimated);
+    trace.push(format!("rrr|{}|{}|{}", g9(f64::from(resistance)), g9(f64::from(estimated)), g9(f64::from(ratio))));
+    if !saves_enough(ratio) {
+        return Ok(false);
+    }
+    design.reroute_net(&net).map_err(|e| Stop::refused("RSZ-GR", e))?;
+    trace.push(format!("rrok|{net}"));
+    Ok(true)
+}
+
+/// `gcell_length <= kShortNetGCellThreshold`: too short for its resistance to matter.
+fn short_route(gcells: i32) -> bool {
+    gcells <= SHORT_NET_GCELLS
+}
+
+/// `!(reduction_ratio < kMinResistanceReduction)`: exactly half is enough.
+#[allow(clippy::neg_cmp_op_on_partial_ord)]
+fn saves_enough(ratio: f32) -> bool {
+    !(ratio < MIN_RESISTANCE_REDUCTION)
+}
+
+/// A top-level port of the netlist (not an instance pin).
+fn is_top_port(netlist: &vyges_sta::netlist::Netlist, pin: &str) -> bool {
+    netlist.ports.iter().any(|p| p.0 == pin)
+}
+
+/// `tryRerouteNet`'s reduction ratio: `(R − R_min_layer) / R`, 0 for a net with no resistance.
+fn resistance_reduction(resistance: f32, estimated: f32) -> f32 {
+    if resistance > 0.0 {
+        (resistance - estimated) / resistance
+    } else {
+        0.0
+    }
+}
+
+/// The global route's length in gcells, as `tryRerouteNet` sums it: each segment that is not a
+/// via (same start and end point) contributes `length / tile_size` — an int division EACH, so
+/// two 1.5-gcell segments are 2, not 3. Segments are `(init_x, init_y, final_x, final_y)`.
+pub fn route_gcell_length(segments: &[(i32, i32, i32, i32)], tile_size: i32) -> i32 {
+    segments.iter().filter(|&&(x0, y0, x1, y1)| !(x0 == x1 && y0 == y1)).map(|&(x0, y0, x1, y1)| ((x0 - x1).abs() + (y0 - y1).abs()) / tile_size).sum()
+}
+
+/// `sta_->slack(graph_->pinDrvrVertex(drvr_pin), max_)`, over every scene.
+///
+/// 🔑 **The call times the whole design first**: `Sta::slack` → `findRequired` →
+/// `searchPreamble` → `findDelays()`, to the last level. So every pending delay is computed here
+/// (the incremental queue emptied), and what the repair reads after this — reroute or not — is
+/// fully timed. Only that side effect and whether the slack is INF are used.
+///
+/// Whether a driver's max slack is INF depends on the constraint topology alone (a path from a
+/// constrained start to a constrained end through it), which buffering and resizing keep. So the
+/// answer for every driver is taken from ONE full search and cached; a pin the cache has not seen
+/// (a repeater made since) runs the search again on the current graphs.
+fn driver_max_slack(design: &dyn Design, graphs: &mut [Graph<'_>], drvr_pin: &str, ctx: &mut NetCtx<'_, '_>) -> Result<f32, Stop> {
+    if let Some(incs) = ctx.timer.as_mut() {
+        let pars: Vec<&HashMap<String, vyges_sta::graph::NetParasitics>> = (0..incs.len()).map(|k| design.parasitics(k)).collect();
+        vyges_sta::incr::find_delays_scenes(incs, graphs, &pars, None).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+    }
+    if let Some(&s) = ctx.max_slacks.get(drvr_pin) {
+        return Ok(s);
+    }
+    let sdc = ctx.args.search_sdc.as_ref().ok_or_else(|| Stop::error("RSZ-REROUTE", "repair_design -reroute: no search constraints".to_string()))?;
+    let mut slacks: HashMap<String, f32> = HashMap::new();
+    for g in graphs.iter() {
+        let mut search = vyges_sta::search::Search::in_graph_order(g, sdc);
+        search.find_arrivals().map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+        search.find_requireds().map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+        for (v, vx) in g.vertices.iter().enumerate().filter(|(_, vx)| vx.is_driver) {
+            let s = search.slack_of(v, vyges_sta::liberty::MAX, None);
+            slacks.entry(vx.name.clone()).and_modify(|m| *m = m.min(s)).or_insert(s);
+        }
+    }
+    ctx.max_slacks = slacks;
+    Ok(ctx.max_slacks.get(drvr_pin).copied().unwrap_or(timing::INF))
+}
+
+/// What a resistance-aware router's `updateSlacks` reads when the next route update runs:
+/// `sta_->slack(net, max)` of each net, which times the design first (`searchPreamble` →
+/// `findDelays()`) on the edits so far and the parasitics as they stand — the invalid nets marked,
+/// none estimated yet. Per net the fuzzily least max slack over its loads, the least over the
+/// scenes; INF unconstrained. Handed to the router for that update only. The timer keeps the
+/// full update: graphs built after this read it.
+fn set_mid_update_slacks(inputs: &Inputs<'_>, design: &mut dyn Design, ctx: &mut NetCtx<'_, '_>) -> Result<(), Stop> {
+    let netlist = design.netlist_shared();
+    let gs = match ctx.timer.as_mut() {
+        Some(incs) => {
+            let mut gs = timer_graphs(inputs, design, &netlist, ctx.annotated, incs)?;
+            let pars: Vec<&HashMap<String, vyges_sta::graph::NetParasitics>> = (0..incs.len()).map(|k| design.parasitics(k)).collect();
+            vyges_sta::incr::find_delays_scenes(incs, &mut gs, &pars, None).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+            gs
+        }
+        None => {
+            let mut gs = current_graphs(inputs, &netlist, ctx.annotated)?;
+            find_all_delays(&mut gs, &*design, "mid-update")?;
+            gs
+        }
+    };
+    let sdc = ctx.args.search_sdc.as_ref().ok_or_else(|| Stop::error("RSZ-REROUTE", "a resistance-aware route update: no search constraints".to_string()))?;
+    let mut slacks: HashMap<String, f32> = HashMap::new();
+    for g in &gs {
+        let mut search = vyges_sta::search::Search::in_graph_order(g, sdc);
+        search.find_arrivals().map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+        search.find_requireds().map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+        let index: HashMap<&str, usize> = g.vertices.iter().enumerate().map(|(i, v)| (v.name.as_str(), i)).collect();
+        for n in &g.netlist.nets {
+            let loads: Vec<usize> = n.pins.iter().filter_map(|c| index.get(g.netlist.pin_name(c).as_str()).copied()).filter(|&v| !g.vertices[v].is_driver).collect();
+            let s = search.net_slack(&loads);
+            slacks.entry(n.name.clone()).and_modify(|x| if vyges_sta::fuzzy::less(s, *x) { *x = s }).or_insert(s);
+        }
+        mid_update_pins_dump(g, &search);
+    }
+    design.set_route_slacks(slacks);
+    Ok(())
+}
+
+/// A diagnostic: with `VYGES_RSZ_RRT_PINS=<net>` and `VYGES_RSZ_RRT_TRACE=<file>`, that net's pins
+/// and its driver instance's, as a mid-update search has them (arrival, slew, required, slack:
+/// the worst over rise/fall at max), in the shape of the reference's instrumented `VYGP` lines.
+fn mid_update_pins_dump(g: &Graph<'_>, search: &vyges_sta::search::Search<'_, '_>) {
+    let (Ok(want), Ok(path)) = (std::env::var("VYGES_RSZ_RRT_PINS"), std::env::var("VYGES_RSZ_RRT_TRACE")) else { return };
+    let Some(n) = g.netlist.nets.iter().find(|n| n.name == want) else { return };
+    let mut pins: Vec<String> = n.pins.iter().map(|c| g.netlist.pin_name(c)).collect();
+    if let Some(d) = pins.iter().find(|p| g.vertices.iter().any(|v| v.is_driver && &v.name == *p)).cloned() {
+        if let Some((inst, _)) = d.rsplit_once('/') {
+            let prefix = format!("{inst}/");
+            for v in g.vertices.iter().filter(|v| v.name.starts_with(&prefix) && v.name != d) {
+                pins.push(v.name.clone());
+                // ...and the driver of that input's net, one level upstream.
+                if !v.is_driver {
+                    if let Some(up) = g.netlist.nets.iter().find(|m| m.pins.iter().any(|c| g.netlist.pin_name(c) == v.name)) {
+                        pins.extend(up.pins.iter().map(|c| g.netlist.pin_name(c)).filter(|p| g.vertices.iter().any(|x| x.is_driver && &x.name == p)));
+                    }
+                }
+            }
+        }
+    }
+    let mut out = String::new();
+    for p in pins {
+        let Some(v) = g.vertices.iter().position(|x| x.name == p) else { continue };
+        let (mut arr, mut req) = (-timing::INF, timing::INF);
+        for path in search.paths[v].iter().filter(|x| x.tag.mm == vyges_sta::liberty::MAX) {
+            arr = arr.max(path.arrival);
+            req = req.min(path.required);
+        }
+        let slew = g.slew[v].iter().map(|s| s[vyges_sta::liberty::MAX]).fold(f32::MIN, f32::max);
+        out.push_str(&format!("VYGP|{p}|arr={}|slew={}|req={}|slack={}\n", crate::trace::c_hex(f64::from(arr)), crate::trace::c_hex(f64::from(slew)), crate::trace::c_hex(f64::from(req)), crate::trace::c_hex(f64::from(search.vertex_slack(v)))));
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = std::io::Write::write_all(&mut f, out.as_bytes());
+    }
 }
 
 /// The instance of an instance pin (`inst/port`).
@@ -1141,5 +1428,47 @@ mod tests {
         assert_eq!(meters_to_dbu(m, 2000), 1_200_000);
         assert_eq!(meters_to_dbu(0.0, 2000), 0);
         assert_eq!(meters_to_dbu(2.5e-10, 2000), 1, "0.5 dbu rounds up");
+    }
+
+    // Rule (`tryRerouteNet`): the route's gcell length sums `seg.length() / tile_size` over its
+    // non-via segments, an int division per segment; a via (same start and end) adds nothing.
+    #[test]
+    fn a_route_is_measured_in_whole_gcells_per_segment() {
+        let segs = [(0, 0, 15, 0), (15, 0, 15, 15), (15, 15, 15, 15), (15, 15, 55, 15)];
+        assert_eq!(route_gcell_length(&segs, 10), 1 + 1 + 4, "not 70 / 10 = 7");
+        assert_eq!(route_gcell_length(&[(30, 0, 0, 0)], 10), 3, "a segment drawn backwards");
+    }
+
+    // Rule (`tryRerouteNet` → `network_->net(drvr_pin)`): `dbNetwork::net` gives no net for a
+    // top-level port, so an input port driving a long net is never rerouted; an instance pin is.
+    #[test]
+    fn a_port_driver_has_no_net_to_reroute() {
+        use vyges_sta::netlist::{Conn, Net, Netlist, PortDir};
+        let netlist = Netlist {
+            insts: vec![("u".into(), "buf".into())],
+            ports: vec![("in".into(), PortDir::Input)],
+            nets: vec![Net { name: "in".into(), pins: vec![Conn::Port(0), Conn::Inst(0, "A".into())] }],
+        };
+        assert!(is_top_port(&netlist, "in"));
+        assert!(!is_top_port(&netlist, "u/Y"));
+    }
+
+    // Rule (`tryRerouteNet`): a route of at most `kShortNetGCellThreshold` = 3 gcells is too
+    // short to reroute; one of 4 is not.
+    #[test]
+    fn a_route_of_three_gcells_is_short() {
+        assert!(short_route(3));
+        assert!(!short_route(4));
+    }
+
+    // Rule (`tryRerouteNet`): `(R − R_min) / R`, 0 when R is 0, must not be below
+    // `kMinResistanceReduction` = 0.50f — exactly half is enough.
+    #[test]
+    fn a_reroute_must_save_half_the_resistance() {
+        assert_eq!(resistance_reduction(10.0, 4.0), 0.6);
+        assert_eq!(resistance_reduction(0.0, 4.0), 0.0);
+        assert!(saves_enough(resistance_reduction(10.0, 5.0)));
+        assert!(!saves_enough(resistance_reduction(10.0, 5.001)));
+        assert!(!saves_enough(resistance_reduction(0.0, 0.0)));
     }
 }

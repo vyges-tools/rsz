@@ -63,8 +63,42 @@ pub trait Design {
     fn net_shape(&self, net: &str, drvr_pin: &str) -> Option<crate::buffered_net::NetShape> {
         self.steiner(net, drvr_pin).map(crate::buffered_net::NetShape::Steiner)
     }
+    /// The net a pin is on, by name (`flatNet`), and whether it is special.
+    fn pin_net(&self, _pin: &str) -> Option<(String, bool)> {
+        None
+    }
+    /// `GlobalRouter::isNetResAware(db_net)`.
+    fn net_res_aware(&self, _net: &str) -> bool {
+        false
+    }
+    /// `getFRNetResistance` and `getFRNetResistanceOnMinResistanceLayer` of a net.
+    fn net_resistances(&self, _net: &str) -> (f32, f32) {
+        (0.0, 0.0)
+    }
+    /// `RerouteCandidate::apply`: `setResistanceAware(true)`, `addDirtyNet`, `setNetIsResAware`,
+    /// `parasiticsInvalid` — the net routed again, resistance-aware, at the next update.
+    fn reroute_net(&mut self, _net: &str) -> Result<(), String> {
+        Err("rerouting needs global-route parasitics".into())
+    }
+    /// The net's global route in gcells of wire ([`crate::repair_design::route_gcell_length`]),
+    /// and the tile size: `tryRerouteNet`'s short-net test. `None` without a route or a tile size.
+    fn net_route_gcells(&self, _net: &str) -> Option<(i32, i32)> {
+        None
+    }
     /// `getParasiticsSrc() == kGlobalRouting`: the parasitics come from the global routes.
     fn global_routing_parasitics(&self) -> bool {
+        false
+    }
+    /// The next `updateParasitics` re-routes nets resistance-aware: its `updateSlacks` reads the
+    /// timer's net slacks mid-update (the edits pulled first, so the router's dirty nets are known).
+    fn route_slacks_wanted(&mut self) -> bool {
+        false
+    }
+    /// Those slacks (`sta_->slack(net, max)` per net), for the next `updateParasitics` only.
+    fn set_route_slacks(&mut self, _slacks: std::collections::HashMap<String, f32>) {}
+    /// `ensureWireParasitic(drvr_pin, net)` would call `updateRoutes`: global-route parasitics,
+    /// and the net invalid or without a pi model (the edits pulled first).
+    fn ensure_routes(&mut self, _net: &str) -> bool {
         false
     }
     /// `Resizer::insertBufferBeforeLoads(nullptr, loads, cell, &loc, reason)` with its
