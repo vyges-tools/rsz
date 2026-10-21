@@ -229,7 +229,9 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
         design.start_timer_edits().map_err(|e| Stop::refused("RSZ-TIMER", e))?;
         let mut incs = Vec::with_capacity(graphs.len());
         for g in &graphs {
+            // scene 0's timer prints the graph-edit trace (`VYGES_STA_GRAPH_TRACE`)
             let mut t = IncTimer::default();
+            t.trace_edits = incs.is_empty();
             t.track_netlist(&netlist);
             t.relevelize(g).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
             t.export(g);
@@ -291,6 +293,17 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
             held = Some((g, index, clocks));
         }
         held = repair_driver(design, &drivers[i], &mut ctx, &mut outcome, trace, held.take())?;
+    }
+    // The timers take each edit at the next graph build; the last driver's have none. With the
+    // graph-edit trace on, they are applied here so the trace shows every edit the repair made.
+    if std::env::var_os("VYGES_STA_GRAPH_TRACE").is_some() {
+        if let Some(incs) = ctx.timer.as_mut() {
+            let edits = design.take_timer_edits();
+            let cx = EventCtx { libs: &inputs.libs.libs, ideal_clock_mode: false };
+            for ev in &edits.events {
+                incs[0].apply_event(&cx, ev).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+            }
+        }
     }
     Ok(outcome)
 }

@@ -366,6 +366,7 @@ impl Timer {
     fn new(design: &mut dyn SetupDesign, scenes: usize, levels: Option<&BTreeMap<String, i32>>) -> Result<Timer, Stop> {
         design.start_timer_edits().map_err(timer_stop)?;
         let mut inc = IncTimer::default();
+        inc.trace_edits = true;
         inc.track_netlist(design.netlist());
         // a carried session: its levels stand until an edit relevelizes them
         if let Some(l) = levels {
