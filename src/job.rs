@@ -678,6 +678,10 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 }
                 let res = vyges_grt::global_route::route_design(&mut db, &opts, &grt_stt, &grt_flutes).map_err(|e| format!("global_route: {e}"))?;
                 global_route_verdict(res.total_overflow)?;
+                // The router leaves its gcell grid on the block (`GCELLGRID` in the written DEF),
+                // as the engine's own `global_route` step does.
+                let (x, y) = res.gcell_grid;
+                db.block_reset_gcell_grid(x, y).map_err(|e| format!("global_route: {e}"))?;
                 groute = Some(res);
                 groute_opts = Some(opts);
             }

@@ -578,10 +578,13 @@ fn timed_levels<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits:
     let search = &searches[0];
     // A diagnostic: every instance pin's max slack per transition after this update, in fs
     // (`VYGES_RSZ_SLACKS=path`, rewritten each update — the last is the state the repair left).
+    // With `VYGES_RSZ_SLACKS_FULL`, ports too, and each transition's latest data arrival and slew
+    // (fs) after its slack.
     if let Some(path) = std::env::var_os("VYGES_RSZ_SLACKS") {
+        let full = std::env::var_os("VYGES_RSZ_SLACKS_FULL").is_some();
         let mut s = String::new();
         for (v, vx) in g.vertices.iter().enumerate() {
-            if vx.lib.is_none() {
+            if vx.lib.is_none() && !full {
                 continue;
             }
             let slack = |rf: usize| {
@@ -594,7 +597,15 @@ fn timed_levels<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits:
                 }
                 if m == INF { "INF".to_string() } else { format!("{:.9}", f64::from(m) * 1e15) }
             };
-            s.push_str(&format!("{} {} {}\n", vx.name, slack(0), slack(1)));
+            s.push_str(&format!("{} {} {}", vx.name, slack(0), slack(1)));
+            if full {
+                for rf in 0..2 {
+                    let arr = search.paths[v].iter().filter(|p| p.tag.mm == MAX && p.tag.rf == rf && !p.tag.is_clock)
+                        .map(|p| p.arrival).fold(-INF, f32::max);
+                    s.push_str(&format!(" {:.6} {:.6}", f64::from(arr) * 1e15, f64::from(g.slew[v][rf][MAX]) * 1e15));
+                }
+            }
+            s.push('\n');
         }
         let _ = std::fs::write(path, s);
     }
@@ -5261,6 +5272,27 @@ impl Repair<'_, '_> {
         // `getWorstPin(use_startpoints)`: the first violating startpoint of least slack.
         let worst = if show { starts.first().map(|p| p.pin.clone()) } else { worst_end };
         let field = format!("{iteration}{}", self.phase.chars().last().unwrap_or('*'));
+        // `VYGES_RSZ_PW_TRACE=<file>`: the row's raw WNS and TNS (seconds) before they are rounded,
+        // as the instrumented reference's `VYGW|` lines (`rsz-progress-raw-patch.py`)
+        if let Some(path) = std::env::var_os("VYGES_RSZ_PW_TRACE") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                let _ = writeln!(f, "VYGW|{field}|{:?}|{:?}", f64::from(wns), f64::from(self.timing.tns()));
+            }
+            // and at the first row, every endpoint's TNS slack (fs), as the timer holds them, and
+            // the last update's VYGES_RSZ_SLACKS (the state that row reads) kept as `<it>.row0`
+            if iteration == 0 {
+                if let Some(sl) = std::env::var_os("VYGES_RSZ_SLACKS") {
+                    let mut to = sl.clone();
+                    to.push(".row0");
+                    let _ = std::fs::copy(&sl, to);
+                }
+                let mut path = path.clone();
+                path.push(".ends");
+                let s: String = self.timing.ends.iter().map(|p| format!("{} {:.9}\n", p.pin, f64::from(p.wns_slack) * 1e15)).collect();
+                let _ = std::fs::write(path, s);
+            }
+        }
         let row = progress_row(
             &Row {
                 iter: &field,
