@@ -287,15 +287,16 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
             // between drivers (the reference times only what each driver's repair asks for).
             let g = timer_graphs(inputs, design, &held_netlist, &annotated, ctx.timer.as_mut().expect("held graphs run on the timer"))?;
             let index = g[0].pin_index();
-            held = Some((g, index));
+            let clocks = timing::clock_pins(&g[0], inputs.clock_sources);
+            held = Some((g, index, clocks));
         }
         held = repair_driver(design, &drivers[i], &mut ctx, &mut outcome, trace, held.take())?;
     }
     Ok(outcome)
 }
 
-/// The graphs held across drivers, and their pin index.
-type HeldGraphs<'g> = (Vec<Graph<'g>>, std::sync::Arc<HashMap<String, usize>>);
+/// The graphs held across drivers, their pin index and their clock pins (`findClkPins`).
+type HeldGraphs<'g> = (Vec<Graph<'g>>, std::sync::Arc<HashMap<String, usize>>, std::collections::BTreeSet<usize>);
 
 /// Graphs done with: their allocations go to the next build (`Graph::recycle`) — a repair
 /// rebuilds the graph after every edit, and most of a build is the pins it did not change.
@@ -305,7 +306,7 @@ fn recycle(graphs: Option<Vec<Graph<'_>>>) {
 
 /// [`recycle`] for held graphs: the index is let go first, so the next build can take it over.
 fn recycle_held(held: Option<HeldGraphs<'_>>) {
-    if let Some((graphs, index)) = held {
+    if let Some((graphs, index, _)) = held {
         drop(index);
         recycle(Some(graphs));
     }
@@ -408,20 +409,21 @@ pub fn repair_clk_nets(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers
                 let mut g = current_graphs(inputs, &held_netlist, &annotated)?;
                 find_all_delays(&mut g, &*design, &name)?;
                 let index = g[0].pin_index();
-                held = Some((g, index));
+                let clocks = timing::clock_pins(&g[0], inputs.clock_sources);
+                held = Some((g, index, clocks));
             }
-            let (graphs, index) = held.take().expect("held graphs");
+            let (graphs, index, clocks) = held.take().expect("held graphs");
             let g0 = &graphs[0];
             let found = g0.vertices.iter().position(|v| v.is_driver && v.name == name).and_then(|d| g0.vertex_net[d].map(|n| (d, n)));
             let Some((drvr, n)) = found else {
-                held = Some((graphs, index));
+                held = Some((graphs, index, clocks));
                 continue;
             };
             let net = held_netlist.nets[n].name.clone();
             let clock_set = timing::clock_pins(g0, inputs.clock_sources);
             outcome.nets_checked += 1;
             let graphs = repair_net(design, graphs, drvr, &net, &clock_set, false, None, &mut ctx, &mut outcome, trace, Some(&index))?;
-            held = Some((graphs, index));
+            held = Some((graphs, index, clocks));
         }
     }
     Ok(outcome)
@@ -566,9 +568,9 @@ fn repair_driver<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut NetCtx<
     // The held graphs (timed whole after the last edit) are lent and handed back, else the
     // design's own, timed later.
     match held {
-        Some((graphs, index)) => {
-            let graphs = repair_driver_net(design, drvr_name, ctx, outcome, trace, graphs, Some(&index))?;
-            Ok(Some((graphs, index)))
+        Some((graphs, index, clocks)) => {
+            let graphs = repair_driver_net(design, drvr_name, ctx, outcome, trace, graphs, Some((&index, &clocks)))?;
+            Ok(Some((graphs, index, clocks)))
         }
         None => {
             let netlist = design.netlist_shared();
@@ -580,11 +582,14 @@ fn repair_driver<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut NetCtx<
 }
 
 /// [`repair_driver`] on the graphs it was given, which it hands back.
-fn repair_driver_net<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut NetCtx<'_, '_>, outcome: &mut Outcome, trace: &mut Trace, graphs: Vec<Graph<'g>>, held_index: Option<&HashMap<String, usize>>) -> Result<Vec<Graph<'g>>, Stop> {
+fn repair_driver_net<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut NetCtx<'_, '_>, outcome: &mut Outcome, trace: &mut Trace, graphs: Vec<Graph<'g>>, held: Option<(&HashMap<String, usize>, &std::collections::BTreeSet<usize>)>) -> Result<Vec<Graph<'g>>, Stop> {
     let g0 = &graphs[0];
+    let held_index = held.map(|(ix, _)| ix);
+    // the held index and clock pins stand for these graphs while their vertex count is the build's
+    let built = held.filter(|(ix, _)| ix.len() == g0.vertices.len());
     // by the held index when every name is its vertex's alone (the first match, as the scan)
-    let found = match held_index {
-        Some(ix) if ix.len() == g0.vertices.len() => ix.get(drvr_name).copied().filter(|&v| g0.vertices[v].is_driver),
+    let found = match built {
+        Some((ix, _)) => ix.get(drvr_name).copied().filter(|&v| g0.vertices[v].is_driver),
         _ => g0.vertices.iter().position(|v| v.is_driver && v.name == drvr_name),
     };
     let Some(drvr) = found else {
@@ -598,7 +603,20 @@ fn repair_driver_net<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut Net
         return Ok(graphs);
     };
     let net = g0.netlist.nets[n].name.clone();
-    let clocks = timing::clock_pins(g0, ctx.inputs.clock_sources);
+    let walked;
+    let clocks = match built {
+        Some((_, ck)) => {
+            // `VYGES_RSZ_CHECK_CLOCKS=1`: the held set against a fresh walk, every driver
+            if std::env::var_os("VYGES_RSZ_CHECK_CLOCKS").is_some() {
+                assert_eq!(*ck, timing::clock_pins(g0, ctx.inputs.clock_sources), "held clock pins stale at {drvr_name}");
+            }
+            ck
+        }
+        None => {
+            walked = timing::clock_pins(g0, ctx.inputs.clock_sources);
+            &walked
+        }
+    };
     let info = design.net_info();
     // `!sta_->isConstant(drvr_pin)` — "Exclude tie hi/low cells and supply nets": a driver the
     // simulator holds constant (a tie cell's output) is passed over like a clock driver.
@@ -609,7 +627,7 @@ fn repair_driver_net<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut Net
     }
     outcome.nets_checked += 1;
     let viol = ctx.drvr_with_load_slew_viol.get(drvr_name).copied();
-    repair_net(design, graphs, drvr, &net, &clocks, true, viol, ctx, outcome, trace, held_index)
+    repair_net(design, graphs, drvr, &net, clocks, true, viol, ctx, outcome, trace, held_index)
 }
 
 /// `makeFanoutRepeater`'s `repairNet(out_net, repeater_out_pin, …)`: the new repeater's net, with
