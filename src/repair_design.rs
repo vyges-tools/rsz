@@ -833,7 +833,7 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
             repaired_net = true;
             // findLoadRegions(net, drvr_pin, max_fanout): the limit as an int.
             let max_fanout = max_fanout as i32;
-            let loads: Vec<String> = design.visit_connected_pins(&name).into_iter().filter(|p| gs!()[0].vertices.iter().any(|v| &v.name == p && !v.is_driver)).collect();
+            let loads: Vec<String> = design.visit_connected_pins(&name).into_iter().filter(|p| gs!()[0].index().get(p.as_str()).is_some_and(|&v| !gs!()[0].vertices[v].is_driver)).collect();
             trace.push(format!("fanloads|{name}|{max_fanout}|{}", loads.iter().map(|p| format!("{p},")).collect::<String>()));
             let mut region = {
                 let d: &dyn Design = &*design;

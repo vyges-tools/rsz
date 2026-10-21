@@ -334,10 +334,7 @@ pub fn connected_pins(g: &Graph<'_>, info: &NetInfo, v: usize) -> Vec<usize> {
     let mut pins: Vec<usize> = g.netlist.nets[n]
         .pins
         .iter()
-        .filter_map(|c| {
-            let name = g.netlist.pin_name(c);
-            g.vertices.iter().position(|x| x.name == name)
-        })
+        .filter_map(|c| g.index().get(g.netlist.pin_name(c).as_str()).copied())
         .collect();
     if !pins.contains(&v) {
         pins.push(v);

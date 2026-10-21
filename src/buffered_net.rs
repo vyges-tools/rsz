@@ -281,7 +281,7 @@ pub fn adjacents(tree: &Tree) -> Vec<Vec<usize>> {
 /// `from`, in adjacency order, recursively, folded likewise; then, below the root and when `to`
 /// is not at `from`'s location, the whole wrapped in a wire at `from`.
 #[allow(clippy::too_many_arguments)]
-fn from_tree(bn: &mut BufferedNet, ctx: &Ctx<'_, '_>, tree: &Tree, from: Option<usize>, to: usize, adj: &[Vec<usize>], visited: &mut std::collections::HashSet<(i32, i32)>, index: &std::collections::HashMap<&str, usize>) -> Option<usize> {
+fn from_tree(bn: &mut BufferedNet, ctx: &Ctx<'_, '_>, tree: &Tree, from: Option<usize>, to: usize, adj: &[Vec<usize>], visited: &mut std::collections::HashSet<(i32, i32)>, index: &std::collections::HashMap<String, usize>) -> Option<usize> {
     let mut bnet: Option<usize> = None;
     let to_loc = tree.location(to);
     if let Some(pins) = tree.pins(to) {
@@ -323,10 +323,10 @@ fn from_tree(bn: &mut BufferedNet, ctx: &Ctx<'_, '_>, tree: &Tree, from: Option<
 pub fn make_buffered_net_steiner(ctx: &Ctx<'_, '_>, tree: &Tree) -> Option<(BufferedNet, usize)> {
     let drvr_pt = tree.drvr_pt?;
     let adj = adjacents(tree);
-    let index: std::collections::HashMap<&str, usize> = ctx.graph.vertices.iter().enumerate().map(|(i, v)| (v.name.as_str(), i)).collect();
+    let index = ctx.graph.index();
     let mut bn = BufferedNet::default();
     let mut visited = std::collections::HashSet::new();
-    let root = from_tree(&mut bn, ctx, tree, None, drvr_pt, &adj, &mut visited, &index)?;
+    let root = from_tree(&mut bn, ctx, tree, None, drvr_pt, &adj, &mut visited, index)?;
     Some((bn, root))
 }
 
@@ -365,12 +365,12 @@ pub fn make_buffered_net_groute(ctx: &Ctx<'_, '_>, g: &GrouteNet) -> Result<Opti
         adj.entry((x0, y0, l0)).or_default().push((x1, y1, l1));
         adj.entry((x1, y1, l1)).or_default().push((x0, y0, l0));
     }
-    let index: std::collections::HashMap<&str, usize> = ctx.graph.vertices.iter().enumerate().map(|(i, v)| (v.name.as_str(), i)).collect();
+    let index = ctx.graph.index();
     let mut bn = BufferedNet { nodes: Vec::new(), layers: Some(g.layers.clone()) };
     let mut visited = std::collections::HashSet::new();
     // The root's `from` is `RoutePt(0, 0, 0)`: compared, never a neighbour.
     let null_pt = (0, 0, 0);
-    let Some(root) = from_groute(&mut bn, ctx, null_pt, drvr_pt, &adj, &loc_pin_map, &index, &mut visited, null_pt) else { return Ok(None) };
+    let Some(root) = from_groute(&mut bn, ctx, null_pt, drvr_pt, &adj, &loc_pin_map, index, &mut visited, null_pt) else { return Ok(None) };
     let loads = bn.load_count(root);
     if loads != g.pins.len() - 1 {
         return Err(format!(
@@ -396,7 +396,7 @@ fn from_groute(
     to: RoutePt,
     adj: &std::collections::HashMap<RoutePt, Vec<RoutePt>>,
     loc_pin_map: &std::collections::HashMap<RoutePt, Vec<&str>>,
-    index: &std::collections::HashMap<&str, usize>,
+    index: &std::collections::HashMap<String, usize>,
     visited: &mut std::collections::HashSet<RoutePt>,
     null_pt: RoutePt,
 ) -> Option<usize> {
@@ -406,7 +406,7 @@ fn from_groute(
     let (from_pt, to_pt) = ((from.0, from.1), (to.0, to.1));
     let mut bnet: Option<usize> = None;
     for name in loc_pin_map.get(&to).map(Vec::as_slice).unwrap_or_default() {
-        let Some(&v) = index.get(name) else { continue };
+        let Some(&v) = index.get(*name) else { continue };
         if !ctx.graph.vertices[v].is_driver {
             let n1 = bn.load(ctx, to_pt, v);
             bnet = Some(match bnet {
