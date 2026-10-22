@@ -450,7 +450,13 @@ impl CliDesign<'_> {
         use vyges_sta::netlist::{Conn, Net, Netlist};
         let mut ord = match self.inst_pos.take() {
             Some((w, ord)) if std::sync::Weak::ptr_eq(&w, &std::sync::Arc::downgrade(old)) => ord,
-            _ => DbOrder::read(self.db, old)?,
+            cached => {
+                // ⚠️ O(design): every instance and net id read again
+                if std::env::var_os("VYGES_RSZ_ORDER_TRACE").is_some() {
+                    eprintln!("VYGORDER|read|{}", if cached.is_some() { "another netlist" } else { "none kept" });
+                }
+                DbOrder::read(self.db, old)?
+            }
         };
         let mut nl = Netlist { insts: old.insts.clone(), ports: old.ports.clone(), nets: Vec::with_capacity(old.nets.len() + 2) };
         // an instance re-read (the general path's `new_insts`) takes its master from the database;

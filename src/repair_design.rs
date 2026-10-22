@@ -823,7 +823,13 @@ fn repair_driver_net<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut Net
     let viol = ctx.drvr_with_load_slew_viol.get(drvr_name).copied();
     // On the timer `repairNet` never reads the held index, and the graphs are edited in place:
     // holding it across the repair would make every edit copy the graph's whole pin index.
-    let held_index = if ctx.timer.is_some() { None } else { held.map(|(ix, _)| ix) };
+    // ⛔ Dropped here: an `if` arm that leaves `held` alone keeps it to the end of the function.
+    let held_index = if ctx.timer.is_some() {
+        drop(held);
+        None
+    } else {
+        held.map(|(ix, _)| ix)
+    };
     repair_net(design, graphs, drvr, &net, clocks, true, viol, ctx, outcome, trace, held_index.as_deref())
 }
 
