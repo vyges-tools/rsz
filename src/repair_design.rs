@@ -172,20 +172,20 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
 
     // RepairDesign::repairDesign
     let r_strongest = r_strongest_buffer(inputs, &buffers.cells);
-    trace.push(format!(
+    crate::tpush!(trace, 
         "pre|shape={}|r_strongest={}|slew_margin={}|cap_margin={}|initial_sizing={}",
         g9(f64::from(slew_shape_factor)),
         g9(f64::from(r_strongest)),
         g9(args.slew_margin),
         g9(args.cap_margin),
         args.pre_placement
-    ));
+    );
     for (i, name) in buffers.cells.iter().enumerate() {
         let r = inputs.libs.link_cell(name).map_or(0.0, preamble::buffer_drive_resistance);
         let tl = target_loads.get(name).map_or(-1.0, |&l| f64::from(l));
-        trace.push(format!("buf|{i}|{name}|{}|{}", g9(f64::from(r)), g9(tl)));
+        crate::tpush!(trace, "buf|{i}|{name}|{}|{}", g9(f64::from(r)), g9(tl));
     }
-    trace.push(format!("lowest|{}", buffers.lowest));
+    crate::tpush!(trace, "lowest|{}", buffers.lowest);
     trace.ran(&["pre", "buf", "lowest"]);
     // checkSlewsPreamble, checkCapacitancesPreamble, checkFanoutPreamble, searchPreamble,
     // findAllArrivals: the timing graphs (one per scene), levelized, their delays found.
@@ -213,7 +213,7 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
     for &v in &loads {
         for (k, anns) in per_scene.iter().enumerate() {
             if let Some(a) = anns.iter().find(|a| a.load == v) {
-                trace.push(format!("annot|{}|{}|{}", g0.vertices[v].name, inputs.libs.scene_name(k), g9(f64::from(a.limit))));
+                crate::tpush!(trace, "annot|{}|{}|{}", g0.vertices[v].name, inputs.libs.scene_name(k), g9(f64::from(a.limit)));
                 annotated[k].insert(g0.vertices[v].name.clone(), a.limit);
                 for d in timing::net_drivers_in(g0, v, &driver_index) {
                     drvr_with_load_slew_viol.insert(g0.vertices[d].name.clone(), k);
@@ -277,7 +277,7 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
     let mut held_gen = design.netlist_generation();
     let mut held: Option<HeldGraphs<'_>> = None;
     for i in (0..drivers.len()).rev() {
-        trace.push(format!("drv|{i}|{}", drivers[i]));
+        crate::tpush!(trace, "drv|{i}|{}", drivers[i]);
         // Changed since the graphs were made: the design's change count when it keeps one (equal
         // counts are equal netlists), else the netlists compared.
         let stale = match (held_gen, design.netlist_generation()) {
@@ -758,7 +758,10 @@ fn repair_driver<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut NetCtx<
     // design's own, timed later.
     match held {
         Some((graphs, index, clocks)) => {
-            let graphs = repair_driver_net(design, drvr_name, ctx, outcome, trace, graphs, Some((&index, &clocks)))?;
+            // the index is lent by value: an in-place edit takes over the graph's own only when
+            // nothing else holds it, so it comes back from the graphs (the same one unless edited)
+            let graphs = repair_driver_net(design, drvr_name, ctx, outcome, trace, graphs, Some((index, &clocks)))?;
+            let index = graphs[0].pin_index();
             Ok(Some((graphs, index, clocks)))
         }
         None => {
@@ -770,12 +773,14 @@ fn repair_driver<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut NetCtx<
     }
 }
 
+/// The held graphs' pin index, lent by value, and their clock pins.
+type LentIndex<'c> = (std::sync::Arc<HashMap<String, usize>>, &'c std::collections::BTreeSet<usize>);
+
 /// [`repair_driver`] on the graphs it was given, which it hands back.
-fn repair_driver_net<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut NetCtx<'g, '_>, outcome: &mut Outcome, trace: &mut Trace, graphs: Vec<Graph<'g>>, held: Option<(&HashMap<String, usize>, &std::collections::BTreeSet<usize>)>) -> Result<Vec<Graph<'g>>, Stop> {
+fn repair_driver_net<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut NetCtx<'g, '_>, outcome: &mut Outcome, trace: &mut Trace, graphs: Vec<Graph<'g>>, held: Option<LentIndex<'_>>) -> Result<Vec<Graph<'g>>, Stop> {
     let g0 = &graphs[0];
-    let held_index = held.map(|(ix, _)| ix);
     // the held index and clock pins stand for these graphs while their vertex count is the build's
-    let built = held.filter(|(ix, _)| ix.len() == g0.vertices.len());
+    let built = held.as_ref().filter(|(ix, _)| ix.len() == g0.vertices.len()).map(|(ix, ck)| (&**ix, *ck));
     // by the held index when every name is its vertex's alone (the first match, as the scan)
     let found = match built {
         Some((ix, _)) => ix.get(drvr_name).copied().filter(|&v| g0.vertices[v].is_driver),
@@ -816,7 +821,10 @@ fn repair_driver_net<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut Net
     }
     outcome.nets_checked += 1;
     let viol = ctx.drvr_with_load_slew_viol.get(drvr_name).copied();
-    repair_net(design, graphs, drvr, &net, clocks, true, viol, ctx, outcome, trace, held_index)
+    // On the timer `repairNet` never reads the held index, and the graphs are edited in place:
+    // holding it across the repair would make every edit copy the graph's whole pin index.
+    let held_index = if ctx.timer.is_some() { None } else { held.map(|(ix, _)| ix) };
+    repair_net(design, graphs, drvr, &net, clocks, true, viol, ctx, outcome, trace, held_index.as_deref())
 }
 
 /// `makeFanoutRepeater`'s `repairNet(out_net, repeater_out_pin, …)`: the new repeater's net, with
@@ -832,13 +840,12 @@ fn repair_repeater_net(design: &mut dyn Design, in_pin: &str, out_pin: &str, out
     if let Some(incs) = ctx.timer.as_mut() {
         // On the timer the new input pin has no state: its slew reads 0 until a queue reaches it.
         let graphs = timer_graphs(ctx.inputs, design, &netlist, ctx.annotated, incs, &mut ctx.edit_log, None)?;
-        let index = graphs[0].pin_index();
         let drvr = graphs[0].vertices.iter().position(|v| v.is_driver && v.name == out_pin).ok_or_else(|| Stop::error("RSZ-INSERT", format!("{out_pin}: not in the timing graph")))?;
         let clocks = graph_clocks(&graphs[0]);
         let mut own = Outcome::default();
-        let r = repair_net(design, graphs, drvr, out_net, &clocks, false, None, ctx, &mut own, trace, Some(&index));
-        // the index let go first, so the next build can take it over
-        drop(index);
+        // no index held across the repair: `repairNet` on the timer never reads it, and the graphs
+        // are edited in place (an edit takes over their index only when nothing else holds it)
+        let r = repair_net(design, graphs, drvr, out_net, &clocks, false, None, ctx, &mut own, trace, None);
         let r = r.map(|g| ctx.edit_log.keep(g));
         outcome.inserted_buffers += own.inserted_buffers;
         outcome.resized += own.resized;
@@ -954,7 +961,7 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
     let inputs = ctx.inputs;
     let name = graphs[0].vertices[drvr].name.clone();
     let checks = ctx.checks;
-    trace.push(format!("net|{name}|{}|{}|{check_fanout}|{}|{}", checks.slew, checks.cap, ctx.max_length, checks.resize_drvr));
+    crate::tpush!(trace, "net|{name}|{}|{}|{check_fanout}|{}|{}", checks.slew, checks.cap, ctx.max_length, checks.resize_drvr);
     trace.ran(&["net", "fo", "fanloads", "dslew", "lslew", "cap"]);
     // `corner`: the command scene, until a violation names one.
     let mut corner = 0usize;
@@ -1054,14 +1061,14 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
     // Fanout is addressed by creating region repeaters.
     if check_fanout {
         let (fanout, max_fanout, fanout_slack) = timing::check_fanout(&gs!()[0], design.net_info(), drvr, &inputs.limits, clocks);
-        trace.push(format!("fo|{}|{}|{}", g9(f64::from(fanout)), g9(f64::from(max_fanout)), g9(f64::from(fanout_slack))));
+        crate::tpush!(trace, "fo|{}|{}|{}", g9(f64::from(fanout)), g9(f64::from(max_fanout)), g9(f64::from(fanout_slack)));
         if max_fanout > 0.0 && fanout_slack < 0.0 {
             outcome.fanout_violations += 1;
             repaired_net = true;
             // findLoadRegions(net, drvr_pin, max_fanout): the limit as an int.
             let max_fanout = max_fanout as i32;
             let loads: Vec<String> = design.visit_connected_pins(&name).into_iter().filter(|p| gs!()[0].index().get(p.as_str()).is_some_and(|&v| !gs!()[0].vertices[v].is_driver)).collect();
-            trace.push(format!("fanloads|{name}|{max_fanout}|{}", loads.iter().map(|p| format!("{p},")).collect::<String>()));
+            crate::tpush!(trace, "fanloads|{name}|{max_fanout}|{}", loads.iter().map(|p| format!("{p},")).collect::<String>());
             let mut region = {
                 let d: &dyn Design = &*design;
                 fanout::find_load_regions(loads, max_fanout, inputs.dbu, &|p| d.pin_location(p))
@@ -1137,7 +1144,7 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
     // First the driver's slew: resize the driver, and if that does not fix it, derive the load
     // cap that would, which then caps the buffered net.
     let (mut slew1, mut max_slew1, mut slack1, mut corner1) = timing::repair_check_slew(&timing::Scenes::new(gs!()), drvr, &inputs.limits, clocks, ctx.args.slew_margin);
-    trace.push(format!("dslew|{}|{}|{}", g9(f64::from(slew1.unwrap_or(0.0))), g9(f64::from(max_slew1)), g9(f64::from(slack1))));
+    crate::tpush!(trace, "dslew|{}|{}|{}", g9(f64::from(slew1.unwrap_or(0.0))), g9(f64::from(max_slew1)), g9(f64::from(slack1)));
     trace.ran(&["rds", "rdsc", "rdsel", "dresize", "dslew2", "slewcap", "slc0", "slc"]);
     if ctx.args.reroute {
         trace.ran(&["rr", "rrs", "rrg", "rrr", "rrok", "dslewr"]);
@@ -1152,7 +1159,7 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
             update_parasitics!();
             retime_driver!(rerouted_netlist, rerouted_clocks, "the rerouted driver");
             (slew1, max_slew1, slack1, corner1) = timing::repair_check_slew(&timing::Scenes::new(gs!()), drvr, &inputs.limits, clocks, ctx.args.slew_margin);
-            trace.push(format!("dslewr|{}|{}|{}", g9(f64::from(slew1.unwrap_or(0.0))), g9(f64::from(max_slew1)), g9(f64::from(slack1))));
+            crate::tpush!(trace, "dslewr|{}|{}|{}", g9(f64::from(slew1.unwrap_or(0.0))), g9(f64::from(max_slew1)), g9(f64::from(slack1)));
         }
         // Still violating: the driver resized, and if that does not fix it, the load cap that
         // would.
@@ -1161,11 +1168,11 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
             if let Some(cell) = repair_driver_slew(&*design, gs!(), c1, drvr, ctx, trace)? {
                 design.swap_master(&inst_of(&name), &cell).map_err(|e| Stop::error("RSZ-RESIZE", e))?;
                 outcome.resized += 1;
-                trace.push(format!("dresize|{cell}"));
+                crate::tpush!(trace, "dresize|{cell}");
                 update_parasitics!();
                 retime_driver!(resized_netlist, resized_clocks, "the resized driver");
                 (slew1, max_slew1, slack1, corner1) = timing::repair_check_slew(&timing::Scenes::new(gs!()), drvr, &inputs.limits, clocks, ctx.args.slew_margin);
-                trace.push(format!("dslew2|{}|{}|{}", g9(f64::from(slew1.unwrap_or(0.0))), g9(f64::from(max_slew1)), g9(f64::from(slack1))));
+                crate::tpush!(trace, "dslew2|{}|{}|{}", g9(f64::from(slew1.unwrap_or(0.0))), g9(f64::from(max_slew1)), g9(f64::from(slack1)));
             }
             // Still violating: the max cap that removes it, from the driver's (resized) LINK port, its
             // models at the violation's corner.
@@ -1175,7 +1182,7 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
                     let link = inputs.libs.link_cell(cell).expect("a link cell");
                     let scene_cell = inputs.libs.scene_cell(c1, cell).expect("a scene cell");
                     max_cap = driver_slew::find_slew_load_cap(link, scene_cell, port, f64::from(max_slew1), ctx.sizing.tgt_slews, trace) as f32;
-                    trace.push(format!("slewcap|{}|{}", g9(f64::from(max_cap)), g9(f64::from(max_slew1))));
+                    crate::tpush!(trace, "slewcap|{}|{}", g9(f64::from(max_cap)), g9(f64::from(max_slew1)));
                     corner = c1;
                     repair_cap = true;
                 }
@@ -1190,7 +1197,7 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
     let viol_scene = corner_w_load_slew_viol;
     let annotated = viol_scene.is_some();
     let shown_slew = ls.slew.or(slew1).unwrap_or(0.0);
-    trace.push(format!("lslew|{}|{}|{}|annot={annotated}", g9(f64::from(shown_slew)), g9(f64::from(ls.limit)), g9(f64::from(ls.slack))));
+    crate::tpush!(trace, "lslew|{}|{}|{}|annot={annotated}", g9(f64::from(shown_slew)), g9(f64::from(ls.limit)), g9(f64::from(ls.slack)));
     // A violation the annotation hides (the load slew clamped to its limit, slack 0): a reroute
     // before the buffering — unverifiable while the annotation stands, but a better parasitic
     // needs fewer buffers.
@@ -1226,7 +1233,7 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
     if max_cap1 > 0.0 && max_cap1 < ctx.min_cap_load {
         return Err(Stop::error("RSZ-0169", format!("Max cap for driver {name} is unreasonably small {max_cap1:e}F. Min buffer or inverter input cap is {:e}F", ctx.min_cap_load)));
     }
-    trace.push(format!("cap|{}|{}|{}|{has_corner}", g9(f64::from(cap1)), g9(f64::from(max_cap1)), g9(ctx.args.cap_margin)));
+    crate::tpush!(trace, "cap|{}|{}|{}|{has_corner}", g9(f64::from(cap1)), g9(f64::from(max_cap1)), g9(ctx.args.cap_margin));
     // needRepairCap: the limit margined; a violation sets max_cap and the corner to its.
     if max_cap1 > 0.0 && has_corner {
         let margined = (f64::from(max_cap1) * (1.0 - ctx.args.cap_margin / 100.0)) as f32;
@@ -1259,8 +1266,10 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
     if repair_wire {
         outcome.length_violations += 1;
     }
-    trace.push(format!("flags|wl={wire_length}|max_length={}|repair_cap={repair_cap}|repair_load_slew={repair_load_slew}|repair_wire={repair_wire}|max_cap={}", ctx.max_length, g9(f64::from(max_cap))));
+    crate::tpush!(trace, "flags|wl={wire_length}|max_length={}|repair_cap={repair_cap}|repair_load_slew={repair_load_slew}|repair_wire={repair_wire}|max_cap={}", ctx.max_length, g9(f64::from(max_cap)));
+    if !trace.off {
     buffered_net::trace_tree(&bn, root, 0, g, &mut trace.lines);
+    }
     if repair_cap || repair_load_slew || repair_wire {
         // RepairDesign::repairNet(bnet, drvr_pin, max_cap, max_length, corner).
         trace.ran(&["w", "wsplit", "wquad", "wbuf", "wexit", "j", "jexit", "l", "wpost", "rep", "rtsd", "rts", "repd"]);
@@ -1304,7 +1313,7 @@ const MIN_RESISTANCE_REDUCTION: f32 = 0.50;
 /// then the net marked to be routed again, resistance-aware, at the next `updateParasitics`.
 /// `graphs` are the current ones.
 fn try_reroute_net(design: &mut dyn Design, graphs: &mut [Graph<'_>], drvr_pin: &str, ctx: &mut NetCtx<'_, '_>, trace: &mut Trace) -> Result<bool, Stop> {
-    trace.push(format!("rr|{drvr_pin}"));
+    crate::tpush!(trace, "rr|{drvr_pin}");
     if !design.global_routing_parasitics() {
         return Ok(false);
     }
@@ -1323,24 +1332,24 @@ fn try_reroute_net(design: &mut dyn Design, graphs: &mut [Graph<'_>], drvr_pin: 
         return Ok(false);
     }
     let slack = driver_max_slack(design, graphs, drvr_pin, ctx)?;
-    trace.push(format!("rrs|{}", if slack >= timing::INF { "inf" } else { "finite" }));
+    crate::tpush!(trace, "rrs|{}", if slack >= timing::INF { "inf" } else { "finite" });
     if slack >= timing::INF {
         return Ok(false);
     }
     if let Some((gcells, tile_size)) = design.net_route_gcells(&net) {
-        trace.push(format!("rrg|{gcells}|{tile_size}"));
+        crate::tpush!(trace, "rrg|{gcells}|{tile_size}");
         if short_route(gcells) {
             return Ok(false);
         }
     }
     let (resistance, estimated) = design.net_resistances(&net);
     let ratio = resistance_reduction(resistance, estimated);
-    trace.push(format!("rrr|{}|{}|{}", g9(f64::from(resistance)), g9(f64::from(estimated)), g9(f64::from(ratio))));
+    crate::tpush!(trace, "rrr|{}|{}|{}", g9(f64::from(resistance)), g9(f64::from(estimated)), g9(f64::from(ratio)));
     if !saves_enough(ratio) {
         return Ok(false);
     }
     design.reroute_net(&net).map_err(|e| Stop::refused("RSZ-GR", e))?;
-    trace.push(format!("rrok|{net}"));
+    crate::tpush!(trace, "rrok|{net}");
     Ok(true)
 }
 
@@ -1502,7 +1511,7 @@ fn repair_driver_slew(design: &dyn Design, graphs: &[Graph<'_>], corner: usize, 
     let dk = sc.at(corner, drvr);
     let load_cap = g.load_cap(dk, design.parasitics(corner));
     let vx = &g.vertices[dk];
-    trace.push(format!("rds|{}|{}|{}", vx.name, vx.cell.as_deref().unwrap_or("-"), g9(f64::from(load_cap))));
+    crate::tpush!(trace, "rds|{}|{}|{}", vx.name, vx.cell.as_deref().unwrap_or("-"), g9(f64::from(load_cap)));
     let (Some(cell), Some(port), true) = (vx.cell.as_deref(), vx.port.as_deref(), vx.name.contains('/')) else { return Ok(None) };
     let inst = inst_of(&vx.name);
     let d = driver_slew::Driver {
@@ -1560,7 +1569,9 @@ fn make_buffered_net_steiner(design: &dyn Design, g: &Graph<'_>, drvr: usize, ne
 
 /// A Steiner tree, printed, as a buffered net at the corner (`g` is its timer).
 fn steiner_buffered_net(tree: &buffered_net::Tree, g: &Graph<'_>, drvr: usize, corner: usize, ctx: &NetCtx<'_, '_>, trace: &mut Trace) -> Option<(buffered_net::BufferedNet, usize)> {
+    if !trace.off {
     buffered_net::trace_steiner(tree, &g.vertices[drvr].name, &mut trace.lines);
+    }
     let bctx = buffered_net::Ctx { graph: g, libs: ctx.inputs.libs, sdc: &ctx.inputs.sdc, limits: &ctx.inputs.limits, dbu: ctx.inputs.dbu, rc: ctx.inputs.wire_rc[corner] };
     buffered_net::make_buffered_net_steiner(&bctx, tree)
 }
@@ -1606,12 +1617,12 @@ mod tests {
         use vyges_sta::netlist::{Conn, Net, Netlist, PortDir};
         let libs = Libs { libs: vec![vyges_sta::liberty::Library::read(&vyges_sta::liberty_parse::parse(LIB).unwrap()).unwrap()], ..Default::default() };
         let netlist = Netlist {
-            insts: vec![("r".into(), "dff".into())],
+            insts: vec![vyges_sta::netlist::inst("r", "dff")],
             ports: vec![("clk".into(), PortDir::Input), ("d".into(), PortDir::Input), ("q".into(), PortDir::Output)],
             nets: vec![
-                Net { name: "clk".into(), pins: vec![Conn::Port(0), Conn::Inst(0, "CK".into())] },
-                Net { name: "d".into(), pins: vec![Conn::Port(1), Conn::Inst(0, "D".into())] },
-                Net { name: "q".into(), pins: vec![Conn::Inst(0, "Q".into()), Conn::Port(2)] },
+                Net { name: "clk".into(), pins: vec![Conn::Port(0), Conn::Inst(0, "CK".into())] }.into(),
+                Net { name: "d".into(), pins: vec![Conn::Port(1), Conn::Inst(0, "D".into())] }.into(),
+                Net { name: "q".into(), pins: vec![Conn::Inst(0, "Q".into()), Conn::Port(2)] }.into(),
             ],
         };
         let (masters, dont_use) = (BTreeMap::new(), BTreeSet::new());
@@ -1639,12 +1650,12 @@ mod tests {
         use vyges_sta::netlist::{Conn, Net, Netlist, PortDir};
         let libs = vec![vyges_sta::liberty::Library::read(&vyges_sta::liberty_parse::parse(LIB).unwrap()).unwrap()];
         let netlist = Netlist {
-            insts: vec![("r".into(), "dff".into())],
+            insts: vec![vyges_sta::netlist::inst("r", "dff")],
             ports: vec![("clk".into(), PortDir::Input), ("d".into(), PortDir::Input), ("q".into(), PortDir::Output)],
             nets: vec![
-                Net { name: "clk".into(), pins: vec![Conn::Port(0), Conn::Inst(0, "CK".into())] },
-                Net { name: "d".into(), pins: vec![Conn::Port(1), Conn::Inst(0, "D".into())] },
-                Net { name: "q".into(), pins: vec![Conn::Inst(0, "Q".into()), Conn::Port(2)] },
+                Net { name: "clk".into(), pins: vec![Conn::Port(0), Conn::Inst(0, "CK".into())] }.into(),
+                Net { name: "d".into(), pins: vec![Conn::Port(1), Conn::Inst(0, "D".into())] }.into(),
+                Net { name: "q".into(), pins: vec![Conn::Inst(0, "Q".into()), Conn::Port(2)] }.into(),
             ],
         };
         let mut g = Graph::build(&libs, &netlist).unwrap();
@@ -1703,9 +1714,9 @@ mod tests {
     fn a_port_driver_has_no_net_to_reroute() {
         use vyges_sta::netlist::{Conn, Net, Netlist, PortDir};
         let netlist = Netlist {
-            insts: vec![("u".into(), "buf".into())],
+            insts: vec![vyges_sta::netlist::inst("u", "buf")],
             ports: vec![("in".into(), PortDir::Input)],
-            nets: vec![Net { name: "in".into(), pins: vec![Conn::Port(0), Conn::Inst(0, "A".into())] }],
+            nets: vec![Net { name: "in".into(), pins: vec![Conn::Port(0), Conn::Inst(0, "A".into())] }.into()],
         };
         assert!(is_top_port(&netlist, "in"));
         assert!(!is_top_port(&netlist, "u/Y"));

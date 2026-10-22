@@ -710,7 +710,7 @@ pub fn sdc_design(db: &vyges_opendb::Db, libs: &Libs) -> vyges_loom::sdc::SdcDes
             }
         }
     }
-    vyges_loom::sdc::SdcDesign { ports, insts: nl.insts.clone(), pins }
+    vyges_loom::sdc::SdcDesign { ports, insts: nl.insts.iter().map(|i| (**i).clone()).collect(), pins }
 }
 
 #[cfg(test)]

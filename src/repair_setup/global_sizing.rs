@@ -332,7 +332,7 @@ impl GsEnv<'_> {
 
     /// The leaf instances in network order, each with its link cell.
     fn leaf_insts(&self) -> Vec<(usize, String, String)> {
-        self.design.netlist().insts.iter().enumerate().map(|(k, (n, c))| (k, n.clone(), c.clone())).collect()
+        self.design.netlist().insts.iter().map(|i| &**i).enumerate().map(|(k, (n, c))| (k, n.clone(), c.clone())).collect()
     }
 
     /// `computeDesignSnap`.
@@ -1082,7 +1082,7 @@ impl Repair<'_, '_> {
             let Some(best) = &r.best_cell else { continue };
             let tol = if r.best_is_downsize { 0.0f32 } else { 0.02f32 };
             if r.best_cost < r.baseline_cost * (1.0 - tol) {
-                let cur = self.design.netlist().insts.iter().find(|(n, _)| n == &r.inst).map(|(_, c)| c.clone()).unwrap_or_default();
+                let cur = self.design.netlist().insts.iter().map(|i| &**i).find(|(n, _)| n == &r.inst).map(|(_, c)| c.clone()).unwrap_or_default();
                 self.gs_replace_cell(&r.inst, &cur, best)?;
                 self.gs_env().trace(format!("apply|{}|{best}", r.inst));
                 moves += 1;

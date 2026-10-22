@@ -83,7 +83,7 @@ pub fn unlevelable(libs: &[Library], netlist: &vyges_sta::netlist::Netlist) -> O
     for net in &netlist.nets {
         for c in &net.pins {
             if let Conn::Inst(i, pin) = c {
-                let (inst, master) = &netlist.insts[*i];
+                let (inst, master) = &*netlist.insts[*i];
                 match cell_of(master) {
                     None => return Some(format!("{inst}/{pin} on net {}: master {master} has no liberty cell", net.name)),
                     Some(cell) => {
@@ -615,7 +615,7 @@ mod tests {
         let lib = |c: vyges_sta::liberty::Cell| Library { cells: [("c".to_string(), c)].into_iter().collect(), ..Default::default() };
         let ay = lib(cell(vec![port("A", Direction::Input, None), port("Y", Direction::Output, None)]));
         let ya = lib(cell(vec![port("Y", Direction::Output, None), port("A", Direction::Input, None)]));
-        let nl = vyges_sta::netlist::Netlist { insts: vec![("u1".into(), "c".into())], ports: Vec::new(), nets: Vec::new() };
+        let nl = vyges_sta::netlist::Netlist { insts: vec![vyges_sta::netlist::inst("u1", "c")], ports: Vec::new(), nets: Vec::new() };
         let (l0, l1) = (vec![ay], vec![ya]);
         let same = [Graph::build(&l0, &nl).unwrap(), Graph::build(&l0, &nl).unwrap()];
         let sc = Scenes::new(&same);
@@ -666,11 +666,11 @@ mod tests {
             pin (X) { direction : output; function : "A"; max_capacitance : 0.5; } } }"#;
         let libs = vec![Library::read(&vyges_sta::liberty_parse::parse(LIB).unwrap()).unwrap()];
         let netlist = vyges_sta::netlist::Netlist {
-            insts: vec![("b".into(), "buf".into())],
+            insts: vec![vyges_sta::netlist::inst("b", "buf")],
             ports: vec![("in".into(), vyges_sta::netlist::PortDir::Input), ("out".into(), vyges_sta::netlist::PortDir::Output)],
             nets: vec![
-                vyges_sta::netlist::Net { name: "in".into(), pins: vec![Conn::Port(0), Conn::Inst(0, "A".into())] },
-                vyges_sta::netlist::Net { name: "out".into(), pins: vec![Conn::Inst(0, "X".into()), Conn::Port(1)] },
+                vyges_sta::netlist::Net { name: "in".into(), pins: vec![Conn::Port(0), Conn::Inst(0, "A".into())] }.into(),
+                vyges_sta::netlist::Net { name: "out".into(), pins: vec![Conn::Inst(0, "X".into()), Conn::Port(1)] }.into(),
             ],
         };
         let g = Graph::build(&libs, &netlist).unwrap();

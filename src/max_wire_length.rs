@@ -149,11 +149,11 @@ pub fn cell_wire_delay(ctx: &Ctx<'_>, cell: &str, drvr_port: &str, load_port: &s
     // The driver's input comes from a port at the target slews.
     let (input, _) = ctx.libs.link_cell(cell).and_then(|c| c.buffer_ports()).ok_or_else(|| Stop::error("RSZ-MWL", format!("{cell}: not a buffer")))?;
     let netlist = Netlist {
-        insts: vec![("drvr".into(), cell.into()), ("load".into(), cell.into())],
+        insts: vec![vyges_sta::netlist::inst("drvr", cell), vyges_sta::netlist::inst("load", cell)],
         ports: vec![("in".into(), PortDir::Input)],
         nets: vec![
-            Net { name: "in".into(), pins: vec![Conn::Inst(0, input.name.clone()), Conn::Port(0)] },
-            Net { name: "wire".into(), pins: vec![Conn::Inst(0, drvr_port.into()), Conn::Inst(1, load_port.into())] },
+            Net { name: "in".into(), pins: vec![Conn::Inst(0, input.name.clone()), Conn::Port(0)] }.into(),
+            Net { name: "wire".into(), pins: vec![Conn::Inst(0, drvr_port.into()), Conn::Inst(1, load_port.into())] }.into(),
         ],
     };
     let mut sdc = SdcEnv::default();

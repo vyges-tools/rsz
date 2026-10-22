@@ -1725,7 +1725,7 @@ impl Repair<'_, '_> {
         let g = &gs[0];
         let ideal0: BTreeSet<usize> = if ctx.ideal_clock { crate::timing::clock_pins(g, ctx.clock_sources).into_iter().collect() } else { BTreeSet::new() };
         let parasitics: Vec<HashMap<String, vyges_sta::graph::NetParasitics>> = (0..gs.len()).map(|k| design.parasitics(k).clone()).collect();
-        let Some(k) = netlist.insts.iter().position(|(n, _)| n == inst) else { return Ok(Vec::new()) };
+        let Some(k) = netlist.insts.iter().map(|i| &**i).position(|(n, _)| n == inst) else { return Ok(Vec::new()) };
         let sc = crate::timing::Scenes::new(&gs);
         let mut out = Vec::new();
         for (u, ux) in g.vertices.iter().enumerate() {
@@ -2455,10 +2455,10 @@ impl HoldRepair<'_, '_> {
         self.design.update_parasitics().map_err(|e| Stop::error("RSZ-EST", e))?;
         let mut resizes = 0;
         if !self.check_max_slew_cap(&r.output)? {
-            let before = self.design.as_design().netlist().insts.iter().find(|(n, _)| n == &r.inst).map(|(_, c)| c.clone());
+            let before = self.design.as_design().netlist().insts.iter().map(|i| &**i).find(|(n, _)| n == &r.inst).map(|(_, c)| c.clone());
             if resize_to_target_slew(self.ctx, self.design, &r, buffer)? {
                 // `replaceCell`: the old master's area out, the new one's in.
-                let after = self.design.as_design().netlist().insts.iter().find(|(n, _)| n == &r.inst).map(|(_, c)| c.clone());
+                let after = self.design.as_design().netlist().insts.iter().map(|i| &**i).find(|(n, _)| n == &r.inst).map(|(_, c)| c.clone());
                 if let (Some(old), Some(new)) = (before, after) {
                     let (ao, an) = (self.design.master_area(&old), self.design.master_area(&new));
                     self.design_area_incr(-ao);
@@ -3682,7 +3682,7 @@ impl Repair<'_, '_> {
             // `trackCriticalPins`, in the set's order: the pins' addresses when the gate supplies
             // them, else the terminal table's order.
             let mut critical: Vec<(u64, String, usize, f32)> = Vec::new();
-            for (i, (_, cell)) in netlist.insts.iter().enumerate() {
+            for (i, (_, cell)) in netlist.insts.iter().map(|i| &**i).enumerate() {
                 let lib_cell = ctx.libs.link_cell(cell);
                 for port in ctx.master_pins.get(cell).map_or(&[][..], |v| v.as_slice()) {
                     let name = netlist.pin_name(&vyges_sta::netlist::Conn::Inst(i, port.clone()));
@@ -3758,7 +3758,7 @@ impl Repair<'_, '_> {
                 s
             };
             let mut pins = Vec::new();
-            for (i, (_, cell)) in netlist.insts.iter().enumerate() {
+            for (i, (_, cell)) in netlist.insts.iter().map(|i| &**i).enumerate() {
                 let lib_cell = ctx.libs.link_cell(cell);
                 for port in ctx.master_pins.get(cell).map_or(&[][..], |v| v.as_slice()) {
                     let name = netlist.pin_name(&vyges_sta::netlist::Conn::Inst(i, port.clone()));
@@ -4684,7 +4684,7 @@ impl Repair<'_, '_> {
 
     /// `MoveCommitter::commit` of an accepted candidate: recorded, and kept in the open level.
     fn commit(&mut self, r: MoveResult) {
-        let ids: Vec<u32> = r.insts.iter().map(|i| self.design.inst_id(i)).collect();
+        let ids: Vec<u32> = r.insts.iter().map(|i| &**i).map(|i| self.design.inst_id(i)).collect();
         self.committer.record(&r, &ids);
         if let Some(level) = self.committer.levels.last_mut() {
             level.push((r, ids));
@@ -5056,7 +5056,7 @@ impl Repair<'_, '_> {
     /// the top output (or inout) ports on the flat net of `inst/port`.
     fn output_net_loads(&self, inst: &str, port: &str) -> Vec<String> {
         let nl = self.design.netlist();
-        let Some(k) = nl.insts.iter().position(|(n, _)| n == inst) else { return Vec::new() };
+        let Some(k) = nl.insts.iter().map(|i| &**i).position(|(n, _)| n == inst) else { return Vec::new() };
         let Some(net) = nl.nets.iter().find(|n| n.pins.iter().any(|c| matches!(c, vyges_sta::netlist::Conn::Inst(i, p) if *i == k && p == port))) else { return Vec::new() };
         net.pins
             .iter()
@@ -5072,7 +5072,7 @@ impl Repair<'_, '_> {
     /// order) decides the module prefix removed (`db_net_name`).
     fn net_display_name(&self, inst: &str, port: &str) -> Option<String> {
         let nl = self.design.netlist();
-        let k = nl.insts.iter().position(|(n, _)| n == inst)?;
+        let k = nl.insts.iter().map(|i| &**i).position(|(n, _)| n == inst)?;
         let net = nl.nets.iter().find(|n| n.pins.iter().any(|c| matches!(c, vyges_sta::netlist::Conn::Inst(i, p) if *i == k && p == port)))?;
         let first_output = net.pins.iter().find_map(|c| match c {
             vyges_sta::netlist::Conn::Inst(i, p) => {
@@ -5450,9 +5450,9 @@ mod tests {
           cell (inv) { pin (A) { direction : input; capacitance : 0.001; } pin (ZN) { direction : output; function : "!A"; } } }"#;
         let lib = vyges_sta::liberty::Library::read(&vyges_sta::liberty_parse::parse(LIB).unwrap()).unwrap();
         use vyges_sta::netlist::{Conn, Net, Netlist};
-        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins };
+        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins }.into();
         let nl = Netlist {
-            insts: vec![("d".into(), "inv".into()), ("b1".into(), "buf".into()), ("i1".into(), "inv".into()), ("b2".into(), "buf".into()), ("b3".into(), "buf".into())],
+            insts: vec![vyges_sta::netlist::inst("d", "inv"), vyges_sta::netlist::inst("b1", "buf"), vyges_sta::netlist::inst("i1", "inv"), vyges_sta::netlist::inst("b2", "buf"), vyges_sta::netlist::inst("b3", "buf")],
             ports: Vec::new(),
             nets: vec![
                 net("n0", vec![Conn::Inst(0, "ZN".into()), Conn::Inst(1, "A".into()), Conn::Inst(2, "A".into()), Conn::Inst(4, "A".into())]),
@@ -5476,9 +5476,9 @@ mod tests {
         let lib = vyges_sta::liberty::Library::read(&vyges_sta::liberty_parse::parse(LIB).unwrap()).unwrap();
         use vyges_sta::netlist::{Conn, Net, Netlist};
         let nl = Netlist {
-            insts: vec![("d".into(), "buf".into()), ("b1".into(), "buf".into()), ("b2".into(), "buf".into())],
+            insts: vec![vyges_sta::netlist::inst("d", "buf"), vyges_sta::netlist::inst("b1", "buf"), vyges_sta::netlist::inst("b2", "buf")],
             ports: Vec::new(),
-            nets: vec![Net { name: "n0".into(), pins: vec![Conn::Inst(0, "X".into()), Conn::Inst(2, "A".into()), Conn::Inst(1, "A".into())] }],
+            nets: vec![Net { name: "n0".into(), pins: vec![Conn::Inst(0, "X".into()), Conn::Inst(2, "A".into()), Conn::Inst(1, "A".into())] }.into()],
         };
         let link = |c: &str| lib.cells.get(c);
         let ids: HashMap<String, u64> = [("d/X", 2), ("b1/A", 6), ("b2/A", 10)].into_iter().map(|(p, i)| (p.to_string(), i)).collect();

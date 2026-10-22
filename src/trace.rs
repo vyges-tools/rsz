@@ -6,6 +6,16 @@
 //! trailing point dropped, scientific form when the decimal exponent is below −4 or at least 9,
 //! the exponent signed and at least two digits. An `f32` is widened to `f64` first, exactly.
 
+/// `crate::tpush!(trace, …)`, formatted only when the trace keeps lines.
+#[macro_export]
+macro_rules! tpush {
+    ($t:expr, $($a:tt)*) => {
+        if !$t.off {
+            $t.push(format!($($a)*));
+        }
+    };
+}
+
 /// `x` as `fmt`'s `{:.9g}`.
 pub fn g9(x: f64) -> String {
     g(x, 9)
@@ -49,6 +59,9 @@ fn trim_zeros(s: &str) -> &str {
 #[derive(Debug, Default, Clone)]
 pub struct Trace {
     pub lines: Vec<String>,
+    /// No line is kept (the job writes no trace): [`tpush!`] does not even format one — the
+    /// repair makes a decision line per driver and per buffer, in the hot loop.
+    pub off: bool,
     /// The tags of every stage that RAN, whether or not it wrote a line: a comparison must
     /// score a stage that wrote nothing as nothing, not skip it.
     pub tags: std::collections::BTreeSet<&'static str>,
@@ -60,7 +73,9 @@ impl Trace {
         self.tags.extend(tags.iter().copied());
     }
     pub fn push(&mut self, line: String) {
-        self.lines.push(line);
+        if !self.off {
+            self.lines.push(line);
+        }
     }
     pub fn text(&self) -> String {
         let mut s = self.lines.join("\n");
@@ -107,6 +122,26 @@ pub fn c_hex(v: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rule: a job that writes no trace keeps no line, and a decision line is not even formatted
+    /// (its arguments are not evaluated) — the repair makes one per driver and per buffer.
+    #[test]
+    fn an_off_trace_keeps_and_formats_nothing() {
+        let calls = std::cell::Cell::new(0);
+        let arg = || {
+            calls.set(calls.get() + 1);
+            1
+        };
+        let mut t = Trace { off: true, ..Trace::default() };
+        crate::tpush!(t, "x {}", arg());
+        t.push("y".into());
+        assert!(t.lines.is_empty());
+        assert_eq!(calls.get(), 0, "an off trace formats nothing");
+        let mut t = Trace::default();
+        crate::tpush!(t, "x {}", arg());
+        assert_eq!(t.lines, vec!["x 1".to_string()]);
+        assert_eq!(calls.get(), 1);
+    }
 
     // Rule: fmt `{:.9g}` — the forms seen in a reference trace.
     #[test]

@@ -137,10 +137,10 @@ impl Walk<'_, '_> {
         let shape = f64::from(self.slew_shape_factor);
         let mut load_slew = (f64::from(r_drvr) * (c_wire + ref_cap) + r_wire * ref_cap + r_wire * c_wire / 2.0) * shape;
         let mut buffer_cell = self.sizing.find_target_cell(self.buffer_lowest_drive, load_cap as f32, false)?;
-        trace.push(format!(
+        crate::tpush!(trace, 
             "w|{level}|{from_x}|{from_y}|{to_x}|{to_y}|len={length}|wl={wire_length}|wl_ref={wire_length_ref}|res={}|cap={}|ref_cap={}|load_cap={}|r_drvr={}|load_slew={}|mls={}|mlsm={}|cell={buffer_cell}",
             g(wire_res), g(wire_cap), g(ref_cap), g(load_cap), g(f64::from(r_drvr)), g(load_slew), g(f64::from(max_load_slew)), g(f64::from(max_load_slew_margined))
-        ));
+        );
         bn.nodes[n].cap = load_cap as f32;
         bn.nodes[n].fanout = bn.nodes[r].fanout;
         bn.nodes[n].max_load_slew = (f64::from(bn.nodes[r].max_load_slew) - r_wire * (c_wire / 2.0 + ref_cap) * shape) as f32;
@@ -175,7 +175,7 @@ impl Walk<'_, '_> {
                 } else if b > 1e-12 {
                     l = -c / b;
                 }
-                trace.push(format!("wquad|{}|{}|{}|{}", g(f64::from(a)), g(f64::from(b)), g(f64::from(c)), g(f64::from(l))));
+                crate::tpush!(trace, "wquad|{}|{}|{}|{}", g(f64::from(a)), g(f64::from(b)), g(f64::from(c)), g(f64::from(l)));
                 if l >= 0.0 {
                     split_length = split_length.min(self.meters_to_dbu(f64::from(l)));
                 } else {
@@ -183,12 +183,12 @@ impl Walk<'_, '_> {
                 }
                 split_wire = true;
             }
-            trace.push(format!(
+            crate::tpush!(trace, 
                 "wsplit|{level}|lenv={}|capv={}|slewv={}|split={split_length}",
                 self.max_length > 0 && i64::from(wire_length) > self.max_length,
                 wire_cap > 0.0 && load_cap > max_cap,
                 load_slew > f64::from(max_load_slew_margined)
-            ));
+            );
             if !split_wire {
                 break;
             }
@@ -200,7 +200,7 @@ impl Walk<'_, '_> {
             let d = if length == 0 { 0.0 } else { buf_dist / f64::from(length) };
             let buf_x = (f64::from(to_x) + d * dx) as i32;
             let buf_y = (f64::from(to_y) + d * dy) as i32;
-            trace.push(format!("wbuf|{level}|buf_dist={}|{buf_x}|{buf_y}", g(buf_dist)));
+            crate::tpush!(trace, "wbuf|{level}|buf_dist={}|{buf_x}|{buf_y}", g(buf_dist));
             let hint = wire_load_cap_hint(buf_dist, self.ctx.dbu, wire_cap, ref_cap);
             let (repeater_cap, repeater_fanout, repeater_max_slew) = self.make_repeater("wire", buf_x, buf_y, &buffer_cell, true, level, &mut load_pins, Some(hint), st, trace)?;
             max_load_slew = repeater_max_slew;
@@ -220,10 +220,10 @@ impl Walk<'_, '_> {
             buffer_cell = self.sizing.find_target_cell(self.buffer_lowest_drive, load_cap as f32, false)?;
             bn.nodes[n].cap = load_cap as f32;
             bn.nodes[n].fanout = repeater_fanout;
-            trace.push(format!(
+            crate::tpush!(trace, 
                 "wpost|{level}|len={length}|load_cap={}|ref_cap={}|load_slew={}|mlsm={}|cell={buffer_cell}|rfo={}|mls={}",
                 g(load_cap), g(ref_cap), g(load_slew), g(f64::from(max_load_slew_margined)), g(f64::from(repeater_fanout)), g(f64::from(max_load_slew))
-            ));
+            );
             bn.nodes[n].max_load_slew = (f64::from(max_load_slew) - r_wire * (c_wire / 2.0 + ref_cap) * shape) as f32;
             // No progress twice in a row (a repeater on the load, no smaller load seen): RSZ-170.
             if zero_advance && ref_cap >= prev_ref_cap {
@@ -235,7 +235,7 @@ impl Walk<'_, '_> {
                 zero_progress_iters = 0;
             }
         }
-        trace.push(format!("wexit|{level}|{}|{}|{}", g(f64::from(bn.nodes[n].cap)), g(f64::from(bn.nodes[n].fanout)), g(f64::from(bn.nodes[n].max_load_slew))));
+        crate::tpush!(trace, "wexit|{level}|{}|{}|{}", g(f64::from(bn.nodes[n].cap)), g(f64::from(bn.nodes[n].fanout)), g(f64::from(bn.nodes[n].max_load_slew)));
         Ok((wire_length, load_pins))
     }
 
@@ -284,11 +284,11 @@ impl Walk<'_, '_> {
             }
             reason = Some("max_length");
         }
-        trace.push(format!(
+        crate::tpush!(trace, 
             "j|{level}|{x}|{y}|cl={}|cr={}|fl={}|fr={}|ml={}|mr={}|wl={wire_length_left}|wr={wire_length_right}|ls={}|mlsm={}|rl={repeater_left}|rr={repeater_right}|reason={}|cell={buffer_cell}",
             g(f64::from(cap_left)), g(f64::from(cap_right)), g(f64::from(fanout_left)), g(f64::from(fanout_right)), g(f64::from(max_load_slew_left)), g(f64::from(max_load_slew_right)),
             g(f64::from(load_slew)), g(f64::from(max_load_slew_margined)), reason.unwrap_or("-")
-        ));
+        );
         // makeRepeater writes the branch's cap, fanout and slew limit (its by-reference outputs).
         let reason_s = reason.unwrap_or("-");
         if repeater_left {
@@ -303,7 +303,7 @@ impl Walk<'_, '_> {
         bn.nodes[n].cap = cap_left + cap_right;
         bn.nodes[n].fanout = fanout_right + fanout_left;
         bn.nodes[n].max_load_slew = max_load_slew_left.min(max_load_slew_right);
-        trace.push(format!("jexit|{level}|{}|{}|{}|wl={wire_length}", g(f64::from(bn.nodes[n].cap)), g(f64::from(bn.nodes[n].fanout)), g(f64::from(bn.nodes[n].max_load_slew))));
+        crate::tpush!(trace, "jexit|{level}|{}|{}|{}|wl={wire_length}", g(f64::from(bn.nodes[n].cap)), g(f64::from(bn.nodes[n].fanout)), g(f64::from(bn.nodes[n].max_load_slew)));
         let mut loads = loads_left;
         loads.append(&mut loads_right);
         Ok((wire_length, loads))
@@ -312,7 +312,7 @@ impl Walk<'_, '_> {
     fn repair_net_load(&self, bn: &mut BufferedNet, n: usize, pin: usize, level: usize, st: &mut State<'_>, trace: &mut Trace) -> Result<Down, Stop> {
         self.check_slew_limit(bn.nodes[n].cap, bn.nodes[n].max_load_slew, &mut st.pre)?;
         let name = self.graph().vertices[pin].name.clone();
-        trace.push(format!("l|{level}|{name}|{}|{}", g(f64::from(bn.nodes[n].cap)), g(f64::from(bn.nodes[n].max_load_slew))));
+        crate::tpush!(trace, "l|{level}|{name}|{}|{}", g(f64::from(bn.nodes[n].cap)), g(f64::from(bn.nodes[n].max_load_slew)));
         Ok((0, vec![name]))
     }
 
@@ -324,13 +324,13 @@ impl Walk<'_, '_> {
     #[allow(clippy::too_many_arguments)]
     pub fn make_repeater(&self, reason: &str, x: i32, y: i32, buffer_cell: &str, resize: bool, level: usize, load_pins: &mut Vec<String>, load_cap_hint: Option<f32>, st: &mut State<'_>, trace: &mut Trace) -> Result<(f32, f32, f32), Stop> {
         let loads: String = load_pins.iter().map(|p| format!("{p},")).collect();
-        trace.push(format!("rep|{level}|{reason}|{x}|{y}|{buffer_cell}|{loads}"));
+        crate::tpush!(trace, "rep|{level}|{reason}|{x}|{y}|{buffer_cell}|{loads}");
         let r = st.design.insert_repeater(load_pins, buffer_cell, (x, y), reason).map_err(|e| Stop::error("RSZ-INSERT", e))?;
         st.inserted += 1;
         let cell = if resize { self.resize_to_target_slew(&r, buffer_cell, load_cap_hint, st, trace)? } else { buffer_cell.to_string() };
         let (input, repeater_cap, repeater_fanout, repeater_max_slew) = repeater_values(self.sizing.libs, &cell, self.ctx.limits, self.corner).expect("a repeater is a liberty buffer");
         let (lx, ly) = st.design.inst_location(&r.inst);
-        trace.push(format!("repd|{}|{}|{cell}|{lx}|{ly}|{}|{}|{}", r.inst, r.out_net, g(f64::from(repeater_cap)), g(f64::from(repeater_fanout)), g(f64::from(repeater_max_slew))));
+        crate::tpush!(trace, "repd|{}|{}|{cell}|{lx}|{ly}|{}|{}|{}", r.inst, r.out_net, g(f64::from(repeater_cap)), g(f64::from(repeater_fanout)), g(f64::from(repeater_max_slew)));
         *load_pins = vec![format!("{}/{input}", r.inst)];
         st.last = Some(r);
         Ok((repeater_cap, repeater_fanout, repeater_max_slew))
@@ -347,7 +347,7 @@ impl Walk<'_, '_> {
         let mut current = cell.to_string();
         if load_cap > 0.0 {
             let target = self.sizing.find_target_cell(cell, load_cap, false)?;
-            trace.push(format!("rts|{}|{cell}|{}|{target}", r.output, g(f64::from(load_cap))));
+            crate::tpush!(trace, "rts|{}|{cell}|{}|{target}", r.output, g(f64::from(load_cap)));
             if target != cell {
                 st.design.swap_master(&r.inst, &target).map_err(|e| Stop::error("RSZ-INSERT", e))?;
                 current = target;
@@ -366,7 +366,7 @@ impl Walk<'_, '_> {
         let graph = crate::repair_design::timer_graph(self.sizing.libs, k, &nl, self.sdc, self.master_pins)?;
         let v = graph.vertices.iter().position(|x| x.name == r.output).ok_or_else(|| Stop::error("RSZ-INSERT", format!("{}: not in the timing graph", r.output)))?;
         let (pin_cap, wire_cap, has_pi) = graph.load_cap_parts(v, &par, RISE);
-        trace.push(format!("rtsd|{}|pin={}|wire={}|pi={has_pi}", r.output, g(f64::from(pin_cap)), g(f64::from(wire_cap))));
+        crate::tpush!(trace, "rtsd|{}|pin={}|wire={}|pi={has_pi}", r.output, g(f64::from(pin_cap)), g(f64::from(wire_cap)));
         Ok(graph.load_cap(v, &par))
     }
 

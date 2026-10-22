@@ -79,7 +79,7 @@ pub fn repair_driver_slew(g: &Graph<'_>, corner: usize, d: &Driver<'_>, load_cap
                 }
             }
         }
-        trace.push(format!("rdsc|{size_cell}|{limit_exists}|{}|{}|{}", g9(f64::from(if limit_exists { limit } else { 0.0 })), g9(f64::from(violation)), g9(f64::from(c.area))));
+        crate::tpush!(trace, "rdsc|{size_cell}|{limit_exists}|{}|{}|{}", g9(f64::from(if limit_exists { limit } else { 0.0 })), g9(f64::from(violation)), g9(f64::from(c.area)));
         sizes.push((violation, size_cell, c.area));
     }
     // `std::ranges::sort` over `pair<float, LibertyCell*>`: libc++'s introsort, so a tie in a
@@ -87,7 +87,7 @@ pub fn repair_driver_slew(g: &Graph<'_>, corner: usize, d: &Driver<'_>, load_cap
     order::libcxx_sort_by(&mut sizes, |a, b| if a.0 == 0.0 && b.0 == 0.0 { a.2 < b.2 } else { a.0 < b.0 })
         .map_err(|h| Stop::refused("RSZ-ORDER", format!("repairDriverSlew: {} sizes reach the sort's heap fallback, which is not modelled", h.len)))?;
     let selected = sizes[0].1;
-    trace.push(format!("rdsel|{selected}"));
+    crate::tpush!(trace, "rdsel|{selected}");
     Ok((selected != d.cell).then(|| selected.to_string()))
 }
 
@@ -122,9 +122,9 @@ pub fn find_slew_load_cap(link: &Cell, scene_cell: &Cell, port: &str, slew: f64,
     let mut cap2 = slew / drvr_res * 2.0;
     let tol = 0.01;
     let mut diff1 = diff(cap2);
-    trace.push(format!("slc0|{}|{}|{}|{}", g9(drvr_res), g17(slew), g17(cap2), g17(diff1)));
+    crate::tpush!(trace, "slc0|{}|{}|{}|{}", g9(drvr_res), g17(slew), g17(cap2), g17(diff1));
     while (cap1 - cap2).abs() > cap1.max(cap2) * tol {
-        trace.push(format!("slc|{}|{}|{}", g17(cap1), g17(cap2), g17(diff1)));
+        crate::tpush!(trace, "slc|{}|{}|{}", g17(cap1), g17(cap2), g17(diff1));
         if diff1 < 0.0 {
             cap1 = cap2;
             cap2 *= 2.0;

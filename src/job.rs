@@ -428,7 +428,8 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
         let u = l.units.ok_or("RC before a liberty library: the timer's default units are not modelled")?;
         Ok(vyges_est::rc::Units { resistance: u.resistance, capacitance: u.capacitance, distance: u.distance })
     };
-    let mut trace = Trace::default();
+    // the decision lines are kept only for a job that writes them
+    let mut trace = Trace { off: job["trace"].as_str().is_none(), ..Trace::default() };
     let mut outcome: Option<Result<repair_design::Outcome, Stop>> = None;
     // The estimator's per-net state after an edit made inside its incremental guard (buffer_ports):
     // a later repair starts from it rather than from a fresh estimate.
@@ -1043,7 +1044,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 // dbNetwork::id(pin) — an instance terminal's odb id << 1, a port's << 1 | 1 — is
                 // the order of the clock network's `PinSet`.
                 let mut ids: HashMap<String, u64> = HashMap::new();
-                for (inst, master) in &netlist.insts {
+                for (inst, master) in netlist.insts.iter().map(|i| &**i) {
                     for t in mpins.get(master).into_iter().flatten() {
                         if let Ok(id) = db.iterm_id(inst, t) {
                             ids.insert(format!("{inst}/{t}"), u64::from(id) << 1);
