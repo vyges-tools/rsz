@@ -789,7 +789,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 let core = (db.block_get_core_area_x_min(), db.block_get_core_area_y_min(), db.block_get_core_area_x_max(), db.block_get_core_area_y_max());
                 let core = (core != (0, 0, 0, 0)).then_some(core);
                 let port_caps = port_caps_at(step["sdc"].as_str(), sdc.as_ref(), &libs, &netlist)?;
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), alpha: routing_alpha, estimating, netlist: std::sync::Arc::new(netlist), netlist_gen: 0, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins: sdc.as_ref().map(sdc_cap_pins).unwrap_or_default(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr: None, gr_error: None, undoing: false, skips: None, skip_log: false };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), alpha: routing_alpha, estimating, netlist: std::sync::Arc::new(netlist), netlist_gen: 0, inst_pos: None, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins: sdc.as_ref().map(sdc_cap_pins).unwrap_or_default(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr: None, gr_error: None, undoing: false, skips: None, skip_log: false };
                 let r = buffer_ports::buffer_ports(&mut design, &o, &weakest);
                 let parasitics = std::mem::take(&mut design.parasitics);
                 match r {
@@ -916,7 +916,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     let none = vyges_loom::sdc::Sdc::default();
                     a.search_sdc = Some(search_sdc_on(sdc.as_ref().unwrap_or(&none), &netlist, lib0.time_scale, false, false)?);
                 }
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), alpha: routing_alpha, estimating, netlist: std::sync::Arc::new(netlist), netlist_gen: 0, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins: sdc.as_ref().map(sdc_cap_pins).unwrap_or_default(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr, gr_error: None, undoing: false, skips: None, skip_log: false };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), alpha: routing_alpha, estimating, netlist: std::sync::Arc::new(netlist), netlist_gen: 0, inst_pos: None, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins: sdc.as_ref().map(sdc_cap_pins).unwrap_or_default(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr, gr_error: None, undoing: false, skips: None, skip_log: false };
                 let inputs = Inputs { libs: &libs, masters: &m, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins, sizing_limits: limits_of_block, clock_pattern: Default::default() };
                 let area0 = crate::odb_design::design_area(design.db);
                 let r = repair_design::repair_design(&inputs, &mut design, &a, &mut trace);
@@ -1056,7 +1056,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     }
                 }
                 let sdc_pins = sdc.as_ref().map(sdc_cap_pins).unwrap_or_default();
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), alpha: routing_alpha, estimating, netlist: std::sync::Arc::new(netlist), netlist_gen: 0, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins, timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr: None, gr_error: None, undoing: false, skips: None, skip_log: false };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), alpha: routing_alpha, estimating, netlist: std::sync::Arc::new(netlist), netlist_gen: 0, inst_pos: None, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins, timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr: None, gr_error: None, undoing: false, skips: None, skip_log: false };
                 let inputs = Inputs { libs: &libs, masters: &m, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins, sizing_limits: limits_of_block, clock_pattern: Default::default() };
                 let order = |p: &str| ids.get(p).copied().unwrap_or(u64::MAX);
                 let r = repair_design::repair_clk_nets(&inputs, &mut design, &clk_buffers, &clocks, &order, max_wire_length, &mut trace);
@@ -1453,7 +1453,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     let core = (core != (0, 0, 0, 0)).then_some(core);
                     let port_caps = env.port_pin_cap.clone();
                     let sdc_nets: BTreeSet<String> = s.env.iter().filter(|e| e.cmd == "set_load" && e.accessor == "get_nets").flat_map(|e| e.objects.iter().cloned()).collect();
-                    let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), alpha: routing_alpha, estimating, netlist: std::sync::Arc::new(netlist), netlist_gen: 0, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated, journal: Vec::new(), sdc_nets, sdc_pins: sdc_cap_pins(s), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr, gr_error: None, undoing: false, skips: None, skip_log: false };
+                    let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), alpha: routing_alpha, estimating, netlist: std::sync::Arc::new(netlist), netlist_gen: 0, inst_pos: None, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated, journal: Vec::new(), sdc_nets, sdc_pins: sdc_cap_pins(s), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr, gr_error: None, undoing: false, skips: None, skip_log: false };
                     if recover {
                         // `Resizer::recoverPower`: `resizePreamble`, then `RecoverPower::recoverPower`.
                         let max_area = match a.max_utilization.as_deref() {

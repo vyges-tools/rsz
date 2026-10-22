@@ -173,7 +173,7 @@ impl<'v, 'g> View<'v, 'g> {
     /// `computeSlackBudgets` visit them in. Any order consistent with the data edges gives the
     /// same VALUES; the permutation of one level's vertices is the reference's visit order.
     fn level_sorted(&self, descending: bool) -> Result<Vec<usize>, Stop> {
-        if let Some(why) = crate::timing::unlevelable(self.g.libs, self.g.netlist) {
+        if let Some(why) = crate::timing::unlevelable(self.g.libs, &self.g.netlist) {
             return Err(Stop::refused("RSZ-LEVELS", why));
         }
         let level = self.g.levels().map_err(|e| Stop::refused("RSZ-TIMER", e))?;

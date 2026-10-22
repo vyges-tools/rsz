@@ -40,6 +40,9 @@ pub struct CliDesign<'a> {
     /// Moves on every refresh that changes [`CliDesign::netlist`], and only then
     /// ([`Design::netlist_generation`]).
     pub netlist_gen: u64,
+    /// Each instance's place in the netlist it was made for (and only that one, by pointer):
+    /// [`CliDesign::refresh_touched`]'s appended path extends it rather than hashing every name.
+    pub inst_pos: Option<(std::sync::Weak<vyges_sta::netlist::Netlist>, HashMap<String, usize>)>,
     /// Per scene.
     pub parasitics: Vec<HashMap<String, NetParasitics>>,
     pub invalid: BTreeSet<String>,
@@ -286,6 +289,9 @@ impl CliDesign<'_> {
             return self.refresh();
         }
         let old = self.netlist.clone();
+        if let Some(fast) = self.appended_netlist(&old, new_insts, touched) {
+            return self.refresh_finish(old, fast, new_insts, touched);
+        }
         let old_master: HashMap<&str, &str> = old.insts.iter().map(|(n, m)| (n.as_str(), m.as_str())).collect();
         let mut nl = Netlist::default();
         let mut inst_index: HashMap<String, usize> = HashMap::new();
@@ -390,6 +396,138 @@ impl CliDesign<'_> {
             let info = net_info(self.db, &full)?;
             if full != *self.netlist || info != self.info {
                 return Err(format!("refresh_touched: differs from the full read (netlist {}, info {})", full == *self.netlist, info == self.info));
+            }
+        }
+        Ok(())
+    }
+
+    /// [`CliDesign::refresh_touched`] when the edit only APPENDED: the database iterates by id and
+    /// an insertion takes a fresh one, so every instance and every untouched net keeps its place —
+    /// read in order against the old lists, nothing re-indexed (the general path hashes every pin
+    /// of the design per edit). `None` when the database's order does not bear that out: an
+    /// instance not where it was, or an untouched net not met exactly once, in order.
+    fn appended_netlist(&mut self, old: &std::sync::Arc<vyges_sta::netlist::Netlist>, new_insts: &[String], touched: &BTreeSet<String>) -> Option<(vyges_sta::netlist::Netlist, bool, bool)> {
+        use vyges_sta::netlist::{Conn, Net, Netlist};
+        let names = self.db.inst_names();
+        if names.len() < old.insts.len() || old.insts.iter().zip(&names).any(|((a, _), b)| a != b) {
+            return None;
+        }
+        let mut pos = match self.inst_pos.take() {
+            Some((w, pos)) if std::sync::Weak::ptr_eq(&w, &std::sync::Arc::downgrade(old)) => pos,
+            _ => old.insts.iter().enumerate().map(|(i, (n, _))| (n.clone(), i)).collect(),
+        };
+        let mut nl = Netlist { insts: Vec::with_capacity(names.len()), ports: old.ports.clone(), nets: Vec::with_capacity(old.nets.len() + 2) };
+        nl.insts.extend(old.insts.iter().cloned());
+        // an instance re-read (the general path's `new_insts`) takes its master from the database
+        let mut master_changed = false;
+        for i in new_insts {
+            if let Some(&k) = pos.get(i) {
+                let m = self.db.inst_master(i);
+                master_changed |= m != nl.insts[k].1;
+                nl.insts[k].1 = m;
+            }
+        }
+        for inst in names.into_iter().skip(old.insts.len()) {
+            let master = self.db.inst_master(&inst);
+            pos.insert(inst.clone(), nl.insts.len());
+            nl.insts.push((inst, master));
+        }
+        let index_of = |inst: &str| -> Option<usize> { pos.get(inst).copied() };
+        let port_index: HashMap<&str, usize> = nl.ports.iter().enumerate().map(|(i, (n, _))| (n.as_str(), i)).collect();
+        let mut kept = old.nets.iter().filter(|n| !touched.contains(&n.name)).peekable();
+        let mut seen_touched = 0usize;
+        for net in self.db.net_names() {
+            if touched.contains(&net) {
+                seen_touched += 1;
+                if self.db.net_is_special(&net) {
+                    continue;
+                }
+                let mut pins = Vec::new();
+                for iterm in self.db.net_iterms(&net) {
+                    let (inst, term) = iterm.rsplit_once('/').unwrap_or((&iterm, ""));
+                    pins.push(Conn::Inst(index_of(inst)?, term.to_string()));
+                }
+                for bterm in self.db.net_bterms(&net) {
+                    if let Some(&p) = port_index.get(bterm.as_str()) {
+                        pins.push(Conn::Port(p));
+                    }
+                }
+                if !pins.is_empty() {
+                    nl.nets.push(Net { name: net, pins });
+                }
+            } else if kept.peek().is_some_and(|n| n.name == net) {
+                nl.nets.push(kept.next().expect("peeked").clone());
+            }
+            // else: a net the old list has not (special, no pins) — or one out of order, which
+            // leaves an untouched net unmet below
+        }
+        if kept.next().is_some() {
+            return None;
+        }
+        drop(kept);
+        self.inst_pos = Some((std::sync::Weak::new(), pos));
+        // a touched net the database no longer has was destroyed
+        Some((nl, seen_touched < touched.len(), master_changed))
+    }
+
+    /// The rest of [`CliDesign::refresh_touched`] on an appended netlist: the per-net and
+    /// per-instance flags, the change test, the generation.
+    fn refresh_finish(&mut self, old: std::sync::Arc<vyges_sta::netlist::Netlist>, (nl, destroyed, master_changed): (vyges_sta::netlist::Netlist, bool, bool), new_insts: &[String], touched: &BTreeSet<String>) -> Result<(), String> {
+        use vyges_sta::netlist::Conn;
+        if destroyed {
+            let live: BTreeSet<String> = self.db.net_names().into_iter().collect();
+            self.info.dont_touch.retain(|n| live.contains(n));
+            self.info.abutment.retain(|n| live.contains(n));
+        }
+        for net in nl.nets.iter().filter(|n| touched.contains(&n.name)) {
+            for c in &net.pins {
+                let name = nl.pin_name(c);
+                let id = match c {
+                    Conn::Inst(i, pin) => u64::from(self.db.iterm_id(&nl.insts[*i].0, pin).map_err(|e| e.to_string())?) << 1,
+                    Conn::Port(_) => (u64::from(self.db.bterm_id(&name).map_err(|e| e.to_string())?) << 1) | 1,
+                };
+                self.info.pin_id.insert(name, id);
+            }
+            if self.db.net_is_do_not_touch(&net.name) {
+                self.info.dont_touch.insert(net.name.clone());
+            } else {
+                self.info.dont_touch.remove(&net.name);
+            }
+            if self.db.net_is_connected_by_abutment(&net.name) {
+                self.info.abutment.insert(net.name.clone());
+            } else {
+                self.info.abutment.remove(&net.name);
+            }
+        }
+        for i in new_insts {
+            if self.db.inst_is_do_not_touch(i) {
+                self.info.dont_touch_insts.insert(i.clone());
+            }
+            if self.db.inst_is_fixed(i) {
+                self.info.fixed_insts.insert(i.clone());
+            }
+        }
+        // Changed: a count, a re-read master (the old instances keep theirs), a touched net's pins.
+        let changed = master_changed || nl.insts.len() != old.insts.len() || nl.nets.len() != old.nets.len() || {
+            let pins = |l: &vyges_sta::netlist::Netlist| -> HashMap<String, Vec<Conn>> { l.nets.iter().filter(|n| touched.contains(&n.name)).map(|n| (n.name.clone(), n.pins.clone())).collect() };
+            pins(&old) != pins(&nl)
+        };
+        let check = std::env::var_os("VYGES_RSZ_CHECK_REFRESH").is_some();
+        if check && changed != (nl != *old) {
+            return Err(format!("refresh_touched (appended): change test says {changed}, the netlists say {}", nl != *old));
+        }
+        if changed {
+            self.netlist_gen += 1;
+        }
+        self.netlist = std::sync::Arc::new(nl);
+        if let Some((w, _)) = self.inst_pos.as_mut() {
+            *w = std::sync::Arc::downgrade(&self.netlist);
+        }
+        if check {
+            let full = vyges_grt::timer::netlist(self.db);
+            let info = net_info(self.db, &full)?;
+            if full != *self.netlist || info != self.info {
+                return Err(format!("refresh_touched (appended): differs from the full read (netlist {}, info {})", full == *self.netlist, info == self.info));
             }
         }
         Ok(())
