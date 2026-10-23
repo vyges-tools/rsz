@@ -610,6 +610,28 @@ impl CliDesign<'_> {
         Ok(())
     }
 
+    /// Holds the estimator's clock nets and constant pins of the design as it is now, with the nets
+    /// an edit must name to drop them, and starts the edit log they are checked against.
+    pub fn hold_skips(&mut self, skips: vyges_est::placement::Skips) -> Result<(), String> {
+        let mut nets: std::collections::HashSet<String> = skips.clock_nets().iter().cloned().collect();
+        nets.extend(skips.constant_pins().iter().map(|p| self.net_of_load(p)).filter(|n| !n.is_empty()));
+        self.skips = Some(HeldSkips { skips, nets });
+        if !self.skip_log && !self.timer.on {
+            self.db.edit_log_start().map_err(|e| e.to_string())?;
+        }
+        self.skip_log = true;
+        Ok(())
+    }
+
+    fn drop_skips_if_touched(&mut self, ev: &str) {
+        if self.skips.as_ref().is_some_and(|h| h.touched_by(ev)) {
+            if std::env::var_os("VYGES_RSZ_SKIPS_TRACE").is_some() {
+                eprintln!("VYGSKIPS|dropped|{ev}");
+            }
+            self.skips = None;
+        }
+    }
+
     /// The database's callbacks since the last read, into the timer's log; the estimator's
     /// callbacks (`est::OdbCallBack`) on its invalid set: a net created, an instance terminal
     /// connected or disconnected, every net of a swapped instance → invalid; a net destroyed →
@@ -619,12 +641,7 @@ impl CliDesign<'_> {
             return;
         }
         for ev in self.db.edit_log_take() {
-            if self.skips.as_ref().is_some_and(|h| h.touched_by(&ev)) {
-                if std::env::var_os("VYGES_RSZ_SKIPS_TRACE").is_some() {
-                    eprintln!("VYGSKIPS|dropped|{ev}");
-                }
-                self.skips = None;
-            }
+            self.drop_skips_if_touched(&ev);
             if !self.timer.on {
                 continue;
             }
@@ -906,15 +923,16 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
                 eprintln!("VYGSKIPS|computed|{net}");
             }
             let skips = vyges_est::placement::skips(self.db, &timing)?;
-            let mut nets: std::collections::HashSet<String> = skips.clock_nets().iter().cloned().collect();
-            nets.extend(skips.constant_pins().iter().map(|p| self.net_of_load(p)).filter(|n| !n.is_empty()));
-            self.skips = Some(HeldSkips { skips, nets });
-            if !self.skip_log && !self.timer.on {
-                self.db.edit_log_start().map_err(|e| e.to_string())?;
-            }
-            self.skip_log = true;
+            self.hold_skips(skips)?;
         }
         let skips = &self.skips.as_ref().expect("computed above").skips;
+        // A check: the held sets against a fresh walk of the design as it is now.
+        if std::env::var_os("VYGES_RSZ_CHECK_SKIPS").is_some() {
+            let fresh = vyges_est::placement::skips(self.db, &timing)?;
+            if fresh.clock_nets() != skips.clock_nets() || fresh.constant_pins() != skips.constant_pins() {
+                return Err(format!("held skips (estimating {net}): differ from a fresh walk (clock nets {}, constant pins {})", fresh.clock_nets() == skips.clock_nets(), fresh.constant_pins() == skips.constant_pins()));
+            }
+        }
         let e = vyges_est::placement::estimate_net_with_skips(self.db, &timing, skips, net, &drvr, self.alpha, &est_stt)?;
         for k in 0..self.parasitics.len() {
             match net_parasitic(self.db, self.rc, &e, k)? {
@@ -1107,8 +1125,13 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
     }
 
     fn start_timer_edits(&mut self) -> Result<(), String> {
-        // Restarting clears the log: what the held skips have not yet read goes with it.
-        self.skips = None;
+        // Restarting clears the log: the held skips read what it holds first (the timer's own
+        // events in it are discarded, as before).
+        if self.skip_log {
+            for ev in self.db.edit_log_take() {
+                self.drop_skips_if_touched(&ev);
+            }
+        }
         self.db.edit_log_start().map_err(|e| e.to_string())?;
         self.timer = TimerLog { on: true, ..TimerLog::default() };
         Ok(())

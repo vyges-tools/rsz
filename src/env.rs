@@ -94,13 +94,24 @@ pub fn port_caps_at(path: Option<&str>, current: Option<&vyges_loom::sdc::Sdc>, 
 
 #[allow(clippy::too_many_arguments)]
 pub fn placement_parasitics_at(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagated: bool, alpha: f32, scenes: usize, port_caps: &PortCaps) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
-    use vyges_est::placement::{estimate_wire_parasitics, Timing};
+    placement_parasitics_held(db, rc, liberty, clock_sources, propagated, alpha, scenes, port_caps, None)
+}
+
+/// [`placement_parasitics_at`] with the clock nets and constant pins of `db` as it is now, when the
+/// caller holds them (`held`); `None` walks the design for them.
+#[allow(clippy::too_many_arguments)]
+pub fn placement_parasitics_held(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagated: bool, alpha: f32, scenes: usize, port_caps: &PortCaps, held: Option<&vyges_est::placement::Skips>) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
+    use vyges_est::placement::{estimate_wire_parasitics, estimate_wire_parasitics_with_skips, Timing};
     if no_signal_cap(db, rc) {
         return Ok(vec![HashMap::new(); scenes]);
     }
     // `isSkipPin`: an ideal clock's nets get no network; a propagated clock's do.
     let timing = Timing { liberty: Some(liberty), clock_sources: clock_sources.to_vec(), propagated };
-    let nets = estimate_wire_parasitics(db, &timing, alpha, &est_stt).map_err(|e| e.to_string())?;
+    let nets = match held {
+        Some(skips) => estimate_wire_parasitics_with_skips(db, &timing, skips, alpha, &est_stt),
+        None => estimate_wire_parasitics(db, &timing, alpha, &est_stt),
+    }
+    .map_err(|e| e.to_string())?;
     let mut out = vec![HashMap::new(); scenes];
     for (k, map) in out.iter_mut().enumerate() {
         for n in &nets {
@@ -119,8 +130,15 @@ pub fn placement_parasitics_at(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_
 /// between the two — a netlist edit is replayed by the command that made it, not read back.
 #[allow(clippy::too_many_arguments)]
 pub fn estimate_state(db: &Db, seen: Option<&str>, netlist: &vyges_sta::netlist::Netlist, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagated: bool, alpha: f32, scenes: usize, port_caps: &PortCaps) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
+    estimate_state_held(db, seen, netlist, rc, liberty, clock_sources, propagated, alpha, scenes, port_caps, None)
+}
+
+/// [`estimate_state`] with `held`: the clock nets and constant pins of `db` as it is now, when the
+/// caller has them; a `seen` design is a different one, so they are not used for it.
+#[allow(clippy::too_many_arguments)]
+pub fn estimate_state_held(db: &Db, seen: Option<&str>, netlist: &vyges_sta::netlist::Netlist, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagated: bool, alpha: f32, scenes: usize, port_caps: &PortCaps, held: Option<&vyges_est::placement::Skips>) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
     match seen {
-        None => placement_parasitics_at(db, rc, liberty, clock_sources, propagated, alpha, scenes, port_caps),
+        None => placement_parasitics_held(db, rc, liberty, clock_sources, propagated, alpha, scenes, port_caps, held),
         Some(path) => {
             let seen = Db::open(path).map_err(|e| format!("{path}: {e}"))?;
             if &vyges_grt::timer::netlist(&seen) != netlist {
@@ -160,15 +178,25 @@ pub fn rise_fall(flags: &[String]) -> [bool; 2] {
 /// ground net, and what the cells' functions propagate from it), by pin name with its value — what
 /// delay calculation and the search skip, and the search's conditional arcs and arc senses read.
 pub fn sim_constants(db: &Db, liberty: &vyges_est::liberty::LibertyClocks) -> Result<HashMap<String, bool>, String> {
+    Ok(constants_by_name(constant_values(db, liberty)?))
+}
+
+/// The logic simulation's constant pins (`vyges_est::sim::constant_pins`), for a caller that also
+/// hands them to the estimator.
+pub fn constant_values(db: &Db, liberty: &vyges_est::liberty::LibertyClocks) -> Result<std::collections::BTreeMap<vyges_est::sim::Pin, bool>, String> {
+    vyges_est::sim::constant_pins(db, liberty).map_err(|e| format!("constant propagation: {e}"))
+}
+
+/// [`constant_values`] keyed as the timer names pins: a port by name, an instance pin `inst/pin`.
+pub fn constants_by_name(values: std::collections::BTreeMap<vyges_est::sim::Pin, bool>) -> HashMap<String, bool> {
     use vyges_est::sim::Pin;
-    let values = vyges_est::sim::constant_pins(db, liberty).map_err(|e| format!("constant propagation: {e}"))?;
-    Ok(values
+    values
         .into_iter()
         .map(|(p, v)| match p {
             Pin::Port(n) => (n, v),
             Pin::ITerm(i, t) => (format!("{i}/{t}"), v),
         })
-        .collect())
+        .collect()
 }
 
 /// The ports `[all_outputs]` / `[all_inputs …]` name. The reference's `allOutputs` keeps every
