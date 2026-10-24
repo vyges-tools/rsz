@@ -425,7 +425,7 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "vyges-dpl"
-version = "0.1.44"
+version = "0.1.45"
 dependencies = [
  "serde",
  "serde_json",
@@ -435,15 +435,15 @@ dependencies = [
 
 [[package]]
 name = "vyges-est"
-version = "0.1.44"
+version = "0.1.45"
 dependencies = [
  "vyges-opendb",
 ]
 
 [[package]]
 name = "vyges-events"
-version = "0.1.44"
-source = "git+https://github.com/vyges-tools/events?branch=main#01165bedc9208abc345044cfc7ae705d2cf75666"
+version = "0.1.45"
+source = "git+https://github.com/vyges-tools/events?branch=main#b3e7c3bdcafebe1c565db3eff91af58f1d475b96"
 dependencies = [
  "serde",
  "serde_json",
@@ -451,12 +451,12 @@ dependencies = [
 
 [[package]]
 name = "vyges-geom"
-version = "0.1.44"
-source = "git+https://github.com/vyges-tools/geom?branch=main#d77a20edc7e3f2369685545acc0c4bf9cd4bbaee"
+version = "0.1.45"
+source = "git+https://github.com/vyges-tools/geom?branch=main#3d0c5d05f575cc88618ca33e9ae54fbccc9ec357"
 
 [[package]]
 name = "vyges-grt"
-version = "0.1.44"
+version = "0.1.45"
 dependencies = [
  "vyges-est",
  "vyges-opendb",
@@ -465,7 +465,7 @@ dependencies = [
 
 [[package]]
 name = "vyges-layout"
-version = "0.1.44"
+version = "0.1.45"
 dependencies = [
  "miniz_oxide 0.8.9",
  "vyges-geom",
@@ -473,11 +473,11 @@ dependencies = [
 
 [[package]]
 name = "vyges-loom"
-version = "0.1.44"
+version = "0.1.45"
 
 [[package]]
 name = "vyges-opendb"
-version = "0.1.44"
+version = "0.1.45"
 dependencies = [
  "cxx",
  "serde",
@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "vyges-opendb-lib"
-version = "0.1.44"
+version = "0.1.45"
 dependencies = [
  "cmake",
  "cxx",
@@ -500,7 +500,7 @@ dependencies = [
 
 [[package]]
 name = "vyges-rsz"
-version = "0.1.44"
+version = "0.1.45"
 dependencies = [
  "flate2",
  "serde_json",
@@ -516,11 +516,11 @@ dependencies = [
 
 [[package]]
 name = "vyges-sta"
-version = "0.1.44"
+version = "0.1.45"
 
 [[package]]
 name = "vyges-stt"
-version = "0.1.44"
+version = "0.1.45"
 dependencies = [
  "serde_json",
  "vyges-events",
