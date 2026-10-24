@@ -603,7 +603,7 @@ mod tests {
     }
 
     fn port(name: &str, direction: Direction, max_cap: Option<f32>) -> vyges_sta::liberty::Port {
-        vyges_sta::liberty::Port { name: name.into(), direction, is_clock: false, capacitance: [[0.0; 2]; 2], function: None, max_transition: None, max_capacitance: max_cap, fanout_load: None, max_fanout: None, three_state: None, is_clock_gate_clock: false }
+        vyges_sta::liberty::Port { name: name.into(), direction, max_capacitance: max_cap, ..Default::default() }
     }
 
     // A scene's graph lists an instance's pins in ITS library's port order, so scene k's vertex
