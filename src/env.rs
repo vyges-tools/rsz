@@ -411,15 +411,18 @@ pub fn expanded_io_delays(s: &vyges_loom::sdc::Sdc, nl: &vyges_sta::netlist::Net
     let [ins, outs] = &mut out;
     for (list, want) in [(ins, PortDir::Input), (outs, PortDir::Output)] {
         let accessor = if want == PortDir::Input { "all_inputs" } else { "all_outputs" };
-        for d in list.iter_mut().filter(|d| d.accessor == accessor) {
+        let except = format!("{accessor}_except");
+        for d in list.iter_mut().filter(|d| d.accessor == accessor || d.accessor == except) {
             // ⛔ A delay relative to a clock is not applied to that clock's own source port — the
             // reference skips it (STA-0441, "set_input_delay relative to a clock defined on the
             // same port/pin not allowed"); expanded with it, the clock port got a data arrival.
             let own: &[String] = d.clock.as_ref().and_then(|c| sources.get(c)).map(Vec::as_slice).unwrap_or(&[]);
+            // `[lsearch -not -exact [all_inputs] P]` (`all_inputs_except`): every input but P.
+            let excluded: Vec<String> = if d.accessor == except { d.ports.clone() } else { Vec::new() };
             d.ports = nl
                 .ports
                 .iter()
-                .filter(|(n, dir)| (*dir == want || *dir == PortDir::Inout) && !own.contains(n))
+                .filter(|(n, dir)| (*dir == want || *dir == PortDir::Inout) && !own.contains(n) && !excluded.contains(n))
                 .map(|(n, _)| n.clone())
                 .collect();
             d.accessor = "get_ports".into();
@@ -760,6 +763,20 @@ mod tests {
         let ss = search_sdc_on(&sdc, &nl, 1e-9, false, false).unwrap();
         assert_eq!(ss.input_delays.iter().map(|d| d.port.as_str()).collect::<Vec<_>>(), ["a"]);
         assert_eq!(ss.output_delays.iter().map(|d| d.port.as_str()).collect::<Vec<_>>(), ["y"]);
+    }
+
+    /// `[lsearch -inline -all -not -exact [all_inputs] $clk_port]` (every input but the clock's,
+    /// the usual flow constraint) reaches the search as the inputs less that port, netlist order.
+    #[test]
+    fn every_input_but_the_clock_port_reaches_the_search() {
+        use vyges_sta::netlist::{Netlist, PortDir::*};
+        let sdc = vyges_loom::sdc::Sdc::parse(
+            "set clk_port [get_ports clk]\ncreate_clock -name clk -period 25 $clk_port\nset non_clock_inputs [lsearch -inline -all -not -exact [all_inputs] $clk_port]\nset_input_delay 5.0 -clock clk $non_clock_inputs\n",
+        )
+        .unwrap();
+        let nl = Netlist { insts: vec![], ports: vec![("a".into(), Input), ("clk".into(), Input), ("b".into(), Inout), ("y".into(), Output)], nets: vec![] };
+        let ss = search_sdc_on(&sdc, &nl, 1e-9, false, false).unwrap();
+        assert_eq!(ss.input_delays.iter().map(|d| d.port.as_str()).collect::<Vec<_>>(), ["a", "b"]);
     }
 
     /// Rules (`Sdc::allOutputs` / `Sdc::allInputs`): any-output = output or bidirect; any-input =
