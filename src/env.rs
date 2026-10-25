@@ -285,7 +285,8 @@ pub fn sdc_env(s: &vyges_loom::sdc::Sdc, libs: &Libs, nl: &vyges_sta::netlist::N
         return Ok(env);
     }
     let lib0 = libs.default_library().ok_or("set_load / set_input_transition before any liberty library")?;
-    let graph = vyges_sta::graph::Graph::build(&libs.libs, nl).map_err(|e| format!("{e} (not modelled)"))?;
+    // the graph only for a net `set_load` (its drivers), built when one asks
+    let mut graph = None;
     for e in &s.env {
         let known = ["-min", "-max", "-rise", "-fall", "-pin_load", "-subtract_pin_load"];
         if let Some(f) = e.flags.iter().find(|f| !known.contains(&f.as_str())) {
@@ -308,6 +309,10 @@ pub fn sdc_env(s: &vyges_loom::sdc::Sdc, libs: &Libs, nl: &vyges_sta::netlist::N
                 let subtract = e.flags.iter().any(|f| f == "-subtract_pin_load");
                 for net in objects {
                     let n = nl.nets.iter().position(|x| &x.name == net).ok_or_else(|| format!("set_load: net {net} not found (not modelled)"))?;
+                    let graph = match &mut graph {
+                        Some(g) => g,
+                        none => none.insert(vyges_sta::graph::Graph::build(&libs.libs, nl).map_err(|e| format!("{e} (not modelled)"))?),
+                    };
                     for d in graph.vertices.iter().enumerate().filter(|(i, v)| v.is_driver && graph.vertex_net[*i] == Some(n)) {
                         let slot = env.net_wire_cap.entry(d.1.name.clone()).or_insert([None; 2]);
                         for k in 0..2 {
