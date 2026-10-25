@@ -9,6 +9,9 @@ homepage = "https://vyges.com"
 repository = "https://github.com/vyges-tools/rsz"
 
 [features]
+# The command-line entry built into the library too (`cli_main`), for the suite binaries
+# that link every engine and run the one they are invoked as.
+suite = ["cli"]
 # The design database: masters, sites, the netlist being repaired. OFF by default, so the rules
 # stay testable without the C++ build.
 odb = ["dep:vyges-opendb", "vyges-opendb/gen-write"]

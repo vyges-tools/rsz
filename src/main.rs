@@ -214,7 +214,7 @@ mod events {
     }
 }
 
-fn main() -> ExitCode {
+pub fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut out: Option<String> = None;
     let mut positional: Vec<&str> = Vec::new();

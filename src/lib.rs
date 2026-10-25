@@ -26,6 +26,10 @@
 //! - [`order`]: sorts whose order is a value.
 //! - [`trace`]: the call-sequence trace, one line per decision.
 
+// The crate's own name inside it: the command-line entry ([`cli_main`]) is built into the
+// library too, and its `vyges_rsz::…` paths resolve here.
+extern crate self as vyges_rsz;
+
 pub mod buffer_ports;
 pub mod buffered_net;
 pub mod clone;
@@ -83,3 +87,10 @@ impl Stop {
         }
     }
 }
+
+/// The `vyges-rsz` command-line entry (the binary's `main`), built into the library too so a
+/// suite binary can link every engine and run the one it is invoked as.
+#[cfg(feature = "suite")]
+#[doc(hidden)]
+#[path = "main.rs"]
+pub mod cli_main;
