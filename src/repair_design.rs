@@ -648,7 +648,7 @@ fn edit_graphs<'n>(inputs: &Inputs<'n>, mut gs: Vec<Graph<'n>>, netlist: &Arc<Ne
 }
 
 /// Can these edits change the graph's clock pins (`findClkPins` from the clock sources)? Only
-/// through an edge into or out of one, or a swap of an instance with one: each names a clock pin
+/// through an edge into or out of one (an instance pin's or a port's), or a swap of an instance with one: each names a clock pin
 /// — the pin itself, a pin on its net, a pin of the swapped instance. An instance made has no
 /// edges to anything yet. Read before the edits are made (the set and indices are the old
 /// graph's; an old vertex keeps its index). An event not known here: yes.
@@ -662,7 +662,8 @@ fn clock_touched(g: &Graph<'_>, events: &[String]) -> bool {
         let f: Vec<&str> = ev.split('|').collect();
         match f.as_slice() {
             ["inst_create", ..] | ["net_create", ..] => false,
-            ["iterm_connect" | "iterm_disconnect", pin, _, pins] => clock(pin) || pins.split(',').any(clock),
+            // a port's pin is named by the port, as an instance pin by inst/term
+            ["iterm_connect" | "iterm_disconnect" | "bterm_connect" | "bterm_disconnect", pin, _, pins] => clock(pin) || pins.split(',').any(clock),
             ["swap_before", inst, _, _, terms] | ["swap_after", inst, terms] => terms.split(';').any(|t| {
                 let mut it = t.split('=');
                 let term = it.next().unwrap_or("");
@@ -1671,6 +1672,9 @@ mod tests {
         assert!(clock_touched(&g, &ev(&["iterm_connect|b/A|clk|clk,r/CK,b/A"])), "a pin onto the clock net");
         assert!(clock_touched(&g, &ev(&["iterm_disconnect|r/CK|clk|clk,r/CK"])), "a clock pin off its net");
         assert!(clock_touched(&g, &ev(&["swap_after|r|D=d=d,r/D;CK=clk=clk,r/CK;Q=q=r/Q,q"])), "a swap of a register");
+        assert!(!clock_touched(&g, &ev(&["bterm_disconnect|q|q|r/Q,q"])), "a port off a data net");
+        assert!(clock_touched(&g, &ev(&["bterm_disconnect|clk|clk|clk,r/CK"])), "the clock port off its net");
+        assert!(clock_touched(&g, &ev(&["bterm_connect|d|clk|clk,r/CK,d"])), "a port onto the clock net");
         assert!(clock_touched(&g, &ev(&["net_merge|a|b"])), "an edit not known");
     }
 
