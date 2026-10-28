@@ -38,8 +38,8 @@ jobs:
           # Same support matrix as opendb, which this transitively builds: Linux x86_64/arm64 +
           # Apple Silicon on macos-15 (Xcode 16 — new enough for cxx, stable for fmt 11.0.2;
           # macos-latest/Xcode 26.5 breaks fmt consteval). Intel Mac is unsupported.
-          - { os: ubuntu-latest,    target: x86_64-unknown-linux-gnu  }
-          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { os: "ubuntu-${{ vars.VYGES_UBUNTU_VERSION || '24.04' }}",    target: x86_64-unknown-linux-gnu  }
+          - { os: "ubuntu-${{ vars.VYGES_UBUNTU_VERSION || '24.04' }}-arm", target: aarch64-unknown-linux-gnu }
           - { os: macos-15,         target: aarch64-apple-darwin      }
     steps:
       # Sibling layout: <ws>/vyges-tools-rsz + opendb + opendb-lib,
@@ -109,6 +109,14 @@ jobs:
         run: |
           [ "${{ runner.os }}" = "macOS" ] && export PATH="$(brew --prefix bison)/bin:$PATH"
           cargo build --release --features cli --bin vyges-rsz
+
+      # Runner and glibc floor, one policy for every release: vyges-tools/actions.
+      - name: glibc ceiling
+        uses: vyges-tools/actions/glibc-ceiling@v1
+        with:
+          runner: ${{ matrix.os }}
+          working-directory: vyges-tools-rsz
+          paths: target
 
       - name: Package vyges-rsz-${{ matrix.target }}.tar.gz
         id: pkg
