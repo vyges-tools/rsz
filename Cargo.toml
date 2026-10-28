@@ -1,6 +1,6 @@
 [package]
 name = "vyges-rsz"
-version = "0.1.47"
+version = "0.1.48"
 edition = "2021"
 description = "Electrical repair of placed designs: repeaters inserted along each net's Steiner tree to fix long wires, max-capacitance and max-slew violations."
 license = "Apache-2.0"
