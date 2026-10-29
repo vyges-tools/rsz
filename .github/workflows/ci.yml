@@ -24,7 +24,7 @@ permissions:
 jobs:
   lib:
     name: library (no C++)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-${{ vars.VYGES_UBUNTU_VERSION || '24.04' }}
     defaults:
       run:
         working-directory: vyges-tools-rsz
@@ -79,7 +79,7 @@ jobs:
 
   cli:
     name: engine (build & test)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-${{ vars.VYGES_UBUNTU_VERSION || '24.04' }}
     defaults:
       run:
         working-directory: vyges-tools-rsz
