@@ -440,7 +440,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
     let mut tie_runs: Vec<Value> = Vec::new();
     // Each repair_clock_nets' result, and the resizer's clock buffer list (`clk_buffers_`) as the
     // session left it — `clock_buffers`, standing for what clock_tree_synthesis set.
-    let mut clock_runs: Vec<Value> = Vec::new();
+    let mut clock_runs = Runs::default();
     let mut clk_buffers: Vec<String> = Vec::new();
     let mut resizer_ran = false;
     // `set_propagated_clock` on the clock, and as the estimate saw it.
@@ -451,7 +451,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
     // which forms it models; every other command refuses them.
     let mut sdc_path_delays = false;
     // Each repair_timing's lines; a refusal after them stops the job.
-    let mut timing_runs: Vec<Value> = Vec::new();
+    let mut timing_runs = Runs::default();
     // `set_debug_level`: each (tool, group) and its level.
     let mut debug_levels: BTreeMap<(String, String), i64> = BTreeMap::new();
     // `setenv <name> <value>`: the environment variables a script set (`set ::env(..)`) that a
@@ -937,16 +937,25 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 if let Ok(o) = &r {
                     repair_design_edited |= o.inserted_buffers > 0 || o.resized > 0;
                 }
-                if let (Ok(o), true) = (&r, a.resize_slack) {
+                if let Ok(o) = &r {
                     let area1 = crate::odb_design::design_area(design.db);
                     let row = |label: &str, area: f64, resized: usize, buffers: usize, repaired: usize, left: usize| format!("{label:>9} | {:>+8.1}% | {resized:>7} | {buffers:>7} | {repaired:>13} | {left:>9}", (area - area0) / area0 * 1e2);
-                    repair_progress = vec![
+                    let table = vec![
                         "Iteration |   Area    | Resized | Buffers | Nets repaired | Remaining".to_string(),
                         "---------------------------------------------------------------------".to_string(),
                         row("0", area0, 0, 0, 0, o.drivers),
                         row("final", area1, o.resized, o.inserted_buffers, o.nets_repaired, 0),
                         "---------------------------------------------------------------------".to_string(),
                     ];
+                    // The command prints it (before the summary lines); gpl's reweight call reads
+                    // it from the report instead and prints it itself.
+                    if a.resize_slack {
+                        repair_progress = table;
+                    } else {
+                        for l in &table {
+                            say(&json!(l));
+                        }
+                    }
                 }
                 outcome = Some(r);
             }
@@ -1756,10 +1765,10 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
         report["repair_design_progress"] = json!(repair_progress);
     }
     if !clock_runs.is_empty() {
-        report["repair_clock_nets"] = json!(clock_runs);
+        report["repair_clock_nets"] = json!(clock_runs.0);
     }
     if !timing_runs.is_empty() {
-        report["repair_timing"] = json!(timing_runs);
+        report["repair_timing"] = json!(timing_runs.0);
     }
     if !tie_runs.is_empty() {
         // A command that left nothing to do (or had nothing to check), then ties inserted: the
@@ -1783,4 +1792,51 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
             .collect();
     }
     Ok((report, db))
+}
+
+/// The run records a repair command leaves in the report. Each run's `lines` are printed as it is
+/// recorded — where the reference's logger writes them, in command order — and kept for the report.
+#[derive(Default)]
+struct Runs(Vec<Value>);
+
+impl Runs {
+    fn push(&mut self, run: Value) {
+        for l in run["lines"].as_array().into_iter().flatten() {
+            say(l);
+        }
+        self.0.push(run);
+    }
+}
+
+impl std::ops::Deref for Runs {
+    type Target = Vec<Value>;
+    fn deref(&self) -> &Vec<Value> {
+        &self.0
+    }
+}
+
+/// One line on the terminal: a coded one — `"[INFO RSZ-0100] …"` or `{code, severity, message}` —
+/// as its event (text mode prints the reference form once); any other as itself.
+fn say(line: &Value) {
+    use vyges_events::{emit, Event, Severity};
+    let sev = |s: &str| match s {
+        "WARNING" | "warning" => Severity::Warn,
+        "ERROR" | "error" => Severity::Error,
+        _ => Severity::Info,
+    };
+    if let (Some(code), Some(msg)) = (line["code"].as_str(), line["message"].as_str()) {
+        emit(&Event::new("vyges-rsz", sev(line["severity"].as_str().unwrap_or("info")), msg.to_string()).with_code(code));
+        return;
+    }
+    let Some(text) = line.as_str() else { return };
+    let coded = text.strip_prefix('[').and_then(|r| r.split_once("] ")).and_then(|(tag, msg)| tag.split_once(' ').map(|(s, c)| (s, c, msg)));
+    match coded {
+        Some((s, code, msg)) => emit(&Event::new("vyges-rsz", sev(s), msg.to_string()).with_code(code)),
+        None => {
+            if !vyges_events::text_mode() {
+                emit(&Event::new("vyges-rsz", Severity::Info, text.to_string()));
+            }
+            eprintln!("{text}");
+        }
+    }
 }
