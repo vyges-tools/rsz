@@ -40,7 +40,7 @@ jobs:
           # macos-latest/Xcode 26.5 breaks fmt consteval). Intel Mac is unsupported.
           - { os: "ubuntu-${{ vars.VYGES_UBUNTU_VERSION || '24.04' }}",    target: x86_64-unknown-linux-gnu  }
           - { os: "ubuntu-${{ vars.VYGES_UBUNTU_VERSION || '24.04' }}-arm", target: aarch64-unknown-linux-gnu }
-          - { os: macos-15,         target: aarch64-apple-darwin      }
+          - { os: "macos-${{ vars.VYGES_MACOS_VERSION || '15' }}",         target: aarch64-apple-darwin      }
     steps:
       # Sibling layout: <ws>/vyges-tools-rsz + opendb + opendb-lib,
       # so both `[patch]` path entries in Cargo.toml resolve on CI. Every patched dependency needs
