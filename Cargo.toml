@@ -18,7 +18,7 @@ odb = ["dep:vyges-opendb", "vyges-opendb/gen-write"]
 # The command-line engine: the database, the netlist and placement parasitics the timer reads
 # (the timer adapter shared with the router, the estimator, the Steiner-tree builder), the SDC
 # reader, and JSON jobs.
-cli = ["odb", "dep:vyges-grt", "dep:vyges-est", "dep:vyges-stt", "dep:vyges-loom", "dep:vyges-dpl", "dep:serde_json", "dep:flate2", "dep:vyges-events"]
+cli = ["odb", "dep:vyges-grt", "dep:vyges-est", "dep:vyges-stt", "dep:vyges-loom", "vyges-sta/loom", "dep:vyges-dpl", "dep:serde_json", "dep:flate2", "dep:vyges-events"]
 
 [dependencies]
 # The timer's library model: cells, ports, arcs and their tables.
