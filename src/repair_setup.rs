@@ -768,7 +768,7 @@ fn expand_path(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTr
     if ctx.sequence.contains(&Move::Buffer) {
         for (i, (v, _)) in chain.iter().enumerate() {
             let st = &stages[i];
-            if i > 0 && st.is_driver && !st.top_port && st.fanout > 1 && st.fanout < rebuffer::REBUFFER_MAX_FANOUT {
+            if i > 0 && st.is_driver && !st.top_port && buffer_fanout_applicable(st.fanout) {
                 stages[i].rebuffer = Some(probe_rebuffer(ctx, gs, ss, cs, design, &g.vertices[*v].name));
             }
         }
@@ -1738,6 +1738,12 @@ fn clock_tree_pins(g: &Graph<'_>, clocks: &BTreeSet<usize>) -> BTreeSet<String> 
         }
     }
     tree
+}
+
+/// `BufferGenerator::isApplicable`'s fanout: 1 up to `kRebufferMaxFanout` exclusive — a
+/// point-to-point net is a target since upstream 6fe943b1c8f (it took 2 or more before).
+fn buffer_fanout_applicable(fanout: usize) -> bool {
+    (1..rebuffer::REBUFFER_MAX_FANOUT).contains(&fanout)
 }
 
 /// `repairBudget` / `repairsPerPass` past their max check: 1 plus `max − 1` scaled by where the
@@ -4428,11 +4434,11 @@ impl Repair<'_, '_> {
     }
 
     /// `MoveGenerator::isApplicable` on a path driver target: SwapPins also needs a path index
-    /// above 0; Buffer a fanout of 2 to 19 on a net it may buffer (`okToBufferNet`); SizeUpMatch a
+    /// above 0; Buffer a fanout of 1 to 19 on a net it may buffer (`okToBufferNet`); SizeUpMatch a
     /// path index of 2 or more.
     fn is_applicable(&self, m: Move, st: &Stage, index: usize) -> bool {
         match m {
-            Move::Buffer => st.fanout > 1 && st.fanout < rebuffer::REBUFFER_MAX_FANOUT && self.design.ok_to_buffer_net(&st.pin),
+            Move::Buffer => buffer_fanout_applicable(st.fanout) && self.design.ok_to_buffer_net(&st.pin),
             Move::SizeUpMatch => index >= 2,
             // `RerouteGenerator::isApplicable`: a global router and its parasitics.
             Move::Reroute => self.design.global_routed(),
@@ -5462,6 +5468,16 @@ fn path_improved(end_slack: f32, worst_slack: f32, prev_end_slack: f32, prev_wor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Rule (BufferGenerator::isApplicable, upstream 6fe943b1c8f): a single-load net is a
+    // BufferMove target; no load, and the rebuffer fanout limit, are not.
+    #[test]
+    fn buffer_move_takes_a_fanout_of_one() {
+        assert!(buffer_fanout_applicable(1));
+        assert!(!buffer_fanout_applicable(0));
+        assert!(buffer_fanout_applicable(rebuffer::REBUFFER_MAX_FANOUT - 1));
+        assert!(!buffer_fanout_applicable(rebuffer::REBUFFER_MAX_FANOUT));
+    }
 
     // Rules (SetupLegacyBase::repairBudget / RepairTargetCollector::repairsPerPass, upstream
     // 92dc2f20db2; its TestResizer cases): the interpolated budget is clamped to [1, max] — a
