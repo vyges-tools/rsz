@@ -105,6 +105,10 @@ pub struct Buffers {
     pub cells: Vec<String>,
     /// `buffer_lowest_drive_`: the LAST of `cells`.
     pub lowest: String,
+    /// `port_buffer_` (upstream bb952a4dfb3): what `selectBufferCell` gives buffer_ports with no
+    /// `-buffer_cell` — of the weakest drive-strength bucket of the footprint/VT-filtered list,
+    /// the buffer with the least output intrinsic delay.
+    pub port_buffer: String,
 }
 
 /// `bufferDriveResistance`: the buffer output port's drive resistance.
@@ -171,7 +175,10 @@ pub fn is_clock_buffer_with(cell: &Cell, pattern: &ClockPattern) -> bool {
 ///   is above one half; only buffers with it are kept (all, when none is picked);
 /// - five buckets of consecutive buffers (the first `n mod 5` one larger); each sorted by drive
 ///   resistance × input capacitance, and with one dominant site its first two taken;
-/// - the weakest buffer is the last one taken.
+/// - the weakest buffer is the last one taken;
+/// - the port buffer (upstream bb952a4dfb3): the last `max(1, n / 5)` buffers of the filtered list
+///   (the weakest drives — it is in ascending drive resistance), the first with the strictly least
+///   `LibertyPort::intrinsicDelay` of its output.
 ///
 /// - with buffers on more than one site: the two sites with the largest shares, and from each
 ///   bucket the first buffer (by R·Cin) on each of them, in site order — one per site, not two.
@@ -387,7 +394,25 @@ pub fn find_buffers_with(libs: &Libs, masters: &BTreeMap<String, Master>, dont_u
         }
     }
     let lowest = cells.last().cloned().ok_or_else(|| Stop::error("RSZ-0022", "no buffers found.".into()))?;
-    Ok(Buffers { cells, lowest })
+    let port_buffer = port_buffer(&kept, size);
+    Ok(Buffers { cells, lowest, port_buffer })
+}
+
+/// `findBuffers`' `port_buffer_`: over the weakest bucket (the last `max(1, bucket_size)` of the
+/// filtered list), the first buffer whose output's intrinsic delay is strictly the least.
+fn port_buffer(kept: &[&Cell], bucket_size: usize) -> String {
+    let start = kept.len() - bucket_size.max(1);
+    let delay = |c: &Cell| c.buffer_ports().map_or(0.0, |(_, out)| crate::rebuffer::intrinsic_delay(c, &out.name));
+    let mut best = kept[start];
+    let mut lowest = delay(best);
+    for &c in &kept[start + 1..] {
+        let d = delay(c);
+        if d < lowest {
+            best = c;
+            lowest = d;
+        }
+    }
+    best.name.clone()
 }
 
 /// `tgt_slew_load_cap_factor`: the target slew is a buffer's at ten times its input cap.
@@ -618,6 +643,37 @@ mod tests {
 
     fn masters(names: &[&str]) -> BTreeMap<String, Master> {
         names.iter().map(|n| (n.to_string(), Master { site: "core".into(), area: 1, width: 1, height: 1, is_core: true, logic_std: true, implant_obs: vec![] })).collect()
+    }
+
+    // Rule (findBuffers' port_buffer_, upstream bb952a4dfb3): buffer_ports' default cell is, of the
+    // weakest bucket — the last max(1, n / 5) of the filtered list, which is in ascending drive
+    // resistance — the first with the strictly least output intrinsic delay (the delay at input
+    // slew 0 and load 0); a faster buffer outside that bucket is not a candidate.
+    #[test]
+    fn the_port_buffer_is_the_fastest_of_the_weakest_bucket() {
+        let bufd = |name: &str, r: f32, d: f32| {
+            format!(
+                r#"cell ({name}) {{ pin (A) {{ direction : input ; capacitance : 1 ; }}
+                  pin (Z) {{ direction : output ; function : "A" ;
+                    timing () {{ related_pin : "A" ; timing_sense : positive_unate ;
+                      cell_fall (t) {{ values ("{d}, {e}", "{d}, {e}") ; }}
+                      fall_transition (t) {{ values ("0, {r}", "0, {r}") ; }} }} }} }}"#,
+                e = d + r
+            )
+        };
+        let names: Vec<String> = (1..=10).map(|i| format!("B{i:02}")).collect();
+        let delays = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.01, 0.2, 0.1];
+        let cells: Vec<String> = names.iter().zip(delays).enumerate().map(|(i, (n, d))| bufd(n, (i + 1) as f32, d)).collect();
+        let m = masters(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let b = find_buffers(&library(&cells), &m, &Default::default(), true).unwrap();
+        assert_eq!(b.port_buffer, "B10", "B08 is faster but not in the weakest bucket (B09, B10)");
+        let mut tied = delays;
+        tied[9] = 0.2;
+        let cells: Vec<String> = names.iter().zip(tied).enumerate().map(|(i, (n, d))| bufd(n, (i + 1) as f32, d)).collect();
+        let b = find_buffers(&library(&cells), &m, &Default::default(), true).unwrap();
+        assert_eq!(b.port_buffer, "B09", "an equal delay later in the bucket does not replace");
+        let one = find_buffers(&library(&cells[..3]), &masters(&["B01", "B02", "B03"]), &Default::default(), true).unwrap();
+        assert_eq!(one.port_buffer, "B03", "under five buffers the bucket is the last one alone");
     }
 
     // Rules (getBufferList, findBuffers): clock buffers, dont_use and master-less cells are out;

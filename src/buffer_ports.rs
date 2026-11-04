@@ -117,8 +117,8 @@ impl Outcome {
     }
 }
 
-/// The `buffer_ports` command: inputs first, then outputs. `weakest` is the weakest buffer
-/// (`findBuffers`' `buffer_lowest_drive_`), used when no `-buffer_cell` is given.
+/// The `buffer_ports` command: inputs first, then outputs. `weakest` is `findBuffers`'
+/// `port_buffer_` (a fast buffer of the weakest drives), used when no `-buffer_cell` is given.
 pub fn buffer_ports(design: &mut dyn PortDesign, o: &Options, weakest: &str) -> Result<Outcome, Stop> {
     let mut out = Outcome::default();
     if o.inputs {
@@ -130,7 +130,7 @@ pub fn buffer_ports(design: &mut dyn PortDesign, o: &Options, weakest: &str) -> 
     Ok(out)
 }
 
-/// `selectBufferCell`: the user's cell, else the weakest buffer.
+/// `selectBufferCell`: the user's cell, else the port buffer.
 fn select_buffer_cell<'a>(o: &'a Options, weakest: &'a str) -> &'a str {
     o.buffer_cell.as_deref().unwrap_or(weakest)
 }

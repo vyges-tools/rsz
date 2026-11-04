@@ -761,7 +761,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 // `Sim`'s constants: a tie cell's output and what it holds (case analysis is refused
                 // at read_sdc, so tie cells are the only source).
                 let constants = sim_constants(&db, &liberty)?;
-                // selectBufferCell: the user's cell (a buffer), else findBuffers' weakest.
+                // selectBufferCell: the user's cell (a buffer), else findBuffers' port buffer.
                 let weakest = match &o.buffer_cell {
                     Some(c) => {
                         if !libs.link_cell(c).is_some_and(|c| c.is_buffer()) {
@@ -769,7 +769,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         }
                         c.clone()
                     }
-                    None => crate::preamble::find_buffers(&libs, &m, &dont_use, true).map_err(|e| e.message().to_string())?.lowest,
+                    None => crate::preamble::find_buffers(&libs, &m, &dont_use, true).map_err(|e| e.message().to_string())?.port_buffer,
                 };
                 let clock_sources: Vec<String> = sdc.as_ref().map(|s| s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect()).unwrap_or_default();
                 rc.sort_clk_and_signal_layers();

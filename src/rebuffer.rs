@@ -283,7 +283,7 @@ pub fn port_cap(cell: &Cell, port: &str) -> f32 {
 
 /// `LibertyPort::intrinsicDelay`: the largest intrinsic delay fuzzily above 0 over the non-check
 /// arcs into the port, else 0.
-fn intrinsic_delay(cell: &Cell, port: &str) -> f32 {
+pub(crate) fn intrinsic_delay(cell: &Cell, port: &str) -> f32 {
     let mut best = -INF;
     let mut found = false;
     for set in cell.arc_sets.iter().filter(|a| a.to == port && !a.role.is_timing_check()) {
