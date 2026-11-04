@@ -682,10 +682,10 @@ fn expand_path(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTr
 /// in their vertices' path arrays, so the `PathExpanded` a pass ranked its targets on still names
 /// the same pins and tags, and each now reads the timer as it is (`repairPath` takes no update
 /// between its targets; a target's live values come from the queries its moves make). Each pin of
-/// `view`'s chain is found again by name and tag and staged as [`expand_path`] stages it. `None`
-/// when a pin or its tag is gone (the reference would read freed memory).
+/// `view`'s chain is found again by name and tag and staged as [`expand_path`] stages it. An error
+/// names a pin or tag that is gone (the reference would read freed memory).
 #[allow(clippy::too_many_arguments)]
-fn restage(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet<usize>], design: &dyn Design, view: &PathView, ideal: &BTreeSet<usize>) -> Option<PathView> {
+fn restage(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet<usize>], design: &dyn Design, view: &PathView, ideal: &BTreeSet<usize>) -> Result<PathView, String> {
     let (g, search) = (&gs[view.scene], &ss[view.scene]);
     let find = |pin: &str, is_driver: bool| g.vertices.iter().position(|x| x.name == pin && x.is_driver == is_driver);
     let chain = refind_chain(&view.chain, find, &search.paths)?;
@@ -693,18 +693,31 @@ fn restage(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSe
     for seg in &view.latch_segments {
         out.latch_segments.push(restage(ctx, gs, ss, cs, design, seg, ideal)?);
     }
-    Some(out)
+    Ok(out)
 }
 
 /// Each key's vertex (`find`) and the path there with the key's tag, as the timer has it now.
-fn refind_chain(keys: &[ChainKey], find: impl Fn(&str, bool) -> Option<usize>, paths: &[Vec<vyges_sta::search::Path>]) -> Option<Vec<(usize, vyges_sta::search::Path)>> {
+/// A tag's identity is its CRPR clock VERTEX (`Tag::cmp`), which our graph numbers afresh on each
+/// rebuild: a key names that vertex by pin (`vertex_of` its pin now), the rest compared as is.
+fn refind_chain(keys: &[ChainKey], find: impl Fn(&str, bool) -> Option<usize>, paths: &[Vec<vyges_sta::search::Path>]) -> Result<Vec<(usize, vyges_sta::search::Path)>, String> {
     let mut chain = Vec::with_capacity(keys.len());
     for key in keys {
-        let v = find(&key.pin, key.is_driver)?;
-        let p = paths.get(v)?.iter().find(|q| q.tag == key.tag)?;
+        let v = find(&key.pin, key.is_driver).ok_or_else(|| format!("pin {} is gone", key.pin))?;
+        let crpr_now = match &key.crpr_pin {
+            Some((pin, d)) => Some(find(pin, *d).ok_or_else(|| format!("CRPR clock pin {pin} of {} is gone", key.pin))?),
+            None => None,
+        };
+        let same = |t: &vyges_sta::search::Tag| {
+            let mut want = key.tag;
+            if let (Some(c), Some(now)) = (want.crpr.as_mut(), crpr_now) {
+                c.vertex = now;
+            }
+            *t == want
+        };
+        let p = paths.get(v).and_then(|ps| ps.iter().find(|q| same(&q.tag))).ok_or_else(|| format!("pin {} has no path with tag {:?}", key.pin, key.tag))?;
         chain.push((v, *p));
     }
-    Some(chain)
+    Ok(chain)
 }
 
 /// One pin of a path as [`restage`] finds it again: its vertex by name and kind, its path by tag.
@@ -713,6 +726,8 @@ struct ChainKey {
     pin: String,
     is_driver: bool,
     tag: vyges_sta::search::Tag,
+    /// The tag's CRPR clock vertex, by pin and kind.
+    crpr_pin: Option<(String, bool)>,
 }
 
 /// The stages of `chain` (root first), each with what its moves read off the timer.
@@ -829,7 +844,8 @@ fn view_of_chain(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[B
             }
         }
     }
-    let chain = chain.iter().map(|(v, p)| ChainKey { pin: g.vertices[*v].name.clone(), is_driver: g.vertices[*v].is_driver, tag: p.tag }).collect();
+    let key = |v: usize| (g.vertices[v].name.clone(), g.vertices[v].is_driver);
+    let chain = chain.iter().map(|(v, p)| ChainKey { pin: key(*v).0, is_driver: key(*v).1, tag: p.tag, crpr_pin: p.tag.crpr.map(|c| key(c.vertex)) }).collect();
     PathView { stages, start, scene, latch_segments: Vec::new(), chain }
 }
 
@@ -2854,9 +2870,7 @@ impl Repair<'_, '_> {
             let mut out = Vec::with_capacity(views.len());
             for v in views {
                 let ideal: BTreeSet<usize> = gs[v.scene].ideal_clock.iter().copied().collect();
-                let Some(r) = restage(ctx, gs, ss, cs, design, v, &ideal) else {
-                    return Err(Stop::refused("RSZ-ABSENT", "a target's path lost a pin to an earlier move in the pass: not modelled".to_string()));
-                };
+                let r = restage(ctx, gs, ss, cs, design, v, &ideal).map_err(|why| Stop::refused("RSZ-ABSENT", format!("a target's path after an earlier move in the pass: {why}, not modelled")))?;
                 out.push(r);
             }
             Ok(out)
@@ -5849,8 +5863,8 @@ mod tests {
         let tag = |rf| Tag { rf, mm: MAX, clk_edge: Some(0), is_clock: false, crpr: None, states: Default::default(), latency: 0, segment_start: false };
         let path = |rf, arrival: f32, prev: Option<Prev>| Path { tag: tag(rf), arrival, required: 1.0, prev };
         let keys = vec![
-            ChainKey { pin: "r1/Q".into(), is_driver: true, tag: tag(0) },
-            ChainKey { pin: "u1/A".into(), is_driver: false, tag: tag(1) },
+            ChainKey { pin: "r1/Q".into(), is_driver: true, tag: tag(0), crpr_pin: None },
+            ChainKey { pin: "u1/A".into(), is_driver: false, tag: tag(1), crpr_pin: None },
         ];
         let names = [("buf/Z", true), ("r1/Q", true), ("u1/A", false)];
         let find = |pin: &str, d: bool| names.iter().position(|&(n, k)| n == pin && k == d);
@@ -5862,8 +5876,18 @@ mod tests {
         assert_eq!((chain[0].1.arrival, chain[1].1.arrival), (0.1, 0.4), "each pin's path BY TAG, at its current value");
         assert_eq!(chain[1].1.prev, Some(via_buf), "the prev the timer has now, not the one ranked on");
         let gone = [("r1/Q", true)];
-        assert!(refind_chain(&keys, |p: &str, d: bool| gone.iter().position(|&(n, k)| n == p && k == d), &paths).is_none(), "a pin removed");
-        assert!(refind_chain(&keys, find, &[vec![], vec![path(0, 0.1, None)], vec![path(0, 0.5, None)]]).is_none(), "a tag gone");
+        assert!(refind_chain(&keys, |p: &str, d: bool| gone.iter().position(|&(n, k)| n == p && k == d), &paths).is_err(), "a pin removed");
+        assert!(refind_chain(&keys, find, &[vec![], vec![path(0, 0.1, None)], vec![path(0, 0.5, None)]]).is_err(), "a tag gone");
+        // A clock path's tag names its CRPR clock vertex: ranked when buf/Z was vertex 5, found
+        // again now it is vertex 0 (the graph rebuilt after the edit).
+        use vyges_sta::search::CrprPath;
+        let mut ck_then = tag(0);
+        ck_then.crpr = Some(CrprPath { vertex: 5, rf: 0, mm: MAX, clk_edge: 0 });
+        let mut ck_now = ck_then;
+        ck_now.crpr = Some(CrprPath { vertex: 0, rf: 0, mm: MAX, clk_edge: 0 });
+        let ck = vec![ChainKey { pin: "r1/Q".into(), is_driver: true, tag: ck_then, crpr_pin: Some(("buf/Z".into(), true)) }];
+        let p_now = vec![vec![], vec![Path { tag: ck_now, arrival: 0.3, required: 1.0, prev: None }], vec![]];
+        assert_eq!(refind_chain(&ck, find, &p_now).expect("the CRPR vertex matched by pin").first().map(|(_, p)| p.arrival), Some(0.3));
     }
 
     use crate::preamble::Master;
