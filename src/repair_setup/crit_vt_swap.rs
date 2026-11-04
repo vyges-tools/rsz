@@ -115,11 +115,11 @@ impl Repair<'_, '_> {
         let design: &dyn super::SetupDesign = &*self.design;
         let dont_touch = &design.net_info().dont_touch_insts;
         let mut result: Vec<CritInst> = Vec::new();
-        super::timed_all(ctx, design.as_design(), &mut self.timer, edits, |gs, ss, cs| {
+        super::timed_all(ctx, design.as_design(), &mut self.timer, edits, |gs, ss, _| {
             let (g, s) = (&gs[0], &ss[0]);
             let parasitics = std::slice::from_ref(design.parasitics(0));
             let sc = crate::timing::Scenes::new(std::slice::from_ref(g));
-            let ideal = if ctx.ideal_clock { cs[0].clone() } else { BTreeSet::new() };
+            let ideal: BTreeSet<usize> = g.ideal_clock.iter().copied().collect();
             // `Vertex::isRegClk`: the from pin of a clock-to-output arc.
             let is_reg_clk = |v: usize| {
                 g.out_edges[v].iter().any(|&e| match g.edges[e].kind {

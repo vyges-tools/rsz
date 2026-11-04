@@ -14,7 +14,7 @@ use crate::buffer_ports;
 use crate::preamble::Libs;
 use crate::repair_design::{self, Args, Inputs};
 use crate::trace::Trace;
-use crate::env::{estimate_state, master_pins, masters, no_signal_cap, port_caps_at, sdc_env, search_sdc_on, sim_constants};
+use crate::env::{estimate_state_per_clock, master_pins, masters, no_signal_cap, port_caps_at, sdc_env, search_sdc_on, sim_constants};
 use crate::Stop;
 use crate::odb_design::{clamp_loc_to_core, gr_layer_rc, grt_flutes, grt_stt, net_info, sdc_cap_pins, sdc_port_cap_limits, sizing_limits, CliDesign, GrLive, TimerLog};
 use crate::timing::{user_time_to_sta, Limits};
@@ -780,7 +780,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         let mut est_rc = estimate_rc.clone().expect("estimated");
                         est_rc.sort_clk_and_signal_layers();
                         let caps = port_caps_at(estimate_sdc.as_deref(), sdc.as_ref(), &libs, &netlist)?;
-                        estimate_state(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, estimate_propagated, estimate_alpha, libs.scene_count(), &caps)?
+                        estimate_state_per_clock(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, &crate::env::est_clocks(sdc.as_ref(), estimate_propagated), estimate_alpha, libs.scene_count(), &caps)?
                     }
                     (None, false) => vec![HashMap::new(); libs.scene_count()],
                 };
@@ -871,7 +871,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         let mut est_rc = estimate_rc.clone().expect("estimated");
                         est_rc.sort_clk_and_signal_layers();
                         let caps = port_caps_at(estimate_sdc.as_deref(), sdc.as_ref(), &libs, &netlist)?;
-                        crate::env::estimate_state_held(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, estimate_propagated, estimate_alpha, libs.scene_count(), &caps, held.as_ref())?
+                        crate::env::estimate_state_held_per_clock(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, &crate::env::est_clocks(sdc.as_ref(), estimate_propagated), estimate_alpha, libs.scene_count(), &caps, held.as_ref())?
                     }
                 };
                 let wire_rc: Vec<crate::buffered_net::WireRc> = (0..libs.scene_count())
@@ -1017,7 +1017,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     Some(p) => p,
                     None => {
                         let caps = port_caps_at(estimate_sdc.as_deref(), sdc.as_ref(), &libs, &netlist)?;
-                        estimate_state(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, estimate_propagated, estimate_alpha, libs.scene_count(), &caps)?
+                        estimate_state_per_clock(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, &crate::env::est_clocks(sdc.as_ref(), estimate_propagated), estimate_alpha, libs.scene_count(), &caps)?
                     }
                 };
                 let wire_rc: Vec<crate::buffered_net::WireRc> = (0..libs.scene_count())
@@ -1237,7 +1237,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         let mut est_rc = estimate_rc.clone().expect("estimated");
                         est_rc.sort_clk_and_signal_layers();
                         let caps = port_caps_at(estimate_sdc.as_deref(), sdc.as_ref(), &libs, &netlist)?;
-                        estimate_state(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, estimate_propagated, estimate_alpha, libs.scene_count(), &caps)?
+                        estimate_state_per_clock(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, &crate::env::est_clocks(sdc.as_ref(), estimate_propagated), estimate_alpha, libs.scene_count(), &caps)?
                     }
                 };
                 let mut env = sdc_env(s, &libs, &netlist)?;
@@ -1249,10 +1249,11 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 if s.ignored.iter().any(|c| c == "set_clock_transition") {
                     return Err("set_clock_transition: not modelled".into());
                 }
-                // An ideal clock's network (`ClkNetwork::isIdealClock`): its registers read the
-                // ideal clock slew, 0.
-                if !clock_propagated {
-                    g.ideal_clock = clocks.iter().copied().collect();
+                // An ideal clock's network (`ClkNetwork::isIdealClock`, per clock — est 8e440c9's
+                // rule as the search resolves it): its registers read the ideal clock slew, 0.
+                let ideal_sources = crate::env::est_clocks(Some(s), clock_propagated).ideal_sources();
+                if !ideal_sources.is_empty() {
+                    g.ideal_clock = crate::timing::clock_pins(&g, &ideal_sources).into_iter().collect();
                 }
                 // A diagnostic: the delay calculation's trace at the repair's start
                 // (`VYGES_RSZ_DCALC_TRACE=<file>`: each gate call and load), as the repair_design
@@ -1289,8 +1290,8 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     for (k, par) in parasitics.iter().enumerate().take(libs.scene_count()) {
                         let mut gk = repair_design::timer_graph(&libs, k, &netlist, &env, &mpins).map_err(|e| e.message().to_string())?;
                         let ck = crate::timing::clock_pins(&gk, &clock_sources);
-                        if !clock_propagated {
-                            gk.ideal_clock = ck.iter().copied().collect();
+                        if !ideal_sources.is_empty() {
+                            gk.ideal_clock = crate::timing::clock_pins(&gk, &ideal_sources).into_iter().collect();
                         }
                         gk.find_delays(par, None)?;
                         let mut sk = vyges_sta::search::Search::in_graph_order(&gk, &ssdc);
@@ -1428,7 +1429,8 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         master_pins: &mpins,
                         ssdc: &ssdc,
                         clock_sources: &clock_sources,
-                        ideal_clock: !clock_propagated,
+                        ideal_clock: !ideal_sources.is_empty(),
+                        ideal_sources: &ideal_sources,
                         margin,
                         time_scale,
                         sequence: &seq,

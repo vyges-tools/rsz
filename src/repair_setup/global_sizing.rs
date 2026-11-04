@@ -647,7 +647,7 @@ impl GsEnv<'_> {
     fn build_snapshots(&self, gs: &Gs, v: &View<'_, '_>, cfg: &GlobalSizingConfig) -> Vec<GateSnapshot> {
         let mut out = Vec::new();
         let sc = crate::timing::Scenes::new(std::slice::from_ref(v.g));
-        let ideal = if self.ctx.ideal_clock { v.clocks.clone() } else { BTreeSet::new() };
+        let ideal: BTreeSet<usize> = v.g.ideal_clock.iter().copied().collect();
         'inst: for (k, name, cell) in self.leaf_insts() {
             if self.design.net_info().dont_touch_insts.contains(&name) || self.ctx.libs.link_cell(&cell).is_none() {
                 continue;

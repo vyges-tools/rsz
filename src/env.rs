@@ -96,24 +96,50 @@ pub fn port_caps_at(path: Option<&str>, current: Option<&vyges_loom::sdc::Sdc>, 
     })
 }
 
+/// Which clocks' nets the estimate skips as ideal: every clock alike (`All`, the run's
+/// `set_propagated_clock` flag — the form the consumers call), or each clock on its own
+/// (`PerClock`, est 8e440c9).
+#[derive(Clone, Copy)]
+enum Propagation<'c> {
+    All(bool),
+    PerClock(&'c vyges_est::placement::Clocks),
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn placement_parasitics_at(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagated: bool, alpha: f32, scenes: usize, port_caps: &PortCaps) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
-    placement_parasitics_held(db, rc, liberty, clock_sources, propagated, alpha, scenes, port_caps, None)
+    parasitics_held(db, rc, liberty, clock_sources, Propagation::All(propagated), alpha, scenes, port_caps, None)
+}
+
+/// [`placement_parasitics_at`] with propagation read per clock (`clocks`, est 8e440c9).
+#[allow(clippy::too_many_arguments)]
+pub fn placement_parasitics_per_clock(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], clocks: &vyges_est::placement::Clocks, alpha: f32, scenes: usize, port_caps: &PortCaps) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
+    parasitics_held(db, rc, liberty, clock_sources, Propagation::PerClock(clocks), alpha, scenes, port_caps, None)
 }
 
 /// [`placement_parasitics_at`] with the clock nets and constant pins of `db` as it is now, when the
 /// caller holds them (`held`); `None` walks the design for them.
 #[allow(clippy::too_many_arguments)]
 pub fn placement_parasitics_held(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagated: bool, alpha: f32, scenes: usize, port_caps: &PortCaps, held: Option<&vyges_est::placement::Skips>) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
-    use vyges_est::placement::{estimate_wire_parasitics, estimate_wire_parasitics_with_skips, Timing};
+    parasitics_held(db, rc, liberty, clock_sources, Propagation::All(propagated), alpha, scenes, port_caps, held)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parasitics_held(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagation: Propagation<'_>, alpha: f32, scenes: usize, port_caps: &PortCaps, held: Option<&vyges_est::placement::Skips>) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
+    use vyges_est::placement::{estimate_wire_parasitics, estimate_wire_parasitics_with_skips, skips_with_clocks, Timing};
     if no_signal_cap(db, rc) {
         return Ok(vec![HashMap::new(); scenes]);
     }
-    // `isSkipPin`: an ideal clock's nets get no network; a propagated clock's do.
+    // `isSkipPin`: an ideal clock's nets get no network; a propagated clock's do — per clock
+    // (est 8e440c9, `ClkNetwork::findClkPins` from the ideal clocks only).
+    let propagated = match propagation {
+        Propagation::All(p) => p,
+        Propagation::PerClock(c) => c.all_propagated(),
+    };
     let timing = Timing { liberty: Some(liberty), clock_sources: clock_sources.to_vec(), propagated };
-    let nets = match held {
-        Some(skips) => estimate_wire_parasitics_with_skips(db, &timing, skips, alpha, &est_stt),
-        None => estimate_wire_parasitics(db, &timing, alpha, &est_stt),
+    let nets = match (held, propagation) {
+        (Some(skips), _) => estimate_wire_parasitics_with_skips(db, &timing, skips, alpha, &est_stt),
+        (None, Propagation::All(_)) => estimate_wire_parasitics(db, &timing, alpha, &est_stt),
+        (None, Propagation::PerClock(c)) => estimate_wire_parasitics_with_skips(db, &timing, &skips_with_clocks(db, &timing, c).map_err(|e| e.to_string())?, alpha, &est_stt),
     }
     .map_err(|e| e.to_string())?;
     let mut out = vec![HashMap::new(); scenes];
@@ -134,21 +160,38 @@ pub fn placement_parasitics_held(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyge
 /// between the two — a netlist edit is replayed by the command that made it, not read back.
 #[allow(clippy::too_many_arguments)]
 pub fn estimate_state(db: &Db, seen: Option<&str>, netlist: &vyges_sta::netlist::Netlist, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagated: bool, alpha: f32, scenes: usize, port_caps: &PortCaps) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
-    estimate_state_held(db, seen, netlist, rc, liberty, clock_sources, propagated, alpha, scenes, port_caps, None)
+    state_held(db, seen, netlist, rc, liberty, clock_sources, Propagation::All(propagated), alpha, scenes, port_caps, None)
+}
+
+/// [`estimate_state`] with propagation read per clock (`clocks`, est 8e440c9).
+#[allow(clippy::too_many_arguments)]
+pub fn estimate_state_per_clock(db: &Db, seen: Option<&str>, netlist: &vyges_sta::netlist::Netlist, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], clocks: &vyges_est::placement::Clocks, alpha: f32, scenes: usize, port_caps: &PortCaps) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
+    state_held(db, seen, netlist, rc, liberty, clock_sources, Propagation::PerClock(clocks), alpha, scenes, port_caps, None)
 }
 
 /// [`estimate_state`] with `held`: the clock nets and constant pins of `db` as it is now, when the
 /// caller has them; a `seen` design is a different one, so they are not used for it.
 #[allow(clippy::too_many_arguments)]
 pub fn estimate_state_held(db: &Db, seen: Option<&str>, netlist: &vyges_sta::netlist::Netlist, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagated: bool, alpha: f32, scenes: usize, port_caps: &PortCaps, held: Option<&vyges_est::placement::Skips>) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
+    state_held(db, seen, netlist, rc, liberty, clock_sources, Propagation::All(propagated), alpha, scenes, port_caps, held)
+}
+
+/// [`estimate_state_held`] with propagation read per clock (`clocks`, est 8e440c9).
+#[allow(clippy::too_many_arguments)]
+pub fn estimate_state_held_per_clock(db: &Db, seen: Option<&str>, netlist: &vyges_sta::netlist::Netlist, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], clocks: &vyges_est::placement::Clocks, alpha: f32, scenes: usize, port_caps: &PortCaps, held: Option<&vyges_est::placement::Skips>) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
+    state_held(db, seen, netlist, rc, liberty, clock_sources, Propagation::PerClock(clocks), alpha, scenes, port_caps, held)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn state_held(db: &Db, seen: Option<&str>, netlist: &vyges_sta::netlist::Netlist, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagation: Propagation<'_>, alpha: f32, scenes: usize, port_caps: &PortCaps, held: Option<&vyges_est::placement::Skips>) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
     match seen {
-        None => placement_parasitics_held(db, rc, liberty, clock_sources, propagated, alpha, scenes, port_caps, held),
+        None => parasitics_held(db, rc, liberty, clock_sources, propagation, alpha, scenes, port_caps, held),
         Some(path) => {
             let seen = Db::open(path).map_err(|e| format!("{path}: {e}"))?;
             if &vyges_grt::timer::netlist(&seen) != netlist {
                 return Err("the netlist was edited between estimate_parasitics and this command by a step the job does not carry: not modelled".into());
             }
-            placement_parasitics_at(&seen, rc, liberty, clock_sources, propagated, alpha, scenes, port_caps)
+            parasitics_held(&seen, rc, liberty, clock_sources, propagation, alpha, scenes, port_caps, None)
         }
     }
 }
@@ -227,6 +270,26 @@ pub fn expand_io_delay_ports(s: &mut vyges_loom::sdc::Sdc, nl: &vyges_sta::netli
     (s.input_delays, s.output_delays) = (i, o);
 }
 
+/// The clock state the estimator reads (est's [`vyges_est::placement::Clocks`]), as the search
+/// resolves it (`search_sdc_on`): each SDC clock made, then propagated when the run's
+/// `propagated` holds and the SDC's `set_propagated_clock` names it — or names no clock at all, when
+/// every clock is (the reference writes the propagation per clock; a virtual clock never is). A
+/// latency on a propagated clock is refused by the search, so no latency reaches the order here.
+pub fn est_clocks(sdc: Option<&vyges_loom::sdc::Sdc>, propagated: bool) -> vyges_est::placement::Clocks {
+    use vyges_est::placement::{ClockObject, Clocks};
+    let mut out = Clocks::default();
+    let Some(s) = sdc else { return out };
+    let named: Vec<&str> = s.propagated.iter().filter(|o| o.accessor == "get_clocks").flat_map(|o| o.names.iter().map(String::as_str)).collect();
+    for c in &s.clocks {
+        out.create_clock(&c.name, &c.sources);
+    }
+    if propagated {
+        let objects: Vec<ClockObject> = s.clocks.iter().filter(|c| !c.is_virtual() && (named.is_empty() || named.contains(&c.name.as_str()))).map(|c| ClockObject::Clock(c.name.clone())).collect();
+        out.set_propagated_clock(&objects).expect("each clock was made above");
+    }
+    out
+}
+
 /// Global placement's virtual clock tree: each `(clock, pin, latency)` as
 /// `setClockLatency(clk, pin, riseFall, all)` — a latency given with the clock, every transition
 /// and min/max.
@@ -246,4 +309,27 @@ pub fn add_virtual_latencies(sdc: &mut vyges_sta::sdc::Sdc, latencies: &[(String
 /// ([`vyges_sta::load::sdc_design`] over the database's netlist), for `Sdc::load_with`.
 pub fn sdc_design(db: &vyges_opendb::Db, libs: &Libs) -> vyges_loom::sdc::SdcDesign {
     vyges_sta::load::sdc_design(&vyges_grt::timer::netlist(db), &libs.libs)
+}
+
+#[cfg(test)]
+mod est_clocks_tests {
+    use super::est_clocks;
+
+    // Rule (est 8e440c9 over the search's resolution, the reference writing propagation per clock):
+    // `set_propagated_clock [all_clocks]` then `set_clock_latency 0.6 [get_clocks clk2]` leaves clk1
+    // propagated and clk2 ideal — the written SDC names clk1 alone — so the estimate skips only
+    // clk2's nets. With no clock named, the run's flag decides for every clock; without it, none is.
+    #[test]
+    fn the_estimate_reads_propagation_per_clock() {
+        let s = vyges_loom::sdc::Sdc::parse(
+            "create_clock -name clk1 -period 2 [get_ports {clk1}]\nset_propagated_clock [get_clocks {clk1}]\ncreate_clock -name clk2 -period 2 [get_ports {clk2}]\nset_clock_latency 0.6 [get_clocks {clk2}]\n",
+        )
+        .unwrap();
+        let c = est_clocks(Some(&s), true);
+        assert_eq!(c.ideal_sources(), vec!["clk2".to_string()]);
+        assert!(est_clocks(Some(&s), false).ideal_sources().len() == 2, "the run never propagated");
+        let all = vyges_loom::sdc::Sdc::parse("create_clock -name a -period 2 [get_ports {a}]\ncreate_clock -name b -period 2 [get_ports {b}]\n").unwrap();
+        assert!(est_clocks(Some(&all), true).all_propagated(), "no clock named: the flag covers all");
+        assert!(est_clocks(None, true).ideal_sources().is_empty());
+    }
 }

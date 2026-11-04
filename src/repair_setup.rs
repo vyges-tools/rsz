@@ -68,8 +68,11 @@ pub struct Ctx<'a> {
     pub master_pins: &'a HashMap<String, Vec<String>>,
     pub ssdc: &'a vyges_sta::sdc::Sdc,
     pub clock_sources: &'a [String],
-    /// The clock is ideal (no `set_propagated_clock`).
+    /// Some clock is ideal (not every clock propagated).
     pub ideal_clock: bool,
+    /// The sources of the clocks that stay ideal (`ClkNetwork::isIdealClock` per clock, est
+    /// 8e440c9's rule as the search resolves it): every clock source when none is propagated.
+    pub ideal_sources: &'a [String],
     /// `-setup_margin`, seconds.
     pub margin: f32,
     pub time_scale: f32,
@@ -383,7 +386,7 @@ fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], timer: &mut Tim
                 }
             }
             let Some((k, v, _)) = best else { continue };
-            let ideal = if ctx.ideal_clock { cs[k].clone() } else { BTreeSet::new() };
+            let ideal: BTreeSet<usize> = gs[k].ideal_clock.iter().copied().collect();
             if let Some(view) = expand(ctx, gs, ss, cs, design, k, v, &ideal)? {
                 paths.insert(n, view);
             }
@@ -471,7 +474,7 @@ fn timed_levels<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits:
         let mut gk = crate::repair_design::timer_graph(ctx.libs, k, netlist, ctx.env, ctx.master_pins)?;
         let ck = crate::timing::clock_pins(&gk, ctx.clock_sources);
         if ctx.ideal_clock {
-            gk.ideal_clock = ck.iter().copied().collect();
+            gk.ideal_clock = crate::timing::clock_pins(&gk, ctx.ideal_sources).into_iter().collect();
         }
         if let Some(stale) = design.stale_out_arcs() {
             gk.set_stale_out_arcs(stale);
@@ -788,9 +791,9 @@ fn expand_path(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTr
 /// `corner_` is `cmdScene()` (scene 0): the buffered net and `setPin`'s limits are read there;
 /// each load's path is its worst over EVERY scene (`vertexWorstSlackPath`), and a transition's
 /// driver arc is timed in its arrival path's scene.
-fn probe_rebuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet<usize>], design: &dyn Design, drvr_name: &str) -> RebufProbe {
+fn probe_rebuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], _cs: &[BTreeSet<usize>], design: &dyn Design, drvr_name: &str) -> RebufProbe {
     let g = &gs[0];
-    let ideal: BTreeSet<usize> = if ctx.ideal_clock { cs[0].clone() } else { BTreeSet::new() };
+    let ideal: BTreeSet<usize> = gs[0].ideal_clock.iter().copied().collect();
     let Some(drvr) = g.vertices.iter().position(|x| x.name == drvr_name && x.is_driver) else { return RebufProbe::Skip };
     let vx = &g.vertices[drvr];
     if vx.lib.is_none() {
@@ -1017,9 +1020,9 @@ fn annotate_import_slacks(gs: &[Graph<'_>], ss: &[Search<'_, '_>], nodes: &mut [
 /// `annotateLoadSlacks` (the original tree), the driver arcs, and the timer's own slack at the
 /// driver (`vertexWorstSlackPath(drvr, max)`: required less arrival, INF without one).
 #[allow(clippy::too_many_arguments)]
-fn full_probe(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet<usize>], design: &dyn Design, removable: &dyn Fn(&str, &str, &str) -> bool, drvr_name: &str) -> FullProbe {
+fn full_probe(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], _cs: &[BTreeSet<usize>], design: &dyn Design, removable: &dyn Fn(&str, &str, &str) -> bool, drvr_name: &str) -> FullProbe {
     let g = &gs[0];
-    let ideal: BTreeSet<usize> = if ctx.ideal_clock { cs[0].clone() } else { BTreeSet::new() };
+    let ideal: BTreeSet<usize> = gs[0].ideal_clock.iter().copied().collect();
     let index: HashMap<(&str, bool), usize> = g.vertices.iter().enumerate().map(|(i, v)| ((v.name.as_str(), v.is_driver), i)).collect();
     let Some(&drvr) = index.get(&(drvr_name, true)) else { return FullProbe::Skip };
     let vx = &g.vertices[drvr];
@@ -1473,7 +1476,7 @@ fn annotate_load_slacks(gs: &[Graph<'_>], ss: &[Search<'_, '_>], bn: &crate::buf
 /// UnbufferMove's timer verdict on each driver of the path that may be ranked
 /// ([`unbuffer::probe`]), taken while the timer is at hand.
 #[allow(clippy::too_many_arguments)]
-fn probe_unbuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet<usize>], design: &dyn Design, scene: usize, ideal: &BTreeSet<usize>, chain: &[(usize, vyges_sta::search::Path)], stages: &mut [Stage]) {
+fn probe_unbuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], _cs: &[BTreeSet<usize>], design: &dyn Design, scene: usize, ideal: &BTreeSet<usize>, chain: &[(usize, vyges_sta::search::Path)], stages: &mut [Stage]) {
     let (g, search) = (&gs[scene], &ss[scene]);
     let index: HashMap<String, usize> = g.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect();
     let steiner = |net: &str, drvr: &str| design.net_shape(net, drvr);
@@ -1482,7 +1485,7 @@ fn probe_unbuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[
     let all_parasitics: Vec<HashMap<String, vyges_sta::graph::NetParasitics>> =
         if several { (0..gs.len()).map(|k| design.parasitics(k).clone()).collect() } else { Vec::new() };
     let ideals: Vec<BTreeSet<usize>> =
-        if several { cs.iter().map(|c| if ctx.ideal_clock { c.clone() } else { BTreeSet::new() }).collect() } else { Vec::new() };
+        if several { gs.iter().map(|gk| gk.ideal_clock.iter().copied().collect()).collect() } else { Vec::new() };
     let indices: Vec<HashMap<String, usize>> = if several {
         gs.iter().map(|gk| gk.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect()).collect()
     } else {
