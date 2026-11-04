@@ -1740,6 +1740,12 @@ fn clock_tree_pins(g: &Graph<'_>, clocks: &BTreeSet<usize>) -> BTreeSet<String> 
     tree
 }
 
+/// `repairEndpoint`'s post-loop finish of an open journal: restored when worsening passes are
+/// pending since the last improved checkpoint, accepted otherwise (upstream 2494eb313a8).
+fn restores_open_journal(decreasing_slack_passes: i64) -> bool {
+    decreasing_slack_passes > 0
+}
+
 /// `BufferGenerator::isApplicable`'s fanout: 1 up to `kRebufferMaxFanout` exclusive — a
 /// point-to-point net is a target since upstream 6fe943b1c8f (it took 2 or more before).
 fn buffer_fanout_applicable(fanout: usize) -> bool {
@@ -4039,11 +4045,21 @@ impl Repair<'_, '_> {
             }
             es.pass += 1;
             if self.args.max_iterations > 0 && self.opto_iteration >= self.args.max_iterations {
-                self.accept_endpoint_state(es)?;
                 break;
             }
         }
-        self.accept_endpoint_state(es)?;
+        // The loop ran out (max passes, max iterations): the open journal is finalized by
+        // whether worsening passes are pending since the last improved checkpoint (upstream
+        // 2494eb313a8; they were accepted before).
+        if es.journal_open {
+            if restores_open_journal(es.decreasing_slack_passes) {
+                let line = format!("{phase} Phase: Restoring best slack; endpoint slack = {}, WNS = {}", self.ds(es.prev_end_slack, 3), self.ds(es.prev_worst_slack, 3));
+                self.debug("repair_setup", 2, line);
+                self.restore_endpoint_state(es)?;
+            } else {
+                self.accept_endpoint_state(es)?;
+            }
+        }
         Ok(())
     }
 
@@ -5468,6 +5484,15 @@ fn path_improved(end_slack: f32, worst_slack: f32, prev_end_slack: f32, prev_wor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Rule (SetupLegacyPolicy::repairEndpoint, upstream 2494eb313a8): a pass loop that runs out
+    // (max passes, max iterations, max area) with worsening passes pending restores the last
+    // improved checkpoint; with none pending it accepts.
+    #[test]
+    fn a_loop_that_runs_out_restores_pending_worsening_passes() {
+        assert!(restores_open_journal(1));
+        assert!(!restores_open_journal(0));
+    }
 
     // Rule (BufferGenerator::isApplicable, upstream 6fe943b1c8f): a single-load net is a
     // BufferMove target; no load, and the rebuffer fanout limit, are not.
