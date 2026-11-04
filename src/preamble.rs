@@ -430,23 +430,7 @@ pub fn find_buffer_target_slews(libs: &Libs, buffers: &[String]) -> ([f32; 2], u
     let mut tgt = [0.0f32; 2];
     let mut tgt_scene = 0;
     for k in 0..libs.scene_count() {
-        let mut slews = [0.0f32; 2];
-        let mut counts = [0i32; 2];
-        for name in buffers {
-            let Some(cell) = libs.scene_cell(k, name) else { continue };
-            let Some((input, output)) = cell.buffer_ports() else { continue };
-            for set in cell.arc_sets.iter().filter(|s| s.from == input.name && s.to == output.name) {
-                for arc in &set.arcs {
-                    if let Model::Gate(model) = &arc.model {
-                        let load_cap = input.capacitance(arc.from_rf, MAX) * TGT_SLEW_LOAD_CAP_FACTOR;
-                        let (_, slew) = model.gate_delay(0.0, load_cap);
-                        let (_, slew) = model.gate_delay(slew, load_cap);
-                        slews[arc.to_rf] += slew;
-                        counts[arc.to_rf] += 1;
-                    }
-                }
-            }
-        }
+        let (slews, counts) = buffer_target_slew_sums(libs, buffers, k);
         let rise = slews[RISE] / counts[RISE] as f32;
         let fall = slews[FALL] / counts[FALL] as f32;
         if rise > tgt[RISE] {
@@ -455,6 +439,29 @@ pub fn find_buffer_target_slews(libs: &Libs, buffers: &[String]) -> ([f32; 2], u
         }
     }
     (tgt, tgt_scene)
+}
+
+/// `findBufferTargetSlews(buffer, pvt, slews, counts)` over `buffers` at one scene (each its
+/// scene cell): the per-output-transition sums and counts, not yet divided.
+pub fn buffer_target_slew_sums(libs: &Libs, buffers: &[String], k: usize) -> ([f32; 2], [i32; 2]) {
+    let mut slews = [0.0f32; 2];
+    let mut counts = [0i32; 2];
+    for name in buffers {
+        let Some(cell) = libs.scene_cell(k, name) else { continue };
+        let Some((input, output)) = cell.buffer_ports() else { continue };
+        for set in cell.arc_sets.iter().filter(|s| s.from == input.name && s.to == output.name) {
+            for arc in &set.arcs {
+                if let Model::Gate(model) = &arc.model {
+                    let load_cap = input.capacitance(arc.from_rf, MAX) * TGT_SLEW_LOAD_CAP_FACTOR;
+                    let (_, slew) = model.gate_delay(0.0, load_cap);
+                    let (_, slew) = model.gate_delay(slew, load_cap);
+                    slews[arc.to_rf] += slew;
+                    counts[arc.to_rf] += 1;
+                }
+            }
+        }
+    }
+    (slews, counts)
 }
 
 /// `Resizer::findTargetLoad(cell, arc, in_slew, out_slew)`: the load at which the arc's output

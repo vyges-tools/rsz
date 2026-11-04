@@ -28,6 +28,8 @@ pub struct Walk<'a, 'g> {
     pub slew_shape_factor: f32,
     pub r_strongest_buffer: f32,
     pub buffer_lowest_drive: &'a str,
+    /// `buffer_cells_`: the pruned buffer list.
+    pub buffer_cells: &'a [String],
     /// The SDC environment every graph the walk builds reads.
     pub sdc: &'a vyges_sta::graph::SdcEnv,
     pub master_pins: &'a std::collections::HashMap<String, Vec<String>>,
@@ -35,10 +37,17 @@ pub struct Walk<'a, 'g> {
     pub corner: usize,
 }
 
-/// `PreChecks`' best-case slew cache, kept across nets as the reference's member is.
+/// `PreChecks`' best-case slew cache, kept across nets as the reference's member is: one per
+/// corner (`slew_check_by_corner_`, upstream 77b7867bfd6), so one corner's best slew never judges
+/// another's limit.
 #[derive(Debug, Clone, Default)]
 pub struct PreCheck {
-    computed: bool,
+    by_corner: std::collections::BTreeMap<usize, SlewCheckCache>,
+}
+
+/// `PreChecks::SlewCheckCache`.
+#[derive(Debug, Clone, Copy, Default)]
+struct SlewCheckCache {
     load: f32,
     slew: f32,
 }
@@ -310,8 +319,8 @@ impl Walk<'_, '_> {
     }
 
     fn repair_net_load(&self, bn: &mut BufferedNet, n: usize, pin: usize, level: usize, st: &mut State<'_>, trace: &mut Trace) -> Result<Down, Stop> {
-        self.check_slew_limit(bn.nodes[n].cap, bn.nodes[n].max_load_slew, &mut st.pre)?;
         let name = self.graph().vertices[pin].name.clone();
+        self.check_slew_limit(&name, bn.nodes[n].cap, bn.nodes[n].max_load_slew, self.corner, &mut st.pre)?;
         crate::tpush!(trace, "l|{level}|{name}|{}|{}", g(f64::from(bn.nodes[n].cap)), g(f64::from(bn.nodes[n].max_load_slew)));
         Ok((0, vec![name]))
     }
@@ -370,27 +379,51 @@ impl Walk<'_, '_> {
         Ok(graph.load_cap(v, &par))
     }
 
-    /// `PreChecks::checkSlewLimit(ref_cap, max_load_slew)`: the best slew any swappable size of
-    /// the weakest buffer reaches at this load — cached, and recomputed only for a smaller load —
-    /// above the limit is RSZ-0090.
-    fn check_slew_limit(&self, ref_cap: f32, max_load_slew: f32, pre: &mut PreCheck) -> Result<(), Stop> {
-        if !pre.computed || ref_cap < pre.load {
-            let swappable = self.sizing.swappable_cells(self.buffer_lowest_drive)?;
+    /// `PreChecks::checkSlewLimit(load_pin, ref_cap, max_load_slew, corner)`: see
+    /// [`check_slew_limit`].
+    fn check_slew_limit(&self, load_pin: &str, ref_cap: f32, max_load_slew: f32, corner: usize, pre: &mut PreCheck) -> Result<(), Stop> {
+        let swappable = || self.sizing.swappable_cells(self.buffer_lowest_drive);
+        check_slew_limit(self.sizing.libs, self.buffer_lowest_drive, &swappable, self.buffer_cells, load_pin, ref_cap, max_load_slew, corner, pre)
+    }
+}
+
+/// `PreChecks::checkSlewLimit(load_pin, ref_cap, max_load_slew, corner)` (upstream 77b7867bfd6):
+/// the best slew the weakest buffer or any swappable size of it reaches at this load AT THE LOAD'S
+/// CORNER — the input slews that corner's own buffer target slews over `buffer_cells` (not the
+/// slowest corner's), cached per corner and recomputed only for a smaller load — above the limit
+/// is RSZ-0090, naming the pin and the corner. A corner whose buffers time no arc of one output
+/// transition cannot be judged: RSZ-3247 (f0eafeec0ca), rise checked first.
+#[allow(clippy::too_many_arguments)]
+fn check_slew_limit(libs: &crate::preamble::Libs, lowest: &str, swappable: &dyn Fn() -> Result<Vec<String>, Stop>, buffer_cells: &[String], load_pin: &str, ref_cap: f32, max_load_slew: f32, corner: usize, pre: &mut PreCheck) -> Result<(), Stop> {
+    let cache = match pre.by_corner.get(&corner).copied() {
+        Some(c) if ref_cap >= c.load => c,
+        _ => {
+            let (sums, counts) = crate::preamble::buffer_target_slew_sums(libs, buffer_cells, corner);
+            let mut input_slews = [0.0f32; 2];
+            for rf in [RISE, FALL] {
+                if counts[rf] == 0 {
+                    let rf_name = if rf == RISE { "rise" } else { "fall" };
+                    return Err(Stop::error("RSZ-3247", format!("Cannot check the slew limit for pin {load_pin} at corner {}: no buffer timing models for {rf_name} transitions.", libs.scene_name(corner))));
+                }
+                input_slews[rf] = sums[rf] / counts[rf] as f32;
+            }
             let slew_of = |name: &str| -> f32 {
-                let cell = self.sizing.libs.link_cell(name).expect("a link cell");
-                buffer_slew(self.sizing, cell, ref_cap)
+                let cell = libs.link_cell(name).expect("the buffer and its swaps are link cells");
+                buffer_slew_at(libs, cell, ref_cap, input_slews, corner)
             };
-            let mut slew = slew_of(self.buffer_lowest_drive);
-            for b in &swappable {
+            let mut slew = slew_of(lowest);
+            for b in &swappable()? {
                 slew = slew.min(slew_of(b));
             }
-            *pre = PreCheck { computed: true, load: ref_cap, slew };
+            let c = SlewCheckCache { load: ref_cap, slew };
+            pre.by_corner.insert(corner, c);
+            c
         }
-        if max_load_slew < pre.slew {
-            return Err(Stop::error("RSZ-0090", format!("Max transition time from SDC is {max_load_slew:e}s. Best achievable transition time is {:e}s with a load of {:e}F", pre.slew, pre.load)));
-        }
-        Ok(())
+    };
+    if max_load_slew < cache.slew {
+        return Err(Stop::error("RSZ-0090", format!("Max transition time for pin {load_pin} at corner {} is {max_load_slew:e}s. Best achievable transition time is {:e}s with a load of {:e}F", libs.scene_name(corner), cache.slew, cache.load)));
     }
+    Ok(())
 }
 
 /// `resizeToTargetSlew`: the caller's hint is the load only under global-route parasitics (it
@@ -432,15 +465,20 @@ pub fn repeater_values(libs: &crate::preamble::Libs, cell: &str, limits: &timing
 /// each at its input transition's target slew and the lumped load, the larger slew per output
 /// transition (from −INF); then the larger of rise and fall.
 pub fn buffer_slew(sizing: &Sizing<'_>, cell: &vyges_sta::liberty::Cell, load_cap: f32) -> f32 {
+    buffer_slew_at(sizing.libs, cell, load_cap, sizing.tgt_slews, sizing.tgt_scene)
+}
+
+/// `gateDelays(output, load_cap, in_slews, corner, max)` then the larger of the rise and fall
+/// slews: the corner's cell, each arc into the output at its input transition's slew.
+pub fn buffer_slew_at(libs: &crate::preamble::Libs, cell: &vyges_sta::liberty::Cell, load_cap: f32, in_slews: [f32; 2], corner: usize) -> f32 {
     use vyges_sta::liberty::Model;
-    // At the target-slew corner (`tgt_slew_corner_`).
-    let cell = sizing.libs.scene_cell(sizing.tgt_scene, &cell.name).unwrap_or(cell);
+    let cell = libs.scene_cell(corner, &cell.name).unwrap_or(cell);
     let Some((_, output)) = cell.buffer_ports() else { return -crate::timing::INF };
     let mut slews = [-crate::timing::INF; 2];
     for set in cell.arc_sets.iter().filter(|s| s.to == output.name && !s.role.is_timing_check()) {
         for arc in &set.arcs {
             if let Model::Gate(m) = &arc.model {
-                let (_, slew) = m.gate_delay(sizing.tgt_slews[arc.from_rf], load_cap);
+                let (_, slew) = m.gate_delay(in_slews[arc.from_rf], load_cap);
                 slews[arc.to_rf] = slews[arc.to_rf].max(slew);
             }
         }
@@ -461,6 +499,74 @@ mod tests {
               cell (BUF) {{ pin (A) {{ direction : input ; {pin_a} }} pin (Z) {{ direction : output ; function : "A" ; }} }} }}"#
         );
         Libs { libs: vec![Library::read(&lparse(&text).unwrap()).unwrap()], ..Default::default() }
+    }
+
+    /// A two-corner session ("fast", "slow") of buffer B whose output slew is `r` ns per pF of load
+    /// at each corner; `arcs` the transition tables B's arc carries.
+    fn two_corners(fast: f32, slow: f32, arcs: &dyn Fn(f32) -> String) -> Libs {
+        let lib = |r: f32| {
+            let text = format!(
+                r#"library (l) {{ time_unit : "1ns" ; capacitive_load_unit (1, pf) ;
+                  lu_table_template (t) {{ variable_1 : input_net_transition ; variable_2 : total_output_net_capacitance ; index_1 ("0, 1") ; index_2 ("0, 1") ; }}
+                  cell (B) {{ pin (A) {{ direction : input ; capacitance : 0.01 ; }} pin (Z) {{ direction : output ; function : "A" ;
+                    timing () {{ related_pin : "A" ; timing_sense : positive_unate ; {} }} }} }} }}"#,
+                arcs(r)
+            );
+            Library::read(&lparse(&text).unwrap()).unwrap()
+        };
+        Libs { libs: vec![lib(fast)], scenes: vec!["fast".into(), "slow".into()], scene_libs: vec![vec![lib(fast)], vec![lib(slow)]], link_scene: Some(0) }
+    }
+
+    fn both(r: f32) -> String {
+        format!(r#"rise_transition (t) {{ values ("0, {r}", "0, {r}") ; }} fall_transition (t) {{ values ("0, {r}", "0, {r}") ; }}"#)
+    }
+
+    fn check(l: &Libs, cap: f32, limit: f32, corner: usize, pre: &mut PreCheck) -> Result<(), Stop> {
+        check_slew_limit(l, "B", &|| Ok(Vec::new()), &["B".to_string()], "load/A", cap, limit, corner, pre)
+    }
+
+    // Rules (PreChecks::checkSlewLimit, upstream 77b7867bfd6; its gtest TestPreChecks): the best
+    // slew is computed at the LOAD'S corner and cached per corner, so the slow corner's best slew
+    // neither rejects a fast-corner limit it would fail nor is reused for it; an impossible limit is
+    // RSZ-0090 naming the pin and the corner, and no longer says the limit came from SDC.
+    #[test]
+    fn the_slew_pre_check_is_per_corner() {
+        let l = two_corners(1.0, 2.0, &both);
+        const CAP: f32 = 1e-15;
+        let (fast, slow) = (1e-12_f32, 2e-12_f32);
+        let limit = (fast + slow) / 2.0;
+        let mut pre = PreCheck::default();
+        assert!(check(&l, CAP, limit, 0, &mut pre).is_ok(), "the fast corner reaches it");
+        let e = check(&l, CAP, limit, 1, &mut pre).unwrap_err();
+        assert_eq!(e.code(), "RSZ-0090");
+        assert!(e.message().contains("pin load/A at corner slow ") && !e.message().contains("from SDC"), "{}", e.message());
+        assert!(check(&l, CAP, limit, 0, &mut pre).is_ok(), "the slow corner's result is not reused for the fast one");
+        let mut pre = PreCheck::default();
+        assert!(check(&l, CAP, 1.0, 1, &mut pre).is_ok());
+        assert!(check(&l, CAP, limit, 0, &mut pre).is_ok(), "a slow-corner check first does not reject the fast corner");
+    }
+
+    // Rule (PreChecks::checkSlewLimit): within a corner the cached best slew is recomputed for a
+    // smaller load (and kept for a larger one).
+    #[test]
+    fn the_slew_pre_check_recomputes_for_a_smaller_load() {
+        let l = two_corners(1.0, 2.0, &both);
+        let (small, large) = (1e-15_f32, 1e-13_f32);
+        let limit = (1e-12 + 1e-10) / 2.0;
+        let mut pre = PreCheck::default();
+        assert!(check(&l, large, 1.0, 0, &mut pre).is_ok());
+        assert!(check(&l, small, limit, 0, &mut pre).is_ok(), "the smaller load's best slew is under the limit");
+        assert!(check(&l, large, limit, 0, &mut pre).is_ok(), "a larger load keeps the smaller load's cache");
+    }
+
+    // Rule (PreChecks::checkSlewLimit, upstream f0eafeec0ca): a corner whose buffers time no arc
+    // to one output transition cannot be judged — RSZ-3247, rise checked before fall.
+    #[test]
+    fn the_slew_pre_check_refuses_a_corner_without_buffer_timing() {
+        let fall_only = |r: f32| format!(r#"fall_transition (t) {{ values ("0, {r}", "0, {r}") ; }}"#);
+        let e = check(&two_corners(1.0, 2.0, &fall_only), 1e-15, 1.0, 1, &mut PreCheck::default()).unwrap_err();
+        assert_eq!(e.code(), "RSZ-3247");
+        assert_eq!(e.message(), "Cannot check the slew limit for pin load/A at corner slow: no buffer timing models for rise transitions.");
     }
 
     // Rule (RepairDesign::makeRepeater → Resizer::portCapacitance → LibertyPort::capacitance()):
