@@ -4406,9 +4406,6 @@ impl Repair<'_, '_> {
             return self.reroute_repair_path(&view, path_slack);
         }
         let repairs_per_pass = self.repair_budget(path_slack, force_single_repair);
-        if repairs_per_pass > 1 {
-            return Err(Stop::refused("RSZ-ABSENT", format!("{repairs_per_pass} repairs in one pass: a target after the first move would read a timer the move changed, which is not modelled")));
-        }
         // `visitPathSegments`: the drivers of the main path, then of each latch D fanin path, each
         // segment ranked on its own, merged by a stable sort on the load delay.
         let segments: Vec<&PathView> = std::iter::once(&view).chain(view.latch_segments.iter()).collect();
@@ -4428,8 +4425,11 @@ impl Repair<'_, '_> {
                 break;
             }
             // A move accepted earlier in the pass: the targets ranked before it keep their pins and
-            // tags and read the timer it changed.
+            // tags and read the timer it changed — the netlist's edits timed, NO net estimated
+            // again (`repairPath` makes no `updateParasitics` between targets: a changed net keeps
+            // its estimate, a new one has none, until the pass ends or a removal updates them).
             if stale {
+                self.retime_without_estimate()?;
                 segs = self.restage_views(&segs)?;
             }
             let before = changed;
