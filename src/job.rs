@@ -454,9 +454,6 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
     let mut timing_runs = Runs::default();
     // `set_debug_level`: each (tool, group) and its level.
     let mut debug_levels: BTreeMap<(String, String), i64> = BTreeMap::new();
-    // `setenv <name> <value>`: the environment variables a script set (`set ::env(..)`) that a
-    // policy reads (`loadPolicyEnvars`), as the capture logged them at its repair_timing.
-    let mut env_vars: BTreeMap<String, String> = BTreeMap::new();
     let mut timing_stop: Option<String> = None;
     // The last repair_design's progress table (`printProgress`), as the reference prints it.
     let mut repair_progress: Vec<String> = Vec::new();
@@ -605,9 +602,11 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
             }
             // One clock is modelled, so the clock it names is that one.
             "set_propagated_clock" => propagated = true,
+            // `setenv <name> <value>`: an environment variable a script set (`set ::env(..)`). No
+            // policy reads one since upstream c4fef946416 (the `RSZ_*` knobs became config fields
+            // at their old unset defaults), so it is checked for shape and has no effect.
             "setenv" => {
-                let [name, value] = args.as_slice() else { return Err(format!("setenv {}: needs a name and a value", args.join(" "))) };
-                env_vars.insert(name.clone(), value.clone());
+                let [_name, _value] = args.as_slice() else { return Err(format!("setenv {}: needs a name and a value", args.join(" "))) };
             }
             // `set_debug_level <tool> <group> <level>`: debug lines are not output this engine
             // scores, except a group that adds report lines (the move tracker's, RSZ-0211 on).
@@ -1193,8 +1192,8 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         timing_runs.push(json!({ "lines": [line], "endpoints": 0, "violating_endpoints": 0, "resized": 0, "removed": 0, "inserted": 0, "error": code }));
                         break;
                     }
-                    Some(rt::PhasePlan::Other) => return Err("repair_timing -phases: GLOBAL_SIZING, MT1, and MEASURED_VT_SWAP with other phases, are not modelled".into()),
-                    Some(rt::PhasePlan::MeasuredVtSwap | rt::PhasePlan::Mt1 | rt::PhasePlan::GlobalSizing) if !a.setup => return Err("repair_timing -phases MEASURED_VT_SWAP / MT1 / GLOBAL_SIZING without -setup: not modelled".into()),
+                    Some(rt::PhasePlan::Other) => return Err("repair_timing -phases: GLOBAL_SIZING with other phases is not modelled".into()),
+                    Some(rt::PhasePlan::GlobalSizing) if !a.setup => return Err("repair_timing -phases GLOBAL_SIZING without -setup: not modelled".into()),
                     _ => {}
                 }
                 if !estimated && !gr_estimated {
@@ -1319,14 +1318,10 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     crate::preamble::get_buffer_list(&libs, &m, &du, !hold_only).map_err(|e| format!("{}: {}", e.code(), e.message()))?.sorted_vt.len()
                 };
                 let seq = if recover { Vec::new() } else { rt::move_sequence(&a, vt_category_count > 1) };
-                // `MeasuredVtSwapPolicy` and `SetupMt1Policy` have no preamble (no
-                // `SetupLegacyBase::start`): their lines start with their own RSZ-2024.
-                let measured = matches!(plan, Some(rt::PhasePlan::MeasuredVtSwap | rt::PhasePlan::Mt1 | rt::PhasePlan::GlobalSizing));
+                // `GlobalSizingPolicy` has no preamble (no `SetupLegacyBase::start`): its lines
+                // start with its own RSZ-2024.
+                let measured = matches!(plan, Some(rt::PhasePlan::GlobalSizing));
                 let mut lines = if recover || measured || fr.is_some() { Vec::new() } else { rt::preamble(&seq, violating.len(), a.repair_tns_end_percent, a.phases.as_deref()) };
-                // `SetupLegacyMtPolicy::start` warns (RSZ-2024) before `SetupLegacyBase::start`'s lines.
-                if !recover && !measured && rt::phase_names(a.phases.as_deref()).first().is_some_and(|n| n == "LEGACY_MT") {
-                    lines.insert(0, "[WARNING RSZ-2024] Experimental repair setup policy 'SetupLegacyMtPolicy' selected. Do not use this for production.".to_string());
-                }
                 // The moves modelled, over one corner or several (each reads the scenes the
                 // reference's does: see the moves), LEGACY and LAST_GASP.
                 let startpoint_rows = matches!(plan, Some(rt::PhasePlan::LegacyPreamble { startpoints: true }));
@@ -1448,7 +1443,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         vt_category_count,
                         pin_addr: pin_addr.as_ref(),
                         hierarchy: db_hierarchy,
-                        policy: crate::repair_setup::PolicyConfig::from_env(&env_vars).map_err(|e| format!("{e} (the reference throws): not modelled"))?,
+                        policy: crate::repair_setup::PolicyConfig::default(),
                         gs: global_sizing_config(&db)?,
                     };
                     drop(search);

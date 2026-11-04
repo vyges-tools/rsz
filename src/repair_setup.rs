@@ -40,9 +40,6 @@ use crate::Stop;
 
 mod crit_vt_swap;
 mod global_sizing;
-mod legacy_mt;
-mod measured_vt_swap;
-mod mt1;
 mod tracked_moves;
 
 pub use global_sizing::GlobalSizingConfig;
@@ -98,49 +95,28 @@ pub struct Ctx<'a> {
     pub pin_addr: Option<&'a unbuffer::PinAddr>,
     /// `dbNetwork::hasHierarchy`: instance and net names print without their parent prefix.
     pub hierarchy: bool,
-    /// The policy tunables `loadPolicyEnvars` reads from the environment (the job's `setenv`).
+    /// The setup repair policies' tunables (`OptimizationPolicyConfig`): fixed, never read from the
+    /// environment.
     pub policy: PolicyConfig,
     /// `Resizer::globalSizingConfig`: the block's `gs_*` properties over the defaults.
     pub gs: GlobalSizingConfig,
 }
 
-/// `OptimizationPolicyConfig` as `OptimizationPolicy::loadPolicyEnvars` fills it: the fields a
-/// modelled policy reads (0: unlimited).
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+/// `OptimizationPolicyConfig`: every tunable of the setup repair policies and their moves, each at
+/// its shipped value. Upstream c4fef946416 turned the `RSZ_*` environment knobs into these fields
+/// (a run does not depend on its shell) and dropped the two that only the removed MT1 /
+/// MEASURED_VT_SWAP policies read (the candidate cap and the committed-move cap).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PolicyConfig {
-    /// `RSZ_VTSWAP_CANDIDATES`: VT-swap candidates per target.
-    pub max_candidate_generation: i32,
-    /// `RSZ_VTSWAP_MAX_MOVES`: accepted moves.
-    pub max_committed_moves: i32,
-    /// `RSZ_MT_DELAY_LEVELS` (default 1): the delay estimator's fanin/fanout stages.
+    /// Stages the delay estimator scores before and after the target stage (0: the target alone).
     pub delay_estimation_levels: i32,
-    /// `RSZ_MT_SLEW_BIAS` (default 1, on when positive): the estimator's STA slew-bias sampling.
+    /// The estimator corrects the fanin driver stage's table slew with STA slews at three loads.
     pub sta_slew_bias: bool,
 }
 
-impl PolicyConfig {
-    /// `utl::readEnvarNonNegativeInt(name, 0)` for each field, from the variables in force: a value
-    /// the reference would throw on (not an integer, negative) is an `Err`.
-    pub fn from_env(vars: &BTreeMap<String, String>) -> Result<PolicyConfig, String> {
-        // `utl::readEnvarInt`: `std::stoi` skips leading white space and takes a sign; every
-        // character must parse.
-        let read_int = |name: &str, default: i32| -> Result<i32, String> {
-            let Some(v) = vars.get(name) else { return Ok(default) };
-            v.trim_start().parse().map_err(|_| format!("Environment variable {name} must be an integer."))
-        };
-        let read = |name: &str| -> Result<i32, String> {
-            let n = read_int(name, 0)?;
-            if n < 0 {
-                return Err(format!("Environment variable {name} must be a non-negative integer."));
-            }
-            Ok(n)
-        };
-        Ok(PolicyConfig {
-            max_candidate_generation: read("RSZ_VTSWAP_CANDIDATES")?,
-            max_committed_moves: read("RSZ_VTSWAP_MAX_MOVES")?,
-            delay_estimation_levels: read_int("RSZ_MT_DELAY_LEVELS", 1)?,
-            sta_slew_bias: read_int("RSZ_MT_SLEW_BIAS", 1)? > 0,
-        })
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        PolicyConfig { delay_estimation_levels: 1, sta_slew_bias: true }
     }
 }
 
@@ -166,13 +142,6 @@ struct Stage {
     load_delay: Option<f32>,
     /// `arcDelay(prev_edge, prev_arc)` at the path's scene, any edge (`None`: the path's root).
     arc_delay: Option<f32>,
-    /// `Path::arrival` of the path at this pin.
-    arrival: f32,
-    /// The pin's vertex in the scene graph the path was expanded in, and the edge and arc index
-    /// the path took into it (`Path::prevEdge` / `prevArc`) — indices into THAT graph, valid only
-    /// while it is (the delay estimator reads them in the same timer update).
-    vertex: usize,
-    in_edge: Option<(usize, usize)>,
     /// `arcDelay(prev_edge, prev_arc)` at the path's scene, for a pin reached by a WIRE edge (the
     /// REROUTE phase ranks a driver by the wire into the next pin).
     in_wire_delay: Option<f32>,
@@ -270,9 +239,6 @@ pub struct Snapshot {
     ends: Vec<Point>,
     starts: Vec<Point>,
     paths: HashMap<String, PathView>,
-    /// Per scene, each driver pin's `Sta::arrival(vertex, riseFall, {scene}, max)` (only when
-    /// [`Timer::driver_arrivals`] asks for them).
-    driver_arrivals: Vec<HashMap<String, f32>>,
 }
 
 impl Snapshot {
@@ -358,8 +324,6 @@ struct Timer {
     inc: Vec<IncTimer>,
     /// The decision trace's length when the update ran (for `VYGES_RSZ_INC_TRACE`).
     trace_at: usize,
-    /// Each snapshot also keeps every driver pin's arrival (MeasuredVtSwapPolicy's measure).
-    driver_arrivals: bool,
 }
 
 impl Timer {
@@ -372,7 +336,7 @@ impl Timer {
         if let Some(l) = levels {
             inc.levels = l.iter().map(|(k, v)| (k.clone(), *v)).collect();
         }
-        Ok(Timer { inc: vec![inc; scenes], trace_at: 0, driver_arrivals: false })
+        Ok(Timer { inc: vec![inc; scenes], trace_at: 0 })
     }
 }
 
@@ -380,7 +344,6 @@ impl Timer {
 /// estimator's current ones; `edits`, what the timer has not seen. `want`: the endpoints whose
 /// worst path the repair will read.
 fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], timer: &mut Timer, edits: TimerEdits) -> Result<Snapshot, Stop> {
-    let with_arrivals = timer.driver_arrivals;
     timed_all(ctx, design, timer, edits, |gs, ss, cs| {
         // Each point's slack: the least over the scenes (`Sta::slack` over every path).
         let mut per_scene = Vec::with_capacity(gs.len());
@@ -425,30 +388,8 @@ fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], timer: &mut Tim
                 paths.insert(n, view);
             }
         }
-        let driver_arrivals = if with_arrivals { (0..gs.len()).map(|k| driver_arrivals(&gs[k], &ss[k])).collect() } else { Vec::new() };
-        Ok(Snapshot { ends, starts, paths, driver_arrivals })
+        Ok(Snapshot { ends, starts, paths })
     })
-}
-
-/// `Sta::arrival(vertex, RiseFallBoth::riseFall(), {scene}, max)` of every driver vertex of one
-/// scene: from `MinMax::max()->initValue()` (-INF), each max path's arrival that is
-/// `delayGreater` — FUZZY (`DelayOps::greater` is `fuzzyGreater`), so of fuzzily equal arrivals the
-/// first in tag order is kept (no generated clock source path here).
-fn driver_arrivals(g: &Graph<'_>, s: &Search<'_, '_>) -> HashMap<String, f32> {
-    let mut out = HashMap::new();
-    for (v, vx) in g.vertices.iter().enumerate() {
-        if !vx.is_driver {
-            continue;
-        }
-        let mut arrival = -INF;
-        for p in s.paths[v].iter().filter(|p| p.tag.mm == MAX) {
-            if fuzzy::greater(p.arrival, arrival) {
-                arrival = p.arrival;
-            }
-        }
-        out.insert(vx.name.clone(), arrival);
-    }
-    out
 }
 
 /// The endpoints' setup points over every scene: each the least over the scenes (`Sta::slack`).
@@ -757,9 +698,6 @@ fn expand_path(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTr
             port: vx.port.clone(),
             load_delay: None,
             arc_delay: None,
-            arrival: p.arrival,
-            vertex: *v,
-            in_edge: p.prev.map(|prev| (prev.edge, prev.arc)),
             in_wire_delay: None,
             in_port: None,
             fanout: g.out_edges[*v].iter().filter(|&&e| matches!(g.edges[e].kind, EdgeKind::Wire)).count(),
@@ -1710,41 +1648,6 @@ fn replacement_preserves_max_cap(libs: &Libs, cell: &str, replacement: &str, fan
     true
 }
 
-impl Repair<'_, '_> {
-    /// `replacementPreservesMaxCap`'s reads on the design as it is NOW (`checkCapacitance` updates
-    /// no timing): each input pin of the instance, its net's drivers' capacitance checks, the pin
-    /// caps of the cells now and the parasitics now — a swap earlier in the batch grew a pin cap
-    /// and dropped its input nets' estimate (pin caps alone until re-estimated). Witness: MT1's
-    /// batch on one net near its limit (mt1_fanout_cap_rvt), whose apply re-check rejects the size-up
-    /// a pre-batch snapshot would pass.
-    pub(super) fn live_fanin_caps(&self, inst: &str) -> Result<Vec<(String, Vec<CapCheck>)>, Stop> {
-        let ctx = self.ctx;
-        let design = self.design.as_design();
-        let netlist = design.netlist();
-        let gs = (0..self.timer.inc.len()).map(|k| crate::repair_design::timer_graph(ctx.libs, k, netlist, ctx.env, ctx.master_pins)).collect::<Result<Vec<_>, _>>()?;
-        let g = &gs[0];
-        let ideal0: BTreeSet<usize> = if ctx.ideal_clock { crate::timing::clock_pins(g, ctx.clock_sources).into_iter().collect() } else { BTreeSet::new() };
-        let parasitics: Vec<HashMap<String, vyges_sta::graph::NetParasitics>> = (0..gs.len()).map(|k| design.parasitics(k).clone()).collect();
-        let Some(k) = netlist.insts.iter().map(|i| &**i).position(|(n, _)| n == inst) else { return Ok(Vec::new()) };
-        let sc = crate::timing::Scenes::new(&gs);
-        let mut out = Vec::new();
-        for (u, ux) in g.vertices.iter().enumerate() {
-            if ux.is_driver || !matches!(&ux.conn, vyges_sta::netlist::Conn::Inst(i, _) if *i == k) {
-                continue;
-            }
-            let checks = crate::timing::net_drivers(g, u)
-                .into_iter()
-                .map(|d| {
-                    let (cap, max_cap, slack, limited, _) = crate::timing::check_capacitance(&sc, d, &parasitics, &ideal0, self.ctx.limits);
-                    CapCheck { cap, max_cap, slack, limited }
-                })
-                .collect();
-            out.push((ux.port.clone().unwrap_or_default(), checks));
-        }
-        Ok(out)
-    }
-}
-
 /// A size-up the generator proposes: the instance, its cell now, the replacement.
 struct SizeUp {
     inst: String,
@@ -1942,13 +1845,10 @@ struct Repair<'c, 'd> {
     target_slack: f32,
     /// Inside the REROUTE phase (`SetupReroutePolicy`): its own `repairPath`.
     reroute_phase: bool,
-    /// Inside a LEGACY_MT phase (`SetupLegacyMtPolicy`): prepared targets, the MT VtSwap / SizeUp.
-    legacy_mt: bool,
     /// `RepairSetupContext::progress_header_printed`: a header has been printed (a legacy phase's
-    /// row 0 prints it; a policy without one, MEASURED_VT_SWAP, leaves it to the final report).
+    /// row 0 prints it; a policy without one leaves it to the final report).
     progress_header_printed: bool,
-    /// The run starts with `SetupLegacyBase::start` (every policy but MEASURED_VT_SWAP, MT1 and
-    /// GLOBAL_SIZING alone).
+    /// The run starts with `SetupLegacyBase::start` (every policy but GLOBAL_SIZING alone).
     legacy_start: bool,
     /// `RepairSetupContext::progress_header_show_startpoint_metrics`: the layout the last header
     /// printed — a phase that shows the other one prints the header again; the final row follows it.
@@ -2564,12 +2464,11 @@ impl<'c, 'd> Repair<'c, 'd> {
             startpoint_rows: false,
             target_slack: 0.0,
             reroute_phase: false,
-            legacy_mt: false,
-            // Only a policy alone that has no legacy start (MEASURED_VT_SWAP, MT1) runs without the
-            // legacy preamble.
+            // Only a policy alone that has no legacy start (GLOBAL_SIZING) runs without the legacy
+            // preamble.
             progress_header_show_starts: false,
             progress_header_printed: false,
-            legacy_start: !matches!(args.phases.as_deref().map(crate::repair_timing::phase_plan), Some(crate::repair_timing::PhasePlan::MeasuredVtSwap | crate::repair_timing::PhasePlan::Mt1 | crate::repair_timing::PhasePlan::GlobalSizing)),
+            legacy_start: !matches!(args.phases.as_deref().map(crate::repair_timing::phase_plan), Some(crate::repair_timing::PhasePlan::GlobalSizing)),
         })
     }
 }
@@ -2581,8 +2480,8 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
     let mut r = Repair::new(ctx, design, args)?;
     // `SetupLegacyBase::start`: with the move tracker on, `captureInitialSlackDistribution` (and
     // `captureOriginalEndpointSlack`, read only by the level-2 profiles) after RSZ-0099.
-    // A policy alone with no legacy start captures nothing here (MT1 captures in its own start;
-    // MEASURED_VT_SWAP and GLOBAL_SIZING never do: "No initial slack data captured").
+    // A policy alone with no legacy start captures nothing here (GLOBAL_SIZING never does: "No
+    // initial slack data captured").
     if r.tracker_level() >= 1 {
         if r.legacy_start {
             r.capture_initial_slack_distribution(true)?;
@@ -2612,21 +2511,6 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
                 r.sequence = ctx.sequence.to_vec();
                 r.iterate()?;
             }
-            // `SetupLegacyMtPolicy`: the LEGACY loop with prepared targets and the MT VtSwap / SizeUp
-            // (its RSZ-2024 opens the preamble: first phase only).
-            "LEGACY_MT" => {
-                if i != 0 {
-                    return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases: LEGACY_MT after another phase (its start's experimental-policy warning mid-run) is not modelled".into()));
-                }
-                if ctx.sequence.contains(&Move::SizeDownFanout) {
-                    return Err(Stop::refused("RSZ-ABSENT", "LEGACY_MT with SizeDownFanoutMove (its batch commits every accepted candidate of a generation): not modelled".into()));
-                }
-                r.phase = format!("LEGACY{marker}");
-                r.sequence = ctx.sequence.to_vec();
-                r.legacy_mt = true;
-                r.iterate()?;
-                r.legacy_mt = false;
-            }
             // `SetupReroutePolicy`: the LEGACY loop with RerouteMove alone and its own `repairPath`.
             "REROUTE" => {
                 r.phase = format!("REROUTE{marker}");
@@ -2636,8 +2520,6 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
                 r.reroute_phase = false;
             }
             "WNS" | "WNS_PATH" => r.wns_phase(marker)?,
-            "MEASURED_VT_SWAP" => r.measured_vt_swap_policy()?,
-            "MT1" => r.mt1_policy()?,
             "GLOBAL_SIZING" => r.global_sizing_policy()?,
             "TNS" => r.tns_phase(marker)?,
             "ENDPOINT_FANIN" => r.directional_phase(marker, false)?,
@@ -3533,7 +3415,7 @@ impl Repair<'_, '_> {
 
     /// `MoveTracker::captureInitialSlackDistribution`: its two lines go to the preamble.
     /// `to_preamble`: the legacy start's capture (spliced after RSZ-0099); else a policy's own
-    /// start (MT1), in the report where it runs.
+    /// start, in the report where it runs.
     fn capture_initial_slack_distribution(&mut self, to_preamble: bool) -> Result<(), Stop> {
         let view = self.tracker_view()?;
         let initial = move_tracker::capture(&view.pins, &view.ends);
@@ -4334,36 +4216,11 @@ impl Repair<'_, '_> {
         let st = &view.stages[index];
         let line = format!("{} {} fanout = {} drvr_index = {index}", st.pin, st.cell.as_deref().unwrap_or("none"), st.fanout);
         self.debug("repair_setup", 3, line);
-        // `SetupLegacyMtPolicy::tryRepairTarget`: the target prepared first (no live fanout).
-        let mt_target = if self.legacy_mt {
-            if !view.latch_segments.is_empty() {
-                return Err(Stop::refused("RSZ-ABSENT", "LEGACY_MT on a path through a latch D -> Q: not modelled".into()));
-            }
-            Some(self.lmt_target(view, index)?)
-        } else {
-            None
-        };
         for m in self.sequence.clone() {
-            let applicable = match (&mt_target, m) {
-                (Some(t), Move::SizeUp | Move::VtSwap) => self.lmt_is_applicable(m, t),
-                _ => self.is_applicable(m, st, index),
-            };
-            if rejected.contains(&m) || !applicable {
+            if rejected.contains(&m) || !self.is_applicable(m, st, index) {
                 continue;
             }
             self.debug("repair_setup", 1, format!("Considering {} for {}", m.name(), st.pin));
-            if mt_target.is_some() {
-                self.lmt_trace(format!("try|{}", m.name()));
-            }
-            if let (Some(t), Move::SizeUp | Move::VtSwap) = (&mt_target, m) {
-                if let Some(r) = self.lmt_estimate_and_commit(m, t)? {
-                    *changed += 1;
-                    let kind = r.kind;
-                    self.commit(r);
-                    return Ok(Some(kind));
-                }
-                continue;
-            }
             // `allowsBatchRepair`: SizeDownFanout repeats on the target until nothing is accepted
             // (`trySizeDownFanoutBatch`), each round on the timer the last move changed.
             if m == Move::SizeDownFanout {
@@ -5440,6 +5297,15 @@ fn path_improved(end_slack: f32, worst_slack: f32, prev_end_slack: f32, prev_wor
 mod tests {
     use super::*;
 
+    // Rule (OptimizationPolicyConfig, upstream c4fef946416): the tunables are config fields whose
+    // defaults are the old unset-environment values — one estimation level each side, and the STA
+    // slew bias ON (the field's default is true; an unset RSZ_MT_SLEW_BIAS used to read as off in
+    // report_delay_estimator_accuracy only, which now takes the field).
+    #[test]
+    fn policy_config_defaults() {
+        assert_eq!(PolicyConfig::default(), PolicyConfig { delay_estimation_levels: 1, sta_slew_bias: true });
+    }
+
     // Rule (Rebuffer::collectImportedTreeBufferInstances): a pin is collected when its cell
     // `isBuffer()` — an inverter has buffer ports and is not one — and its input is not a load of
     // the unbuffered tree; the walk continues through each collected buffer's output net.
@@ -5496,9 +5362,6 @@ mod tests {
             port: None,
             load_delay: Some(load_delay),
             arc_delay: None,
-            arrival: 0.0,
-            vertex: 0,
-            in_edge: None,
             in_wire_delay: None,
             in_port: None,
             fanout: 1,

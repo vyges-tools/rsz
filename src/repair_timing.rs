@@ -366,8 +366,7 @@ pub fn preamble(seq: &[Move], violating: usize, repair_tns_end_percent: f64, pha
     lines
 }
 
-/// The phase names `Optimizer::makePolicyForPhase` knows, as its errors list them (LEGACY_MT,
-/// MT1 and MEASURED_VT_SWAP are accepted but not listed).
+/// The phase names `Optimizer::makePolicyForPhase` knows, as its errors list them.
 const VALID_PHASES: &str = "LEGACY, WNS, WNS_PATH, WNS_CONE, TNS, ENDPOINT_FANIN, STARTPOINT_FANOUT, LAST_GASP, CRIT_VT_SWAP, REROUTE, GLOBAL_SIZING";
 
 /// What `Optimizer::run` does with a `-phases` / `-policy` list, as far as it is modelled.
@@ -382,14 +381,9 @@ pub enum PhasePlan {
     /// then runs a policy that is not modelled. `startpoints`: STARTPOINT_FANOUT, whose rows
     /// name the worst STARTPOINT (`printProgress(.., use_startpoint_metrics)`).
     LegacyPreamble { startpoints: bool },
-    /// MEASURED_VT_SWAP alone: `MeasuredVtSwapPolicy`, which prints no preamble (modelled).
-    MeasuredVtSwap,
-    /// MT1 alone: `SetupMt1Policy`, which prints no preamble (modelled).
-    Mt1,
     /// GLOBAL_SIZING alone: `GlobalSizingPolicy`, which prints no preamble (modelled).
     GlobalSizing,
-    /// The first phase is GLOBAL_SIZING, MT1 or MEASURED_VT_SWAP followed by more phases: another
-    /// preamble, not modelled.
+    /// The first phase is GLOBAL_SIZING followed by more phases: another preamble, not modelled.
     Other,
 }
 
@@ -398,7 +392,7 @@ pub enum PhasePlan {
 /// after a list with a legacy-compatible phase and none of its own.
 pub fn phase_names(phases: Option<&str>) -> Vec<String> {
     let mut names: Vec<String> = phases.unwrap_or("LEGACY LAST_GASP").split([' ', '\t']).filter(|s| !s.is_empty()).map(String::from).collect();
-    let legacy_compatible = |n: &str| matches!(n, "LEGACY" | "LEGACY_MT" | "WNS" | "WNS_PATH" | "WNS_CONE" | "TNS" | "ENDPOINT_FANIN" | "STARTPOINT_FANOUT" | "LAST_GASP");
+    let legacy_compatible = |n: &str| matches!(n, "LEGACY" | "WNS" | "WNS_PATH" | "WNS_CONE" | "TNS" | "ENDPOINT_FANIN" | "STARTPOINT_FANOUT" | "LAST_GASP");
     if names.iter().any(|n| legacy_compatible(n)) && !names.iter().any(|n| n == "CRIT_VT_SWAP") {
         names.push("CRIT_VT_SWAP".into());
     }
@@ -407,7 +401,7 @@ pub fn phase_names(phases: Option<&str>) -> Vec<String> {
 
 /// Whether every phase of the list is modelled.
 pub fn phases_modelled(phases: &str) -> bool {
-    phase_names(Some(phases)).iter().all(|n| matches!(n.as_str(), "LEGACY" | "LEGACY_MT" | "WNS" | "WNS_PATH" | "TNS" | "ENDPOINT_FANIN" | "STARTPOINT_FANOUT" | "LAST_GASP" | "CRIT_VT_SWAP" | "REROUTE"))
+    phase_names(Some(phases)).iter().all(|n| matches!(n.as_str(), "LEGACY" | "WNS" | "WNS_PATH" | "TNS" | "ENDPOINT_FANIN" | "STARTPOINT_FANOUT" | "LAST_GASP" | "CRIT_VT_SWAP" | "REROUTE"))
 }
 
 /// `sta::parseTokens(phases)` (space and tab delimited), then the first phase's policy.
@@ -419,18 +413,12 @@ pub fn phase_plan(phases: &str) -> PhasePlan {
     if names == ["LEGACY"] {
         return PhasePlan::Legacy;
     }
-    if names == ["MEASURED_VT_SWAP"] {
-        return PhasePlan::MeasuredVtSwap;
-    }
-    if names == ["MT1"] {
-        return PhasePlan::Mt1;
-    }
     if names == ["GLOBAL_SIZING"] {
         return PhasePlan::GlobalSizing;
     }
     match first {
-        "LEGACY" | "LEGACY_MT" | "WNS" | "WNS_PATH" | "WNS_CONE" | "TNS" | "ENDPOINT_FANIN" | "STARTPOINT_FANOUT" | "LAST_GASP" | "CRIT_VT_SWAP" | "REROUTE" => PhasePlan::LegacyPreamble { startpoints: first == "STARTPOINT_FANOUT" },
-        "MT1" | "MEASURED_VT_SWAP" | "GLOBAL_SIZING" => PhasePlan::Other,
+        "LEGACY" | "WNS" | "WNS_PATH" | "WNS_CONE" | "TNS" | "ENDPOINT_FANIN" | "STARTPOINT_FANOUT" | "LAST_GASP" | "CRIT_VT_SWAP" | "REROUTE" => PhasePlan::LegacyPreamble { startpoints: first == "STARTPOINT_FANOUT" },
+        "GLOBAL_SIZING" => PhasePlan::Other,
         _ => PhasePlan::Error { code: "RSZ-0217", line: format!("[ERROR RSZ-0217] Unknown phase name '{first}'. Valid phase names are: {VALID_PHASES}") },
     }
 }
@@ -834,13 +822,14 @@ mod tests {
         assert_eq!(phase_plan("\tLEGACY "), PhasePlan::Legacy);
         assert_eq!(phase_plan("GLOBAL_SIZING"), PhasePlan::GlobalSizing);
         assert_eq!(phase_plan("GLOBAL_SIZING LEGACY"), PhasePlan::Other);
-        // MEASURED_VT_SWAP is not legacy-compatible: no implicit CRIT_VT_SWAP follows it, and
-        // alone it is modelled; with a later phase (whose start prints its own preamble) it is not.
-        assert_eq!(phase_plan("MEASURED_VT_SWAP"), PhasePlan::MeasuredVtSwap);
-        assert_eq!(phase_names(Some("MEASURED_VT_SWAP")), vec!["MEASURED_VT_SWAP"]);
-        assert_eq!(phase_plan("MEASURED_VT_SWAP LEGACY"), PhasePlan::Other);
-        assert_eq!(phase_plan("MT1"), PhasePlan::Mt1);
-        assert_eq!(phase_names(Some("MT1")), vec!["MT1"]);
+        // Upstream c4fef946416 removed the MT1, MEASURED_VT_SWAP and LEGACY_MT policies: their
+        // tokens are unknown phases now (RSZ-0217 as the first phase), and LEGACY_MT no longer
+        // counts as legacy-compatible (no implicit CRIT_VT_SWAP after it).
+        for gone in ["MT1", "MEASURED_VT_SWAP", "LEGACY_MT"] {
+            let PhasePlan::Error { code, line } = phase_plan(gone) else { panic!("{gone}") };
+            assert_eq!((code, line.contains(&format!("Unknown phase name '{gone}'"))), ("RSZ-0217", true), "{gone}");
+            assert_eq!(phase_names(Some(gone)), vec![gone.to_string()], "{gone}");
+        }
         assert_eq!(phase_plan("WNS LEGACY LAST_GASP"), PhasePlan::LegacyPreamble { startpoints: false });
         assert_eq!(phase_plan("STARTPOINT_FANOUT"), PhasePlan::LegacyPreamble { startpoints: true });
     }

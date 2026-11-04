@@ -20,7 +20,7 @@ use vyges_sta::liberty::{Direction, Role, MAX};
 use vyges_sta::netlist::Conn;
 use vyges_sta::search::Search;
 
-use super::measured_vt_swap::c_hex;
+use crate::trace::c_hex;
 use super::{Repair, Stop};
 
 /// `GlobalSizingConfig`, as `Resizer::initBlock` reads it from the block's `gs_*` properties.

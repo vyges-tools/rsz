@@ -41,8 +41,10 @@ REPAIR_DESIGN OPTIONS:
   -max_wire_length L    the longest wire, microns (0: none)
   -slew_margin P        percent taken off every slew limit
   -cap_margin P         percent taken off every capacitance limit
+  -reroute              before resizing or buffering a slew violation, move the net to its least
+                        resistive layer (global-route parasitics only; a no-op on placement ones)
   -verbose              accepted
-  refused: -pre_placement / -buffer_gain, -match_cell_footprint, -reroute, -max_utilization
+  refused: -pre_placement / -buffer_gain, -match_cell_footprint, -max_utilization
 
 BUFFER_PORTS OPTIONS:
   -inputs / -outputs    which side (neither: both) — a buffer after each input port, before
@@ -69,11 +71,10 @@ REPAIR_TIMING:
   TNS, ENDPOINT_FANIN, STARTPOINT_FANOUT, LAST_GASP, CRIT_VT_SWAP and REROUTE are modelled (an
   empty list or an unknown first phase is the command's own error), on placement or global-route
   parasitics (the live incremental router; a resistance-aware re-route reads the timer's net
-  slacks mid-update); the experimental policies
-  GLOBAL_SIZING, MT1 and MEASURED_VT_SWAP each alone (tunables from RSZ_* environment variables,
-  a setenv step), and LEGACY_MT as the first phase. -recover_power runs in full (RecoverPower: every row, the trace, the design; -match_cell_footprint
+  slacks mid-update); the experimental policy
+  GLOBAL_SIZING alone. -recover_power runs in full (RecoverPower: every row, the trace, the design; -match_cell_footprint
   and global-route parasitics refused). Refused before the lines: an experimental policy with
-  other phases, LEGACY_MT after another phase or with SizeDownFanoutMove, parasitics other than -placement and -global_routing, setup clock
+  other phases, parasitics other than -placement and -global_routing, setup clock
   uncertainty, clock latency / transition, derates, false and multicycle paths, clock groups,
   path delays other than the forms the timer models (see --describe); refused during the repair:
   -setup with -max_utilization, more than one repair per pass.

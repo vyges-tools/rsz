@@ -1151,8 +1151,9 @@ mod tests {
         assert_eq!(pin_pointer(addr, 7), Some(0x1000 + 0x58 * 3 + 2));
     }
 
-    /// The upstream golden (`repair_setup_legacy_mt_tracker.ok`): five committed moves on one
-    /// endpoint — the phase summary, its rates by move type (counts are floats printed bare),
+    /// The upstream golden `repair_setup_legacy_mt_tracker.ok` (the test was removed with LEGACY_MT
+    /// in c4fef946416; MoveTracker's printing is unchanged, so its lines still pin it): five
+    /// committed moves on one endpoint — the phase summary, its rates by move type (counts are floats printed bare),
     /// the totals, and the success report's rows.
     #[test]
     fn legacy_mt_tracker_golden_lines() {

@@ -1,6 +1,6 @@
 //! `DelayEstimator`: a target stage's (and its fanin/fanout neighbours') timing captured from the
 //! timer once (`buildContext`), then each candidate cell scored on the Liberty table models alone
-//! (`estimate`) — the arrival improvement over the stage window. The MT policies' (MT1) scoring.
+//! (`estimate`) — the arrival improvement over the stage window. Upstream keeps it after c4fef946416 removed the MT policies that scored with it; nothing here calls it.
 //!
 //! The functions are the reference's, in its order. The builder reads one scene's graph after a
 //! timer update; the estimate reads only the libraries and the captured state.
