@@ -460,6 +460,9 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
     // `resize_slack_preamble`: what `Resizer::resizeSlackPreamble` logged — each corner without a
     // wire resistance (RSZ-0088), and RSZ-0089 when no corner has one.
     let mut slack_preamble: Option<Value> = None;
+    // `notes`: what this engine adds to the reference's output, at info level — a limit that was
+    // read but can never act (not a reference message; reported so it is not a silent no-op).
+    let mut notes: Vec<Value> = Vec::new();
     // `sta_levels`: the timer's levels a caller carries from an earlier job (its session), given
     // to each timing step and returned as the last left them; whether a repair_design edited the
     // netlist under them (their incremental relevelization is not modelled across the steps).
@@ -835,6 +838,9 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     design_max_capacitance: sdc.as_ref().and_then(|s| s.max_capacitance).map(|v| crate::timing::user_cap_to_sta(v, lib0.cap_scale)),
                     port_max_capacitance: sdc.as_ref().map(|s| sdc_port_cap_limits(s, lib0.cap_scale)).unwrap_or_default(),
                 };
+                if let Some(n) = inert_fanout_limit(limits.design_max_fanout, &libs) {
+                    notes.push(n);
+                }
                 let clock_sources: Vec<String> = sdc.as_ref().map(|s| s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect()).unwrap_or_default();
                 let netlist = vyges_grt::timer::netlist(&db);
                 if !estimated && !gr_estimated {
@@ -1761,6 +1767,13 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
     if !repair_progress.is_empty() {
         report["repair_design_progress"] = json!(repair_progress);
     }
+    if !notes.is_empty() {
+        notes.dedup();
+        for n in &notes {
+            say(n);
+        }
+        report["notes"] = json!(notes);
+    }
     if !clock_runs.is_empty() {
         report["repair_clock_nets"] = json!(clock_runs.0);
     }
@@ -1810,6 +1823,20 @@ impl std::ops::Deref for Runs {
     fn deref(&self) -> &Vec<Value> {
         &self.0
     }
+}
+
+/// A design `set_max_fanout` is checked against the sum of each load's fanout load: its port's
+/// `fanout_load`, else its library's `default_fanout_load`, else 0 (`portFanoutLoad`). With
+/// neither attribute in any library read, every sum is 0 and the limit can never act: said at
+/// info level, since a limit read and never applied is otherwise silent.
+fn inert_fanout_limit(limit: Option<f32>, libs: &Libs) -> Option<Value> {
+    let limit = limit?;
+    let counted = libs.libs.iter().any(|l| l.default_fanout_load.is_some() || l.cells.values().any(|c| c.ports.iter().any(|p| p.fanout_load.is_some())));
+    (!counted).then(|| {
+        json!({ "code": "RSZ-FANOUT-LOAD", "severity": "info", "message": format!(
+            "set_max_fanout {limit}: no library read gives a fanout_load or a default_fanout_load, so every load counts 0 and the limit never acts")
+        })
+    })
 }
 
 /// One line on the terminal: a coded one — `"[INFO RSZ-0100] …"` or `{code, severity, message}` —
