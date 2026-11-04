@@ -225,6 +225,9 @@ impl Sizing<'_> {
     /// dont_use or non-link cells, cells with no master, cells whose LEF area or leakage exceeds
     /// the source's by more than the block's limits (4 each by default); a source with a `user_function_class` keeps
     /// only cells with the same one. (No site/VT keeping or footprint matching: off by default.)
+    /// When no cell larger than the source (LEF area) is left, the smallest larger one excluded by
+    /// the leakage limit alone (the first of equal areas) is kept, at its place in the class order
+    /// — upstream 03bdb5beb4d / 43c34061db2: a low-leakage cell keeps one upsizing step.
     pub fn swappable_cells(&self, source: &str) -> Result<Vec<String>, Stop> {
         let Some(master) = self.masters.get(source).filter(|m| m.is_core) else { return Ok(Vec::new()) };
         if self.dont_use.contains(source) {
@@ -239,6 +242,9 @@ impl Sizing<'_> {
         // The source's leakage is read only when a leakage limit is in force.
         let source_leakage = if self.limits.leakage.is_some() { cell_leakage(source_cell) } else { None };
         let mut out = Vec::new();
+        // The smallest larger cell over the leakage limit only: name, area, its position in `out`.
+        let mut next_larger: Option<(&String, i64, usize)> = None;
+        let mut has_larger_cell = false;
         for name in &self.equiv.classes[k] {
             // Class members are link cells by construction.
             if self.dont_use.contains(name) {
@@ -249,12 +255,9 @@ impl Sizing<'_> {
                 continue;
             }
             let cell = self.libs.link_cell(name).expect("a link cell");
-            // The ratio is float, compared with the double limit.
-            if let (Some(limit), Some(src), Some(eq)) = (self.limits.leakage, source_leakage, cell_leakage(cell)) {
-                if f64::from(eq / src) > limit {
-                    continue;
-                }
-            }
+            // The ratio is float, compared with the double limit; the cell is held out after the
+            // other filters.
+            let exceeds_leakage_limit = matches!((self.limits.leakage, source_leakage, cell_leakage(cell)), (Some(limit), Some(src), Some(eq)) if f64::from(eq / src) > limit);
             // `sizing_keep_site_`: the source's site only.
             if self.limits.keep_site && m.site != master.site {
                 continue;
@@ -266,7 +269,17 @@ impl Sizing<'_> {
             if !source_cell.user_function_class.is_empty() && source_cell.user_function_class != cell.user_function_class {
                 continue;
             }
+            if exceeds_leakage_limit {
+                if m.area > source_area && next_larger.is_none_or(|(_, a, _)| m.area < a) {
+                    next_larger = Some((name, m.area, out.len()));
+                }
+                continue;
+            }
+            has_larger_cell |= m.area > source_area;
             out.push(name.clone());
+        }
+        if let (false, Some((name, _, pos))) = (has_larger_cell, next_larger) {
+            out.insert(pos, name.clone());
         }
         Ok(out)
     }
@@ -453,6 +466,45 @@ mod tests {
         let (dont_use, loads) = (BTreeSet::new(), BTreeMap::new());
         let s = Sizing { libs: &l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: SizingLimits::default() };
         assert_eq!(s.swappable_cells("B1").unwrap(), vec!["B1".to_string(), "B2".into()], "B4 leaks 4.1x B1");
+    }
+
+    // Rule (getSwappableCells, upstream 03bdb5beb4d / 43c34061db2): when the leakage limit leaves
+    // no cell larger than the source (LEF area), the smallest larger one it alone excluded is
+    // kept, at its place in the class order; with a larger cell left, nothing is added. (sky130hd
+    // o211ai_1 leaks 4.9x less than o211ai_2 and could never be upsized.)
+    #[test]
+    fn the_leakage_limit_leaves_one_upsizing_step() {
+        let buf = |n: &str, r: f32, leak: f32| {
+            format!(
+                r#"cell ({n}) {{ cell_leakage_power : {leak} ; pin (A) {{ direction : input ; }} pin (Z) {{ direction : output ; function : "A" ;
+                  timing () {{ related_pin : "A" ; timing_sense : positive_unate ; fall_transition (t) {{ values ("0, {r}", "0, {r}") ; }} }} }} }}"#
+            )
+        };
+        let swappable = |leaks: [f32; 4], areas: [i64; 4]| {
+            let names = ["B1", "B2", "B3", "B4"];
+            let l = lib(&format!(
+                r#"library (l) {{ lu_table_template (t) {{ variable_1 : input_net_transition ; variable_2 : total_output_net_capacitance ;
+                  index_1 ("0, 1") ; index_2 ("0, 1") ; }} {} {} {} {} }}"#,
+                buf("B1", 4.0, leaks[0]),
+                buf("B2", 2.0, leaks[1]),
+                buf("B3", 1.5, leaks[2]),
+                buf("B4", 1.0, leaks[3])
+            ));
+            let masters: BTreeMap<String, Master> = names.iter().zip(areas).map(|(n, area)| (n.to_string(), Master { site: "s".into(), area, width: 1, height: 1, is_core: true, logic_std: true, implant_obs: vec![] })).collect();
+            let equiv = make_equiv_cells(&l);
+            let (dont_use, loads) = (BTreeSet::new(), BTreeMap::new());
+            let s = Sizing { libs: &l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: SizingLimits::default() };
+            s.swappable_cells("B1").unwrap()
+        };
+        let v = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // B2..B4 all leak over 4x B1: the smallest larger, B3 (area 2), comes back in its place.
+        assert_eq!(swappable([10.0, 50.0, 45.0, 41.0], [1, 3, 2, 4]), v(&["B1", "B3"]));
+        // Of equal areas the first in class order.
+        assert_eq!(swappable([10.0, 50.0, 45.0, 41.0], [1, 2, 2, 4]), v(&["B1", "B2"]));
+        // B2 is within the limit and larger: nothing is added.
+        assert_eq!(swappable([10.0, 30.0, 45.0, 41.0], [1, 3, 2, 4]), v(&["B1", "B2"]));
+        // A smaller cell left is no upsizing step: the fallback still applies.
+        assert_eq!(swappable([10.0, 50.0, 5.0, 41.0], [2, 3, 1, 4]), v(&["B1", "B2", "B3"]));
     }
 
     // Rules (makeEquivCells, sta::equivCells): same ports and functions ⇒ one class, sorted by
