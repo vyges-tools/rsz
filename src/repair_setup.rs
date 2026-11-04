@@ -4036,11 +4036,15 @@ impl Repair<'_, '_> {
                 self.debug("repair_setup", 3, format!("{phase} Phase: Allowing decreasing slack for {}/{DECREASING_SLACK_MAX_PASSES} passes", es.decreasing_slack_passes));
             }
             // overMaxArea: -max_utilization is refused, so never.
-            // `useWorstEndpoint` and `setCurrentEndpoint` on the worst endpoint.
+            // The first endpoint follows the worst one only when it moves, taking its slack with
+            // it (`prev_end_slack` stays the high-water mark — upstream 6d88a0eb5b8); then
+            // `useWorstEndpoint` and `setCurrentEndpoint`.
             if self.end_index == 1 {
-                if let Some(w) = es.worst_vertex.clone() {
+                if let Some(w) = es.worst_vertex.clone().filter(|w| *w != es.end) {
+                    es.end = w.clone();
+                    es.end_slack = es.worst_slack;
+                    self.current_endpoint = Some(w.clone());
                     self.trk_set_current_endpoint(&w)?;
-                    es.end = w;
                 }
             }
             es.pass += 1;
