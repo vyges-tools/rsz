@@ -1648,6 +1648,51 @@ fn replacement_preserves_max_cap(libs: &Libs, cell: &str, replacement: &str, fan
     true
 }
 
+/// `RepairHold::findClockTreePins` (upstream 022bcd85d2b): from every clock sink in the clock
+/// network — a register or latch clock pin (`isRegClkPin`: its port is the from of a clock-to-Q or
+/// enable-to-Q arc set), a check's clock pin (`isCheckClk`: the from of a timing-check arc set),
+/// or a top-level output port — backward through each non-check fanin edge whose from pin is in
+/// the clock network. Pins that only feed data (a clock used as data) are not reached. By pin name.
+fn clock_tree_pins(g: &Graph<'_>, clocks: &BTreeSet<usize>) -> BTreeSet<String> {
+    let port_role = |v: usize, test: &dyn Fn(Role) -> bool| -> bool {
+        let vx = &g.vertices[v];
+        let (Some(cell), Some(port)) = (vx.lib.and_then(|l| g.libs.get(l)).and_then(|l| l.cells.get(vx.cell.as_deref()?)), vx.port.as_deref()) else { return false };
+        cell.arc_sets.iter().any(|a| a.from == port && test(a.role))
+    };
+    let is_sink = |v: usize| {
+        let vx = &g.vertices[v];
+        port_role(v, &|r| matches!(r, Role::RegClkToQ | Role::LatchEnToQ)) || port_role(v, &|r| r.is_timing_check()) || (g.is_port(v) && !vx.is_driver)
+    };
+    let clock_pins: BTreeSet<&str> = clocks.iter().map(|&v| g.vertices[v].name.as_str()).collect();
+    let mut tree: BTreeSet<String> = BTreeSet::new();
+    let mut queue: Vec<String> = Vec::new();
+    for &v in clocks {
+        if is_sink(v) && tree.insert(g.vertices[v].name.clone()) {
+            queue.push(g.vertices[v].name.clone());
+        }
+    }
+    // `pinVertices`: a pin's vertex and, for a bidirect, its driver vertex.
+    let mut vertices: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (u, ux) in g.vertices.iter().enumerate() {
+        vertices.entry(ux.name.as_str()).or_default().push(u);
+    }
+    let is_check = |e: usize| matches!(g.edges[e].kind, EdgeKind::Gate { set } if g.arc_set(e, set).role.is_timing_check());
+    while let Some(pin) = queue.pop() {
+        for &to in vertices.get(pin.as_str()).map_or(&[][..], |v| v.as_slice()) {
+            for &e in &g.in_edges[to] {
+                if is_check(e) {
+                    continue;
+                }
+                let from = &g.vertices[g.edges[e].from].name;
+                if clock_pins.contains(from.as_str()) && tree.insert(from.clone()) {
+                    queue.push(from.clone());
+                }
+            }
+        }
+    }
+    tree
+}
+
 /// `RepairHold::mergeInit`: every slack, min and max side, at INF (upstream 2045c6ccbc4; the
 /// max side was -INF before).
 fn merge_init() -> [[f32; 2]; 2] {
@@ -1969,7 +2014,7 @@ pub fn repair_hold(ctx: &Ctx<'_>, hctx: &crate::repair_hold::HoldCtx<'_>, design
     let initial_area = design.design_area();
     // `setMaxUtilization`: the core area times the fraction; 0 (no limit) without one.
     let max_area = ha.max_utilization.map_or(0.0, |u| design.core_area() * u);
-    let mut h = HoldRepair { ctx, hctx, ha, design, timer, out: crate::repair_hold::HoldOutcome::default(), inserted: 0, resized: 0, initial_area, max_buffer_count: 0, design_area: initial_area, max_area };
+    let mut h = HoldRepair { ctx, hctx, ha, design, timer, out: crate::repair_hold::HoldOutcome::default(), inserted: 0, resized: 0, initial_area, max_buffer_count: 0, design_area: initial_area, max_area, clk_tree_pins: None };
     h.run()?;
     h.out.inserted = h.inserted;
     h.out.resized = h.resized;
@@ -1995,6 +2040,8 @@ struct HoldRepair<'c, 'd> {
     design_area: f64,
     /// `max_area_`.
     max_area: f64,
+    /// `clk_tree_pins_` once `findClockTreePins` has run (`clk_tree_pins_valid_`; reset by `init`).
+    clk_tree_pins: Option<BTreeSet<String>>,
 }
 
 /// A fanout of a driver on a hold path, as `repairEndHold` reads it.
@@ -2018,6 +2065,11 @@ struct HoldPath {
     len: usize,
     /// From `startIndex()` to the end: each pin and whether it is a driver.
     vertices: Vec<(String, bool)>,
+    /// Per vertex, whether its pin is in a clock network (`Sta::isClock`).
+    clock: Vec<bool>,
+    /// The clock tree pins ([`clock_tree_pins`]) on this path's timing, when the repair has not
+    /// found them yet and the path holds a clock-network pin.
+    tree: Option<BTreeSet<String>>,
 }
 
 const MIN: usize = 0;
@@ -2196,7 +2248,8 @@ impl HoldRepair<'_, '_> {
     /// end's setup slack.
     fn worst_hold_path(&mut self, end: &str) -> Result<Option<(HoldPath, f32)>, Stop> {
         let end = end.to_string();
-        self.query_all(move |gs, ss, _| {
+        let want_tree = self.clk_tree_pins.is_none();
+        self.query_all(move |gs, ss, cs| {
             let Some(v0) = gs[0].vertices.iter().position(|x| x.name == end) else { return Ok(None) };
             // `vertexWorstSlackPath(end, min)` over every scene's paths: the fuzzily least, the
             // earlier scene on a tie; the path expanded in its own scene.
@@ -2233,7 +2286,9 @@ impl HoldRepair<'_, '_> {
             let start = n - 1 - start_from_end.unwrap_or(n - 1);
             chain.reverse();
             let vertices = chain[start..].iter().map(|&u| (g.vertices[u].name.clone(), g.vertices[u].is_driver)).collect();
-            Ok(Some((HoldPath { slack: min_slack, len: n, vertices }, slack_over_scenes(gs, ss, v0, MAX, None))))
+            let clock: Vec<bool> = chain[start..].iter().map(|u| cs[k].contains(u)).collect();
+            let tree = (want_tree && clock.iter().any(|&c| c)).then(|| clock_tree_pins(g, &cs[k]));
+            Ok(Some((HoldPath { slack: min_slack, len: n, vertices, clock, tree }, slack_over_scenes(gs, ss, v0, MAX, None))))
         })
     }
 
@@ -2273,9 +2328,26 @@ impl HoldRepair<'_, '_> {
         })
     }
 
+    /// `RepairHold::isClockTreeDriver`: the pin is on the clock tree proper
+    /// ([`clock_tree_pins`], found once per repair, on the first ask).
+    /// Asked of a pin off the clock network (`is_clock`) it is false at once; the walk runs at the
+    /// first ask of a clock-network pin (`tree`: the path's, taken on its timing — the clock tree
+    /// is no data-side insertion's to change), which logs its size (`repair_hold` level 2).
+    fn is_clock_tree_driver(&mut self, pin: &str, is_clock: bool, tree: &mut Option<BTreeSet<String>>) -> bool {
+        if !is_clock {
+            return false;
+        }
+        if self.clk_tree_pins.is_none() {
+            let pins = tree.take().expect("a path with a clock-network pin carries the tree when none is found yet");
+            self.debug("repair_hold", 2, format!("found {} clock tree pins", pins.len()));
+            self.clk_tree_pins = Some(pins);
+        }
+        self.clk_tree_pins.as_ref().is_some_and(|t| t.contains(pin))
+    }
+
     /// `repairEndHold`.
     fn repair_end_hold(&mut self, end: &str, buffer: &str) -> Result<(), Stop> {
-        let Some((path, end_setup)) = self.worst_hold_path(end)? else { return Ok(()) };
+        let Some((mut path, end_setup)) = self.worst_hold_path(end)? else { return Ok(()) };
         self.debug("repair_hold", 3, format!("repair end {} hold_slack={} setup_slack={}", end, self.ds(path.slack), self.ds(end_setup)));
         if path.len <= 1 {
             return Ok(());
@@ -2283,7 +2355,10 @@ impl HoldRepair<'_, '_> {
         let (sm, hm) = (self.ha.setup_margin, self.ha.hold_margin);
         for i in 0..path.vertices.len().saturating_sub(1) {
             let (pin, is_driver) = path.vertices[i].clone();
-            if !is_driver || !self.design.ok_to_buffer_net(&pin) {
+            // `isClockTreeDriver` (upstream 022bcd85d2b): a hold path that starts at a clock source
+            // (a clock used as data) runs through clock-tree drivers; only the data side is buffered,
+            // so no other sink's clock latency moves.
+            if !is_driver || !self.design.ok_to_buffer_net(&pin) || self.is_clock_tree_driver(&pin, path.clock[i], &mut path.tree) {
                 continue;
             }
             let mut loads: Vec<String> = Vec::new();
@@ -5324,6 +5399,65 @@ mod tests {
         merge_into(&[[-0.3, 0.01], [-0.05, 0.9]], &mut m);
         assert_eq!(m, [[-0.3, 0.01], [-0.1, 0.4]]);
         assert_eq!(merge_init(), [[INF, INF], [INF, INF]], "no load leaves the setup side at INF");
+    }
+
+    // Rule (RepairHold::findClockTreePins, upstream 022bcd85d2b; its case
+    // repair_hold_clock_as_data_clk_tree): the clock tree is the clock-network pins that reach a
+    // clock sink (a register clock pin, a check's clock pin, an output port) backward through
+    // non-check fanin. clk drives r1/CK (a register with no checks: a sink by its clock-to-Q arc
+    // alone) through the gate i1 (enable en), the output port cko
+    // through i3, and r2/D through dbuf: the gate's clock side, i3 and the sinks are in the tree;
+    // dbuf (a clock used as data), r2/D and the enable are not, so a hold buffer may go after dbuf
+    // but never on the clk net.
+    #[test]
+    fn the_clock_tree_is_the_clock_pins_that_reach_a_clock_sink() {
+        // Every arc carries tables: an arc without them is not built.
+        const D: &str = r#"cell_rise (t) { values ("0.01, 0.01", "0.01, 0.01"); } rise_transition (t) { values ("0.01, 0.01", "0.01, 0.01"); }
+          cell_fall (t) { values ("0.01, 0.01", "0.01, 0.01"); } fall_transition (t) { values ("0.01, 0.01", "0.01, 0.01"); }"#;
+        const C: &str = r#"rise_constraint (t) { values ("0.01, 0.01", "0.01, 0.01"); } fall_constraint (t) { values ("0.01, 0.01", "0.01, 0.01"); }"#;
+        let lib = format!(
+            r#"library (t) {{ time_unit : "1ns"; capacitive_load_unit (1, pf);
+          lu_table_template (t) {{ variable_1 : input_net_transition; variable_2 : total_output_net_capacitance; index_1 ("0, 1"); index_2 ("0, 1"); }}
+          cell (buf) {{ pin (A) {{ direction : input; capacitance : 0.001; }}
+            pin (Z) {{ direction : output; function : "A"; timing () {{ related_pin : "A"; timing_sense : positive_unate; {D} }} }} }}
+          cell (and2) {{ pin (A) {{ direction : input; capacitance : 0.001; }} pin (B) {{ direction : input; capacitance : 0.001; }}
+            pin (Z) {{ direction : output; function : "A*B"; timing () {{ related_pin : "A"; timing_sense : positive_unate; {D} }}
+              timing () {{ related_pin : "B"; timing_sense : positive_unate; {D} }} }} }}
+          cell (dff) {{ ff (IQ, IQN) {{ clocked_on : "CK"; next_state : "D"; }}
+            pin (D) {{ direction : input; capacitance : 0.001;
+              timing () {{ related_pin : "CK"; timing_type : hold_rising; {C} }}
+              timing () {{ related_pin : "CK"; timing_type : setup_rising; {C} }} }}
+            pin (CK) {{ direction : input; clock : true; capacitance : 0.001; }}
+            pin (Q) {{ direction : output; function : "IQ"; timing () {{ related_pin : "CK"; timing_type : rising_edge; {D} }} }} }}
+          cell (dffnc) {{ ff (IQ, IQN) {{ clocked_on : "CK"; next_state : "D"; }}
+            pin (D) {{ direction : input; capacitance : 0.001; }}
+            pin (CK) {{ direction : input; clock : true; capacitance : 0.001; }}
+            pin (Q) {{ direction : output; function : "IQ"; timing () {{ related_pin : "CK"; timing_type : rising_edge; {D} }} }} }} }}"#
+        );
+        use vyges_sta::netlist::{inst, Conn, Net, Netlist, PortDir};
+        let libs = vec![vyges_sta::liberty::Library::read(&vyges_sta::liberty_parse::parse(&lib).unwrap()).unwrap()];
+        let netlist = Netlist {
+            insts: vec![inst("i1", "and2"), inst("dbuf", "buf"), inst("r1", "dffnc"), inst("r2", "dff"), inst("i3", "buf")],
+            ports: vec![("clk".into(), PortDir::Input), ("clk2".into(), PortDir::Input), ("q1".into(), PortDir::Output), ("q2".into(), PortDir::Output), ("en".into(), PortDir::Input), ("cko".into(), PortDir::Output)],
+            nets: vec![
+                Net { name: "clk".into(), pins: vec![Conn::Port(0), Conn::Inst(0, "A".into()), Conn::Inst(1, "A".into()), Conn::Inst(4, "A".into())] }.into(),
+                Net { name: "en".into(), pins: vec![Conn::Port(4), Conn::Inst(0, "B".into())] }.into(),
+                Net { name: "cko".into(), pins: vec![Conn::Inst(4, "Z".into()), Conn::Port(5)] }.into(),
+                Net { name: "ck1".into(), pins: vec![Conn::Inst(0, "Z".into()), Conn::Inst(2, "CK".into())] }.into(),
+                Net { name: "dd".into(), pins: vec![Conn::Inst(1, "Z".into()), Conn::Inst(3, "D".into()), Conn::Inst(2, "D".into())] }.into(),
+                Net { name: "clk2".into(), pins: vec![Conn::Port(1), Conn::Inst(3, "CK".into())] }.into(),
+                Net { name: "q1".into(), pins: vec![Conn::Inst(2, "Q".into()), Conn::Port(2)] }.into(),
+                Net { name: "q2".into(), pins: vec![Conn::Inst(3, "Q".into()), Conn::Port(3)] }.into(),
+            ],
+        };
+        let g = Graph::build(&libs, &netlist).unwrap();
+        let clocks = crate::timing::clock_pins(&g, &["clk".to_string()]);
+        let name = |v: usize| g.vertices[v].name.as_str();
+        assert!(clocks.iter().any(|&v| name(v) == "dbuf/Z") && clocks.iter().any(|&v| name(v) == "r2/D"), "the clock is used as data: dbuf and r2/D are in its network: {:?}", clocks.iter().map(|&v| name(v)).collect::<Vec<_>>());
+        let tree = clock_tree_pins(&g, &clocks);
+        // i1/B (an enable, off the clock network) is fanin of the tree but not in it; i3 reaches
+        // the clock output port cko.
+        assert_eq!(tree, ["clk", "cko", "i1/A", "i1/Z", "i3/A", "i3/Z", "r1/CK"].iter().map(|s| s.to_string()).collect::<BTreeSet<_>>());
     }
 
     // Rule (OptimizationPolicyConfig, upstream c4fef946416): the tunables are config fields whose
