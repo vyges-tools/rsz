@@ -1566,6 +1566,17 @@ fn port_intrinsic_delay(cell: &Cell, port: &str) -> f32 {
 /// target slew of its input transition and the lumped load, the larger delay per output
 /// transition (from −INF); then the larger of rise and fall.
 fn gate_delay(sizing: &Sizing<'_>, cell: &Cell, port: &str, load_cap: f32) -> f32 {
+    let delays = gate_delays(sizing, cell, port, load_cap);
+    crate::rebuffer::std_max(delays[0], delays[1])
+}
+
+/// `Resizer::gateDelay(drvr_port, rf, load_cap)`: [`gate_delay`]'s delay of one output transition.
+fn gate_delay_rf(sizing: &Sizing<'_>, cell: &Cell, port: &str, rf: usize, load_cap: f32) -> f32 {
+    gate_delays(sizing, cell, port, load_cap)[rf]
+}
+
+/// `Resizer::gateDelays`: per output transition, the larger arc delay (from −INF).
+fn gate_delays(sizing: &Sizing<'_>, cell: &Cell, port: &str, load_cap: f32) -> [f32; 2] {
     let mut delays = [-INF; 2];
     for set in cell.arc_sets.iter().filter(|s| s.to == port && !s.role.is_timing_check()) {
         for arc in &set.arcs {
@@ -1575,55 +1586,91 @@ fn gate_delay(sizing: &Sizing<'_>, cell: &Cell, port: &str, load_cap: f32) -> f3
             }
         }
     }
-    crate::rebuffer::std_max(delays[0], delays[1])
+    delays
 }
 
-/// `MoveGenerator::weakerCellFirst(lhs, rhs, port, lib_ap)` as a strict "lhs first": the cells
-/// with the driver port at the scene (`scenePort`) first; among those, `std::tie(drive
-/// resistance, intrinsic delay)` of lhs GREATER than rhs's; cells without it by name.
-#[allow(clippy::neg_cmp_op_on_partial_ord)]
-fn weaker_cell_first(libs: &Libs, scene: usize, a: &str, b: &str, port: &str) -> bool {
-    let (ca, cb) = (libs.scene_cell(scene, a), libs.scene_cell(scene, b));
-    let pa = ca.filter(|c| c.port(port).is_some());
-    let pb = cb.filter(|c| c.port(port).is_some());
-    match (pa, pb) {
-        (Some(_), None) => true,
-        (None, Some(_)) => false,
-        (None, None) => a < b,
-        (Some(x), Some(y)) => {
-            let (xr, xi) = (x.drive_resistance(port), port_intrinsic_delay(x, port));
-            let (yr, yi) = (y.drive_resistance(port), port_intrinsic_delay(y, port));
-            // `std::tie(...) > std::tie(...)`: lexicographic, each `<` on `float`.
-            yr < xr || (!(xr < yr) && yi < xi)
+/// `LibertyPort::driveResistance(rf, max)`: over the non-check arcs into the port whose output
+/// transition is `rf`, the largest positive arc drive resistance; 0 when none.
+fn drive_resistance_rf(cell: &Cell, port: &str, rf: usize) -> f32 {
+    let mut max_drive = -INF;
+    let mut found = false;
+    for set in cell.arc_sets.iter().filter(|s| s.to == port && !s.role.is_timing_check()) {
+        for arc in set.arcs.iter().filter(|a| a.to_rf == rf) {
+            if let Model::Gate(m) = &arc.model {
+                let drive = m.drive_resistance();
+                if drive > 0.0 {
+                    if drive > max_drive {
+                        max_drive = drive;
+                    }
+                    found = true;
+                }
+            }
         }
     }
+    if found { max_drive } else { 0.0 }
 }
 
-/// `SizeUpGenerator::upsizeCell`: the swappable cells weaker first; the first whose port drives no
-/// worse and whose stage delay — `gateDelay` at the load plus the previous driver's resistance
-/// times its input capacitance — is smaller than the current cell's.
-fn upsize_cell(sizing: &Sizing<'_>, scene: usize, in_port: &str, cell: &str, drvr_port: &str, load_cap: f32, prev_drive: f32) -> Result<Option<String>, Stop> {
+/// `LibertyPort::capacitance(rf, max)`.
+fn port_capacitance_rf(cell: &Cell, port: &str, rf: usize) -> Option<f32> {
+    Some(cell.port(port)?.capacitance[rf][MAX])
+}
+
+/// `upsizeCell`'s cost of a nominal cell: its leakage when positive, else its LEF area when
+/// positive, else its liberty area when positive — one entry per metric, `None` where unavailable.
+fn upsize_costs(sizing: &Sizing<'_>, name: &str) -> [Option<f32>; 3] {
+    let cell = sizing.libs.link_cell(name);
+    let leakage = cell.and_then(crate::sizing::cell_leakage).filter(|&l| l > 0.0);
+    let lef_area = sizing.masters.get(name).filter(|m| m.area > 0).map(|m| m.area as f32);
+    let lib_area = cell.map(|c| c.area).filter(|&a| a > 0.0);
+    [leakage, lef_area, lib_area]
+}
+
+/// `SizeUpGenerator::upsizeCell` (upstream e8a60441a37, 52952d39cca): over the swappable cells in
+/// their class order, the source skipped, those that drive no weaker on EITHER edge
+/// (`driveResistance(rise|fall, max)` at the scene) and whose stage delay — `gateDelay` on the
+/// path's output edge at the load, plus the previous driver's resistance times the input
+/// capacitance of the path's input edge — is smaller; of those, the best delay gain per unit cost
+/// (`(delay − new) / max(1, new/old cost)` on the first metric both cells have: leakage, LEF area,
+/// liberty area), the first on a tie; none when no cell gains.
+#[allow(clippy::too_many_arguments)]
+fn upsize_cell(sizing: &Sizing<'_>, scene: usize, in_port: &str, in_rf: usize, cell: &str, drvr_port: &str, drvr_rf: usize, load_cap: f32, prev_drive: f32) -> Result<Option<String>, Stop> {
     let libs = sizing.libs;
-    let mut swappable = sizing.swappable_cells(cell)?;
+    let swappable = sizing.swappable_cells(cell)?;
     if swappable.is_empty() {
         return Ok(None);
     }
-    crate::order::libcxx_sort_by(&mut swappable, |a, b| weaker_cell_first(libs, scene, a, b, drvr_port)).map_err(|h| Stop::refused("RSZ-ORDER", format!("{} swappable cells reach the sort's heap fallback, which is not modelled", h.len)))?;
-    // The current cell's ports at the scene (`scenePort`); the gate delay of its arcs there.
+    let cell_costs = upsize_costs(sizing, cell);
+    // new/old on the first metric both support (never mixing units).
+    let cost_ratio = |name: &str| -> Option<f32> {
+        let new_costs = upsize_costs(sizing, name);
+        cell_costs.iter().zip(new_costs).find_map(|(old, new)| Some(new? / (*old)?))
+    };
+    // The current cell's ports at the scene (`scenePort`).
     let Some(c) = libs.scene_cell(scene, cell) else { return Ok(None) };
-    let (Some(_), Some(in_cap)) = (c.port(drvr_port), port_capacitance(c, in_port)) else { return Ok(None) };
-    let drive_r = c.drive_resistance(drvr_port);
-    let delay = gate_delay(sizing, c, drvr_port, load_cap) + prev_drive * in_cap;
+    let (Some(_), Some(in_cap)) = (c.port(drvr_port), port_capacitance_rf(c, in_port, in_rf)) else { return Ok(None) };
+    let drive_r = [drive_resistance_rf(c, drvr_port, 0), drive_resistance_rf(c, drvr_port, 1)];
+    let delay = gate_delay_rf(sizing, c, drvr_port, drvr_rf, load_cap) + prev_drive * in_cap;
+    let mut best: Option<String> = None;
+    let mut best_score = 0.0f32;
     for name in swappable {
+        if name == cell {
+            continue;
+        }
         let Some(s) = libs.scene_cell(scene, &name) else { continue };
-        let (Some(_), Some(s_in_cap)) = (s.port(drvr_port), port_capacitance(s, in_port)) else { continue };
-        let s_drive_r = s.drive_resistance(drvr_port);
-        let s_delay = gate_delay(sizing, s, drvr_port, load_cap) + prev_drive * s_in_cap;
-        if s_drive_r <= drive_r && s_delay < delay {
-            return Ok(Some(name));
+        let (Some(_), Some(s_in_cap)) = (s.port(drvr_port), port_capacitance_rf(s, in_port, in_rf)) else { continue };
+        let s_drive_r = [drive_resistance_rf(s, drvr_port, 0), drive_resistance_rf(s, drvr_port, 1)];
+        let s_delay = gate_delay_rf(sizing, s, drvr_port, drvr_rf, load_cap) + prev_drive * s_in_cap;
+        if s_drive_r[0] > drive_r[0] || s_drive_r[1] > drive_r[1] || s_delay >= delay {
+            continue;
+        }
+        let Some(ratio) = cost_ratio(&name) else { continue };
+        let score = (delay - s_delay) / 1.0f32.max(ratio);
+        if score > best_score {
+            best = Some(name);
+            best_score = score;
         }
     }
-    Ok(None)
+    Ok(best)
 }
 
 /// `Resizer::replacementPreservesMaxCap`: each input pin whose capacitance grows must leave every
@@ -1752,11 +1799,16 @@ fn size_up(ctx: &Ctx<'_>, design: &dyn Design, view: &PathView, index: usize) ->
     let Some(in_port) = &st.in_port else { return Ok(None) };
     // The driver path's prev path's prev path: the previous driver (a top-level port has no
     // liberty port, so no drive).
+    // The arc into the driver: its from edge (the input pin's transition) and to edge (the
+    // driver's).
+    let Some(in_rf) = index.checked_sub(1).map(|k| view.stages[k].rf) else { return Ok(None) };
+    let drvr_rf = st.rf;
+    // The previous driver's resistance on the input edge, at the scene (`scenePort`, else its own).
     let prev_drive = match index.checked_sub(2).map(|k| &view.stages[k]) {
-        Some(Stage { cell: Some(c), port: Some(p), .. }) => ctx.libs.link_cell(c).map_or(0.0, |c| c.drive_resistance(p)),
+        Some(Stage { cell: Some(c), port: Some(p), .. }) => ctx.libs.scene_cell(view.scene, c).map_or(0.0, |c| drive_resistance_rf(c, p, in_rf)),
         _ => 0.0,
     };
-    let Some(to) = upsize_cell(ctx.sizing, view.scene, in_port, cell, port, st.load_cap, prev_drive)? else { return Ok(None) };
+    let Some(to) = upsize_cell(ctx.sizing, view.scene, in_port, in_rf, cell, port, drvr_rf, st.load_cap, prev_drive)? else { return Ok(None) };
     if !replacement_preserves_max_cap(ctx.libs, cell, &to, &st.fanin_caps) {
         return Ok(None);
     }
@@ -5677,31 +5729,58 @@ mod tests {
         assert_eq!(load_centroid(&[(-1, 0), (-2, 1)], (7, 9)), (-1, 0));
     }
 
-    // Rule (weakerCellFirst): cells with the driver port first, the LARGER drive resistance
-    // first; cells without the port after them, by name.
-    #[test]
-    fn swappable_cells_are_tried_weakest_first() {
-        let l = libs(&[buf("B4", 0.01, 0.1, 0.2, 1.0), buf("B1", 0.01, 0.1, 0.5, 4.0), buf("B2", 0.01, 0.1, 0.3, 2.0)]);
-        let mut cells = vec!["B4".to_string(), "B2".into(), "NOPE".into(), "B1".into()];
-        crate::order::libcxx_sort_by(&mut cells, |a, b| weaker_cell_first(&l, 0, a, b, "Z")).unwrap();
-        assert_eq!(cells, vec!["B1", "B2", "B4", "NOPE"]);
+    /// A buffer as [`buf`] with separate rise and fall drive (`rr`, `rf`) and a leakage.
+    fn bufx(name: &str, d0: f32, d1: f32, rr: f32, rf: f32, leak: f32) -> String {
+        format!(
+            r#"cell ({name}) {{ cell_leakage_power : {leak} ; pin (A) {{ direction : input ; capacitance : 0.01 ; }} pin (Z) {{ direction : output ; function : "A" ;
+              timing () {{ related_pin : "A" ; timing_sense : positive_unate ;
+                cell_rise (t) {{ values ("{d0}, {d1}", "{d0}, {d1}") ; }} cell_fall (t) {{ values ("{d0}, {d1}", "{d0}, {d1}") ; }}
+                rise_transition (t) {{ values ("0, {rr}", "0, {rr}") ; }} fall_transition (t) {{ values ("0, {rf}", "0, {rf}") ; }} }} }} }}"#
+        )
     }
 
-    // Rule (upsizeCell): the first weaker-first cell that drives no worse and whose stage delay —
-    // gateDelay at the load plus the previous driver's resistance times ITS input capacitance — is
-    // smaller. A larger input capacitance can make the next size up lose to the one after it.
+    // Rule (upsizeCell, upstream e8a60441a37 / 52952d39cca): of the cells that drive no weaker on
+    // either edge and give a faster stage, the best delay gain per unit cost — gain over
+    // max(1, new/old leakage) — not the first adequate one; the first on a tie; the source is
+    // skipped. At half the unit load B1's stage is 0.30, B2's 0.20, B4's 0.15.
     #[test]
-    fn size_up_takes_the_first_cell_with_a_faster_stage() {
-        let l = libs(&[buf("B1", 0.01, 0.1, 0.5, 4.0), buf("B2", 0.2, 0.12, 0.32, 2.0), buf("B4", 0.05, 0.15, 0.25, 1.0)]);
+    fn size_up_takes_the_best_gain_per_unit_cost() {
+        let unit = |l: &Libs| l.libs[0].cells["B1"].port("A").unwrap().capacitance[0][MAX] / 0.01;
+        let pick = |cells: &[String], from: &str| {
+            let l = libs(cells);
+            let u = unit(&l);
+            with_sizing(&l, |s| upsize_cell(s, 0, "A", 0, from, "Z", 0, 0.5 * u, 0.0).unwrap())
+        };
+        // Equal leakage: B4's larger gain beats the first adequate B2.
+        let b = |b2: f32, b4: f32| vec![bufx("B1", 0.1, 0.5, 4.0, 4.0, 1.0), bufx("B2", 0.1, 0.3, 2.0, 2.0, b2), bufx("B4", 0.1, 0.2, 1.0, 1.0, b4)];
+        assert_eq!(pick(&b(1.0, 1.0), "B1").as_deref(), Some("B4"));
+        // B4 leaks 3x: 0.15/3 < 0.10, B2 wins; a cheaper cell is not rewarded (max(1, ratio)).
+        assert_eq!(pick(&b(1.0, 3.0), "B1").as_deref(), Some("B2"));
+        assert_eq!(pick(&b(0.1, 1.0), "B1").as_deref(), Some("B4"));
+        // B4 drives weaker on the fall edge than B1: not eligible however fast.
+        let weak_fall = vec![bufx("B1", 0.1, 0.5, 4.0, 4.0, 1.0), bufx("B2", 0.1, 0.3, 2.0, 2.0, 1.0), bufx("B4", 0.1, 0.2, 1.0, 5.0, 1.0)];
+        assert_eq!(pick(&weak_fall, "B1").as_deref(), Some("B2"));
+        // The strongest cell has nothing faster.
+        assert_eq!(pick(&b(1.0, 1.0), "B4"), None);
+        // Two identical best cells: the first in class order.
+        let tie = vec![bufx("B1", 0.1, 0.5, 4.0, 4.0, 1.0), bufx("C4", 0.1, 0.2, 1.0, 1.0, 1.0), bufx("B4", 0.1, 0.2, 1.0, 1.0, 1.0)];
+        let l = libs(&tie);
+        let first = with_sizing(&l, |s| s.swappable_cells("B1").unwrap()).into_iter().find(|n| n != "B1");
+        assert_eq!(pick(&tie, "B1"), first);
+    }
+
+    // Rule (upsizeCell): the stage delay adds the previous driver's resistance times the
+    // candidate's input capacitance on the path's input edge, so a larger input cap can lose.
+    #[test]
+    fn size_up_charges_the_previous_driver_for_input_capacitance() {
+        // B2: stage 0.20 ns, input 0.2; B4: 0.23 ns, input 0.01.
+        let l = libs(&[buf("B1", 0.01, 0.1, 0.5, 4.0), buf("B2", 0.2, 0.1, 0.3, 2.0), buf("B4", 0.01, 0.1, 0.36, 1.0)]);
         let unit = l.libs[0].cells["B1"].port("A").unwrap().capacitance[0][MAX] / 0.01;
         with_sizing(&l, |s| {
-            // No previous driver: B2 is faster at half the unit load.
-            assert_eq!(upsize_cell(s, 0, "A", "B1", "Z", 0.5 * unit, 0.0).unwrap().as_deref(), Some("B2"));
-            // A previous driver of 1 (time per unit cap) pays for B2's input cap: B4 wins.
-            let r = l.libs[0].cells["B1"].drive_resistance("Z") / 4.0;
-            assert_eq!(upsize_cell(s, 0, "A", "B1", "Z", 0.5 * unit, r).unwrap().as_deref(), Some("B4"));
-            // The strongest cell has nothing stronger.
-            assert_eq!(upsize_cell(s, 0, "A", "B4", "Z", 0.5 * unit, 0.0).unwrap(), None);
+            assert_eq!(upsize_cell(s, 0, "A", 0, "B1", "Z", 0, 0.5 * unit, 0.0).unwrap().as_deref(), Some("B2"));
+            // 10 ns per input unit: B2 pays 2 ns, B4 0.1 ns.
+            let r = 1e-9 / (0.1 * unit);
+            assert_eq!(upsize_cell(s, 0, "A", 0, "B1", "Z", 0, 0.5 * unit, r).unwrap().as_deref(), Some("B4"));
         });
     }
 
