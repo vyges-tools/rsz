@@ -112,8 +112,8 @@ fn simulate(expr: &FuncExpr, port: &dyn Fn(&str) -> Option<bool>) -> Result<bool
 /// `Resizer::findSwapPinCandidate(input_port, drvr_port, equiv_ports, load_cap, …)`: over the
 /// non-check arcs into the driver port, each at its input transition's slew (the instance's
 /// annotated input slew, else the target slew): the current input's largest delay is the base;
-/// any other port keeps its FIRST arc's delay (a later arc from it writes the current input's
-/// entry instead, which nothing reads — kept as the reference has it). Then, in the equivalent
+/// any other port keeps the largest delay over its arcs (6d88a0eb5b8: a later arc updates that
+/// port's own entry). Then, in the equivalent
 /// ports' order, a port that is an input, not the current input or the driver, and faster than
 /// the best so far becomes the swap. Returns the swap (the current input when none), the base
 /// delay (0 when no arc) and the swap's delay (0 when no arc).
@@ -135,7 +135,7 @@ pub fn find_swap_pin_candidate(cell: &Cell, scene_cell: &Cell, input_port: &str,
                 port_delays.insert(port, gate_delay);
             } else {
                 let d = port_delays[port].max(gate_delay);
-                port_delays.insert(input_port, d);
+                port_delays.insert(port, d);
             }
         }
     }
@@ -235,6 +235,31 @@ mod tests {
         assert_eq!(swap, "B", "C ties B and comes later");
         assert!(cur > sw);
         assert_eq!(select_swap_port(&c, &c, "Z", "B", 0.0, &slew).unwrap(), None, "nothing beats B");
+    }
+
+    // Rule (findSwapPinCandidate, 6d88a0eb5b8): a candidate port's delay is the LARGEST over its
+    // arcs into the driver, not its first arc's: a later arc updates that port's own entry.
+    #[test]
+    fn a_candidates_delay_is_its_slowest_arc() {
+        let two = |from: &str, r: f32, f: f32| {
+            format!(
+                r#"timing () {{ related_pin : "{from}" ; timing_sense : positive_unate ;
+                    cell_rise (t) {{ values ("{r}, {r}", "{r}, {r}") ; }} cell_fall (t) {{ values ("{f}, {f}", "{f}, {f}") ; }}
+                    rise_transition (t) {{ values ("0, 0", "0, 0") ; }} fall_transition (t) {{ values ("0, 0", "0, 0") ; }} }}"#
+            )
+        };
+        let slew = |_: &str, _: usize| 0.0;
+        for (r, f) in [(0.1, 0.5), (0.5, 0.1)] {
+            let c = cell(&format!(
+                r#"pin (A) {{ direction : input ; }} pin (B) {{ direction : input ; }}
+                   pin (Z) {{ direction : output ; function : "A*B" ; {} {} }}"#,
+                arc("A", 0.3),
+                two("B", r, f)
+            ));
+            let (swap, cur, sw) = find_swap_pin_candidate(&c, &c, "A", "Z", &["B".into()], 0.0, &slew);
+            assert_eq!(swap, "A", "B's slow arc ({r}, {f}) makes it slower than A");
+            assert_eq!(cur, sw, "no swap: the swap delay is the current one");
+        }
     }
 
     // Rule (gateDelay at the target's scene → `TimingArc::sceneArc`): the arcs are the link cell's
