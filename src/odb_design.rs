@@ -106,6 +106,40 @@ fn edit_names_any(ev: &str, nets: &std::collections::HashSet<String>) -> bool {
     ev.split(['|', ',', ';', '=']).any(|t| nets.contains(t))
 }
 
+/// `parasiticsInvalid(db_net)` for each net `IncrementalGRoute::updateRoutes` routed again
+/// (upstream c5943b20d8f): each joins the estimator's invalid set and has its delays invalidated
+/// with the rest — except `estimated_now`, the net `ensureWireParasitic` estimates and erases at
+/// once, whose delays it does not invalidate.
+fn absorb_rerouted(invalid: &mut BTreeSet<String>, delays: &mut BTreeSet<String>, routed: Vec<String>, estimated_now: Option<&str>) {
+    for net in routed {
+        if Some(net.as_str()) != estimated_now {
+            delays.insert(net.clone());
+        }
+        invalid.insert(net);
+    }
+}
+
+#[cfg(test)]
+mod rerouted_tests {
+    use super::*;
+
+    // Rule (EstimateParasitics::updateParasitics / ensureWireParasitic, upstream c5943b20d8f):
+    // every net the incremental global route routes again is made invalid — re-estimated and its
+    // delays invalidated — not only the edited ones; the net ensureWireParasitic is estimating
+    // is erased from the invalid set right after, so its delays are left alone.
+    #[test]
+    fn every_rerouted_net_is_re_estimated() {
+        let (mut invalid, mut delays) = (BTreeSet::from(["n1".to_string()]), BTreeSet::new());
+        absorb_rerouted(&mut invalid, &mut delays, vec!["n1".into(), "n7".into()], None);
+        assert_eq!(invalid, BTreeSet::from(["n1".to_string(), "n7".to_string()]));
+        assert_eq!(delays, BTreeSet::from(["n1".to_string(), "n7".to_string()]));
+        let (mut invalid, mut delays) = (BTreeSet::new(), BTreeSet::new());
+        absorb_rerouted(&mut invalid, &mut delays, vec!["n1".into(), "n7".into()], Some("n1"));
+        assert_eq!(delays, BTreeSet::from(["n7".to_string()]), "the net estimated now is not delay-invalidated");
+        assert!(invalid.contains("n7"));
+    }
+}
+
 #[cfg(test)]
 mod held_skips_tests {
     use super::edit_names_any;
@@ -176,9 +210,10 @@ impl GrLive {
 
     /// `IncrementalGRoute::updateRoutes` → `updateDirtyRoutesFastRoute`: the dirty nets (odb id
     /// order) whose pins moved are released and routed again from the graphs as they stand.
-    pub fn update_routes(&mut self, db: &mut Db) -> Result<(), String> {
+    /// Returns every net it routed again (upstream c5943b20d8f: `updateRoutes` hands them back).
+    pub fn update_routes(&mut self, db: &mut Db) -> Result<Vec<String>, String> {
         if self.dirty.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let order: Vec<String> = db.net_names().into_iter().filter(|n| self.dirty.contains(n)).collect();
         self.dirty.clear();
@@ -206,7 +241,7 @@ impl GrLive {
         for net in &routed {
             gr_trace(&format!("VYGR|upd|seg|{net}|{}", gr_segs(&self.after, net)));
         }
-        Ok(())
+        Ok(routed)
     }
 }
 
@@ -767,14 +802,15 @@ impl CliDesign<'_> {
         }
     }
 
-    /// The router's state as a refused callback left it, or the incremental re-route.
-    pub fn gr_update_routes(&mut self) -> Result<(), String> {
+    /// The router's state as a refused callback left it, or the incremental re-route: the nets
+    /// it routed again.
+    pub fn gr_update_routes(&mut self) -> Result<Vec<String>, String> {
         if let Some(e) = self.gr_error.take() {
             return Err(e);
         }
         match self.gr.as_mut() {
             Some(gr) => gr.update_routes(self.db),
-            None => Ok(()),
+            None => Ok(Vec::new()),
         }
     }
 
@@ -902,7 +938,13 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
             // Under global-route parasitics: invalid or with no pi model (no network here — a net
             // with a route has one) → the dirty nets re-routed, then this net from its route.
             if self.invalid.contains(net) || !self.parasitics[0].contains_key(net) {
-                self.gr_update_routes()?;
+                // c5943b20d8f: the other nets the router moved stay invalid until the next
+                // `updateParasitics` (re-estimated, their delays invalidated then); this one is
+                // estimated now and erased.
+                let routed = self.gr_update_routes()?;
+                if self.estimating {
+                    absorb_rerouted(&mut self.invalid, &mut self.timer.est_invalid, routed, Some(net));
+                }
                 self.gr_estimate(net);
                 self.invalid.remove(net);
             }
@@ -953,18 +995,24 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
         // The estimator's invalid nets: each estimated, then `delaysInvalidFromFanin` each, the
         // set cleared.
         self.pull_edits();
-        let updated = std::mem::take(&mut self.timer.est_invalid);
-        self.timer.updated.extend(updated);
+        let mut updated = std::mem::take(&mut self.timer.est_invalid);
         if self.gr.is_some() {
             // Under global-route parasitics the dirty nets are re-routed FIRST, whatever is
-            // invalid; then each invalid net from its route (a net with none keeps its network).
+            // invalid; every net routed again joins the invalid set (c5943b20d8f), then each
+            // invalid net from its route (a net with none keeps its network), its delays
+            // invalidated.
             gr_trace(&format!("VYGR|est|update|src=2|{}", self.invalid.iter().map(|n| format!("{n};")).collect::<String>()));
-            self.gr_update_routes()?;
+            let routed = self.gr_update_routes()?;
+            if self.estimating {
+                absorb_rerouted(&mut self.invalid, &mut updated, routed, None);
+            }
+            self.timer.updated.extend(updated);
             for net in std::mem::take(&mut self.invalid) {
                 self.gr_estimate(&net);
             }
             return Ok(());
         }
+        self.timer.updated.extend(updated);
         let invalid: Vec<String> = self.invalid.iter().cloned().collect();
         for net in invalid {
             self.ensure_wire_parasitic(&net)?;
