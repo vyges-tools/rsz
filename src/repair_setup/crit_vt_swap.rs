@@ -160,7 +160,11 @@ impl Repair<'_, '_> {
                                         continue;
                                     }
                                     let is_input = ctx.libs.link_cell(cell).and_then(|c| c.port(ux.port.as_deref()?)).is_some_and(|p| p.direction == Direction::Input);
-                                    if !is_input {
+                                    // The target has no scene or path (`Target::mode` is null), so no
+                                    // register clock pin is skipped (`max_cap_skips_pin(_, None)`);
+                                    // a scan pin is.
+                                    let scan = ctx.libs.link_cell(cell).zip(ux.port.as_deref()).is_some_and(|(c, port)| super::is_scan_pin(c, port));
+                                    if !is_input || scan {
                                         continue;
                                     }
                                     let checks = crate::timing::net_drivers(g, u)

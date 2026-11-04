@@ -728,14 +728,20 @@ fn expand_path(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTr
                 if !same || ux.is_driver {
                     continue;
                 }
-                let checks = crate::timing::net_drivers(g, u)
+                let reg_clk = ux.cell.as_deref().and_then(|c| ctx.libs.link_cell(c)).zip(ux.port.as_deref()).is_some_and(|(c, port)| c.arc_sets.iter().any(|a| a.from == port && matches!(a.role, Role::RegClkToQ | Role::LatchEnToQ)));
+                let scan = ux.cell.as_deref().and_then(|c| ctx.libs.link_cell(c)).zip(ux.port.as_deref()).is_some_and(|(c, port)| is_scan_pin(c, port));
+                let checks = if scan || max_cap_skips_pin(reg_clk, Some(ideal.contains(&u))) {
+                    Vec::new()
+                } else {
+                    crate::timing::net_drivers(g, u)
                     .into_iter()
                     .filter_map(to_scene0)
                     .map(|d| {
                         let (cap, max_cap, slack, limited, _) = crate::timing::check_capacitance(&sc, d, parasitics, &ideal0, ctx.limits);
                         CapCheck { cap, max_cap, slack, limited }
                     })
-                    .collect();
+                    .collect()
+                };
                 st.fanin_caps.push((ux.port.clone().unwrap_or_default(), checks));
                 // annotateInputSlews: an input pin with a liberty port.
                 let is_input = ux.cell.as_deref().and_then(|c| ctx.libs.link_cell(c)).and_then(|c| c.port(ux.port.as_deref()?)).is_some_and(|p| p.direction == vyges_sta::liberty::Direction::Input);
@@ -1675,6 +1681,25 @@ fn upsize_cell(sizing: &Sizing<'_>, scene: usize, in_port: &str, in_rf: usize, c
 
 /// `Resizer::replacementPreservesMaxCap`: each input pin whose capacitance grows must leave every
 /// driver of its net within its limit (`checkMaxCapOK`: a driver already over it may not grow).
+/// `Resizer::replacementPreservesMaxCap`'s register-clock skip (upstream 21e78aafd40): a register
+/// clock pin's fanin net is not checked only when the target has a mode (`Target::mode`: its
+/// scene, else its endpoint path's) and the pin's clock is ideal there. `mode_ideal` is `None` for
+/// a target with neither (a `CRIT_VT_SWAP` instance), whose clock pins are always checked.
+fn max_cap_skips_pin(is_reg_clk: bool, mode_ideal: Option<bool>) -> bool {
+    is_reg_clk && mode_ideal == Some(true)
+}
+
+/// `replacementPreservesMaxCap`'s scan skip (`dbNetwork::isScanEnable` / `isScanIn`): the pin is
+/// the cell's (its `test_cell`'s) FIRST port, in declaration order, whose `signal_type` is
+/// `test_scan_enable[_inverted]` — or the first that is `test_scan_in[_inverted]`. Its fanin net
+/// is never checked (at 4155ac3 unconditionally: 21e78aafd40's high-fanout condition was dropped).
+pub(crate) fn is_scan_pin(cell: &Cell, port: &str) -> bool {
+    use vyges_sta::liberty::ScanSignalType as T;
+    let Some(test) = cell.test_cell.as_deref() else { return false };
+    let first = |types: &[T]| test.ports.iter().find(|p| types.contains(&p.scan_signal_type)).map(|p| p.name.as_str());
+    first(&[T::Enable, T::EnableInverted]) == Some(port) || first(&[T::Input, T::InputInverted]) == Some(port)
+}
+
 fn replacement_preserves_max_cap(libs: &Libs, cell: &str, replacement: &str, fanin_caps: &[(String, Vec<CapCheck>)]) -> bool {
     let (Some(cur), Some(rep)) = (libs.link_cell(cell), libs.link_cell(replacement)) else { return true };
     for (port, checks) in fanin_caps {
@@ -5506,6 +5531,39 @@ mod tests {
         assert!(!buffer_fanout_applicable(0));
         assert!(buffer_fanout_applicable(rebuffer::REBUFFER_MAX_FANOUT - 1));
         assert!(!buffer_fanout_applicable(rebuffer::REBUFFER_MAX_FANOUT));
+    }
+
+    // Rule (dbNetwork::isScanEnable / isScanIn via getLibertyScanEnable / getLibertyScanIn, as
+    // replacementPreservesMaxCap skips them at 4155ac3): a scan pin is the FIRST test-cell port of
+    // a scan-enable type, or the first of a scan-in type; a later one of the same type is not.
+    #[test]
+    fn the_scan_pins_are_the_test_cells_first_enable_and_input() {
+        let text = r#"library (l) { cell (c) {
+            pin (D) { direction : input ; } pin (SCD) { direction : input ; } pin (SCE) { direction : input ; }
+            pin (SCE2) { direction : input ; } pin (Q) { direction : output ; function : "D" ; }
+            test_cell () { pin (D) { direction : input ; } pin (SCD) { direction : input ; signal_type : test_scan_in ; }
+              pin (SCE) { direction : input ; signal_type : test_scan_enable_inverted ; }
+              pin (SCE2) { direction : input ; signal_type : test_scan_enable ; }
+              pin (Q) { direction : output ; signal_type : test_scan_out ; } } } }"#;
+        let lib = vyges_sta::liberty::Library::read(&vyges_sta::liberty_parse::parse(text).unwrap()).unwrap();
+        let c = &lib.cells["c"];
+        assert!(is_scan_pin(c, "SCD") && is_scan_pin(c, "SCE"));
+        assert!(!is_scan_pin(c, "SCE2"), "a second enable is not the scan enable");
+        assert!(!is_scan_pin(c, "D") && !is_scan_pin(c, "Q"));
+        let mut plain = c.clone();
+        plain.test_cell = None;
+        assert!(!is_scan_pin(&plain, "SCD"), "no test cell, no scan pin");
+    }
+
+    // Rule (Resizer::replacementPreservesMaxCap, upstream 21e78aafd40): a register clock pin is
+    // skipped only when its clock is ideal in the target's mode; it is checked on a propagated
+    // clock, and on a target with no mode (a crit-VT instance). Other pins are always checked.
+    #[test]
+    fn a_register_clock_pin_skips_max_cap_only_on_an_ideal_clock() {
+        assert!(max_cap_skips_pin(true, Some(true)), "ideal clock");
+        assert!(!max_cap_skips_pin(true, Some(false)), "propagated clock");
+        assert!(!max_cap_skips_pin(true, None), "no mode: crit VT");
+        assert!(!max_cap_skips_pin(false, Some(true)), "a data pin");
     }
 
     // Rules (SetupLegacyBase::repairBudget / RepairTargetCollector::repairsPerPass, upstream
