@@ -1693,6 +1693,30 @@ fn clock_tree_pins(g: &Graph<'_>, clocks: &BTreeSet<usize>) -> BTreeSet<String> 
     tree
 }
 
+/// `repairBudget` / `repairsPerPass` past their max check: 1 plus `max − 1` scaled by where the
+/// slack's violation sits between `min_viol` and `max_viol` — `std::round` of the float expression
+/// added to an int — clamped to `[1, max]` (upstream 92dc2f20db2: a violation below `min_viol` used
+/// to give 0 or fewer, and `repairPath` then changed nothing). 1 when the span is 0. The callers
+/// have returned 0 for a max below 1 first.
+fn interpolated_repairs(max_repairs_per_pass: i64, path_slack: f32, min_viol: f32, max_viol: f32) -> i64 {
+    let mut repairs = 1i64;
+    if max_viol - min_viol != 0.0 {
+        repairs += ((max_repairs_per_pass - 1) as f32 * (-path_slack - min_viol) / (max_viol - min_viol)).round() as i64;
+        repairs = repairs.clamp(1, max_repairs_per_pass);
+    }
+    repairs
+}
+
+/// `SetupLegacyBase::repairBudget`: 0 for a max of 0 or less; else 1 when forced, else
+/// [`interpolated_repairs`].
+fn repair_budget(max_repairs_per_pass: i64, path_slack: f32, min_viol: f32, max_viol: f32, force_single_repair: bool) -> i64 {
+    if max_repairs_per_pass <= 0 {
+        return 0;
+    }
+    let repairs = interpolated_repairs(max_repairs_per_pass, path_slack, min_viol, max_viol);
+    if force_single_repair { 1 } else { repairs }
+}
+
 /// `RepairHold::mergeInit`: every slack, min and max side, at INF (upstream 2045c6ccbc4; the
 /// max side was -INF before).
 fn merge_init() -> [[f32; 2]; 2] {
@@ -3473,20 +3497,19 @@ impl Repair<'_, '_> {
     }
 
     /// `RepairTargetCollector::repairsPerPass(max)`: one, plus `max − 1` scaled by where the
-    /// current endpoint's slack sits between the collector's least and worst violation (rounded).
+    /// current endpoint's slack sits between the collector's least and worst violation (rounded,
+    /// clamped to `[1, max]`; 0 for a max of 0 or less — upstream 92dc2f20db2).
     fn repairs_per_pass(&self, max_repairs_per_pass: i64) -> i64 {
+        if max_repairs_per_pass <= 0 {
+            return 0;
+        }
         let (mut min_viol, mut max_viol) = (-INF, 0.0f32);
         if let (Some(first), Some(last)) = (self.collector_ends.first(), self.collector_ends.last()) {
             min_viol = -last.1;
             max_viol = -first.1;
         }
         let path_slack = self.current_endpoint.as_deref().map_or(0.0, |e| self.timing.slack(e));
-        let mut repairs = 1i64;
-        if max_viol - min_viol != 0.0 {
-            // `std::round` of the float expression (an int times a float), added to an int.
-            repairs += ((max_repairs_per_pass - 1) as f32 * (-path_slack - min_viol) / (max_viol - min_viol)).round() as i64;
-        }
-        repairs
+        interpolated_repairs(max_repairs_per_pass, path_slack, min_viol, max_viol)
     }
 
     /// `RSZ move_tracker`'s debug level (0: off).
@@ -3931,6 +3954,9 @@ impl Repair<'_, '_> {
                 es.prev_end_slack = es.end_slack;
                 es.prev_worst_slack = es.worst_slack;
                 es.decreasing_slack_passes = 0;
+                // An improving pass lifts the one-repair throttle a worsening one set (upstream
+                // 92dc2f20db2; before, it stayed on for every later pass).
+                es.force_single_repair = false;
                 self.save_improved_checkpoint(es)?;
             } else {
                 es.force_single_repair = true;
@@ -4170,14 +4196,10 @@ impl Repair<'_, '_> {
         false
     }
 
-    /// `repairBudget`: one repair, or more for a slack nearer the worst violation.
+    /// `repairBudget`: one repair, or more for a slack nearer the worst violation; none for a
+    /// max of 0 or less, even when forced to one (upstream 92dc2f20db2).
     fn repair_budget(&self, path_slack: f32, force_single_repair: bool) -> i64 {
-        let mut repairs_per_pass = 1i64;
-        if self.max_viol - self.min_viol != 0.0 {
-            // round() of a float expression, added to an int.
-            repairs_per_pass += ((self.args.max_repairs_per_pass - 1) as f32 * (-path_slack - self.min_viol) / (self.max_viol - self.min_viol)).round() as i64;
-        }
-        if force_single_repair { 1 } else { repairs_per_pass }
+        repair_budget(self.args.max_repairs_per_pass, path_slack, self.min_viol, self.max_viol, force_single_repair)
     }
 
     /// `SetupLegacyBase::repairPath`.
@@ -5388,6 +5410,26 @@ fn path_improved(end_slack: f32, worst_slack: f32, prev_end_slack: f32, prev_wor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Rules (SetupLegacyBase::repairBudget / RepairTargetCollector::repairsPerPass, upstream
+    // 92dc2f20db2; its TestResizer cases): the interpolated budget is clamped to [1, max] — a
+    // violation that improved below the initial least one gives 1, not 0 — and a max of 0 or less
+    // gives 0 even when forced to one repair.
+    #[test]
+    fn the_repair_budget_is_clamped_to_one_through_max() {
+        // min_viol 0.1, max_viol 0.5, max 9: slack -0.5 → 9, -0.3 → 5, -0.1 → 1.
+        assert_eq!(repair_budget(9, -0.5, 0.1, 0.5, false), 9);
+        assert_eq!(repair_budget(9, -0.3, 0.1, 0.5, false), 5);
+        assert_eq!(repair_budget(9, -0.1, 0.1, 0.5, false), 1);
+        assert_eq!(repair_budget(9, -0.02, 0.1, 0.5, false), 1, "below the least violation: 1, not 0");
+        assert_eq!(repair_budget(9, 0.2, 0.1, 0.5, false), 1, "a positive slack: 1, not negative");
+        assert_eq!(repair_budget(9, -0.9, 0.1, 0.5, false), 9, "past the worst: max");
+        assert_eq!(repair_budget(9, -0.3, 0.1, 0.5, true), 1, "forced");
+        assert_eq!(repair_budget(0, -0.3, 0.1, 0.5, true), 0, "a max of 0: none, even forced");
+        assert_eq!(repair_budget(-2, -0.3, 0.1, 0.1, false), 0, "and with no span");
+        assert_eq!(repair_budget(9, -0.3, 0.1, 0.1, false), 1, "no span: 1");
+        assert_eq!(interpolated_repairs(9, -0.02, 0.1, 0.5), 1);
+    }
 
     // Rule (RepairHold::mergeInit / mergeInto, upstream 2045c6ccbc4; its gtest TestRepairHold on
     // repair_hold_shared_driver): the hold-violating loads' setup slacks merge by min from INF, so
