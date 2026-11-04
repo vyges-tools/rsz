@@ -363,8 +363,104 @@ impl<T: Clone, F: FnMut(&T, &T) -> bool> Sorter<'_, T, F> {
     }
 }
 
+/// `std::priority_queue` as libc++ implements it over a vector (the reference's build links libc++):
+/// `push_heap` sifts the new element up while its parent ranks below it; `pop_heap` drives the
+/// hole from the root to a leaf through the larger child (the right one only when strictly
+/// greater; Floyd), drops the last element into it and sifts that up. ⛔ Not `BinaryHeap`: the
+/// pop order of equal keys is fixed by these moves alone.
+pub struct LibcxxHeap<T: Copy, F: Fn(&T, &T) -> bool> {
+    v: Vec<T>,
+    /// `comp(a, b)`: `a` ranks BELOW `b`; the top is the greatest.
+    less: F,
+}
+
+impl<T: Copy, F: Fn(&T, &T) -> bool> LibcxxHeap<T, F> {
+    pub fn new(less: F) -> Self {
+        LibcxxHeap { v: Vec::new(), less }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.v.is_empty()
+    }
+    /// `__sift_up(first, last, comp, len)`: the element at `len - 1` climbs.
+    fn sift_up(&mut self, len: usize) {
+        if len <= 1 {
+            return;
+        }
+        let mut last = len - 1;
+        let mut parent = (len - 2) / 2;
+        if (self.less)(&self.v[parent], &self.v[last]) {
+            let t = self.v[last];
+            loop {
+                self.v[last] = self.v[parent];
+                last = parent;
+                if parent == 0 {
+                    break;
+                }
+                parent = (parent - 1) / 2;
+                if !(self.less)(&self.v[parent], &t) {
+                    break;
+                }
+            }
+            self.v[last] = t;
+        }
+    }
+    pub fn push(&mut self, x: T) {
+        self.v.push(x);
+        let n = self.v.len();
+        self.sift_up(n);
+    }
+    /// `__floyd_sift_down`: the hole at 0 descends to a leaf; returns it.
+    fn floyd_sift_down(&mut self, len: usize) -> usize {
+        let mut hole = 0usize;
+        loop {
+            let mut child = 2 * hole + 1;
+            if child + 1 < len && (self.less)(&self.v[child], &self.v[child + 1]) {
+                child += 1;
+            }
+            self.v[hole] = self.v[child];
+            hole = child;
+            if child > (len - 2) / 2 {
+                return hole;
+            }
+        }
+    }
+    /// `top()` then `pop()`.
+    pub fn pop(&mut self) -> Option<T> {
+        let len = self.v.len();
+        let top = *self.v.first()?;
+        if len > 1 {
+            let hole = self.floyd_sift_down(len);
+            let last = len - 1;
+            if hole == last {
+                self.v[hole] = top;
+            } else {
+                self.v[hole] = self.v[last];
+                self.v[last] = top;
+                self.sift_up(hole + 1);
+            }
+        }
+        self.v.pop()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    // Rule (libc++ `push_heap` / `pop_heap`, the reference's `std::priority_queue`): equal keys pop
+    // in the order the moves leave them — sift-up on push; on pop, Floyd's descent through the
+    // strictly greater child, the last element dropped in and sifted up. Sequences worked by
+    // hand from libc++'s source.
+    #[test]
+    fn equal_keys_pop_in_libcxx_order() {
+        let pops = |keys: &[i32]| {
+            let mut h = LibcxxHeap::new(|a: &usize, b: &usize| keys[*a] > keys[*b]);
+            (0..keys.len()).for_each(|i| h.push(i));
+            std::iter::from_fn(|| h.pop()).collect::<Vec<_>>()
+        };
+        assert_eq!(pops(&[5, 5, 5, 5]), vec![0, 1, 3, 2]);
+        assert_eq!(pops(&[3, 1, 2, 0]), vec![3, 1, 2, 0], "a strict order pops in order");
+        assert_eq!(pops(&[2, 2, 1, 2, 2, 1, 2]), vec![2, 5, 1, 3, 6, 4, 0]);
+    }
+
     use super::*;
 
     // Rule (libstdc++ std::sort): ≤ 16 elements is insertion sort — ties keep input order.

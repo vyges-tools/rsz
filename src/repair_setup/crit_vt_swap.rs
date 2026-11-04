@@ -9,7 +9,7 @@
 //! library, so the order can show only through the max-capacitance guard on a fanin net two swaps
 //! share — ours commits in discovery order.
 
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashSet};
 
 use vyges_sta::fuzzy;
 use vyges_sta::graph::EdgeKind;
@@ -17,6 +17,7 @@ use vyges_sta::liberty::{Direction, Role, MAX};
 use vyges_sta::netlist::Conn;
 
 use super::{replacement_preserves_max_cap, CapCheck, MoveResult, Repair, Stop};
+use crate::order::LibcxxHeap;
 use crate::repair_timing::{collect_violating, Move};
 
 /// `kMaxCritEndpoints`, `kMaxCritInstancesPerEndpoint`.
@@ -103,7 +104,7 @@ impl Repair<'_, '_> {
     }
 
     /// `traverseFaninCone` over each endpoint in order, in one timer read: from the endpoint, the
-    /// violating fanin (in-edges newest first; a register clock pin not followed), each
+    /// violating fanin worst slack first (in-edges newest first; a register clock pin not followed), each
     /// swappable instance whose worst output slack violates collected once, at most 50 new ones
     /// per endpoint.
     fn collect_crit_insts(&mut self, ends: &[String], not_swappable: &mut HashSet<String>) -> Result<Vec<CritInst>, Stop> {
@@ -136,10 +137,11 @@ impl Repair<'_, '_> {
                 if !visited.insert(ev) {
                     continue;
                 }
-                let mut queue = VecDeque::from([ev]);
                 let mut endpoint_insts = 0;
-                while endpoint_insts < MAX_CRIT_INSTANCES_PER_ENDPOINT {
-                    let Some(cur) = queue.pop_front() else { break };
+                let fanins = |cur: usize| {
+                    g.in_edges[cur].iter().rev().map(|&e| g.edges[e].from).filter(|&f| !is_reg_clk(f)).map(|f| (f, s.slack_of(f, MAX, None))).collect::<Vec<_>>()
+                };
+                walk_fanin_cone(ev, s.slack_of(ev, MAX, None), margin, &mut visited, fanins, |cur| {
                     if let Conn::Inst(k, _) = &g.vertices[cur].conn {
                         let (inst, cell) = (&g.netlist.insts[*k].0, &g.netlist.insts[*k].1);
                         if let Some(best) = check_and_mark_vt_swappable(ctx, dont_touch, inst, cell, not_swappable) {
@@ -174,20 +176,59 @@ impl Repair<'_, '_> {
                             }
                         }
                     }
-                    for &e in g.in_edges[cur].iter().rev() {
-                        let fanin = g.edges[e].from;
-                        if is_reg_clk(fanin) || visited.contains(&fanin) {
-                            continue;
-                        }
-                        if fuzzy::less(s.slack_of(fanin, MAX, None), margin) {
-                            queue.push_back(fanin);
-                            visited.insert(fanin);
-                        }
-                    }
-                }
+                    endpoint_insts < MAX_CRIT_INSTANCES_PER_ENDPOINT
+                });
             }
             Ok(())
         })?;
         Ok(result)
+    }
+}
+
+/// `traverseFaninCone`'s walk (6d88a0eb5b8): a min-slack `std::priority_queue` of (slack, vertex),
+/// ordered by slack alone, seeded with the endpoint; each popped vertex is visited, then its
+/// fanins (in the order given) not yet visited whose slack violates the margin are queued and
+/// marked visited. The walk stops when the queue empties or `visit` reports the cap reached.
+/// Equal slacks pop in the libc++ heap's order.
+fn walk_fanin_cone(start: usize, start_slack: f32, margin: f32, visited: &mut HashSet<usize>, fanins: impl Fn(usize) -> Vec<(usize, f32)>, mut visit: impl FnMut(usize) -> bool) {
+    let mut queue = LibcxxHeap::new(|a: &(f32, usize), b: &(f32, usize)| a.0 > b.0);
+    queue.push((start_slack, start));
+    while let Some((_, cur)) = queue.pop() {
+        let more = visit(cur);
+        for (fanin, slack) in fanins(cur) {
+            if !visited.contains(&fanin) && fuzzy::less(slack, margin) {
+                queue.push((slack, fanin));
+                visited.insert(fanin);
+            }
+        }
+        if !more {
+            break;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Rule (SetupCritVtSwapPolicy::traverseFaninCone, 6d88a0eb5b8): the violating fanin is walked
+    // worst slack first (a min-slack priority queue, not FIFO), so the per-endpoint cap keeps the
+    // most critical gates; fanins at or above the margin are not followed.
+    #[test]
+    fn the_fanin_cone_is_walked_worst_slack_first() {
+        // 0 <- {1: -0.1, 2: -0.5}; 1 <- {3: -0.9}; 2 <- {4: -0.2, 5: 0.0 (not violating)}
+        let slack = [-1.0, -0.1, -0.5, -0.9, -0.2, 0.0];
+        let fanin_of: [&[usize]; 6] = [&[1, 2], &[3], &[4, 5], &[], &[], &[]];
+        let order = |cap: usize| {
+            let mut seen = Vec::new();
+            let mut visited = HashSet::from([0]);
+            walk_fanin_cone(0, slack[0], 0.0, &mut visited, |v| fanin_of[v].iter().map(|&f| (f, slack[f])).collect(), |v| {
+                seen.push(v);
+                seen.len() < cap
+            });
+            seen
+        };
+        assert_eq!(order(usize::MAX), vec![0, 2, 4, 1, 3], "FIFO would give 0, 1, 2, 3, 4");
+        assert_eq!(order(3), vec![0, 2, 4], "the cap keeps the worst branch");
     }
 }
