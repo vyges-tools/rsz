@@ -234,6 +234,8 @@ struct PathView {
     /// `visitLatchFaninSegments`: for a path through a latch D -> Q, the latch D path expanded on
     /// its own, then ITS latch D path, … (each latch D once).
     latch_segments: Vec<PathView>,
+    /// The pins and tags the path was expanded on, root first (for [`restage`]).
+    chain: Vec<ChainKey>,
 }
 
 /// The timer over the design as it is now: every endpoint's and startpoint's slack, and the worst
@@ -673,6 +675,51 @@ fn expand_path(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTr
     let n = chain.len();
     let start = n - 1 - start_from_end.unwrap_or(n - 1);
     chain.reverse();
+    Ok((view_of_chain(ctx, gs, ss, cs, design, scene, &chain, start, ideal), latch_d_path))
+}
+
+/// A target kept from before a move, read on the timer the move changed: `sta::Path` objects live
+/// in their vertices' path arrays, so the `PathExpanded` a pass ranked its targets on still names
+/// the same pins and tags, and each now reads the timer as it is (`repairPath` takes no update
+/// between its targets; a target's live values come from the queries its moves make). Each pin of
+/// `view`'s chain is found again by name and tag and staged as [`expand_path`] stages it. `None`
+/// when a pin or its tag is gone (the reference would read freed memory).
+#[allow(clippy::too_many_arguments)]
+fn restage(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet<usize>], design: &dyn Design, view: &PathView, ideal: &BTreeSet<usize>) -> Option<PathView> {
+    let (g, search) = (&gs[view.scene], &ss[view.scene]);
+    let find = |pin: &str, is_driver: bool| g.vertices.iter().position(|x| x.name == pin && x.is_driver == is_driver);
+    let chain = refind_chain(&view.chain, find, &search.paths)?;
+    let mut out = view_of_chain(ctx, gs, ss, cs, design, view.scene, &chain, view.start, ideal);
+    for seg in &view.latch_segments {
+        out.latch_segments.push(restage(ctx, gs, ss, cs, design, seg, ideal)?);
+    }
+    Some(out)
+}
+
+/// Each key's vertex (`find`) and the path there with the key's tag, as the timer has it now.
+fn refind_chain(keys: &[ChainKey], find: impl Fn(&str, bool) -> Option<usize>, paths: &[Vec<vyges_sta::search::Path>]) -> Option<Vec<(usize, vyges_sta::search::Path)>> {
+    let mut chain = Vec::with_capacity(keys.len());
+    for key in keys {
+        let v = find(&key.pin, key.is_driver)?;
+        let p = paths.get(v)?.iter().find(|q| q.tag == key.tag)?;
+        chain.push((v, *p));
+    }
+    Some(chain)
+}
+
+/// One pin of a path as [`restage`] finds it again: its vertex by name and kind, its path by tag.
+#[derive(Debug, Clone, PartialEq)]
+struct ChainKey {
+    pin: String,
+    is_driver: bool,
+    tag: vyges_sta::search::Tag,
+}
+
+/// The stages of `chain` (root first), each with what its moves read off the timer.
+#[allow(clippy::too_many_arguments)]
+fn view_of_chain(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet<usize>], design: &dyn Design, scene: usize, chain: &[(usize, vyges_sta::search::Path)], start: usize, ideal: &BTreeSet<usize>) -> PathView {
+    let g = &gs[scene];
+    let n = chain.len();
     // `checkMaxCapOK` (`checkCapacitance` over every scene), in scene 0's vertices.
     let sc = crate::timing::Scenes::new(gs);
     let all_parasitics: Vec<HashMap<String, vyges_sta::graph::NetParasitics>>;
@@ -756,7 +803,7 @@ fn expand_path(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTr
         stages.push(st);
     }
     if ctx.sequence.contains(&Move::Unbuffer) {
-        probe_unbuffer(ctx, gs, ss, cs, design, scene, ideal, &chain, &mut stages);
+        probe_unbuffer(ctx, gs, ss, cs, design, scene, ideal, chain, &mut stages);
     }
     if ctx.sequence.contains(&Move::Clone) {
         for (i, (v, _)) in chain.iter().enumerate() {
@@ -782,7 +829,8 @@ fn expand_path(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTr
             }
         }
     }
-    Ok((PathView { stages, start, scene, latch_segments: Vec::new() }, latch_d_path))
+    let chain = chain.iter().map(|(v, p)| ChainKey { pin: g.vertices[*v].name.clone(), is_driver: g.vertices[*v].is_driver, tag: p.tag }).collect();
+    PathView { stages, start, scene, latch_segments: Vec::new(), chain }
 }
 
 /// `rebufferPin` up to its buffering: the driver's checks, `makeBufferedNet`, `annotateLoadSlacks`
@@ -2794,6 +2842,27 @@ impl Repair<'_, '_> {
     /// The timer brought up to date with the edits, the parasitics left as estimated (between two
     /// moves of one pass). Witness: re-estimating here moves a removed buffer's estimated slew by
     /// one ulp on the directional phases' second pass.
+    /// The pass's ranked paths re-read on the timer as it is now ([`restage`]): the same pins and
+    /// tags, their values and probes the timer's. A path that lost a pin to an earlier move in the
+    /// pass is refused.
+    fn restage_views(&mut self, views: &[PathView]) -> Result<Vec<PathView>, Stop> {
+        let edits = self.design.take_timer_edits();
+        self.timer.trace_at = self.out.trace.len();
+        let ctx = self.ctx;
+        let design = self.design.as_design();
+        timed_all(ctx, design, &mut self.timer, edits, |gs, ss, cs| {
+            let mut out = Vec::with_capacity(views.len());
+            for v in views {
+                let ideal: BTreeSet<usize> = gs[v.scene].ideal_clock.iter().copied().collect();
+                let Some(r) = restage(ctx, gs, ss, cs, design, v, &ideal) else {
+                    return Err(Stop::refused("RSZ-ABSENT", "a target's path lost a pin to an earlier move in the pass: not modelled".to_string()));
+                };
+                out.push(r);
+            }
+            Ok(out)
+        })
+    }
+
     fn retime_without_estimate(&mut self) -> Result<(), Stop> {
         let edits = self.design.take_timer_edits();
         self.timer.trace_at = self.out.trace.len();
@@ -4338,11 +4407,20 @@ impl Repair<'_, '_> {
         let line = format!("Path slack: {}, repairs: {repairs_per_pass}, ranked_targets: {}", self.ds(path_slack, 3), ranked.len());
         self.debug("repair_setup", 3, line);
         let mut changed = 0i64;
+        let mut segs: Vec<PathView> = segments.into_iter().cloned().collect();
+        let mut stale = false;
         for (k, index, _) in ranked {
             if changed >= repairs_per_pass {
                 break;
             }
-            self.try_repair_path_target(segments[k], index, &mut changed, repairs_per_pass)?;
+            // A move accepted earlier in the pass: the targets ranked before it keep their pins and
+            // tags and read the timer it changed.
+            if stale {
+                segs = self.restage_views(&segs)?;
+            }
+            let before = changed;
+            self.try_repair_path_target(&segs[k], index, &mut changed, repairs_per_pass)?;
+            stale = changed != before;
         }
         Ok(changed > 0)
     }
@@ -5756,8 +5834,36 @@ mod tests {
             start: 2,
             scene: 0,
             latch_segments: Vec::new(),
+            chain: Vec::new(),
         };
         assert_eq!(rank_path_drivers(&view), vec![(4, 5.0), (6, 2.0), (2, 2.0)]);
+    }
+
+    // Rule (SetupLegacyBase::repairPath: targets ranked once, `tryRepairPathTarget` on each with no
+    // timing update between; a target holds `PathExpanded`'s raw `sta::Path` objects, which live in
+    // their vertices' path arrays): a target after an accepted move reads the SAME pins and tags at
+    // the values the timer has now, prev pointers included. A pin or tag gone is no path.
+    #[test]
+    fn a_later_target_rereads_its_pins_and_tags_on_the_changed_timer() {
+        use vyges_sta::search::{Path, Prev, Tag};
+        let tag = |rf| Tag { rf, mm: MAX, clk_edge: Some(0), is_clock: false, crpr: None, states: Default::default(), latency: 0, segment_start: false };
+        let path = |rf, arrival: f32, prev: Option<Prev>| Path { tag: tag(rf), arrival, required: 1.0, prev };
+        let keys = vec![
+            ChainKey { pin: "r1/Q".into(), is_driver: true, tag: tag(0) },
+            ChainKey { pin: "u1/A".into(), is_driver: false, tag: tag(1) },
+        ];
+        let names = [("buf/Z", true), ("r1/Q", true), ("u1/A", false)];
+        let find = |pin: &str, d: bool| names.iter().position(|&(n, k)| n == pin && k == d);
+        // After the move: u1/A now reached from an inserted buffer, later; r1/Q unchanged.
+        let via_buf = Prev { vertex: 0, tag: tag(0), edge: 7, arc: 0 };
+        let paths = vec![vec![path(0, 0.2, None)], vec![path(1, 0.9, None), path(0, 0.1, None)], vec![path(0, 0.5, None), path(1, 0.4, Some(via_buf))]];
+        let chain = refind_chain(&keys, find, &paths).expect("every pin and tag still there");
+        assert_eq!(chain.iter().map(|(v, _)| *v).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!((chain[0].1.arrival, chain[1].1.arrival), (0.1, 0.4), "each pin's path BY TAG, at its current value");
+        assert_eq!(chain[1].1.prev, Some(via_buf), "the prev the timer has now, not the one ranked on");
+        let gone = [("r1/Q", true)];
+        assert!(refind_chain(&keys, |p: &str, d: bool| gone.iter().position(|&(n, k)| n == p && k == d), &paths).is_none(), "a pin removed");
+        assert!(refind_chain(&keys, find, &[vec![], vec![path(0, 0.1, None)], vec![path(0, 0.5, None)]]).is_none(), "a tag gone");
     }
 
     use crate::preamble::Master;
