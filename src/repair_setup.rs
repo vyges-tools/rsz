@@ -2042,7 +2042,11 @@ impl HoldRepair<'_, '_> {
                 .iter()
                 .map(|p| {
                     let v = g.vertices.iter().position(|x| x.name == p.pin).expect("an endpoint vertex");
-                    crate::repair_hold::HoldEnd { pin: p.pin.clone(), hold_slack: slack_over_scenes(gs, ss, v, MIN, None), setup_slack: p.slack, is_clock: clocks.contains(&v) }
+                    // `isClock(pin) && !vertex->hasChecks()` (upstream 28e3110e528): a clock-network
+                    // pin that is no timing check's data pin; a register D pin sampling a clock used
+                    // as data is a real hold endpoint.
+                    let has_checks = g.in_edges[v].iter().any(|&e| matches!(g.edges[e].kind, EdgeKind::Gate { set } if g.arc_set(e, set).role.is_timing_check()));
+                    crate::repair_hold::HoldEnd { pin: p.pin.clone(), hold_slack: slack_over_scenes(gs, ss, v, MIN, None), setup_slack: p.slack, clock_tree_end: crate::repair_hold::clock_tree_end(clocks.contains(&v), has_checks) }
                 })
                 .collect())
         })

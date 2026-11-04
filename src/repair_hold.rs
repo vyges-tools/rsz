@@ -55,13 +55,20 @@ pub struct HoldArgs {
 }
 
 /// An endpoint as the hold repair reads it: its min (hold) and max (setup) slacks, and whether
-/// its pin is a clock pin (`Sta::isClock`).
+/// it lies on the clock tree itself ([`clock_tree_end`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct HoldEnd {
     pub pin: String,
     pub hold_slack: f32,
     pub setup_slack: f32,
-    pub is_clock: bool,
+    pub clock_tree_end: bool,
+}
+
+/// `findHoldViolations`' `clk_tree_endpoint` (upstream 28e3110e528): the pin is in a clock
+/// network (`Sta::isClock`) and its vertex has no timing check (`hasChecks`). A data pin sampling
+/// a clock used as data (a cross-domain endpoint) carries a check and is repaired.
+pub fn clock_tree_end(is_clock: bool, has_checks: bool) -> bool {
+    is_clock && !has_checks
 }
 
 /// What the hold repair logged: `lines` (the report) and `trace` (report and debug, in order).
@@ -176,7 +183,7 @@ pub fn find_hold_buffer(ctx: &HoldCtx<'_>, out: &mut HoldOutcome) -> Result<Opti
     Ok(Some(best.1.name.clone()))
 }
 
-/// `findHoldViolations`: in endpoint order, each non-clock endpoint whose hold slack is below the
+/// `findHoldViolations`: in endpoint order, each endpoint off the clock tree whose hold slack is below the
 /// margin (`float < double`, compared in `double`), logged with its setup slack; the worst is the
 /// `std::min` of their slacks from `INF`.
 pub fn find_hold_violations(ctx: &HoldCtx<'_>, ends: &[HoldEnd], hold_margin: f64, out: &mut HoldOutcome) -> (f32, Vec<usize>) {
@@ -184,7 +191,7 @@ pub fn find_hold_violations(ctx: &HoldCtx<'_>, ends: &[HoldEnd], hold_margin: f6
     let mut viol = Vec::new();
     debug(ctx, out, "repair_hold", 3, "Hold violations".into());
     for (i, e) in ends.iter().enumerate() {
-        if !e.is_clock && f64::from(e.hold_slack) < hold_margin {
+        if !e.clock_tree_end && f64::from(e.hold_slack) < hold_margin {
             debug(ctx, out, "repair_hold", 3, format!(" {} hold_slack={} setup_slack={}", e.pin, delay_as_string(e.hold_slack, 3, ctx.time_scale), delay_as_string(e.setup_slack, 3, ctx.time_scale)));
             worst = std_min(e.hold_slack, worst);
             viol.push(i);
@@ -231,5 +238,21 @@ pub fn print_progress(ctx: &HoldCtx<'_>, ends: &[HoldEnd], p: &Progress, iterati
     }
     if end {
         out.report("-".repeat(86));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Rule (RepairHold::findHoldViolations, upstream 28e3110e528, OpenROAD #8075): an endpoint is
+    // skipped as clock tree only when it is a clock-network pin WITHOUT a timing check. A register
+    // D pin fed by a clock used as data is in the clock network yet has checks, so its hold
+    // violation is repaired (witness: repair_hold_clock_as_data, r2/D).
+    #[test]
+    fn a_clock_used_as_data_is_a_hold_endpoint() {
+        assert!(clock_tree_end(true, false), "a clock pin with no check is the clock tree's");
+        assert!(!clock_tree_end(true, true), "a checked data pin in a clock network is an endpoint");
+        assert!(!clock_tree_end(false, false) && !clock_tree_end(false, true));
     }
 }
