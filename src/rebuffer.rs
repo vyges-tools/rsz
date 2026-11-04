@@ -599,7 +599,7 @@ impl Rebuf<'_> {
         let sl = self.ctx.delay(nd.max_load_slew);
         let buffers = self.buffer_count(n);
         let s = match &nd.kind {
-            Kind::Load { pin } => format!("load {pin} ({x}, {y}) cap {cap} slack {slack} load sl {sl}"),
+            Kind::Load { pin } => load_text(pin, &x, &y, &cap, &slack, &sl),
             Kind::Wire { .. } => format!("wire ({x}, {y}) cap {cap} slack {slack} buffers {buffers} load sl {sl}"),
             Kind::Buffer { cell, .. } => format!("buffer ({x}, {y}) {cell} cap {cap} slack {slack} buffers {buffers} load sl {sl}"),
             Kind::Junction { .. } => format!("junction ({x}, {y}) cap {cap} slack {slack} buffers {buffers} load sl {sl}"),
@@ -1669,9 +1669,22 @@ fn middle_value(mut a: i32, mut b: i32, c: i32) -> i32 {
 /// place.
 pub type DontTouch = BTreeSet<String>;
 
+/// `BufferedNet::to_string` for a load: its pin by `sdcNetwork()->pathName` — the SDC spelling,
+/// a lone escape dropped (`staToSdc`), where the other lines use the db network's name.
+fn load_text(pin: &str, x: &str, y: &str, cap: &str, slack: &str, sl: &str) -> String {
+    format!("load {} ({x}, {y}) cap {cap} slack {slack} load sl {sl}", crate::repair_timing::sta_to_sdc(pin))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Rule (BufferedNet::to_string, load case): the pin prints through the SDC network, so an
+    // escaped bus bracket prints bare.
+    #[test]
+    fn a_load_prints_its_sdc_name() {
+        assert_eq!(load_text(r"dpath.a_reg.out\[7\]$_DFFE_PP_/D", "1", "2", "0.693", "-2.990", "320.000"), "load dpath.a_reg.out[7]$_DFFE_PP_/D (1, 2) cap 0.693 slack -2.990 load sl 320.000");
+    }
 
     // Rule (FixedDelay): float seconds × 1e15 in double, truncated; back as a float over 1e15.
     // 1.5e-12 is just below 1.5 ps as a float, so it truncates to 1499 fs.
