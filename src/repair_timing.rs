@@ -366,8 +366,9 @@ pub fn preamble(seq: &[Move], violating: usize, repair_tns_end_percent: f64, pha
     lines
 }
 
-/// The phase names `Optimizer::makePolicyForPhase` knows, as its errors list them.
-const VALID_PHASES: &str = "LEGACY, WNS, WNS_PATH, WNS_CONE, TNS, ENDPOINT_FANIN, STARTPOINT_FANOUT, LAST_GASP, CRIT_VT_SWAP, REROUTE, GLOBAL_SIZING";
+/// The phase names `Optimizer::makePolicyForPhase` knows, as its errors list them (upstream
+/// 32b4e4d06d7 added the experimental PARALLEL_EVAL, listed last with its tag).
+const VALID_PHASES: &str = "LEGACY, WNS, WNS_PATH, WNS_CONE, TNS, ENDPOINT_FANIN, STARTPOINT_FANOUT, LAST_GASP, CRIT_VT_SWAP, REROUTE, GLOBAL_SIZING, PARALLEL_EVAL (experimental)";
 
 /// What `Optimizer::run` does with a `-phases` / `-policy` list, as far as it is modelled.
 #[derive(Debug, Clone, PartialEq)]
@@ -383,7 +384,8 @@ pub enum PhasePlan {
     LegacyPreamble { startpoints: bool },
     /// GLOBAL_SIZING alone: `GlobalSizingPolicy`, which prints no preamble (modelled).
     GlobalSizing,
-    /// The first phase is GLOBAL_SIZING followed by more phases: another preamble, not modelled.
+    /// The first phase is GLOBAL_SIZING followed by more phases (another preamble), or
+    /// PARALLEL_EVAL (`SetupParallelEvalPolicy`): not modelled.
     Other,
 }
 
@@ -418,7 +420,7 @@ pub fn phase_plan(phases: &str) -> PhasePlan {
     }
     match first {
         "LEGACY" | "WNS" | "WNS_PATH" | "WNS_CONE" | "TNS" | "ENDPOINT_FANIN" | "STARTPOINT_FANOUT" | "LAST_GASP" | "CRIT_VT_SWAP" | "REROUTE" => PhasePlan::LegacyPreamble { startpoints: first == "STARTPOINT_FANOUT" },
-        "GLOBAL_SIZING" => PhasePlan::Other,
+        "GLOBAL_SIZING" | "PARALLEL_EVAL" => PhasePlan::Other,
         _ => PhasePlan::Error { code: "RSZ-0217", line: format!("[ERROR RSZ-0217] Unknown phase name '{first}'. Valid phase names are: {VALID_PHASES}") },
     }
 }
@@ -810,13 +812,13 @@ mod tests {
     }
 
     /// Rules (`Optimizer::run`): an empty list errors with RSZ-0223; an unknown FIRST phase with
-    /// RSZ-0217 (text from the reference's repair_setup_invalid_phase.ok); tokens split on space
+    /// RSZ-0217 (text from the reference's repair_setup_invalid_phase.ok at 4155ac3); tokens split on space
     /// and tab only.
     #[test]
     fn phase_plans() {
         assert!(matches!(phase_plan(" "), PhasePlan::Error { code: "RSZ-0223", .. }));
         let PhasePlan::Error { line, .. } = phase_plan("BAD_PHASE WNS") else { panic!() };
-        assert_eq!(line, "[ERROR RSZ-0217] Unknown phase name 'BAD_PHASE'. Valid phase names are: LEGACY, WNS, WNS_PATH, WNS_CONE, TNS, ENDPOINT_FANIN, STARTPOINT_FANOUT, LAST_GASP, CRIT_VT_SWAP, REROUTE, GLOBAL_SIZING");
+        assert_eq!(line, "[ERROR RSZ-0217] Unknown phase name 'BAD_PHASE'. Valid phase names are: LEGACY, WNS, WNS_PATH, WNS_CONE, TNS, ENDPOINT_FANIN, STARTPOINT_FANOUT, LAST_GASP, CRIT_VT_SWAP, REROUTE, GLOBAL_SIZING, PARALLEL_EVAL (experimental)");
         assert_eq!(phase_plan("WNS_PATH BAD_PHASE LAST_GASP"), PhasePlan::LegacyPreamble { startpoints: false });
         assert_eq!(phase_plan("LEGACY"), PhasePlan::Legacy);
         assert_eq!(phase_plan("\tLEGACY "), PhasePlan::Legacy);
@@ -825,6 +827,13 @@ mod tests {
         // Upstream c4fef946416 removed the MT1, MEASURED_VT_SWAP and LEGACY_MT policies: their
         // tokens are unknown phases now (RSZ-0217 as the first phase), and LEGACY_MT no longer
         // counts as legacy-compatible (no implicit CRIT_VT_SWAP after it).
+        // Upstream 32b4e4d06d7: PARALLEL_EVAL is a known phase (its own policy, no legacy
+        // preamble, no implicit CRIT_VT_SWAP), and both error lists end with it.
+        assert_eq!(phase_plan("PARALLEL_EVAL"), PhasePlan::Other);
+        assert_eq!(phase_names(Some("PARALLEL_EVAL")), vec!["PARALLEL_EVAL"]);
+        assert!(!phases_modelled("LEGACY PARALLEL_EVAL"));
+        let PhasePlan::Error { line, .. } = phase_plan("") else { panic!("empty list") };
+        assert!(line.ends_with("REROUTE, GLOBAL_SIZING, PARALLEL_EVAL (experimental)"), "{line}");
         for gone in ["MT1", "MEASURED_VT_SWAP", "LEGACY_MT"] {
             let PhasePlan::Error { code, line } = phase_plan(gone) else { panic!("{gone}") };
             assert_eq!((code, line.contains(&format!("Unknown phase name '{gone}'"))), ("RSZ-0217", true), "{gone}");

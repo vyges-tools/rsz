@@ -1192,7 +1192,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         timing_runs.push(json!({ "lines": [line], "endpoints": 0, "violating_endpoints": 0, "resized": 0, "removed": 0, "inserted": 0, "error": code }));
                         break;
                     }
-                    Some(rt::PhasePlan::Other) => return Err("repair_timing -phases: GLOBAL_SIZING with other phases is not modelled".into()),
+                    Some(rt::PhasePlan::Other) => return Err("repair_timing -phases: GLOBAL_SIZING with other phases, and PARALLEL_EVAL, are not modelled".into()),
                     Some(rt::PhasePlan::GlobalSizing) if !a.setup => return Err("repair_timing -phases GLOBAL_SIZING without -setup: not modelled".into()),
                     _ => {}
                 }
