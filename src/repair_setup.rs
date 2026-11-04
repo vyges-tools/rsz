@@ -1648,6 +1648,21 @@ fn replacement_preserves_max_cap(libs: &Libs, cell: &str, replacement: &str, fan
     true
 }
 
+/// `RepairHold::mergeInit`: every slack, min and max side, at INF (upstream 2045c6ccbc4; the
+/// max side was -INF before).
+fn merge_init() -> [[f32; 2]; 2] {
+    [[INF, INF], [INF, INF]]
+}
+
+/// `RepairHold::mergeInto(from, result)`: per transition, `std::min` of the min slacks and (since
+/// upstream 2045c6ccbc4) `std::min` of the max slacks.
+fn merge_into(from: &[[f32; 2]; 2], result: &mut [[f32; 2]; 2]) {
+    for (merged, from) in result.iter_mut().zip(from) {
+        merged[MIN] = crate::rebuffer::std_min(merged[MIN], from[MIN]);
+        merged[MAX] = crate::rebuffer::std_min(merged[MAX], from[MAX]);
+    }
+}
+
 /// A size-up the generator proposes: the instance, its cell now, the replacement.
 struct SizeUp {
     inst: String,
@@ -2272,9 +2287,10 @@ impl HoldRepair<'_, '_> {
                 continue;
             }
             let mut loads: Vec<String> = Vec::new();
-            // mergeInit / mergeInto: min of the min slacks, max of the max slacks (`std::min`,
-            // `std::max`).
-            let mut slacks = [[INF, -INF], [INF, -INF]];
+            // mergeInit / mergeInto: the least of the min (hold) slacks AND of the max (setup)
+            // slacks — upstream 2045c6ccbc4 merges setup with `std::min` from INF, so the setup
+            // guard judges the driver by its TIGHTEST hold-violating load, not its loosest.
+            let mut slacks = merge_init();
             let mut loads_have_out_port = false;
             let mut load_cap = 0.0f32;
             for f in self.driver_fanouts(&pin)? {
@@ -2282,10 +2298,7 @@ impl HoldRepair<'_, '_> {
                     continue;
                 }
                 if f64::from(f.hold_slack) < hm {
-                    for (merged, from) in slacks.iter_mut().zip(&f.slacks) {
-                        merged[MIN] = crate::rebuffer::std_min(merged[MIN], from[MIN]);
-                        merged[MAX] = crate::rebuffer::std_max(merged[MAX], from[MAX]);
-                    }
+                    merge_into(&f.slacks, &mut slacks);
                     if f.out_port {
                         loads_have_out_port = true;
                     }
@@ -5300,6 +5313,18 @@ fn path_improved(end_slack: f32, worst_slack: f32, prev_end_slack: f32, prev_wor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Rule (RepairHold::mergeInit / mergeInto, upstream 2045c6ccbc4; its gtest TestRepairHold on
+    // repair_hold_shared_driver): the hold-violating loads' setup slacks merge by min from INF, so
+    // one tight load makes the setup guard refuse a buffer the loose loads could absorb.
+    #[test]
+    fn hold_loads_merge_setup_slacks_by_the_tightest() {
+        let mut m = merge_init();
+        merge_into(&[[-0.2, 0.5], [-0.1, 0.4]], &mut m);
+        merge_into(&[[-0.3, 0.01], [-0.05, 0.9]], &mut m);
+        assert_eq!(m, [[-0.3, 0.01], [-0.1, 0.4]]);
+        assert_eq!(merge_init(), [[INF, INF], [INF, INF]], "no load leaves the setup side at INF");
+    }
 
     // Rule (OptimizationPolicyConfig, upstream c4fef946416): the tunables are config fields whose
     // defaults are the old unset-environment values — one estimation level each side, and the STA
