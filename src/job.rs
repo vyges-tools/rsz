@@ -942,8 +942,10 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 if let Ok(o) = &r {
                     let edited = o.inserted_buffers > 0 || o.resized > 0;
                     // The session's levels after the repair (its edits relevelized): what a later
-                    // timing step in this session starts from, carried or first levelized here.
-                    if sta_levels.is_some() || edited {
+                    // timing step in this session starts from, carried or first levelized here. A
+                    // session is a carried timer or the placer's reweight (findResizeSlacks, whose
+                    // rebuffering follows in this job); a standalone repair reports no levels.
+                    if sta_levels.is_some() || (edited && a.resize_slack) {
                         sta_levels = o.levels.clone().or(sta_levels.take());
                     }
                 }
