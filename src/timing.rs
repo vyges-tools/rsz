@@ -293,6 +293,24 @@ pub struct NetInfo {
     /// keep their footprint — no size move resizes them; a VT swap (same footprint) still may.
     pub fixed_insts: std::collections::BTreeSet<String>,
     pub abutment: std::collections::BTreeSet<String>,
+    /// Nets whose signal type is neither SIGNAL nor CLOCK (SCAN, RESET, TIEOFF, ANALOG …): the
+    /// ones global placement does not place, so `Resizer::isPlacedNet` turns them away while the
+    /// placer's predicate is installed (see [`is_placed_net`]).
+    pub unplaced_sig_type: std::collections::BTreeSet<String>,
+}
+
+/// The placer's net predicate `findResizeSlacks` installs as `placed_net_` for the reweight
+/// (timingBase.cpp: `isValidSigType(net->getSigType())`, i.e. SIGNAL or CLOCK) and
+/// `Resizer::isPlacedNet` reads (`!placed_net_ || placed_net_(net)`): under the placer
+/// (`installed`) a net of another signal type is not repaired; with no predicate every net is.
+/// At 4155ac3 it is read by `repairDriver`, `okToBufferNet` and `fullyRebuffer`.
+pub fn is_placed_net(info: &NetInfo, net: &str, installed: bool) -> bool {
+    !installed || !info.unplaced_sig_type.contains(net)
+}
+
+/// `gpl::isValidSigType`: SIGNAL or CLOCK.
+pub fn is_valid_sig_type(sig_type: &str) -> bool {
+    matches!(sig_type, "SIGNAL" | "CLOCK")
 }
 
 /// `ClkNetwork::findClkPins` (no propagated clocks, so ideal = all): breadth first from each
@@ -597,6 +615,24 @@ pub fn min_cap_load(libs: &[Library]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upstream rule (4155ac3): `TimingBase::executeTimingDriven` passes `findResizeSlacks` the
+    /// placer's predicate `isValidSigType(net->getSigType())` — SIGNAL or CLOCK — which
+    /// `Resizer::isPlacedNet` applies only while installed (`!placed_net_ || placed_net_(net)`).
+    /// So under the reweight a SCAN net keeps its loads unbuffered (simple01-td-scan-net: 63
+    /// buffers in 27 nets, not 74 in 28), and a plain repair_design buffers it like any other.
+    #[test]
+    fn placed_net_predicate_is_the_placers_sig_types() {
+        assert!(is_valid_sig_type("SIGNAL") && is_valid_sig_type("CLOCK"));
+        for t in ["SCAN", "RESET", "TIEOFF", "ANALOG", "POWER", "GROUND"] {
+            assert!(!is_valid_sig_type(t), "{t} is not a placed net type");
+        }
+        let mut info = NetInfo::default();
+        info.unplaced_sig_type.insert("scan".into());
+        assert!(!is_placed_net(&info, "scan", true), "under the placer a SCAN net is not placed");
+        assert!(is_placed_net(&info, "scan", false), "no predicate: every net is placed");
+        assert!(is_placed_net(&info, "data", true));
+    }
 
     fn lib(default_max: Option<f32>) -> Library {
         Library { default_max_transition: default_max, ..Default::default() }

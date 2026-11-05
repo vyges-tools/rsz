@@ -415,6 +415,7 @@ impl CliDesign<'_> {
         let live: BTreeSet<&str> = net_names.iter().map(String::as_str).collect();
         self.info.dont_touch.retain(|n| live.contains(n.as_str()));
         self.info.abutment.retain(|n| live.contains(n.as_str()));
+        self.info.unplaced_sig_type.retain(|n| live.contains(n.as_str()));
         for net in nl.nets.iter().filter(|n| touched.contains(&n.name)) {
             for c in &net.pins {
                 let name = nl.pin_name(c);
@@ -433,6 +434,11 @@ impl CliDesign<'_> {
                 self.info.abutment.insert(net.name.clone());
             } else {
                 self.info.abutment.remove(&net.name);
+            }
+            if crate::timing::is_valid_sig_type(&self.db.net_get_sig_type(&net.name)) {
+                self.info.unplaced_sig_type.remove(&net.name);
+            } else {
+                self.info.unplaced_sig_type.insert(net.name.clone());
             }
         }
         for i in new_insts {
@@ -581,6 +587,7 @@ impl CliDesign<'_> {
             let live: BTreeSet<String> = self.db.net_names().into_iter().collect();
             self.info.dont_touch.retain(|n| live.contains(n));
             self.info.abutment.retain(|n| live.contains(n));
+            self.info.unplaced_sig_type.retain(|n| live.contains(n));
         }
         // the touched nets by their slots (the appended path's own map), not by a pass over every net
         let slots: Vec<usize> = match self.inst_pos.as_ref() {
@@ -609,6 +616,11 @@ impl CliDesign<'_> {
                 self.info.abutment.insert(net.name.clone());
             } else {
                 self.info.abutment.remove(&net.name);
+            }
+            if crate::timing::is_valid_sig_type(&self.db.net_get_sig_type(&net.name)) {
+                self.info.unplaced_sig_type.remove(&net.name);
+            } else {
+                self.info.unplaced_sig_type.insert(net.name.clone());
             }
         }
         for i in new_insts {
@@ -1623,6 +1635,9 @@ pub fn net_info(db: &Db, nl: &vyges_sta::netlist::Netlist) -> Result<NetInfo, St
         }
         if db.net_is_connected_by_abutment(&net.name) {
             info.abutment.insert(net.name.clone());
+        }
+        if !crate::timing::is_valid_sig_type(&db.net_get_sig_type(&net.name)) {
+            info.unplaced_sig_type.insert(net.name.clone());
         }
     }
     info.dont_touch_insts = nl.insts.iter().map(|i| &**i).filter(|(i, _)| db.inst_is_do_not_touch(i)).map(|(i, _)| i.clone()).collect();

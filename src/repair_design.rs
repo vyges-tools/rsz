@@ -820,7 +820,10 @@ fn repair_driver_net<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut Net
     // `!sta_->isConstant(drvr_pin)` — "Exclude tie hi/low cells and supply nets": a driver the
     // simulator holds constant (a tie cell's output) is passed over like a clock driver.
     let constant = ctx.inputs.sdc.constants.contains_key(drvr_name);
-    if info.dont_touch.contains(&net) || info.abutment.contains(&net) || clocks.contains(&drvr) || constant {
+    // `resizer_->isPlacedNet(net_db)`: under the placer's predicate (the reweight) a net global
+    // placement does not place (SCAN …) is passed over.
+    let unplaced = !timing::is_placed_net(info, &net, ctx.args.resize_slack);
+    if info.dont_touch.contains(&net) || info.abutment.contains(&net) || unplaced || clocks.contains(&drvr) || constant {
         outcome.drivers_skipped += 1;
         return Ok(graphs);
     }
