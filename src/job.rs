@@ -956,6 +956,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     // it from the report instead and prints it itself.
                     if a.resize_slack {
                         repair_progress = table;
+                        repair_progress.extend(find_resize_slacks_violation_counters(o));
                     } else {
                         for l in &table {
                             say(&json!(l));
@@ -1825,6 +1826,15 @@ impl std::ops::Deref for Runs {
     }
 }
 
+/// `Resizer::findResizeSlacks` (timing-driven placement's reweight): after `repairDesign` it
+/// calls `reportViolationCounters(false, …)`, so the reweight's log carries the counter lines
+/// (RSZ-0034 slew, -0035 fanout, -0036 capacitance, -0037 long wires, -0039 resized, -0044
+/// rerouted, -0038 inserted; `false` picks 38, not 55) right after the progress table, before
+/// the rebuffering. Each line in the logger's form, as gpl prints the table.
+pub fn find_resize_slacks_violation_counters(o: &repair_design::Outcome) -> Vec<String> {
+    o.summary().into_iter().map(|(code, text)| format!("[INFO {code}] {text}")).collect()
+}
+
 /// A design `set_max_fanout` is checked against the sum of each load's fanout load: its port's
 /// `fanout_load`, else its library's `default_fanout_load`, else 0 (`portFanoutLoad`). With
 /// neither attribute in any library read, every sum is 0 and the limit can never act: said at
@@ -1862,5 +1872,33 @@ fn say(line: &Value) {
             }
             eprintln!("{text}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Upstream rule (`Resizer::findResizeSlacks` at 4155ac3): the reweight's `repairDesign` is
+    /// followed by `reportViolationCounters(false, …)`, so its counters print after the progress
+    /// table in `reportViolationCounters`' order (34 slew, 35 fanout, 36 cap, 37 long wires, 39
+    /// resized, 44 rerouted, then 38 inserted — `false` picks 38 over 55); a zero count prints
+    /// nothing. Witness: simple01-td-restart's first reweight, `[INFO RSZ-0035] Found 78 fanout
+    /// violations.` then `[INFO RSZ-0038] Inserted 367 buffers in 78 nets.`
+    #[test]
+    fn reweight_prints_the_violation_counters() {
+        let o = repair_design::Outcome { fanout_violations: 78, inserted_buffers: 367, nets_repaired: 78, ..Default::default() };
+        assert_eq!(find_resize_slacks_violation_counters(&o), [
+            "[INFO RSZ-0035] Found 78 fanout violations.",
+            "[INFO RSZ-0038] Inserted 367 buffers in 78 nets.",
+        ]);
+        let o = repair_design::Outcome { slew_violations: 2, length_violations: 1, resized: 3, inserted_buffers: 4, nets_repaired: 2, ..Default::default() };
+        assert_eq!(find_resize_slacks_violation_counters(&o), [
+            "[INFO RSZ-0034] Found 2 slew violations.",
+            "[INFO RSZ-0037] Found 1 long wires.",
+            "[INFO RSZ-0039] Resized 3 instances.",
+            "[INFO RSZ-0038] Inserted 4 buffers in 2 nets.",
+        ]);
+        assert!(find_resize_slacks_violation_counters(&repair_design::Outcome::default()).is_empty(), "no counts, no lines");
     }
 }
