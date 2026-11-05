@@ -2857,11 +2857,10 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
         let Some(&marker) = PHASE_MARKERS.get(i) else {
             return Err(Stop::refused("RSZ-ABSENT", "more than 8 phases: not modelled".into()));
         };
-        // Under a path group only LEGACY and LAST_GASP (and an idle CRIT_VT_SWAP) read the group
-        // as the reference's do, through the collector alone; each other policy reads the
+        // Under a path group only LEGACY, LAST_GASP and CRIT_VT_SWAP (`findGroupFanout`) read the
+        // group as the reference's do, through the collector alone; each other policy reads the
         // timer's own worst and total slacks in places.
-        let crit_vt_idle = args.skip_crit_vt_swap || args.skip_vt_swap || ctx.vt_category_count < 2;
-        if ctx.path_group.is_some() && !(name == "LEGACY" || name == "LAST_GASP" || (name == "CRIT_VT_SWAP" && crit_vt_idle)) {
+        if ctx.path_group.is_some() && !matches!(name.as_str(), "LEGACY" | "LAST_GASP" | "CRIT_VT_SWAP") {
             return Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -path_group with the {name} phase: not modelled")));
         }
         match name.as_str() {

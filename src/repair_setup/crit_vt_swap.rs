@@ -115,21 +115,16 @@ impl Repair<'_, '_> {
         let design: &dyn super::SetupDesign = &*self.design;
         let dont_touch = &design.net_info().dont_touch_insts;
         let mut result: Vec<CritInst> = Vec::new();
-        super::timed_all(ctx, design.as_design(), &mut self.timer, edits, |gs, ss, _| {
+        // Under a group, `findGroupFanout`'s side: whether its startpoints are inputs.
+        let group_from_inputs = ctx.path_group.and_then(crate::path_group::group_sides).map(|(i, _)| i);
+        super::timed_all(ctx, design.as_design(), &mut self.timer, edits, |gs, ss, cs| {
             let (g, s) = (&gs[0], &ss[0]);
             let parasitics = std::slice::from_ref(design.parasitics(0));
             let sc = crate::timing::Scenes::new(std::slice::from_ref(g));
             let ideal: BTreeSet<usize> = g.ideal_clock.iter().copied().collect();
             // `Vertex::isRegClk`: the from pin of a clock-to-output arc.
-            let is_reg_clk = |v: usize| {
-                g.out_edges[v].iter().any(|&e| match g.edges[e].kind {
-                    EdgeKind::Gate { set } => {
-                        let vx = &g.vertices[g.edges[e].to];
-                        vx.lib.and_then(|l| g.libs.get(l)).and_then(|l| l.cells.get(vx.cell.as_deref()?)).is_some_and(|c| matches!(c.arc_sets[set].role, Role::RegClkToQ | Role::LatchEnToQ))
-                    }
-                    EdgeKind::Wire => false,
-                })
-            };
+            let is_reg_clk = |v: usize| is_reg_clk(g, v);
+            let group_fanout = group_from_inputs.map(|from_inputs| find_group_fanout(g, &cs[0], from_inputs, &is_reg_clk));
             let mut visited: HashSet<usize> = HashSet::new();
             let mut crit_set: HashSet<String> = HashSet::new();
             for end in ends {
@@ -139,10 +134,15 @@ impl Repair<'_, '_> {
                 }
                 let mut endpoint_insts = 0;
                 let fanins = |cur: usize| {
-                    g.in_edges[cur].iter().rev().map(|&e| g.edges[e].from).filter(|&f| !is_reg_clk(f)).map(|f| (f, s.slack_of(f, MAX, None))).collect::<Vec<_>>()
+                    // Under a group: logic no group startpoint reaches carries none of its paths.
+                    let in_group = |f: usize| !matches!(&group_fanout, Some(r) if !r.contains(&f));
+                    g.in_edges[cur].iter().rev().map(|&e| g.edges[e].from).filter(|&f| !is_reg_clk(f) && in_group(f)).map(|f| (f, s.slack_of(f, MAX, None))).collect::<Vec<_>>()
                 };
                 walk_fanin_cone(ev, s.slack_of(ev, MAX, None), margin, &mut visited, fanins, |cur| {
-                    if let Conn::Inst(k, _) = &g.vertices[cur].conn {
+                    // Under a group an instance counts only through an output (its own delay on
+                    // the group's paths; the endpoint's register is reached by its data pin).
+                    let counted = counts_instance(group_fanout.is_some(), g.vertices[cur].is_driver);
+                    if let (true, Conn::Inst(k, _)) = (counted, &g.vertices[cur].conn) {
                         let (inst, cell) = (&g.netlist.insts[*k].0, &g.netlist.insts[*k].1);
                         if let Some(best) = check_and_mark_vt_swappable(ctx, dont_touch, inst, cell, not_swappable) {
                             // `getInstanceSlack`: the least (`std::min`) slack over the output pins.
@@ -189,6 +189,71 @@ impl Repair<'_, '_> {
     }
 }
 
+/// `Vertex::isRegClk`: the from pin of a clock-to-output arc.
+fn is_reg_clk(g: &vyges_sta::graph::Graph<'_>, v: usize) -> bool {
+    g.out_edges[v].iter().any(|&e| match g.edges[e].kind {
+        EdgeKind::Gate { set } => {
+            let vx = &g.vertices[g.edges[e].to];
+            vx.lib.and_then(|l| g.libs.get(l)).and_then(|l| l.cells.get(vx.cell.as_deref()?)).is_some_and(|c| matches!(c.arc_sets[set].role, Role::RegClkToQ | Role::LatchEnToQ))
+        }
+        EdgeKind::Wire => false,
+    })
+}
+
+/// Whether `traverseFaninCone` counts the instance of a pin it pops: under a group only through
+/// an output (its own delay on the group's paths; the endpoint's register is reached by its data
+/// pin), else through any pin.
+fn counts_instance(group: bool, driver: bool) -> bool {
+    !group || driver
+}
+
+/// `findGroupFanout`: every vertex a group startpoint reaches — from each top input, or each
+/// register output (`Resizer::isRegister`: a sequential cell's), on its side of the group
+/// (`startpointInGroup`: a top input exactly when the group starts at inputs) and off the clock
+/// network, forward through every edge but a timing check and one into a register clock pin.
+fn find_group_fanout(g: &vyges_sta::graph::Graph<'_>, clock_network: &BTreeSet<usize>, from_inputs: bool, is_reg_clk: &dyn Fn(usize) -> bool) -> HashSet<usize> {
+    let register = |v: usize| {
+        let vx = &g.vertices[v];
+        vx.lib.and_then(|l| g.libs.get(l)).and_then(|l| l.cells.get(vx.cell.as_deref()?)).is_some_and(|c| c.is_sequential())
+    };
+    let seeds: Vec<usize> = (0..g.vertices.len()).filter(|&v| is_group_start(g.vertices[v].is_driver, clock_network.contains(&v), g.is_port(v), register(v), from_inputs)).collect();
+    // An edge is followed unless it is a timing check or ends at a register clock pin.
+    let next = |v: usize| -> Vec<usize> {
+        g.out_edges[v]
+            .iter()
+            .filter(|&&e| !matches!(g.edges[e].kind, EdgeKind::Gate { set } if g.arc_set(e, set).role.is_timing_check()))
+            .map(|&e| g.edges[e].to)
+            .filter(|&to| !is_reg_clk(to))
+            .collect()
+    };
+    reach_forward(&seeds, next)
+}
+
+/// A `findGroupFanout` seed: a driver off the clock network that is a top input or a register
+/// output, a top input exactly when the group starts at inputs (`startpointInGroup`).
+fn is_group_start(driver: bool, on_clock: bool, input: bool, register: bool, from_inputs: bool) -> bool {
+    driver && !on_clock && (input || register) && input == from_inputs
+}
+
+/// Breadth first from `seeds` along `next`: every vertex reached, the seeds included.
+fn reach_forward(seeds: &[usize], next: impl Fn(usize) -> Vec<usize>) -> HashSet<usize> {
+    let mut reached: HashSet<usize> = HashSet::new();
+    let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    for &v in seeds {
+        if reached.insert(v) {
+            queue.push_back(v);
+        }
+    }
+    while let Some(v) = queue.pop_front() {
+        for to in next(v) {
+            if reached.insert(to) {
+                queue.push_back(to);
+            }
+        }
+    }
+    reached
+}
+
 /// `traverseFaninCone`'s walk (6d88a0eb5b8): a min-slack `std::priority_queue` of (slack, vertex),
 /// ordered by slack alone, seeded with the endpoint; each popped vertex is visited, then its
 /// fanins (in the order given) not yet visited whose slack violates the margin are queued and
@@ -214,6 +279,77 @@ fn walk_fanin_cone(start: usize, start_slack: f32, margin: f32, visited: &mut Ha
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rules (`SetupCritVtSwapPolicy::findGroupFanout`, `PathGroupFilter::startpointInGroup`):
+    /// a group's startpoints are the top inputs (in2reg, in2out) or the register outputs
+    /// (reg2reg, reg2out), never a clock-network pin nor a load; the fanout is everything they
+    /// reach forward, the walk stopping at a timing check and at a register clock pin (handed in
+    /// `next`).
+    #[test]
+    fn a_groups_fanout_starts_on_its_side() {
+        // (driver, on_clock, input, register)
+        assert!(is_group_start(true, false, true, false, true));
+        assert!(!is_group_start(true, false, true, false, false), "an input is no reg2reg start");
+        assert!(is_group_start(true, false, false, true, false));
+        assert!(!is_group_start(true, false, false, true, true), "a register is no in2reg start");
+        assert!(!is_group_start(true, true, false, true, false), "a clock-network pin is none");
+        assert!(!is_group_start(false, false, false, true, false), "a register's input is none");
+        assert!(!is_group_start(true, false, false, false, false), "a combinational output is none");
+        let next = [vec![1], vec![2, 3], vec![], vec![1]];
+        let r = reach_forward(&[0], |v| next[v].clone());
+        assert_eq!(r, HashSet::from([0, 1, 2, 3]));
+        assert_eq!(reach_forward(&[2], |v| next[v].clone()), HashSet::from([2]));
+    }
+
+    /// Rules (`findGroupFanout` on a graph): reg2reg reaches from every register output on; in2reg
+    /// from the inputs off the clock network, and an input driving a register's clock pin stops
+    /// there (that register's output is not reached through it).
+    #[test]
+    fn a_groups_fanout_stops_at_register_clock_pins() {
+        const D: &str = r#"cell_rise (t) { values ("0.01, 0.01", "0.01, 0.01"); } rise_transition (t) { values ("0.01, 0.01", "0.01, 0.01"); }
+          cell_fall (t) { values ("0.01, 0.01", "0.01, 0.01"); } fall_transition (t) { values ("0.01, 0.01", "0.01, 0.01"); }"#;
+        const C: &str = r#"rise_constraint (t) { values ("0.01, 0.01", "0.01, 0.01"); } fall_constraint (t) { values ("0.01, 0.01", "0.01, 0.01"); }"#;
+        let lib = format!(
+            r#"library (t) {{ time_unit : "1ns"; capacitive_load_unit (1, pf);
+          lu_table_template (t) {{ variable_1 : input_net_transition; variable_2 : total_output_net_capacitance; index_1 ("0, 1"); index_2 ("0, 1"); }}
+          cell (buf) {{ pin (A) {{ direction : input; capacitance : 0.001; }}
+            pin (Z) {{ direction : output; function : "A"; timing () {{ related_pin : "A"; timing_sense : positive_unate; {D} }} }} }}
+          cell (dff) {{ ff (IQ, IQN) {{ clocked_on : "CK"; next_state : "D"; }}
+            pin (D) {{ direction : input; capacitance : 0.001; timing () {{ related_pin : "CK"; timing_type : setup_rising; {C} }} }}
+            pin (CK) {{ direction : input; clock : true; capacitance : 0.001; }}
+            pin (Q) {{ direction : output; function : "IQ"; timing () {{ related_pin : "CK"; timing_type : rising_edge; {D} }} }} }} }}"#
+        );
+        use vyges_sta::netlist::{inst, Conn, Net, Netlist, PortDir};
+        let libs = vec![vyges_sta::liberty::Library::read(&vyges_sta::liberty_parse::parse(&lib).unwrap()).unwrap()];
+        let i = |k: usize, p: &str| Conn::Inst(k, p.into());
+        let netlist = Netlist {
+            insts: vec![inst("b1", "buf"), inst("r1", "dff"), inst("b2", "buf"), inst("r2", "dff"), inst("r3", "dff")],
+            ports: vec![("clk".into(), PortDir::Input), ("a".into(), PortDir::Input), ("en".into(), PortDir::Input), ("q".into(), PortDir::Output)],
+            nets: vec![
+                Net { name: "clk".into(), pins: vec![Conn::Port(0), i(1, "CK"), i(3, "CK")] }.into(),
+                Net { name: "a".into(), pins: vec![Conn::Port(1), i(0, "A"), i(4, "D")] }.into(),
+                Net { name: "n1".into(), pins: vec![i(0, "Z"), i(1, "D")] }.into(),
+                Net { name: "n2".into(), pins: vec![i(1, "Q"), i(2, "A")] }.into(),
+                Net { name: "n3".into(), pins: vec![i(2, "Z"), i(3, "D")] }.into(),
+                Net { name: "en".into(), pins: vec![Conn::Port(2), i(4, "CK")] }.into(),
+                Net { name: "q".into(), pins: vec![i(4, "Q"), Conn::Port(3)] }.into(),
+            ],
+        };
+        let g = vyges_sta::graph::Graph::build(&libs, &netlist).unwrap();
+        let clocks = crate::timing::clock_pins(&g, &["clk".to_string()]);
+        let names = |from_inputs: bool| -> BTreeSet<String> { find_group_fanout(&g, &clocks, from_inputs, &|v| is_reg_clk(&g, v)).into_iter().map(|v| g.vertices[v].name.clone()).collect() };
+        let set = |xs: &[&str]| -> BTreeSet<String> { xs.iter().map(|x| x.to_string()).collect() };
+        assert_eq!(names(true), set(&["a", "b1/A", "b1/Z", "en", "r1/D", "r3/D"]));
+        assert_eq!(names(false), set(&["b2/A", "b2/Z", "q", "r1/Q", "r2/D", "r2/Q", "r3/Q"]));
+    }
+
+    /// Rule (`traverseFaninCone` under -path_group): an instance counts only through an output pin;
+    /// with no group, through any pin.
+    #[test]
+    fn under_a_group_an_instance_counts_through_its_output() {
+        assert!(counts_instance(false, false) && counts_instance(false, true));
+        assert!(counts_instance(true, true) && !counts_instance(true, false));
+    }
 
     // Rule (SetupCritVtSwapPolicy::traverseFaninCone, 6d88a0eb5b8): the violating fanin is walked
     // worst slack first (a min-slack priority queue, not FIFO), so the per-endpoint cap keeps the
