@@ -1185,6 +1185,13 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 };
                 let mut a = if fr.is_some() { rt::Args::parse(&["-setup".to_string(), "-sequence".to_string(), "buffer".to_string()])? } else { rt::Args::parse(&args)? };
                 a.sta_levels = sta_levels.clone();
+                // `-path_group` (`rsz::resolve_path_group`, before anything else of the command):
+                // an unknown name warns and restricts nothing; a group is not modelled yet.
+                let (path_group, path_group_lines) = rt::resolve_path_group(a.path_group.as_deref());
+                if let Some(name) = path_group {
+                    return Err(format!("repair_timing -path_group {name}: not modelled"));
+                }
+                timing_runs.prefix = path_group_lines;
                 // `-recover_power` dispatches to `rsz::recover_power` in place of setup and hold:
                 // -phases, -sequence and the setup flags never reach it.
                 let recover = a.recover_power;
@@ -1780,10 +1787,10 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
         report["notes"] = json!(notes);
     }
     if !clock_runs.is_empty() {
-        report["repair_clock_nets"] = json!(clock_runs.0);
+        report["repair_clock_nets"] = json!(clock_runs.runs);
     }
     if !timing_runs.is_empty() {
-        report["repair_timing"] = json!(timing_runs.0);
+        report["repair_timing"] = json!(timing_runs.runs);
     }
     if !tie_runs.is_empty() {
         // A command that left nothing to do (or had nothing to check), then ties inserted: the
@@ -1811,22 +1818,32 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
 
 /// The run records a repair command leaves in the report. Each run's `lines` are printed as it is
 /// recorded — where the reference's logger writes them, in command order — and kept for the report.
+/// `prefix`: the lines the command printed before its run's own (the Tcl's RSZ-0227 warning),
+/// which the next run pushed takes first.
 #[derive(Default)]
-struct Runs(Vec<Value>);
+struct Runs {
+    runs: Vec<Value>,
+    prefix: Vec<String>,
+}
 
 impl Runs {
-    fn push(&mut self, run: Value) {
+    fn push(&mut self, mut run: Value) {
+        if !self.prefix.is_empty() {
+            let mut lines: Vec<Value> = std::mem::take(&mut self.prefix).into_iter().map(Value::from).collect();
+            lines.extend(run["lines"].as_array().cloned().unwrap_or_default());
+            run["lines"] = Value::from(lines);
+        }
         for l in run["lines"].as_array().into_iter().flatten() {
             say(l);
         }
-        self.0.push(run);
+        self.runs.push(run);
     }
 }
 
 impl std::ops::Deref for Runs {
     type Target = Vec<Value>;
     fn deref(&self) -> &Vec<Value> {
-        &self.0
+        &self.runs
     }
 }
 

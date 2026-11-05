@@ -57,6 +57,8 @@ pub struct Args {
     pub skip_crit_vt_swap: bool,
     pub match_cell_footprint: bool,
     pub allow_setup_violations: bool,
+    /// `-path_group`, as given (resolved by [`resolve_path_group`]).
+    pub path_group: Option<String>,
     /// The timer's levels as an earlier call left them (a session the caller carries across
     /// calls, as the reference's one timer does): the levels its incremental relevelization had
     /// reached, which a fresh levelization need not give. `None`: levelize from scratch.
@@ -161,6 +163,7 @@ impl Args {
             skip_crit_vt_swap: false,
             match_cell_footprint: false,
             allow_setup_violations: false,
+            path_group: None,
             sta_levels: None,
         };
         let mut i = 0;
@@ -210,6 +213,10 @@ impl Args {
                     }
                     i += 1;
                 }
+                "-path_group" => {
+                    a.path_group = Some(value(i)?);
+                    i += 1;
+                }
                 "-max_utilization" => {
                     a.max_utilization = Some(value(i)?);
                     i += 1;
@@ -253,6 +260,26 @@ impl Args {
             a.hold = true;
         }
         Ok(a)
+    }
+}
+
+/// `pathGroupNames`: the names `-path_group` takes, in the order RSZ-0227 lists them.
+pub const PATH_GROUP_NAMES: [&str; 5] = ["reg2reg", "in2reg", "reg2out", "in2out", "gated_clock"];
+
+/// `resolvePathGroupName` (run by the Tcl before anything else of the command): a name
+/// `findPathGroupType` does not know warns RSZ-0227 and resolves to no group, so the repair is
+/// not restricted; a known one is the group's name. `None` in: no `-path_group`.
+pub fn resolve_path_group(name: Option<&str>) -> (Option<&'static str>, Vec<String>) {
+    let Some(name) = name else { return (None, Vec::new()) };
+    match PATH_GROUP_NAMES.iter().find(|n| **n == name) {
+        Some(n) => (Some(n), Vec::new()),
+        None => (
+            None,
+            vec![format!(
+                "[WARNING RSZ-0227] Unknown -path_group '{name}'. Valid path groups are {}. Timing optimization is not restricted to a path group.",
+                PATH_GROUP_NAMES.join(", ")
+            )],
+        ),
     }
 }
 
@@ -685,6 +712,26 @@ pub fn timing_points(g: &vyges_sta::graph::Graph<'_>, search: &vyges_sta::search
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rule (`resolvePathGroupName`, `findPathGroupType`, `pathGroupNames`): only the five names
+    /// are groups, matched exactly; any other warns RSZ-0227, listing them in that order, and
+    /// restricts nothing. No `-path_group`: no group, no line.
+    #[test]
+    fn an_unknown_path_group_warns_and_restricts_nothing() {
+        let a = Args::parse(&["-setup".into(), "-path_group".into(), "bogus".into()]).unwrap();
+        assert_eq!(a.path_group.as_deref(), Some("bogus"));
+        let (g, lines) = resolve_path_group(a.path_group.as_deref());
+        assert_eq!(g, None);
+        assert_eq!(
+            lines,
+            ["[WARNING RSZ-0227] Unknown -path_group 'bogus'. Valid path groups are reg2reg, in2reg, reg2out, in2out, gated_clock. Timing optimization is not restricted to a path group."]
+        );
+        assert_eq!(resolve_path_group(Some("Reg2reg")).0, None);
+        for n in PATH_GROUP_NAMES {
+            assert_eq!(resolve_path_group(Some(n)), (Some(n), Vec::new()));
+        }
+        assert_eq!(resolve_path_group(None), (None, Vec::new()));
+    }
 
     fn p(pin: &str, slack: f32) -> Point {
         Point { pin: pin.into(), slack, wns_slack: slack }
