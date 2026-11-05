@@ -46,6 +46,7 @@ pub mod max_wire_length;
 pub mod odb_design;
 pub mod move_tracker;
 pub mod order;
+pub mod path_group;
 pub mod preamble;
 pub mod rebuffer;
 pub mod repair_design;

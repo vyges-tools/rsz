@@ -452,6 +452,8 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
     let mut sdc_path_delays = false;
     // Each repair_timing's lines; a refusal after them stops the job.
     let mut timing_runs = Runs::default();
+    // `makePathGroup`'s group paths, in the order the commands made them.
+    let mut made_groups: Vec<vyges_sta::sdc::PathDelay> = Vec::new();
     // `set_debug_level`: each (tool, group) and its level.
     let mut debug_levels: BTreeMap<(String, String), i64> = BTreeMap::new();
     let mut timing_stop: Option<String> = None;
@@ -711,11 +713,12 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     return Err(format!("{path}: {q}: object query not evaluated, not modelled"));
                 }
                 // set_max_transition / set_max_fanout / set_max_capacitance on the design are
-                // modelled (the limits); on any other object they are not.
+                // modelled (the limits); on any other object they are not. `group_path`: read by
+                // repair_timing's search (`search_sdc_on`), which refuses what it does not model.
                 let unmodelled: Vec<&str> = s
                     .ignored_affecting_timing()
                     .into_iter()
-                    .filter(|c| (*c != "set_max_transition" || s.max_transition_on_objects) && (*c != "set_max_fanout" || s.max_fanout_on_objects) && *c != "set_max_capacitance" && *c != "set_driving_cell" && *c != "set_propagated_clock" && *c != "set_max_delay" && *c != "set_min_delay")
+                    .filter(|c| (*c != "set_max_transition" || s.max_transition_on_objects) && (*c != "set_max_fanout" || s.max_fanout_on_objects) && *c != "set_max_capacitance" && *c != "set_driving_cell" && *c != "set_propagated_clock" && *c != "set_max_delay" && *c != "set_min_delay" && *c != "group_path")
                     .collect();
                 if !unmodelled.is_empty() {
                     return Err(format!("{path}: {} not modelled", unmodelled.join(", ")));
@@ -1188,8 +1191,8 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 // `-path_group` (`rsz::resolve_path_group`, before anything else of the command):
                 // an unknown name warns and restricts nothing; a group is not modelled yet.
                 let (path_group, path_group_lines) = rt::resolve_path_group(a.path_group.as_deref());
-                if let Some(name) = path_group {
-                    return Err(format!("repair_timing -path_group {name}: not modelled"));
+                if path_group == Some("gated_clock") {
+                    return Err("repair_timing -path_group gated_clock: not modelled (the timer's gated-clock group)".into());
                 }
                 timing_runs.prefix = path_group_lines;
                 // `-recover_power` dispatches to `rsz::recover_power` in place of setup and hold:
@@ -1285,6 +1288,28 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 }
                 let mut ssdc = search_sdc_on(s, &netlist, time_scale, clock_propagated, a.hold)?;
                 crate::env::add_virtual_latencies(&mut ssdc, &virtual_latencies)?;
+                // The groups earlier commands made stay in the constraints (`makeGroupPath` on the
+                // command SDC), after the file's own.
+                ssdc.path_delays.extend(made_groups.iter().cloned());
+                // `resolvePathGroupName`: a known group the constraints do not name
+                // (`isPathGroupName`: no group path, nor clock, of the name) is made.
+                if let Some(name) = path_group {
+                    let named = ssdc.path_delays.iter().any(|pd| pd.group.as_deref() == Some(name)) || ssdc.clocks.iter().any(|c| c.name == name);
+                    if !named {
+                        if let Some((pd, line)) = crate::path_group::make_path_group(&g, &netlist, name, &clock_sources) {
+                            // A diagnostic: the group's sides (`VYGES_RSZ_GROUP_DUMP=<file>`: `from`
+                            // and `to` lines, a pin each, sorted), against the reference's write_sdc.
+                            if let Ok(path) = std::env::var("VYGES_RSZ_GROUP_DUMP") {
+                                let mut out: Vec<String> = pd.from_pins.iter().map(|p| format!("from {p}")).chain(pd.to_pins.iter().map(|p| format!("to {p}"))).collect();
+                                out.sort();
+                                std::fs::write(&path, out.join("\n") + "\n").map_err(|e| format!("{path}: {e}"))?;
+                            }
+                            ssdc.path_delays.push(pd.clone());
+                            made_groups.push(pd);
+                            timing_runs.prefix.push(line);
+                        }
+                    }
+                }
                 let mut search = vyges_sta::search::Search::in_graph_order(&g, &ssdc);
                 search.constraints_modelled()?;
                 search.find_arrivals()?;
@@ -1325,7 +1350,15 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 // over the endpoints' min and max slacks.
                 let hold_only = !a.setup;
                 let margin = vyges_sta::sdc::user_to_sta(a.setup_margin, time_scale);
-                let violating = rt::collect_violating(&ends, margin);
+                // Under a group (`restrictedToPathGroup`): the group's path ends in place of the
+                // endpoints (`collectViolatingEndpoints` -> `refreshGroupSlacks`).
+                let group_ends = match path_group {
+                    Some(_) if hold_only || recover || fr.is_some() => return Err("repair_timing -path_group with -hold or -recover_power: not modelled".into()),
+                    Some(_) if libs.scene_count() > 1 => return Err("repair_timing -path_group over several corners: not modelled".into()),
+                    Some(name) => Some(crate::path_group::group_ends(&g, &search, name)),
+                    None => None,
+                };
+                let violating = rt::collect_violating(group_ends.as_deref().unwrap_or(&ends), margin);
                 let violating_starts = rt::collect_violating(&starts, margin);
                 // `hasVtSwapCells`: more than one VT category among the buffers (`getBufferList` in
                 // the preamble, clock buffers excluded for -setup).
@@ -1341,6 +1374,10 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 // start with its own RSZ-2024.
                 let measured = matches!(plan, Some(rt::PhasePlan::GlobalSizing));
                 let mut lines = if recover || measured || fr.is_some() { Vec::new() } else { rt::preamble(&seq, violating.len(), a.repair_tns_end_percent, a.phases.as_deref()) };
+                // Under a group: GLOBAL_SIZING and the startpoint metrics are not modelled.
+                if group_ends.is_some() && (measured || matches!(plan, Some(rt::PhasePlan::LegacyPreamble { startpoints: true }))) {
+                    return Err("repair_timing -path_group with GLOBAL_SIZING or the startpoint metrics: not modelled".into());
+                }
                 // The moves modelled, over one corner or several (each reads the scenes the
                 // reference's does: see the moves), LEGACY and LAST_GASP.
                 let startpoint_rows = matches!(plan, Some(rt::PhasePlan::LegacyPreamble { startpoints: true }));
@@ -1358,7 +1395,11 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 if !recover && !hold_only && !measured && violating.is_empty() && fr.is_none() {
                     timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": 0 }));
                 } else if let Some(why) = unmodelled.filter(|_| !hold_only && !recover) {
-                    lines.extend(rt::row0_with(&ends, violating.len(), &starts, &violating_starts, time_scale, startpoint_rows));
+                    if let Some(ge) = &group_ends {
+                        lines.extend(group_row0(&violating, ge, time_scale));
+                    } else {
+                        lines.extend(rt::row0_with(&ends, violating.len(), &starts, &violating_starts, time_scale, startpoint_rows));
+                    }
                     timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len() }));
                     timing_stop = Some(why);
                     break;
@@ -1426,7 +1467,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                             rb_sizes_store = match crate::rebuffer::characterize(&ci, &buffers.cells) {
                                 Ok(s) => s,
                                 Err(e) => {
-                                    lines.extend(rt::row0(&ends, violating.len(), &starts, &violating_starts, time_scale));
+                                    lines.extend(match &group_ends { Some(ge) => group_row0(&violating, ge, time_scale), None => rt::row0(&ends, violating.len(), &starts, &violating_starts, time_scale) });
                                     timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len() }));
                                     timing_stop = Some(format!("{e} (not modelled)"));
                                     break;
@@ -1441,6 +1482,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         None
                     };
                     let ctx = crate::repair_setup::Ctx {
+                        path_group,
                         libs: &libs,
                         sizing: &sizing,
                         env: &env,
@@ -1657,7 +1699,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         Err(Stop::Refused { msg, .. }) => {
                             // A step refused during the repair: scored, as a refusal before it is,
                             // on the preamble and the progress table's header and row 0.
-                            lines.extend(rt::row0(&ends, violating.len(), &starts, &violating_starts, time_scale));
+                            lines.extend(match &group_ends { Some(ge) => group_row0(&violating, ge, time_scale), None => rt::row0(&ends, violating.len(), &starts, &violating_starts, time_scale) });
                             timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len() }));
                             timing_stop = Some(format!("{msg} (not modelled)"));
                             break;
@@ -1814,6 +1856,16 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
             .collect();
     }
     Ok((report, db))
+}
+
+/// The progress table's header and row 0 under a path group (`printProgress` with
+/// `restrictedToPathGroup`: `getWns`, `getTns`, `getWorstPin` over the group's ends).
+fn group_row0(violating: &[crate::repair_timing::Point], group_ends: &[crate::repair_timing::Point], time_scale: f32) -> Vec<String> {
+    use crate::repair_timing as rt;
+    let (wns, en_tns, worst) = crate::path_group::group_row(violating, group_ends);
+    let mut lines = rt::progress_header(false);
+    lines.push(rt::progress_row(&rt::Row { iter: "0*", removed: 0, resized: 0, inserted: 0, cloned: 0, swaps: 0, area_growth_percent: 0.0, wns, st_tns: None, en_tns, viol: violating.len(), worst: worst.as_deref().unwrap_or("") }, time_scale));
+    lines
 }
 
 /// The run records a repair command leaves in the report. Each run's `lines` are printed as it is

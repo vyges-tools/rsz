@@ -103,6 +103,9 @@ pub struct Ctx<'a> {
     pub policy: PolicyConfig,
     /// `Resizer::globalSizingConfig`: the block's `gs_*` properties over the defaults.
     pub gs: GlobalSizingConfig,
+    /// `-path_group` resolved to a group (`restrictedToPathGroup`): the repair reads that group's
+    /// path ends ([`crate::path_group`]) in place of the endpoints'.
+    pub path_group: Option<&'a str>,
 }
 
 /// `OptimizationPolicyConfig`: every tunable of the setup repair policies and their moves, each at
@@ -241,25 +244,67 @@ struct PathView {
 /// The timer over the design as it is now: every endpoint's and startpoint's slack, and the worst
 /// path of the endpoints asked for (and of the worst endpoint).
 pub struct Snapshot {
+    /// The endpoints, in the timer's order; under a group, the group's path ends in the group's
+    /// order, each with the group's slack (`groupEndpointSlacks`).
     ends: Vec<Point>,
     starts: Vec<Point>,
     paths: HashMap<String, PathView>,
+    /// Restricted to a path group (`restrictedToPathGroup`).
+    group: bool,
+    /// Under a group: every endpoint's own slack (`Sta::slack(vertex, max)`), which some reads
+    /// keep (`getCurrentEndpointSlack`).
+    sta_slacks: HashMap<String, f32>,
 }
 
 impl Snapshot {
-    /// `Sta::slack(vertex, max)` of an endpoint.
+    /// `RepairTargetCollector::endpointSlack`: `Sta::slack(vertex, max)` of an endpoint; under a
+    /// group its group slack, INF when it has no path in the group.
     fn slack(&self, pin: &str) -> f32 {
         self.ends.iter().find(|p| p.pin == pin).map_or(INF, |p| p.slack)
     }
 
-    /// `Sta::worstSlack(max, wns, worst_vertex)`.
+    /// `Sta::slack(vertex, max)` of an endpoint, under a group too (`getCurrentEndpointSlack`).
+    fn sta_slack(&self, pin: &str) -> f32 {
+        if self.group {
+            return self.sta_slacks.get(pin).copied().unwrap_or(INF);
+        }
+        self.slack(pin)
+    }
+
+    /// `RepairTargetCollector::worstSlack`: `Sta::worstSlack(max, wns, worst_vertex)`; under a
+    /// group `groupWorst`, the group's first end (INF and none when it has none).
     fn worst(&self) -> (f32, Option<String>) {
+        if self.group {
+            return self.ends.first().map_or((INF, None), |p| (p.slack, Some(p.pin.clone())));
+        }
         let (wns, at) = worst_slack(&self.ends);
         (wns, at.map(|p| p.pin.clone()))
     }
 
+    /// `RepairTargetCollector::totalNegativeSlack`: `Sta::totalNegativeSlack(max)`; under a group
+    /// the slacks of `groupEndpointSlacks(max, 0.0)` — every end fuzzily at or under zero — summed
+    /// in float in the group's order.
     fn tns(&self) -> f32 {
+        if self.group {
+            let mut tns = 0.0f32;
+            for p in self.ends.iter().filter(|p| fuzzy::less_equal(p.slack, 0.0)) {
+                tns += p.slack;
+            }
+            return tns;
+        }
         total_negative_slack(&self.ends)
+    }
+
+    /// A progress row's WNS, TNS and Worst (`getWns`, `getTns(false)`, `getWorstPin(false)`),
+    /// over the endpoints fuzzily under `margin`: the timer's worst and total; under a group
+    /// [`crate::path_group::group_row`].
+    fn row(&self, margin: f32) -> (f32, f32, Option<String>) {
+        if self.group {
+            let violating: Vec<Point> = self.ends.iter().filter(|p| fuzzy::less(p.slack, margin)).cloned().collect();
+            return crate::path_group::group_row(&violating, &self.ends);
+        }
+        let (wns, worst) = self.worst();
+        (wns, self.tns(), worst)
     }
 }
 
@@ -363,13 +408,41 @@ fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], timer: &mut Tim
                 crate::repair_timing::least_over_scenes(per_scene.iter().map(|(_, s)| s.as_slice()).collect()).map_err(timer_stop)?,
             )
         };
+        // Under a group (one scene): its path ends, each endpoint's path the group's worst there
+        // (`findWorstSlackPath` -> `worstGroupEnd`), and the startpoints on its start side
+        // (`startpointInGroup`).
+        let sta_slacks: HashMap<String, f32> = if ctx.path_group.is_some() { ends.iter().map(|p| (p.pin.clone(), p.slack)).collect() } else { HashMap::new() };
+        let (ends, starts, group_paths) = match ctx.path_group {
+            None => (ends, starts, HashMap::new()),
+            Some(_) if gs.len() > 1 => return Err(Stop::refused("RSZ-ABSENT", "repair_timing -path_group over several corners: not modelled".into())),
+            Some(name) => {
+                let group_ends = ss[0].group_path_ends(name, MAX, usize::MAX, -INF, INF);
+                let points: Vec<Point> = group_ends.iter().map(|e| Point { pin: gs[0].vertices[e.vertex].name.clone(), slack: e.slack, wns_slack: e.slack }).collect();
+                let paths: HashMap<String, (usize, usize)> = group_ends.iter().map(|e| (gs[0].vertices[e.vertex].name.clone(), (e.vertex, e.path))).collect();
+                let from_inputs = crate::path_group::group_sides(name).is_some_and(|(i, _)| i);
+                let starts: Vec<Point> = starts.into_iter().filter(|p| gs[0].vertices.iter().position(|x| x.name == p.pin).is_some_and(|v| (gs[0].is_port(v) && gs[0].vertices[v].is_driver) == from_inputs)).collect();
+                (points, starts, paths)
+            }
+        };
+        let group = ctx.path_group.is_some();
         let mut names: Vec<String> = want.to_vec();
-        if let (_, Some(w)) = worst_slack(&ends) {
+        if group {
+            if let Some(w) = ends.first() {
+                names.push(w.pin.clone());
+            }
+        } else if let (_, Some(w)) = worst_slack(&ends) {
             names.push(w.pin.clone());
         }
         let mut paths = HashMap::new();
         for n in names {
             if paths.contains_key(&n) {
+                continue;
+            }
+            if let Some(&(v, k)) = group_paths.get(&n) {
+                let ideal: BTreeSet<usize> = gs[0].ideal_clock.iter().copied().collect();
+                if let Some(view) = expand_at(ctx, gs, ss, cs, design, 0, v, Some(k), &ideal)? {
+                    paths.insert(n, view);
+                }
                 continue;
             }
             // `vertexWorstSlackPath(end, max)` over every scene's paths: the fuzzily least slack,
@@ -393,7 +466,7 @@ fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], timer: &mut Tim
                 paths.insert(n, view);
             }
         }
-        Ok(Snapshot { ends, starts, paths })
+        Ok(Snapshot { ends, starts, paths, group, sta_slacks })
     })
 }
 
@@ -611,10 +684,17 @@ fn inc_trace(inc: &IncTimer, trace_at: usize) {
 /// `startIndex`: the pin reached by the clock-to-output arc nearest the end, else the root.
 #[allow(clippy::too_many_arguments)]
 fn expand(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet<usize>], design: &dyn Design, scene: usize, end: usize, ideal: &BTreeSet<usize>) -> Result<Option<PathView>, Stop> {
+    expand_at(ctx, gs, ss, cs, design, scene, end, None, ideal)
+}
+
+/// [`expand`] of the path `path` (an index into the vertex's paths) when given — a group's worst
+/// end (`worstGroupEnd(...)->path()`) — else of the vertex's worst max path.
+#[allow(clippy::too_many_arguments)]
+fn expand_at(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet<usize>], design: &dyn Design, scene: usize, end: usize, path: Option<usize>, ideal: &BTreeSet<usize>) -> Result<Option<PathView>, Stop> {
     let search = &ss[scene];
-    let mut worst = None;
+    let mut worst = path.map(|k| search.paths[end][k]);
     let mut min_slack = INF;
-    for p in search.paths[end].iter().filter(|p| p.tag.mm == MAX) {
+    for p in search.paths[end].iter().filter(|p| p.tag.mm == MAX && path.is_none()) {
         let slack = p.required - p.arrival;
         if fuzzy::less(slack, min_slack) {
             min_slack = slack;
@@ -2777,6 +2857,13 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
         let Some(&marker) = PHASE_MARKERS.get(i) else {
             return Err(Stop::refused("RSZ-ABSENT", "more than 8 phases: not modelled".into()));
         };
+        // Under a path group only LEGACY and LAST_GASP (and an idle CRIT_VT_SWAP) read the group
+        // as the reference's do, through the collector alone; each other policy reads the
+        // timer's own worst and total slacks in places.
+        let crit_vt_idle = args.skip_crit_vt_swap || args.skip_vt_swap || ctx.vt_category_count < 2;
+        if ctx.path_group.is_some() && !(name == "LEGACY" || name == "LAST_GASP" || (name == "CRIT_VT_SWAP" && crit_vt_idle)) {
+            return Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -path_group with the {name} phase: not modelled")));
+        }
         match name.as_str() {
             "LEGACY" => {
                 r.phase = format!("LEGACY{marker}");
@@ -3631,7 +3718,7 @@ impl Repair<'_, '_> {
         let mut changed = 0i64;
         let mut moved = false;
         // `focus_slack`: the collector's current endpoint's.
-        self.target_slack = self.current_endpoint.as_deref().map_or(0.0, |e| self.timing.slack(e));
+        self.target_slack = self.current_endpoint.as_deref().map_or(0.0, |e| self.timing.sta_slack(e));
         for pin in pins {
             if changed >= repairs_per_pass {
                 break;
@@ -5438,7 +5525,7 @@ impl Repair<'_, '_> {
         if show {
             self.collector_starts = starts.iter().map(|p| p.pin.clone()).collect();
         }
-        let (wns, worst_end) = self.timing.worst();
+        let (wns, en_tns, worst_end) = self.timing.row(self.ctx.margin);
         // `getWorstPin(use_startpoints)`: the first violating startpoint of least slack.
         let worst = if show { starts.first().map(|p| p.pin.clone()) } else { worst_end };
         let field = format!("{iteration}{}", self.phase.chars().last().unwrap_or('*'));
@@ -5447,7 +5534,7 @@ impl Repair<'_, '_> {
         if let Some(path) = std::env::var_os("VYGES_RSZ_PW_TRACE") {
             use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                let _ = writeln!(f, "VYGW|{field}|{:?}|{:?}", f64::from(wns), f64::from(self.timing.tns()));
+                let _ = writeln!(f, "VYGW|{field}|{:?}|{:?}", f64::from(wns), f64::from(en_tns));
             }
             // and at the first row, every endpoint's TNS slack (fs), as the timer holds them, and
             // the last update's VYGES_RSZ_SLACKS (the state that row reads) kept as `<it>.row0`
@@ -5475,7 +5562,7 @@ impl Repair<'_, '_> {
                 area_growth_percent: self.area_growth_percent(),
                 wns,
                 st_tns: show.then(|| startpoint_tns(&self.timing.starts)),
-                en_tns: self.timing.tns(),
+                en_tns,
                 viol: self.collector_violating,
                 worst: worst.as_deref().unwrap_or(""),
             },
@@ -5496,7 +5583,7 @@ impl Repair<'_, '_> {
         }
         let show = self.progress_header_show_starts;
         let violating = collect_violating(&self.timing.ends, self.ctx.margin).len();
-        let (wns, worst) = self.timing.worst();
+        let (wns, en_tns, worst) = self.timing.row(self.ctx.margin);
         let row = progress_row(
             &Row {
                 iter: "final",
@@ -5509,7 +5596,7 @@ impl Repair<'_, '_> {
                 area_growth_percent: self.area_growth_percent(),
                 wns,
                 st_tns: show.then(|| startpoint_tns(&self.timing.starts)),
-                en_tns: self.timing.tns(),
+                en_tns,
                 viol: violating,
                 worst: worst.as_deref().unwrap_or(""),
             },
@@ -5608,6 +5695,45 @@ fn path_improved(end_slack: f32, worst_slack: f32, prev_end_slack: f32, prev_wor
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rules (`RepairTargetCollector` under `restrictedToPathGroup`): `endpointSlack` is the
+    /// group slack, INF off the group (`getCurrentEndpointSlack` keeps the timer's own);
+    /// `worstSlack` is `groupWorst`, the group's FIRST end (its order, not the least of a later
+    /// tie); `totalNegativeSlack` sums `groupEndpointSlacks(max, 0)` — ends fuzzily at or under
+    /// zero — in float.
+    #[test]
+    fn a_group_snapshot_reads_the_group() {
+        let p = |pin: &str, slack: f32| Point { pin: pin.into(), slack, wns_slack: slack };
+        let snap = Snapshot {
+            ends: vec![p("b", -2e-12), p("a", -2e-12), p("c", 1e-30), p("d", 1e-12)],
+            starts: Vec::new(),
+            paths: HashMap::new(),
+            group: true,
+            sta_slacks: [("b".to_string(), -5e-12), ("x".to_string(), -9e-12)].into_iter().collect(),
+        };
+        assert_eq!(snap.slack("b"), -2e-12);
+        assert_eq!(snap.slack("x"), INF, "an endpoint with no path in the group");
+        assert_eq!(snap.sta_slack("b"), -5e-12);
+        assert_eq!(snap.worst(), (-2e-12, Some("b".to_string())));
+        assert_eq!(snap.tns(), -4e-12 + 1e-30);
+        let (wns, tns, worst) = snap.row(0.0);
+        assert_eq!((wns, tns, worst.as_deref()), (-2e-12, -4e-12, Some("b")));
+        let empty = Snapshot { ends: Vec::new(), starts: Vec::new(), paths: HashMap::new(), group: true, sta_slacks: HashMap::new() };
+        assert_eq!(empty.worst(), (INF, None));
+        // TNS is summed in float, not double: two ends of half an ulp each are lost in float (the
+        // timer's double sum would keep one ulp).
+        let big = -(2f32.powi(-20));
+        let half_ulp = -(2f32.powi(-44));
+        let group = |ends: Vec<Point>| Snapshot { ends, starts: Vec::new(), paths: HashMap::new(), group: true, sta_slacks: HashMap::new() };
+        let sum = group(vec![p("a", big), p("b", half_ulp), p("c", half_ulp)]);
+        assert_eq!(sum.tns(), big);
+        assert_ne!(total_negative_slack(&sum.ends), big, "the unrestricted sum keeps the ulp");
+        // An end fuzzily at zero but above it counts toward the TNS (`groupEndpointSlacks(max, 0.0)`
+        // keeps ends fuzzily at or under the bound).
+        assert_eq!(group(vec![p("z", 5e-16)]).tns(), 5e-16);
+        // None violating: the row reads the group's worst end and a TNS of 0, not the group's TNS.
+        assert_eq!(snap.row(-1e-11), (-2e-12, 0.0, Some("b".to_string())));
+    }
 
     // Rule (SetupLegacyPolicy::repairEndpoint, upstream 2494eb313a8): a pass loop that runs out
     // (max passes, max iterations, max area) with worsening passes pending restores the last

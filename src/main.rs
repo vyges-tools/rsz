@@ -91,13 +91,19 @@ REPAIR_TIMING:
   uncertainty, clock latency / transition, derates, false and multicycle paths, clock groups,
   path delays other than the forms the timer models (see --describe); refused during the repair:
   -setup with -max_utilization, more than one repair per pass.
+  -path_group G: reg2reg, in2reg, reg2out or in2out restricts -setup to the group's path ends
+  (one per endpoint, its worst path in the group), in LEGACY and LAST_GASP; a group the
+  constraints do not name is made first (RSZ-0228: register clock pins or inputs without clocks,
+  to register data pins or outputs). Another name warns (RSZ-0227) and restricts nothing.
+  Refused: gated_clock, with -hold, over several corners, with another phase.
 
 CONSTRAINTS READ FROM SDC:
   create_clock (-waveform: a rise then a fall within one period), set_input_delay /
   set_output_delay (-clock, one delay per port and clock; -add_delay adds a clock or merges),
   set_max_transition and set_max_fanout on the design, set_max_capacitance on the design, ports
   and pins, set_load on nets and ports, set_input_transition, set_driving_cell, set_max_delay /
-  set_min_delay (repair_timing only, the forms above); any other timing-affecting command is
+  set_min_delay (repair_timing only, the forms above), group_path -name (repair_timing only,
+  not beside the other exceptions); any other timing-affecting command is
   refused
 
 OPTIONS:
