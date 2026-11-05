@@ -43,6 +43,10 @@ pub struct Args {
     /// The search constraints `tryRerouteNet`'s `sta_->slack(drvr, max)` reads: set by the caller
     /// when `reroute` is on under global-route parasitics.
     pub search_sdc: Option<vyges_sta::sdc::Sdc>,
+    /// The session's timer levels when the repair runs in a carried session (global placement's
+    /// later reweights): the timer is levelized already, so `ensureLevelized` relevelizes from
+    /// what the session's edits queued instead of levelizing afresh. `None`: the first timing.
+    pub sta_levels: Option<BTreeMap<String, i32>>,
 }
 
 /// What the repair reads besides the arguments and the design it edits.
@@ -97,6 +101,9 @@ pub struct Outcome {
     /// The levelized drivers the repair walked (`driver_vertices.size()`: the progress table's
     /// "Remaining" at row 0).
     pub drivers: usize,
+    /// The timer's levels once the repair's edits are relevelized (what the session's next
+    /// `ensureLevelized` leaves): `None` without the incremental timer.
+    pub levels: Option<BTreeMap<String, i32>>,
 }
 
 impl Outcome {
@@ -190,7 +197,8 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
     // checkSlewsPreamble, checkCapacitancesPreamble, checkFanoutPreamble, searchPreamble,
     // findAllArrivals: the timing graphs (one per scene), levelized, their delays found.
     let netlist = design.netlist_shared();
-    let (mut graphs, level) = timer_preambles(inputs, &netlist)?;
+    let (mut graphs, fresh) = timer_preambles(inputs, &netlist)?;
+    let level = session_levels(graphs[0].vertices.iter().map(|v| v.name.as_str()), fresh, args.sta_levels.as_ref());
     if args.pre_placement {
         return Err(Stop::refused("RSZ-ABSENT", "the early sizing round (-pre_placement / -buffer_gain) is not modelled".into()));
     }
@@ -235,6 +243,10 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
             let mut t = IncTimer::default();
             t.trace_edits = incs.is_empty();
             t.track_netlist(&netlist);
+            // a carried session: its levels stand until an edit relevelizes them
+            if let Some(l) = &args.sta_levels {
+                t.levels = l.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            }
             t.relevelize(g).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
             t.export(g);
             t.delays_exist = true;
@@ -312,6 +324,19 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
                 incs[0].apply_event(&cx, ev).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
             }
         }
+    }
+    // `ensureLevelized` at the session's next timing (`levelizedDrvrVertices` in fullyRebuffer, or
+    // repair_timing's preamble): the edits the last drivers made relevelized on the final netlist.
+    if let Some(incs) = ctx.timer.as_mut() {
+        let netlist = design.netlist_shared();
+        let old = held.take().map(|(g, index, _)| {
+            drop(index);
+            g
+        });
+        let g = timer_graphs(inputs, design, &netlist, &annotated, incs, &mut ctx.edit_log, old)?;
+        incs[0].relevelize(&g[0]).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+        outcome.levels = Some(incs[0].levels.iter().map(|(k, v)| (k.clone(), *v)).collect());
+        held = Some((g, std::sync::Arc::new(HashMap::new()), Default::default()));
     }
     recycle_held(held);
     if std::env::var_os("VYGES_RSZ_EDIT_STATS").is_some() {
@@ -1592,6 +1617,19 @@ fn steiner_buffered_net(tree: &buffered_net::Tree, g: &Graph<'_>, drvr: usize, c
     buffered_net::make_buffered_net_steiner(&bctx, tree)
 }
 
+/// `Levelize::ensureLevelized` at the repair's preamble: a session levelized before (`levelized_`)
+/// keeps its levels — `relevelize` only raises what the queued edits reach (levels never fall), so
+/// they are not a fresh `findLevels` of the netlist as it stands — and only the first timing
+/// levelizes afresh. Each vertex by name; a vertex the session never levelized reads 0
+/// (`makeVertex`). OpenSTA cc9027d6; e67ee8b3c (#554, after the pin) adds an arrival
+/// invalidation when a loop cut moves, not a level rule.
+fn session_levels<'v>(names: impl Iterator<Item = &'v str>, fresh: Vec<i32>, carried: Option<&BTreeMap<String, i32>>) -> Vec<i32> {
+    match carried {
+        None => fresh,
+        Some(l) => names.map(|n| l.get(n).copied().unwrap_or(0)).collect(),
+    }
+}
+
 /// The timer's preambles: the graph over the netlist, its levels (`ensureLevelized`), refused
 /// where this timer would level it differently from the reference.
 fn timer_preambles<'n>(inputs: &'n Inputs<'_>, netlist: &'n vyges_sta::netlist::Netlist) -> Result<(Vec<Graph<'n>>, Vec<i32>), Stop> {
@@ -1606,6 +1644,20 @@ fn timer_preambles<'n>(inputs: &'n Inputs<'_>, netlist: &'n vyges_sta::netlist::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upstream rule (OpenSTA cc9027d6 `Levelize::ensureLevelized`): once a session is levelized,
+    /// a later timing only `relevelize`s from the vertices its edits queued, raising and never
+    /// lowering, so repair_design in global placement's later reweights orders its drivers and
+    /// loads on the session's levels, not a fresh `findLevels`; a vertex the session never
+    /// levelized reads 0. The first timing of a session levelizes afresh.
+    #[test]
+    fn a_carried_session_keeps_its_levels() {
+        let names = ["a/Z", "b/Z", "new/Z"];
+        let fresh = vec![1, 2, 3];
+        assert_eq!(session_levels(names.iter().copied(), fresh.clone(), None), fresh, "the first timing: fresh levels");
+        let carried: BTreeMap<String, i32> = [("a/Z".to_string(), 50), ("b/Z".to_string(), 20)].into_iter().collect();
+        assert_eq!(session_levels(names.iter().copied(), fresh, Some(&carried)), [50, 20, 0], "carried, raised levels kept; unseen 0");
+    }
 
     // Rule (Resizer::makeBufferedNet): the buffered net is built from the parasitics' own source
     // — a Steiner tree under placement, the global route under global-route parasitics (no

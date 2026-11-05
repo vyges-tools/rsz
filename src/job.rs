@@ -464,13 +464,12 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
     // read but can never act (not a reference message; reported so it is not a silent no-op).
     let mut notes: Vec<Value> = Vec::new();
     // `sta_levels`: the timer's levels a caller carries from an earlier job (its session), given
-    // to each timing step and returned as the last left them; whether a repair_design edited the
-    // netlist under them (their incremental relevelization is not modelled across the steps).
+    // to each timing step (repair_design included) and returned as the last left them; a
+    // repair_design that edits the netlist relevelizes them and hands them on.
     let mut sta_levels: Option<BTreeMap<String, i32>> = match &job["sta_levels"] {
         Value::Object(m) => Some(m.iter().filter_map(|(k, v)| v.as_i64().map(|l| (k.clone(), l as i32))).collect()),
         _ => None,
     };
-    let mut repair_design_edited = false;
     // `clock_latencies`: global placement's virtual clock tree for this reweight (`virtual_cts`'s
     // result, set in the timer as `setClockLatency(clk, pin)` before every timing step).
     let virtual_latencies: Vec<(String, String, f32)> = job["clock_latencies"]
@@ -935,12 +934,18 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 }
                 let inputs = Inputs { libs: &libs, masters: &m, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins, sizing_limits: limits_of_block, clock_pattern: Default::default() };
                 let area0 = crate::odb_design::design_area(design.db);
+                a.sta_levels = sta_levels.clone();
                 let r = repair_design::repair_design(&inputs, &mut design, &a, &mut trace);
                 // `RepairDesign::printProgress` (not verbose): the header, row 0, the final row and
                 // the closing rule — area growth against the design area when the repair started.
                 // Reported for gpl's reweight (`-vyges_resize_slack`), which prints it.
                 if let Ok(o) = &r {
-                    repair_design_edited |= o.inserted_buffers > 0 || o.resized > 0;
+                    let edited = o.inserted_buffers > 0 || o.resized > 0;
+                    // The session's levels after the repair (its edits relevelized): what a later
+                    // timing step in this session starts from, carried or first levelized here.
+                    if sta_levels.is_some() || edited {
+                        sta_levels = o.levels.clone().or(sta_levels.take());
+                    }
                 }
                 if let Ok(o) = &r {
                     let area1 = crate::odb_design::design_area(design.db);
@@ -1177,9 +1182,6 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     _ => None,
                 };
                 let mut a = if fr.is_some() { rt::Args::parse(&["-setup".to_string(), "-sequence".to_string(), "buffer".to_string()])? } else { rt::Args::parse(&args)? };
-                if sta_levels.is_some() && repair_design_edited {
-                    return Err("carried timer levels across a repair_design edit: their relevelization is not modelled".into());
-                }
                 a.sta_levels = sta_levels.clone();
                 // `-recover_power` dispatches to `rsz::recover_power` in place of setup and hold:
                 // -phases, -sequence and the setup flags never reach it.
