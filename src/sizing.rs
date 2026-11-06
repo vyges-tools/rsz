@@ -314,7 +314,14 @@ impl Sizing<'_> {
             out.push(name.clone());
         }
         let leak = |n: &String| self.libs.link_cell(n).and_then(cell_leakage).unwrap_or(0.0);
-        out.sort_by(|a, b| if leak(a) < leak(b) { std::cmp::Ordering::Less } else if leak(b) < leak(a) { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal });
+        let by_leak = |a: &String, b: &String| if leak(a) < leak(b) { std::cmp::Ordering::Less } else if leak(b) < leak(a) { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal };
+        // Grouped by VT category, ascending leakage within each, so that same-VT cells are
+        // adjacent for the deduplication (upstream d2fe5292d2; before it the list was sorted by
+        // leakage alone, and two same-VT cells with another between them both stayed). The
+        // reference orders the groups by `VTCategory` (its index: the order the implant sets were
+        // first seen); here by the set itself. The group order shows only through equal
+        // leakages after the final sort.
+        out.sort_by(|a, b| vt(&self.masters[a]).cmp(&vt(&self.masters[b])).then_with(|| by_leak(a, b)));
         let common = |a: &str| a.bytes().zip(source.bytes()).take_while(|(x, y)| x == y).count();
         let mut i = 0;
         while i + 1 < out.len() {
@@ -329,6 +336,8 @@ impl Sizing<'_> {
                 i += 1;
             }
         }
+        // The deduplicated list in ascending leakage.
+        out.sort_by(by_leak);
         out
     }
 
@@ -505,6 +514,36 @@ mod tests {
         assert_eq!(swappable([10.0, 30.0, 45.0, 41.0], [1, 3, 2, 4]), v(&["B1", "B2"]));
         // A smaller cell left is no upsizing step: the fallback still applies.
         assert_eq!(swappable([10.0, 50.0, 5.0, 41.0], [2, 3, 1, 4]), v(&["B1", "B2", "B3"]));
+    }
+
+    // Rule (getVTEquivCells, upstream d2fe5292d2): the cells are grouped by VT category before the
+    // same-VT deduplication, so two cells of one VT with another VT's cell between them by
+    // leakage are deduplicated too (the one sharing the longer prefix with the source kept);
+    // the survivors then in ascending leakage.
+    #[test]
+    fn vt_equivalents_keep_one_cell_per_vt_even_when_not_adjacent_by_leakage() {
+        let buf = |n: &str, leak: f32| {
+            format!(
+                r#"cell ({n}) {{ cell_leakage_power : {leak} ; pin (A) {{ direction : input ; }} pin (Z) {{ direction : output ; function : "A" ;
+                  timing () {{ related_pin : "A" ; timing_sense : positive_unate ; fall_transition (t) {{ values ("0, 1", "0, 1") ; }} }} }} }}"#
+            )
+        };
+        let l = lib(&format!(
+            r#"library (l) {{ lu_table_template (t) {{ variable_1 : input_net_transition ; variable_2 : total_output_net_capacitance ;
+              index_1 ("0, 1") ; index_2 ("0, 1") ; }} {} {} {} {} }}"#,
+            buf("BUF_R", 1.0),
+            buf("BUF_L", 2.0),
+            buf("XBUF_R", 3.0),
+            buf("BUF_S", 4.0)
+        ));
+        let vt = |n: &str| match n { "BUF_R" | "XBUF_R" => vec!["rvt".to_string()], "BUF_L" => vec!["lvt".to_string()], _ => vec!["svt".to_string()] };
+        let masters: BTreeMap<String, Master> = ["BUF_R", "BUF_L", "XBUF_R", "BUF_S"].iter().map(|n| (n.to_string(), Master { site: "s".into(), area: 1, width: 1, height: 1, is_core: true, logic_std: true, implant_obs: vt(n) })).collect();
+        let equiv = make_equiv_cells(&l);
+        let (dont_use, loads) = (BTreeSet::new(), BTreeMap::new());
+        let s = Sizing { libs: &l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: SizingLimits::default() };
+        // By leakage alone R(1) L(2) XR(3) S(4): R and XR are not adjacent and both stayed.
+        assert_eq!(s.vt_equiv_cells("BUF_L", 3), vec!["BUF_R".to_string(), "BUF_L".into(), "BUF_S".into()], "XBUF_R deduplicated against BUF_R");
+        assert!(s.vt_equiv_cells("BUF_L", 1).is_empty(), "one VT category: none");
     }
 
     // Rules (makeEquivCells, sta::equivCells): same ports and functions ⇒ one class, sorted by
