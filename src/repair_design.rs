@@ -1051,8 +1051,12 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
     // The fanout repair below (or a mid-update timing before the ensure) rebuilds the graphs from
     // the edited design: no longer the held ones.
     let mut fanout_edited = false;
-    // After an edit that `updateParasitics` estimated (a resize, a reroute): the graphs again,
-    // then `Sta::findDelays(drvr)` — levelized, then the queue up to the driver's level.
+    // After an edit to the driver's net (a resize, a reroute), its parasitic ensured: the graphs
+    // again, then `GraphDelayCalc::findDelays(drvr)` — the driver alone (`findVertexDelay`) from
+    // the slews the graphs hold, nothing levelized or drained. (Upstream fff622d066: before it,
+    // `updateParasitics()` + `Sta::findDelays(drvr)`, the queue up to the driver's level, so a
+    // resized driver read its inputs' slews re-timed for its new input caps; now they stay as
+    // they were.)
     macro_rules! retime_driver {
         ($netlist:ident, $clocks:ident, $what:literal) => {
             $netlist = design.netlist_shared();
@@ -1069,22 +1073,22 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
                     for (inc, g) in incs.iter_mut().zip(own.iter()) {
                         inc.relevelize(g).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
                     }
-                    let level = incs[0].levels.get(&name).copied();
                     let pars: Vec<&HashMap<String, vyges_sta::graph::NetParasitics>> = (0..incs.len()).map(|k| design.parasitics(k)).collect();
-                    vyges_sta::incr::find_delays_scenes(incs, own, &pars, level).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+                    vyges_sta::incr::find_vertex_delay_scenes(incs, own, &pars, &name).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
                 }
                 None => find_all_delays(own_graphs.as_mut().expect("just built"), &*design, &name)?,
             }
         };
     }
-    // `updateParasitics()`; under a resistance-aware router its route update first reads the
-    // timer's net slacks (`set_mid_update_slacks`).
-    macro_rules! update_parasitics {
+    // `ensureWireParasitic(drvr_pin, net)`: the driver's net alone (upstream fff622d066; was
+    // `updateParasitics()`, every invalid net). A route update it makes under a resistance-aware
+    // router reads the timer's net slacks first (`set_mid_update_slacks`).
+    macro_rules! ensure_driver_net {
         () => {
-            if design.route_slacks_wanted() {
+            if design.ensure_routes(&net_name) && design.route_slacks_wanted() {
                 set_mid_update_slacks(inputs, design, ctx)?;
             }
-            design.update_parasitics().map_err(|e| Stop::error("RSZ-EST", e))?;
+            design.ensure_wire_parasitic(&net_name).map_err(|e| Stop::error("RSZ-EST", e))?;
         };
     }
     // `rerouteEnabled() && tryRerouteNet(drvr_pin)` on the current graphs.
@@ -1196,7 +1200,7 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
         // buffer.
         if try_reroute!() {
             outcome.rerouted += 1;
-            update_parasitics!();
+            ensure_driver_net!();
             retime_driver!(rerouted_netlist, rerouted_clocks, "the rerouted driver");
             (slew1, max_slew1, slack1, corner1) = timing::repair_check_slew(&timing::Scenes::new(gs!()), drvr, &inputs.limits, clocks, ctx.args.slew_margin);
             crate::tpush!(trace, "dslewr|{}|{}|{}", g9(f64::from(slew1.unwrap_or(0.0))), g9(f64::from(max_slew1)), g9(f64::from(slack1)));
@@ -1209,7 +1213,7 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
                 design.swap_master(&inst_of(&name), &cell).map_err(|e| Stop::error("RSZ-RESIZE", e))?;
                 outcome.resized += 1;
                 crate::tpush!(trace, "dresize|{cell}");
-                update_parasitics!();
+                ensure_driver_net!();
                 retime_driver!(resized_netlist, resized_clocks, "the resized driver");
                 (slew1, max_slew1, slack1, corner1) = timing::repair_check_slew(&timing::Scenes::new(gs!()), drvr, &inputs.limits, clocks, ctx.args.slew_margin);
                 crate::tpush!(trace, "dslew2|{}|{}|{}", g9(f64::from(slew1.unwrap_or(0.0))), g9(f64::from(max_slew1)), g9(f64::from(slack1)));
@@ -1246,7 +1250,7 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
     let hidden = !(ls.slack < 0.0) && annotated;
     if hidden && try_reroute!() {
         outcome.rerouted += 1;
-        update_parasitics!();
+        ensure_driver_net!();
         retime_driver!(annot_netlist, annot_clocks, "the rerouted driver");
     }
     repair_load_slew = ls.slack < 0.0 || annotated;
