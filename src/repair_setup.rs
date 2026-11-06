@@ -1764,6 +1764,50 @@ fn drive_resistance_rf(cell: &Cell, port: &str, rf: usize) -> f32 {
     if found { max_drive } else { 0.0 }
 }
 
+/// `Resizer::selectBetterRfDriveVtCell`: walking the VT-equivalent cells (ascending leakage) past
+/// the cell itself, the running best becomes each candidate that weakens no drive — at every
+/// scene's max cell, each output of the running best has a same-named port on the candidate whose
+/// rise and fall drive resistances are no larger. None when the running best stays the cell, or the
+/// cell is not among its equivalents (upstream e8a60441a3; before it, the last equivalent).
+///
+/// A scene cell is never missing here: `Libs::scene_cell` falls back to the link cell.
+fn select_better_rf_drive_vt_cell(ctx: &Ctx<'_>, cell: &str) -> Option<String> {
+    let equiv = ctx.sizing.vt_equiv_cells(cell, ctx.vt_category_count);
+    better_rf_drive_walk(&equiv, cell, |best, cand| weakens_drive(ctx.libs, best, cand))
+}
+
+/// `selectBetterRfDriveVtCell`'s walk over the equivalents after the cell.
+fn better_rf_drive_walk(equiv: &[String], cell: &str, weakens: impl Fn(&str, &str) -> bool) -> Option<String> {
+    let at = equiv.iter().position(|c| c == cell)?;
+    let mut running_best = cell;
+    for cand in &equiv[at + 1..] {
+        if !weakens(running_best, cand) {
+            running_best = cand;
+        }
+    }
+    (running_best != cell).then(|| running_best.to_string())
+}
+
+/// `selectBetterRfDriveVtCell`'s test of a candidate against the running best, scene by scene.
+fn weakens_drive(libs: &Libs, best: &str, cand: &str) -> bool {
+    use vyges_sta::liberty::Direction;
+    for k in 0..libs.scene_count() {
+        let Some(best_corner) = libs.scene_cell(k, best) else { continue };
+        let Some(cand_corner) = libs.scene_cell(k, cand) else { return true };
+        for best_port in best_corner.ports.iter().filter(|p| matches!(p.direction, Direction::Output | Direction::Tristate | Direction::Bidirect)) {
+            if cand_corner.port(&best_port.name).is_none() {
+                return true;
+            }
+            for rf in 0..2 {
+                if drive_resistance_rf(cand_corner, &best_port.name, rf) > drive_resistance_rf(best_corner, &best_port.name, rf) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 /// `LibertyPort::capacitance(rf, max)`.
 fn port_capacitance_rf(cell: &Cell, port: &str, rf: usize) -> Option<f32> {
     Some(cell.port(port)?.capacitance[rf][MAX])
@@ -4963,16 +5007,15 @@ impl Repair<'_, '_> {
 
     /// `VtSwapGenerator::selectPathBestCell` → `VtSwapCandidate::applyReplacement`: the path driver's
     /// instance, with two VT categories or more, not dont_touch, a logic standard cell; the best
-    /// VT-equivalent cell (`getVTEquivCells(..).back()`) unless it is the cell itself; refused by
-    /// the max-capacitance guard, else `replaceCell`.
+    /// VT-equivalent cell (`selectBetterRfDriveVtCell`); refused by the max-capacitance guard, else
+    /// `replaceCell`.
     fn vt_swap_move(&mut self, view: &PathView, index: usize) -> Result<Option<MoveResult>, Stop> {
         let st = &view.stages[index];
         let (Some(inst), Some(cell)) = (&st.inst, &st.cell) else { return Ok(None) };
         if self.ctx.vt_category_count < 2 || self.design.net_info().dont_touch_insts.contains(inst) || !self.ctx.sizing.masters.get(cell).is_some_and(|m| m.logic_std) {
             return Ok(None);
         }
-        let equiv = self.ctx.sizing.vt_equiv_cells(cell, self.ctx.vt_category_count);
-        let Some(best) = equiv.last().filter(|b| *b != cell).cloned() else { return Ok(None) };
+        let Some(best) = select_better_rf_drive_vt_cell(self.ctx, cell) else { return Ok(None) };
         // The candidate: the attempt, before its apply (the max-capacitance guard is the apply's).
         self.trk_attempt(&st.pin, Move::VtSwap)?;
         if !replacement_preserves_max_cap(self.ctx.libs, cell, &best, &st.fanin_caps) {
@@ -6185,4 +6228,57 @@ mod tests {
         assert!(path_improved(-0.1, -0.2, -0.3, -0.2));
         assert!(!path_improved(-0.3, -0.2, -0.3, -0.2));
     }
+
+    /// Upstream e8a60441a3 (`selectBetterRfDriveVtCell`): the best VT cell is not the LAST
+    /// equivalent but the walk's running best — a candidate is taken only when it weakens no
+    /// drive against the running best (so a later one is compared with the last taken, not with
+    /// the cell); the cell itself is no answer, nor is a cell missing from its equivalents.
+    #[test]
+    fn the_better_vt_cell_is_the_last_one_weakening_no_drive_against_the_running_best() {
+        let eq: Vec<String> = ["H", "S", "L", "U"].iter().map(|s| s.to_string()).collect();
+        // resistances: H 4, S 3, L 5 (weaker than S), U 2
+        let r = |c: &str| match c { "H" => 4.0, "S" => 3.0, "L" => 5.0, _ => 2.0 };
+        let weakens = |b: &str, c: &str| r(c) > r(b);
+        assert_eq!(better_rf_drive_walk(&eq, "H", weakens).as_deref(), Some("U"), "L skipped, U against S");
+        assert_eq!(better_rf_drive_walk(&eq, "L", weakens).as_deref(), Some("U"), "from the cell's own position");
+        // U weakens only against L: once L is taken, U is compared with L and refused.
+        let u_weaker_than_l = |b: &str, c: &str| c == "U" && b == "L";
+        assert_eq!(better_rf_drive_walk(&eq, "S", u_weaker_than_l).as_deref(), Some("L"), "U against the running best L, not S");
+        // L refused: U is compared with S, and taken.
+        assert_eq!(better_rf_drive_walk(&eq, "S", |b, c| c == "L" || (c == "U" && b == "L")).as_deref(), Some("U"));
+        assert_eq!(better_rf_drive_walk(&eq, "U", weakens), None, "the last: nothing after it");
+        assert_eq!(better_rf_drive_walk(&eq, "H", |_, _| true), None, "every candidate weaker: none");
+        assert_eq!(better_rf_drive_walk(&eq, "X", |_, _| false), None, "not among its equivalents");
+    }
+
+    /// `selectBetterRfDriveVtCell`'s test: at each scene's cell, every OUTPUT of the running best
+    /// needs a same-named port on the candidate with rise AND fall drive resistance no larger.
+    #[test]
+    fn a_candidate_weakens_drive_when_either_transition_of_an_output_is_more_resistive() {
+        use vyges_sta::liberty::Library;
+        use vyges_sta::liberty_parse::parse;
+        let cell = |name: &str, rise: f32, fall: f32, out: &str| {
+            format!(
+                r#"cell ({name}) {{ pin (A) {{ direction : input ; capacitance : 0.01 ; }} pin ({out}) {{ direction : output ; function : "A" ;
+                  timing () {{ related_pin : "A" ; timing_sense : positive_unate ;
+                    rise_transition (t) {{ values ("0, {rise}", "0, {rise}") ; }} fall_transition (t) {{ values ("0, {fall}", "0, {fall}") ; }} }} }} }}"#
+            )
+        };
+        let text = format!(
+            r#"library (l) {{ time_unit : "1ns" ; capacitive_load_unit (1, pf) ;
+              lu_table_template (t) {{ variable_1 : input_net_transition ; variable_2 : total_output_net_capacitance ; index_1 ("0, 1") ; index_2 ("0, 1") ; }}
+              {} {} {} {} }}"#,
+            cell("B", 2.0, 2.0, "Z"),
+            cell("FAST", 1.0, 1.0, "Z"),
+            cell("FALLSLOW", 1.0, 3.0, "Z"),
+            cell("OTHERPIN", 1.0, 1.0, "Y")
+        );
+        let libs = Libs { libs: vec![Library::read(&parse(&text).unwrap()).unwrap()], ..Default::default() };
+        assert!(!weakens_drive(&libs, "B", "FAST"));
+        assert!(!weakens_drive(&libs, "B", "B"), "equal is not weaker");
+        assert!(weakens_drive(&libs, "B", "FALLSLOW"), "fall alone");
+        assert!(weakens_drive(&libs, "FAST", "B"));
+        assert!(weakens_drive(&libs, "B", "OTHERPIN"), "the output missing on the candidate");
+    }
+
 }

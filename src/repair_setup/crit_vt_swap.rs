@@ -1,7 +1,7 @@
 //! `SetupCritVtSwapPolicy` (`CRIT_VT_SWAP`, the phase every legacy-compatible list ends with): from
 //! the worst violating endpoints (at most 100), a backward walk through the violating fanin
 //! (at most 50 critical instances per endpoint) collects the instances whose output slack
-//! violates; each is swapped to its best VT-equivalent cell (`getVTEquivCells(..).back()`) in one
+//! violates; each is swapped to its best VT-equivalent cell (`selectBetterRfDriveVtCell`) in one
 //! batch, then the timer is updated once.
 //!
 //! The reference commits the batch in its `unordered_map<Instance*>` order (heap addresses: its
@@ -33,8 +33,8 @@ struct CritInst {
 }
 
 /// `Resizer::checkAndMarkVTSwappable`: not marked, not dont_touch, a logic standard cell with a
-/// liberty cell and VT-equivalent cells whose last is not the cell itself — the best cell;
-/// otherwise marked not swappable.
+/// liberty cell and a better VT cell (`selectBetterRfDriveVtCell`) — the best cell; otherwise
+/// marked not swappable.
 fn check_and_mark_vt_swappable(ctx: &super::Ctx<'_>, dont_touch: &BTreeSet<String>, inst: &str, cell: &str, not_swappable: &mut HashSet<String>) -> Option<String> {
     if not_swappable.contains(inst) {
         return None;
@@ -42,7 +42,7 @@ fn check_and_mark_vt_swappable(ctx: &super::Ctx<'_>, dont_touch: &BTreeSet<Strin
     let best = if dont_touch.contains(inst) || !ctx.sizing.masters.get(cell).is_some_and(|m| m.logic_std) || ctx.libs.link_cell(cell).is_none() {
         None
     } else {
-        ctx.sizing.vt_equiv_cells(cell, ctx.vt_category_count).last().filter(|b| *b != cell).cloned()
+        super::select_better_rf_drive_vt_cell(ctx, cell)
     };
     if best.is_none() {
         not_swappable.insert(inst.to_string());
