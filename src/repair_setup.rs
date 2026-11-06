@@ -3712,29 +3712,41 @@ impl Repair<'_, '_> {
             return Ok((false, chosen));
         }
         let repairs_per_pass = if force_single { 1 } else { self.repairs_per_pass(max_repairs_per_pass) };
-        // On a focus path the reference keeps reading the path it found before the first move.
-        if repairs_per_pass > 1 && focus.is_some() {
-            return Err(Stop::refused("RSZ-ABSENT", format!("{repairs_per_pass} repairs in one pass on a focus path: not modelled")));
-        }
         let mut changed = 0i64;
-        let mut moved = false;
+        let mut timing_stale = false;
         // `focus_slack`: the collector's current endpoint's.
         self.target_slack = self.current_endpoint.as_deref().map_or(0.0, |e| self.timing.sta_slack(e));
+        // The focus path's vertex (its endpoint), to look the path up again after a refresh.
+        let focus_end = focus.and_then(|v| v.stages.last()).map(|s| s.pin.clone());
+        // `focus_path` once looked up again (none found: null, so the pin's own target).
+        let mut refreshed: Option<Option<PathView>> = None;
         for pin in pins {
             if changed >= repairs_per_pass {
                 break;
             }
-            // A target after a move in the same pass reads the timer the move changed — with the
-            // parasitics as they were: the reference re-estimates only after the pass
-            // (`updateParasitics` follows `repairPins`).
-            if moved {
-                self.retime_without_estimate()?;
-                moved = false;
+            // After an accepted move the targets' paths are stale: `updateParasitics`,
+            // `findRequireds`, and the focus path found again from its endpoint
+            // (`findWorstSlackPath`, so in the group under -path_group) — upstream 8627cb2e37,
+            // 77b020d681, 86825ab08b. Before them the next target read the timer with the
+            // parasitics as they were, and the focus path as found before the first move.
+            if timing_stale {
+                match &focus_end {
+                    Some(end) => {
+                        self.retime(std::slice::from_ref(end))?;
+                        refreshed = Some(self.timing.paths.get(end).cloned());
+                    }
+                    None => self.retime(&[])?,
+                }
+                timing_stale = false;
             }
             // `makePinTargetOnPath` on the focus path, else on the pin's own worst path
             // (`makePinTarget`: `vertexWorstSlackPath` at its driver vertex).
             let own;
-            let view = match focus {
+            let current = match &refreshed {
+                Some(r) => r.as_ref(),
+                None => focus,
+            };
+            let view = match current {
                 Some(v) => v,
                 None => {
                     let Some(v) = self.focus_view(pin)? else { continue };
@@ -3751,10 +3763,11 @@ impl Repair<'_, '_> {
             let focus_slack = self.target_slack;
             self.trk_violator(pin, focus_slack, focus_slack)?;
             let rej = rejected.get(pin).cloned().unwrap_or_default();
+            let changed_before = changed;
             if let Some(kind) = self.try_repair_target(seg, index, &mut changed, repairs_per_pass, &rej)? {
                 chosen.push((pin.clone(), kind));
-                moved = true;
             }
+            timing_stale = changed != changed_before;
         }
         Ok((changed > 0, chosen))
     }
