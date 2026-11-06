@@ -1261,8 +1261,25 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         estimate_state_per_clock(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, &crate::env::est_clocks(sdc.as_ref(), estimate_propagated), estimate_alpha, libs.scene_count(), &caps)?
                     }
                 };
+                // `set_timing_derate` (no objects) onto the graph, as the timer's own reader puts
+                // it (`constraints_with`); the search's constraints are read without it.
+                let derates = vyges_sta::load::timing_derates(&s.derates)?;
+                let underated;
+                let s = if derates.is_some() {
+                    let mut c = s.clone();
+                    c.derates.clear();
+                    (c.late_derate, c.early_derate) = (None, None);
+                    underated = c;
+                    &underated
+                } else {
+                    s
+                };
                 let mut env = sdc_env(s, &libs, &netlist)?;
                 env.constants = constants.clone();
+                env.derates = derates;
+                // `-skip_crpr` (Resizer.tcl `repair_timing`): `sta::set_crpr_enabled 0` for the
+                // repair; the timer's next command starts from the entry setting again.
+                env.crpr_disabled = a.skip_crpr;
                 let mpins = master_pins(&db)?;
                 let mut g = repair_design::timer_graph(&libs, 0, &netlist, &env, &mpins).map_err(|e| e.message().to_string())?;
                 let clock_propagated = propagated || sdc_propagated;
@@ -1374,6 +1391,10 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 // start with its own RSZ-2024.
                 let measured = matches!(plan, Some(rt::PhasePlan::GlobalSizing));
                 let mut lines = if recover || measured || fr.is_some() { Vec::new() } else { rt::preamble(&seq, violating.len(), a.repair_tns_end_percent, a.phases.as_deref()) };
+                // RSZ-0225: logged before `repair_setup` runs (its RSZ-0100 first line).
+                if a.skip_crpr && a.setup && !recover {
+                    lines.insert(0, "[INFO RSZ-0225] CRPR disabled during setup repair.".to_string());
+                }
                 // Under a group: GLOBAL_SIZING and the startpoint metrics are not modelled.
                 if group_ends.is_some() && (measured || matches!(plan, Some(rt::PhasePlan::LegacyPreamble { startpoints: true }))) {
                     return Err("repair_timing -path_group with GLOBAL_SIZING or the startpoint metrics: not modelled".into());
@@ -1622,7 +1643,9 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                             let all: Vec<String> = trace_head.into_iter().chain(o.trace.iter().cloned()).collect();
                             std::fs::write(path, all.join("\n") + "\n").map_err(|e| format!("{path}: {e}"))?;
                         }
-                        timing_runs.push(json!({ "hold": true, "lines": o.lines, "endpoints": ends.len(), "violating_endpoints": o.violating, "inserted": o.inserted, "resized": o.resized, "stopped": o.stopped, "error": o.error }));
+                        // RSZ-0226: logged before `repair_hold` runs.
+                        let lines: Vec<String> = a.skip_crpr.then(|| "[INFO RSZ-0226] CRPR disabled during hold repair.".to_string()).into_iter().chain(o.lines).collect();
+                        timing_runs.push(json!({ "hold": true, "lines": lines, "endpoints": ends.len(), "violating_endpoints": o.violating, "inserted": o.inserted, "resized": o.resized, "stopped": o.stopped, "error": o.error }));
                         if let Some(why) = o.stopped {
                             timing_stop = Some(why);
                             break;

@@ -55,6 +55,9 @@ pub struct Args {
     pub verbose: bool,
     pub skip_last_gasp: bool,
     pub skip_crit_vt_swap: bool,
+    /// `-skip_crpr`: CRPR disabled for the repair (`sta::set_crpr_enabled 0` around
+    /// `repair_setup` / `repair_hold`, the entry setting restored after), RSZ-0225 / RSZ-0226.
+    pub skip_crpr: bool,
     pub match_cell_footprint: bool,
     pub allow_setup_violations: bool,
     /// `-path_group`, as given (resolved by [`resolve_path_group`]).
@@ -161,6 +164,7 @@ impl Args {
             verbose: false,
             skip_last_gasp: false,
             skip_crit_vt_swap: false,
+            skip_crpr: false,
             match_cell_footprint: false,
             allow_setup_violations: false,
             path_group: None,
@@ -247,10 +251,7 @@ impl Args {
                 "-allow_setup_violations" => a.allow_setup_violations = true,
                 "-match_cell_footprint" => a.match_cell_footprint = true,
                 "-verbose" => a.verbose = true,
-                // `-skip_crpr` turns `crpr_enabled` off for the repair, and CRPR only acts under
-                // on_chip_variation analysis (`StaState::crprActive`) — which, with set_timing_derate, the
-                // timer does not model. Its one witness (repair_timing_crpr) needs both.
-                "-skip_crpr" => return Err("repair_timing -skip_crpr: not modelled (CRPR acts only under on_chip_variation analysis and set_timing_derate, which the timer does not model)".into()),
+                "-skip_crpr" => a.skip_crpr = true,
                 other => return Err(format!("repair_timing {other}: not modelled")),
             }
             i += 1;
@@ -731,6 +732,17 @@ mod tests {
             assert_eq!(resolve_path_group(Some(n)), (Some(n), Vec::new()));
         }
         assert_eq!(resolve_path_group(None), (None, Vec::new()));
+    }
+
+    /// Rule (proc repair_timing, Resizer.tcl): `-skip_crpr` disables CRPR for the repair
+    /// (`sta::set_crpr_enabled 0` around `repair_setup` / `repair_hold`, the entry setting
+    /// restored in `finally`), logging RSZ-0225 / RSZ-0226. Its witness is the rt case
+    /// `repair_timing_crpr` (setup and hold steps exact, slacks taken with CRPR off under
+    /// `set_timing_derate -early 0.9 -late 1.1`).
+    #[test]
+    fn skip_crpr_is_read_not_refused() {
+        assert!(Args::parse(&["-setup".into(), "-skip_crpr".into()]).unwrap().skip_crpr);
+        assert!(!Args::parse(&["-setup".into()]).unwrap().skip_crpr);
     }
 
     fn p(pin: &str, slack: f32) -> Point {
