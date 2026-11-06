@@ -434,15 +434,11 @@ fn compute_new_delays_slews(ctx: &Ctx<'_>, t: &Timer<'_, '_>, p: &SlackParams<'_
     Some((old_delay, new_delay, old_slew, new_slew, old_load_cap, new_load_cap))
 }
 
-/// `Resizer::checkMaxCapOK(drvr, cap_delta)`: with a limit, a driver already over it may not
-/// grow, else it must stay within it.
+/// `Resizer::checkMaxCapOK(drvr, cap_delta)`: the delta within `maxCapIncrease` (upstream
+/// 6c1ea36e45).
 fn check_max_cap_ok(t: &Timer<'_, '_>, drvr: usize, cap_delta: f32) -> bool {
     let (cap, max_cap, slack, _, scene) = check_capacitance_all(t, drvr);
-    if max_cap > 0.0 && scene.is_some() {
-        let new_cap = cap + cap_delta;
-        return if slack < 0.0 { new_cap <= cap } else { new_cap <= max_cap };
-    }
-    true
+    cap_delta <= crate::repair_setup::max_cap_increase(cap, max_cap, slack, scene.is_some())
 }
 
 /// `Sta::slew(vertex, riseFall, scene, max)`: the larger of its rise and fall max slews.

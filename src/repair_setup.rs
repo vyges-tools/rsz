@@ -1776,6 +1776,20 @@ fn select_better_rf_drive_vt_cell(ctx: &Ctx<'_>, cell: &str) -> Option<String> {
     better_rf_drive_walk(&equiv, cell, |best, cand| weakens_drive(ctx.libs, best, cand))
 }
 
+/// `Resizer::maxCapIncrease`: the load a driver still accepts — 0 when it already violates its
+/// limit, `max_cap − cap` within it, infinity with no limit (`max_cap > 0` at a scene). Upstream
+/// 6c1ea36e45: `checkMaxCapOK` is `cap_delta <= maxCapIncrease`, where it was `cap + cap_delta <=
+/// max_cap` (or `<= cap` when violating) — the two differ at the float boundary.
+pub(crate) fn max_cap_increase(cap: f32, max_cap: f32, cap_slack: f32, limited: bool) -> f32 {
+    if max_cap > 0.0 && limited {
+        if cap_slack < 0.0 {
+            return 0.0;
+        }
+        return max_cap - cap;
+    }
+    f32::INFINITY
+}
+
 /// `terminateProgress`'s skip: with a setup margin, once the initial or the current TNS is 0 the
 /// remaining work targets the margin, which the fix rate cannot measure — no exit, the TNS kept
 /// (upstream 3df123c405, 1d391a6b85, 910a49987c, d1c3ab4a914: only with a margin; before them
@@ -1914,12 +1928,9 @@ fn replacement_preserves_max_cap(libs: &Libs, cell: &str, replacement: &str, fan
             continue;
         }
         for c in checks {
-            if c.max_cap > 0.0 && c.limited {
-                let new_cap = c.cap + cap_delta;
-                let ok = if c.slack < 0.0 { new_cap <= c.cap } else { new_cap <= c.max_cap };
-                if !ok {
-                    return false;
-                }
+            // `checkMaxCapOK`: the delta against the driver's headroom.
+            if cap_delta > max_cap_increase(c.cap, c.max_cap, c.slack, c.limited) {
+                return false;
             }
         }
     }
@@ -6323,4 +6334,20 @@ mod tests {
         assert!(!fix_rate_unmeasurable(-1e-12, 0.0, 0.0), "a negative margin is no margin");
     }
 
+    /// Upstream 6c1ea36e45: `checkMaxCapOK(drvr, delta)` is `delta <= maxCapIncrease(drvr)` — 0
+    /// for a violating driver, `max_cap - cap` within the limit, infinity without one — not `cap +
+    /// delta <= max_cap`; the two differ where `cap + delta` rounds to `max_cap`.
+    #[test]
+    fn the_max_cap_check_compares_the_delta_with_the_headroom() {
+        assert_eq!(max_cap_increase(1.0, 3.0, 2.0, true), 2.0);
+        assert_eq!(max_cap_increase(4.0, 3.0, -1.0, true), 0.0, "violating: no growth");
+        assert_eq!(max_cap_increase(1.0, 0.0, 0.0, true), f32::INFINITY, "no limit");
+        assert_eq!(max_cap_increase(1.0, 3.0, 2.0, false), f32::INFINITY, "no scene");
+        // The float boundary: cap + delta rounds down to max_cap (the old test passed), while
+        // delta exceeds the headroom max_cap - cap (one ulp).
+        let (cap, max_cap) = (1.0f32, 1.0f32 + f32::EPSILON);
+        let delta = 1.4 * f32::EPSILON;
+        assert!(cap + delta <= max_cap, "the old test: within");
+        assert!(delta > max_cap_increase(cap, max_cap, max_cap - cap, true), "the headroom test: over");
+    }
 }
