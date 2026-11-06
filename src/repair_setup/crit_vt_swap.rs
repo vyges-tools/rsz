@@ -28,7 +28,7 @@ struct CritInst {
     inst: String,
     cell: String,
     best: String,
-    /// `outputPin(inst)`: its first output pin (the instance's driver vertices in graph order).
+    /// `outputPin(inst)`: its first output pin in the instance's pin order ([`first_output_port`]).
     out_pin: Option<String>,
     /// `getInstanceSlack`: the target's slack.
     slack: f32,
@@ -158,13 +158,15 @@ impl Repair<'_, '_> {
                         if let Some(best) = check_and_mark_vt_swappable(ctx, dont_touch, inst, cell, not_swappable) {
                             // `getInstanceSlack`: the least (`std::min`) slack over the output pins.
                             let mut inst_slack = f32::MAX;
-                            let mut out_pin = None;
                             for (u, ux) in g.vertices.iter().enumerate() {
                                 if ux.is_driver && matches!(&ux.conn, Conn::Inst(j, _) if j == k) {
                                     inst_slack = inst_slack.min(s.slack_of(u, MAX, None));
-                                    out_pin.get_or_insert_with(|| ux.name.clone());
                                 }
                             }
+                            // `outputPin(inst)`: the first any-output pin in the instance's pin
+                            // iterator order (its master's terminals, as LEF orders them).
+                            let out_pin = first_output_port(ctx.master_pins.get(cell).map(Vec::as_slice).unwrap_or_default(), |port| ctx.libs.link_cell(cell).and_then(|c| c.port(port)).map(|p| p.direction))
+                                .and_then(|port| g.vertices.iter().find(|ux| ux.port.as_deref() == Some(port) && matches!(&ux.conn, Conn::Inst(j, _) if j == k)).map(|ux| ux.name.clone()));
                             if fuzzy::less(inst_slack, margin) && crit_set.insert(inst.clone()) {
                                 endpoint_insts += 1;
                                 let mut fanin_caps = Vec::new();
@@ -203,6 +205,12 @@ impl Repair<'_, '_> {
 }
 
 /// `Vertex::isRegClk`: the from pin of a clock-to-output arc.
+/// `SetupCritVtSwapPolicy::outputPin`: the first of the instance's pins (`pinIterator`, its
+/// master's terminals in order) whose direction `isAnyOutput` — output, tristate or bidirect.
+fn first_output_port<'p>(ports: &'p [String], direction: impl Fn(&str) -> Option<Direction>) -> Option<&'p str> {
+    ports.iter().map(String::as_str).find(|p| matches!(direction(p), Some(Direction::Output | Direction::Tristate | Direction::Bidirect)))
+}
+
 fn is_reg_clk(g: &vyges_sta::graph::Graph<'_>, v: usize) -> bool {
     g.out_edges[v].iter().any(|&e| match g.edges[e].kind {
         EdgeKind::Gate { set } => {
@@ -291,6 +299,21 @@ fn walk_fanin_cone(start: usize, start_slack: f32, margin: f32, visited: &mut Ha
 
 #[cfg(test)]
 mod tests {
+    /// Rule (`outputPin`, upstream a5756aefab's tracker): the output pin a CRIT_VT swap is tracked
+    /// at is the first any-output pin in the master's terminal order, not the first driver vertex
+    /// the graph made — on a two-output cell (`COUT`, `SUM`) the two can differ, and the tracker
+    /// then counts the swap at another pin than a later reroute of the same instance.
+    #[test]
+    fn the_tracked_output_pin_is_the_first_any_output_in_terminal_order() {
+        use vyges_sta::liberty::Direction::*;
+        let ports: Vec<String> = ["A", "B", "CI", "COUT", "SUM"].iter().map(|p| p.to_string()).collect();
+        let dir = |p: &str| Some(if matches!(p, "COUT" | "SUM") { Output } else { Input });
+        assert_eq!(super::first_output_port(&ports, dir), Some("COUT"));
+        let ports: Vec<String> = ["A", "Z", "Y"].iter().map(|p| p.to_string()).collect();
+        assert_eq!(super::first_output_port(&ports, |p| Some(match p { "A" => Input, "Z" => Tristate, _ => Output })), Some("Z"));
+        assert_eq!(super::first_output_port(&ports, |p| Some(if p == "A" { Input } else { Internal })), None);
+    }
+
     use super::*;
 
     /// Rules (`SetupCritVtSwapPolicy::findGroupFanout`, `PathGroupFilter::startpointInGroup`):
