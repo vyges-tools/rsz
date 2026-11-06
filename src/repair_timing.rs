@@ -128,7 +128,8 @@ impl Move {
             "unbuffer" => Move::Unbuffer,
             "swap" => Move::SwapPins,
             "sizeup" => Move::SizeUp,
-            "size_down_fanout" | "size_down" => Move::SizeDownFanout,
+            // `sizedown`: upstream 94811999d3, beside `sizeup`.
+            "size_down_fanout" | "size_down" | "sizedown" => Move::SizeDownFanout,
             "clone" => Move::Clone,
             "split" => Move::SplitLoad,
             "sizeup_match" => Move::SizeUpMatch,
@@ -747,6 +748,14 @@ pub fn timing_points(g: &vyges_sta::graph::Graph<'_>, search: &vyges_sta::search
 
 #[cfg(test)]
 mod tests {
+    /// `moveTypeFromString` (upstream 94811999d3): `sizedown` is SizeDownFanout, as `size_down` and
+    /// `size_down_fanout` are.
+    #[test]
+    fn sizedown_is_an_alias_of_size_down() {
+        assert_eq!(parse_move_sequence("sizeup,sizedown").unwrap(), vec![Move::SizeUp, Move::SizeDownFanout]);
+        assert_eq!(parse_move_sequence("SizeDown size_down").unwrap(), vec![Move::SizeDownFanout, Move::SizeDownFanout]);
+    }
+
     use super::*;
 
     /// Rule (`resolvePathGroupName`, `findPathGroupType`, `pathGroupNames`): only the five names
