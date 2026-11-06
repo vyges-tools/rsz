@@ -39,6 +39,7 @@ use crate::{clone, move_tracker, rebuffer, swap_pins, unbuffer};
 use crate::Stop;
 
 mod crit_vt_swap;
+mod parallel_eval;
 mod global_sizing;
 mod tracked_moves;
 
@@ -2820,7 +2821,7 @@ impl<'c, 'd> Repair<'c, 'd> {
             // preamble.
             progress_header_show_starts: false,
             progress_header_printed: false,
-            legacy_start: !matches!(args.phases.as_deref().map(crate::repair_timing::phase_plan), Some(crate::repair_timing::PhasePlan::GlobalSizing)),
+            legacy_start: !matches!(args.phases.as_deref().map(crate::repair_timing::phase_plan), Some(crate::repair_timing::PhasePlan::GlobalSizing | crate::repair_timing::PhasePlan::ParallelEval)),
         })
     }
 }
@@ -2890,6 +2891,7 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
             }
             // `SetupCritVtSwapPolicy`: nothing to do when skipped or with one VT category.
             "CRIT_VT_SWAP" => r.crit_vt_swap_phase()?,
+            "PARALLEL_EVAL" => r.parallel_eval_policy()?,
             other => return Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -phases: {other} is not modelled"))),
         }
     }

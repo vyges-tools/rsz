@@ -19,6 +19,21 @@ use vyges_sta::fuzzy;
 /// The timer's initial slack (`MinMax::min()->initValue()`), as the reference spells INF.
 pub const SLACK_INIT: f32 = 1e30;
 
+/// `RepairEffort`: how long PARALLEL_EVAL works for the last gains after its batches converge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+}
+
+/// `proc repair_timing`'s RSZ-3244: `-effort` given while `-phases` (upper-cased, as a Tcl list)
+/// does not list PARALLEL_EVAL. Logged by the Tcl before the repair runs.
+pub fn effort_warning(a: &Args) -> Option<String> {
+    let listed = a.phases.as_deref().unwrap_or_default().to_uppercase().split_whitespace().any(|p| p == "PARALLEL_EVAL");
+    (a.effort.is_some() && !listed).then(|| "[WARNING RSZ-3244] -effort has no effect unless -phases lists PARALLEL_EVAL.".to_string())
+}
+
 /// `repair_timing`'s flags, as `repair_setup` receives them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Args {
@@ -58,6 +73,9 @@ pub struct Args {
     /// `-skip_crpr`: CRPR disabled for the repair (`sta::set_crpr_enabled 0` around
     /// `repair_setup` / `repair_hold`, the entry setting restored after), RSZ-0225 / RSZ-0226.
     pub skip_crpr: bool,
+    /// `-effort` (`repairEffortFromString`), when given: read by PARALLEL_EVAL alone (high when
+    /// not given).
+    pub effort: Option<Effort>,
     pub match_cell_footprint: bool,
     pub allow_setup_violations: bool,
     /// `-path_group`, as given (resolved by [`resolve_path_group`]).
@@ -165,6 +183,7 @@ impl Args {
             skip_last_gasp: false,
             skip_crit_vt_swap: false,
             skip_crpr: false,
+            effort: None,
             match_cell_footprint: false,
             allow_setup_violations: false,
             path_group: None,
@@ -252,6 +271,17 @@ impl Args {
                 "-match_cell_footprint" => a.match_cell_footprint = true,
                 "-verbose" => a.verbose = true,
                 "-skip_crpr" => a.skip_crpr = true,
+                // `repairEffortFromString`: low, medium or high; anything else is RSZ-3242, an
+                // error.
+                "-effort" => {
+                    a.effort = Some(match value(i)?.as_str() {
+                        "low" => Effort::Low,
+                        "medium" => Effort::Medium,
+                        "high" => Effort::High,
+                        other => return Err(format!("repair_timing -effort {other} (RSZ-3242): not modelled")),
+                    });
+                    i += 1;
+                }
                 other => return Err(format!("repair_timing {other}: not modelled")),
             }
             i += 1;
@@ -412,8 +442,10 @@ pub enum PhasePlan {
     LegacyPreamble { startpoints: bool },
     /// GLOBAL_SIZING alone: `GlobalSizingPolicy`, which prints no preamble (modelled).
     GlobalSizing,
-    /// The first phase is GLOBAL_SIZING followed by more phases (another preamble), or
-    /// PARALLEL_EVAL (`SetupParallelEvalPolicy`): not modelled.
+    /// PARALLEL_EVAL alone: `SetupParallelEvalPolicy`, which prints no preamble either (its
+    /// start modelled, its batches not).
+    ParallelEval,
+    /// The first phase is GLOBAL_SIZING or PARALLEL_EVAL followed by more phases: not modelled.
     Other,
 }
 
@@ -445,6 +477,9 @@ pub fn phase_plan(phases: &str) -> PhasePlan {
     }
     if names == ["GLOBAL_SIZING"] {
         return PhasePlan::GlobalSizing;
+    }
+    if names == ["PARALLEL_EVAL"] {
+        return PhasePlan::ParallelEval;
     }
     match first {
         "LEGACY" | "WNS" | "WNS_PATH" | "WNS_CONE" | "TNS" | "ENDPOINT_FANIN" | "STARTPOINT_FANOUT" | "LAST_GASP" | "CRIT_VT_SWAP" | "REROUTE" => PhasePlan::LegacyPreamble { startpoints: first == "STARTPOINT_FANOUT" },
@@ -740,6 +775,22 @@ mod tests {
     /// `repair_timing_crpr` (setup and hold steps exact, slacks taken with CRPR off under
     /// `set_timing_derate -early 0.9 -late 1.1`).
     #[test]
+    fn effort_is_read_and_warns_without_parallel_eval() {
+        // Upstream repair_timing: -effort low|medium|high (repairEffortFromString; else RSZ-3242),
+        // default high; RSZ-3244 when -phases (toupper, lsearch -exact) has no PARALLEL_EVAL.
+        let a = Args::parse(&["-setup".into(), "-phases".into(), "parallel_eval".into(), "-effort".into(), "low".into()]).unwrap();
+        assert_eq!(a.effort, Some(Effort::Low));
+        assert_eq!(effort_warning(&a), None, "upper-cased before the search");
+        let b = Args::parse(&["-setup".into(), "-effort".into(), "medium".into()]).unwrap();
+        assert_eq!(b.effort, Some(Effort::Medium));
+        assert_eq!(effort_warning(&b).as_deref(), Some("[WARNING RSZ-3244] -effort has no effect unless -phases lists PARALLEL_EVAL."));
+        let c = Args::parse(&["-setup".into(), "-phases".into(), "PARALLEL_EVAL_X".into(), "-effort".into(), "high".into()]).unwrap();
+        assert!(effort_warning(&c).is_some(), "an exact list element, not a substring");
+        assert_eq!(effort_warning(&Args::parse(&["-setup".into()]).unwrap()), None);
+        assert!(Args::parse(&["-effort".into(), "max".into()]).unwrap_err().contains("RSZ-3242"));
+    }
+
+    #[test]
     fn skip_crpr_is_read_not_refused() {
         assert!(Args::parse(&["-setup".into(), "-skip_crpr".into()]).unwrap().skip_crpr);
         assert!(!Args::parse(&["-setup".into()]).unwrap().skip_crpr);
@@ -888,7 +939,8 @@ mod tests {
         // counts as legacy-compatible (no implicit CRIT_VT_SWAP after it).
         // Upstream 32b4e4d06d7: PARALLEL_EVAL is a known phase (its own policy, no legacy
         // preamble, no implicit CRIT_VT_SWAP), and both error lists end with it.
-        assert_eq!(phase_plan("PARALLEL_EVAL"), PhasePlan::Other);
+        assert_eq!(phase_plan("PARALLEL_EVAL"), PhasePlan::ParallelEval);
+        assert_eq!(phase_plan("PARALLEL_EVAL LEGACY"), PhasePlan::Other);
         assert_eq!(phase_names(Some("PARALLEL_EVAL")), vec!["PARALLEL_EVAL"]);
         assert!(!phases_modelled("LEGACY PARALLEL_EVAL"));
         let PhasePlan::Error { line, .. } = phase_plan("") else { panic!("empty list") };

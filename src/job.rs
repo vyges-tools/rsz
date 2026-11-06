@@ -1213,8 +1213,9 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         timing_runs.push(json!({ "lines": [line], "endpoints": 0, "violating_endpoints": 0, "resized": 0, "removed": 0, "inserted": 0, "error": code }));
                         break;
                     }
-                    Some(rt::PhasePlan::Other) => return Err("repair_timing -phases: GLOBAL_SIZING with other phases, and PARALLEL_EVAL, are not modelled".into()),
+                    Some(rt::PhasePlan::Other) => return Err("repair_timing -phases: GLOBAL_SIZING or PARALLEL_EVAL with other phases: not modelled".into()),
                     Some(rt::PhasePlan::GlobalSizing) if !a.setup => return Err("repair_timing -phases GLOBAL_SIZING without -setup: not modelled".into()),
+                    Some(rt::PhasePlan::ParallelEval) if !a.setup => return Err("repair_timing -phases PARALLEL_EVAL without -setup: not modelled".into()),
                     _ => {}
                 }
                 if !estimated && !gr_estimated {
@@ -1387,16 +1388,20 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     crate::preamble::get_buffer_list(&libs, &m, &du, !hold_only).map_err(|e| format!("{}: {}", e.code(), e.message()))?.sorted_vt.len()
                 };
                 let seq = if recover { Vec::new() } else { rt::move_sequence(&a, vt_category_count > 1) };
-                // `GlobalSizingPolicy` has no preamble (no `SetupLegacyBase::start`): its lines
-                // start with its own RSZ-2024.
-                let measured = matches!(plan, Some(rt::PhasePlan::GlobalSizing));
+                // `GlobalSizingPolicy` and `SetupParallelEvalPolicy` have no preamble (no
+                // `SetupLegacyBase::start`): their lines start with their own.
+                let measured = matches!(plan, Some(rt::PhasePlan::GlobalSizing | rt::PhasePlan::ParallelEval));
                 let mut lines = if recover || measured || fr.is_some() { Vec::new() } else { rt::preamble(&seq, violating.len(), a.repair_tns_end_percent, a.phases.as_deref()) };
                 // RSZ-0225: logged before `repair_setup` runs (its RSZ-0100 first line).
                 if a.skip_crpr && a.setup && !recover {
                     lines.insert(0, "[INFO RSZ-0225] CRPR disabled during setup repair.".to_string());
                 }
+                // RSZ-3244: the Tcl's argument check, before RSZ-0225.
+                if let Some(w) = rt::effort_warning(&a).filter(|_| a.setup) {
+                    lines.insert(0, w);
+                }
                 // Under a group: GLOBAL_SIZING and the startpoint metrics are not modelled.
-                if group_ends.is_some() && (measured || matches!(plan, Some(rt::PhasePlan::LegacyPreamble { startpoints: true }))) {
+                if group_ends.is_some() && (matches!(plan, Some(rt::PhasePlan::GlobalSizing)) || matches!(plan, Some(rt::PhasePlan::LegacyPreamble { startpoints: true }))) {
                     return Err("repair_timing -path_group with GLOBAL_SIZING or the startpoint metrics: not modelled".into());
                 }
                 // The moves modelled, over one corner or several (each reads the scenes the
@@ -1644,7 +1649,8 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                             std::fs::write(path, all.join("\n") + "\n").map_err(|e| format!("{path}: {e}"))?;
                         }
                         // RSZ-0226: logged before `repair_hold` runs.
-                        let lines: Vec<String> = a.skip_crpr.then(|| "[INFO RSZ-0226] CRPR disabled during hold repair.".to_string()).into_iter().chain(o.lines).collect();
+                        // RSZ-3244 (the Tcl's argument check) before it.
+                        let lines: Vec<String> = rt::effort_warning(&a).into_iter().chain(a.skip_crpr.then(|| "[INFO RSZ-0226] CRPR disabled during hold repair.".to_string())).chain(o.lines).collect();
                         timing_runs.push(json!({ "hold": true, "lines": lines, "endpoints": ends.len(), "violating_endpoints": o.violating, "inserted": o.inserted, "resized": o.resized, "stopped": o.stopped, "error": o.error }));
                         if let Some(why) = o.stopped {
                             timing_stop = Some(why);
