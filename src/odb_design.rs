@@ -1297,8 +1297,8 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
     }
 
     /// `canRemoveBuffer(buffer, true)`'s database checks: the buffer neither dont_touch nor FIXED,
-    /// neither net dont_touch; then the net to go (the input net when the output net has a port,
-    /// else the output net): neither buffer pin a clock's source nor named by `set_max_capacitance`
+    /// neither net dont_touch, an input net; then the net to go (the input net when the output net
+    /// has a port and the input net none, else the output net): neither buffer pin a clock's source nor named by `set_max_capacitance`
     /// (`Sdc::isConstrained(pin)`: the pin constraints an accepted SDC can put on an instance pin), the net to go not named by
     /// `set_load` (`isConstrained(net)`), and that net mergeable into the other
     /// (`dbNet::canMergeNet`), or absent.
@@ -1308,11 +1308,19 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
         }
         let in_net = self.db.net_of(inst, in_pin);
         let out_net = self.db.net_of(inst, out_pin);
+        // No input net: nothing to merge into (upstream aa89cb9694).
+        if in_net.is_empty() {
+            return false;
+        }
         if [&in_net, &out_net].iter().any(|n| !n.is_empty() && self.db.net_is_do_not_touch(n)) {
             return false;
         }
-        let out_net_ports = !out_net.is_empty() && !self.db.net_bterms(&out_net).is_empty();
-        let (survivor, removed) = if out_net_ports { (out_net, in_net) } else { (in_net, out_net) };
+        // `bufferRemovalKeepsOutputNet` (flat: no module-net feedthrough): the output net
+        // survives only when it has a port and the input net has none — the survivor removeBuffer
+        // picks (upstream aa89cb9694, 9ffa16d003; before them a port on the output net alone).
+        let has_port = |n: &str| !n.is_empty() && !self.db.net_bterms(n).is_empty();
+        let keep_output = buffer_removal_keeps_output_net(has_port(&in_net), has_port(&out_net));
+        let (survivor, removed) = if keep_output { (out_net, in_net) } else { (in_net, out_net) };
         let pins = [format!("{inst}/{in_pin}"), format!("{inst}/{out_pin}")];
         if pins.iter().any(|p| self.clock_sources.contains(p) || self.sdc_pins.contains(p)) || self.sdc_nets.contains(&removed) {
             return false;
@@ -1708,4 +1716,26 @@ pub fn sdc_port_cap_limits(s: &vyges_loom::sdc::Sdc, cap_scale: f32) -> BTreeMap
         }
     }
     out
+}
+
+/// `bufferRemovalKeepsOutputNet` on a flat netlist (upstream aa89cb9694, 9ffa16d003): removing
+/// a buffer keeps its output net only when that net has a port and the input net has none.
+pub fn buffer_removal_keeps_output_net(in_net_has_port: bool, out_net_has_port: bool) -> bool {
+    !in_net_has_port && out_net_has_port
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Upstream rule (aa89cb9694, 9ffa16d003): the output net survives a buffer removal only when
+    /// it has a port and the input net has none; with ports on both sides the input net survives
+    /// (before them a port on the output net alone decided it).
+    #[test]
+    fn a_buffer_removal_keeps_the_output_net_only_when_the_input_net_has_no_port() {
+        assert!(buffer_removal_keeps_output_net(false, true));
+        assert!(!buffer_removal_keeps_output_net(true, true), "ports on both nets: the input net survives");
+        assert!(!buffer_removal_keeps_output_net(true, false));
+        assert!(!buffer_removal_keeps_output_net(false, false));
+    }
 }
