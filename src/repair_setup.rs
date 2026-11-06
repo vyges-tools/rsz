@@ -1776,6 +1776,14 @@ fn select_better_rf_drive_vt_cell(ctx: &Ctx<'_>, cell: &str) -> Option<String> {
     better_rf_drive_walk(&equiv, cell, |best, cand| weakens_drive(ctx.libs, best, cand))
 }
 
+/// `terminateProgress`'s skip: with a setup margin, once the initial or the current TNS is 0 the
+/// remaining work targets the margin, which the fix rate cannot measure — no exit, the TNS kept
+/// (upstream 3df123c405, 1d391a6b85, 910a49987c, d1c3ab4a914: only with a margin; before them
+/// the rate was always taken, dividing by a zero initial TNS).
+fn fix_rate_unmeasurable(setup_margin: f32, initial_tns: f32, curr_tns: f32) -> bool {
+    setup_margin > 0.0 && (initial_tns >= 0.0 || curr_tns >= 0.0)
+}
+
 /// `selectBetterRfDriveVtCell`'s walk over the equivalents after the cell.
 fn better_rf_drive_walk(equiv: &[String], cell: &str, weakens: impl Fn(&str, &str) -> bool) -> Option<String> {
     let at = equiv.iter().position(|c| c == cell)?;
@@ -4529,6 +4537,10 @@ impl Repair<'_, '_> {
         }
         if iteration % OPTO_SMALL_INTERVAL == 0 {
             let curr_tns = self.timing.tns();
+            if fix_rate_unmeasurable(self.ctx.margin, self.initial_tns, curr_tns) {
+                self.prev_tns = curr_tns;
+                return false;
+            }
             let inc_fix_rate = (self.prev_tns - curr_tns) / self.initial_tns;
             self.prev_tns = curr_tns;
             if iteration > 1000 && inc_fix_rate < *fix_rate_threshold {
@@ -6298,6 +6310,17 @@ mod tests {
         assert!(weakens_drive(&libs, "B", "FALLSLOW"), "fall alone");
         assert!(weakens_drive(&libs, "FAST", "B"));
         assert!(weakens_drive(&libs, "B", "OTHERPIN"), "the output missing on the candidate");
+    }
+
+    /// Upstream d1c3ab4a914 (and the 3df123c405 family): the fix-rate exit is skipped only with a
+    /// positive setup margin, and then when the initial or current TNS is not negative.
+    #[test]
+    fn the_fix_rate_exit_is_skipped_at_zero_tns_only_with_a_setup_margin() {
+        assert!(fix_rate_unmeasurable(1e-12, 0.0, -1e-9), "initial TNS 0");
+        assert!(fix_rate_unmeasurable(1e-12, -1e-9, 0.0), "current TNS 0");
+        assert!(!fix_rate_unmeasurable(1e-12, -1e-9, -1e-10), "both violating: measured");
+        assert!(!fix_rate_unmeasurable(0.0, 0.0, 0.0), "no margin: measured");
+        assert!(!fix_rate_unmeasurable(-1e-12, 0.0, 0.0), "a negative margin is no margin");
     }
 
 }
