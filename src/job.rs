@@ -1186,6 +1186,11 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     "resize_slacks" => Some(String::new()),
                     _ => None,
                 };
+                // `set_opt_config -rebuffer_size_driver` (upstream acd46b9bf5): fullyRebuffer sizes
+                // each driver together with its buffer tree — not modelled.
+                if cmd == "fully_rebuffer" && db.block_bool_property("rebuffer_size_driver").map_err(|e| e.to_string())? == Some(true) {
+                    return Err("fully_rebuffer with set_opt_config -rebuffer_size_driver (drivers sized with their buffer trees): not modelled".into());
+                }
                 let mut a = if fr.is_some() { rt::Args::parse(&["-setup".to_string(), "-sequence".to_string(), "buffer".to_string()])? } else { rt::Args::parse(&args)? };
                 a.sta_levels = sta_levels.clone();
                 // `-path_group` (`rsz::resolve_path_group`, before anything else of the command):
