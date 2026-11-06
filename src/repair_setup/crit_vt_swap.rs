@@ -207,7 +207,7 @@ impl Repair<'_, '_> {
 /// `Vertex::isRegClk`: the from pin of a clock-to-output arc.
 /// `SetupCritVtSwapPolicy::outputPin`: the first of the instance's pins (`pinIterator`, its
 /// master's terminals in order) whose direction `isAnyOutput` — output, tristate or bidirect.
-fn first_output_port<'p>(ports: &'p [String], direction: impl Fn(&str) -> Option<Direction>) -> Option<&'p str> {
+fn first_output_port(ports: &[String], direction: impl Fn(&str) -> Option<Direction>) -> Option<&str> {
     ports.iter().map(String::as_str).find(|p| matches!(direction(p), Some(Direction::Output | Direction::Tristate | Direction::Bidirect)))
 }
 
