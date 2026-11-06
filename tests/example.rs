@@ -65,3 +65,33 @@ fn a_repair_that_checks_nothing_exits_two() {
     assert_eq!(out.status.code(), Some(2), "{report}");
     assert!(report.contains(r#""status":"vacuous""#) && report.contains(r#""nets_checked":0"#), "{report}");
 }
+
+// A refusal is never a vacuous pass: a setup policy with no preamble (GLOBAL_SIZING, and
+// PARALLEL_EVAL) refused before it logs a line leaves no timing run, and the job is still
+// `refused`, exit 3 — not `vacuous` ("no repair_design step").
+#[test]
+fn a_policy_refused_before_its_first_line_is_refused_not_vacuous() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("long_wire_policy_refused");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    for f in ["cells.lef", "cells.lib", "long_wire.def"] {
+        std::fs::copy(example().join(f), dir.join(f)).unwrap();
+    }
+    // A virtual clock times the two ports, so the repair gets past its constraints check.
+    std::fs::write(dir.join("io.sdc"), "create_clock -name vclk -period 0.1\nset_input_delay 0 -clock vclk [get_ports in1]\nset_output_delay 0 -clock vclk [get_ports out1]\n").unwrap();
+    let job = read(&example().join("job.json")).replace(
+        r#"{ "cmd": "repair_design",       "args": ["-max_wire_length", "400"] }"#,
+        r#"{ "cmd": "read_sdc",            "args": ["io.sdc"] },
+    { "cmd": "repair_timing",       "args": ["-setup", "-phases", "GLOBAL_SIZING", "-max_utilization", "50"] }"#,
+    );
+    assert!(job.contains("GLOBAL_SIZING"), "the example job's repair_design step was replaced");
+    std::fs::write(dir.join("job.json"), job).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_vyges-rsz"))
+        .args(["repair_design", "job.json", "-o", "report.json"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    let report = read(&dir.join("report.json"));
+    assert_eq!(out.status.code(), Some(3), "{report}");
+    assert!(report.contains(r#""status":"refused""#) && report.contains("max_utilization"), "{report}");
+}

@@ -1766,8 +1766,9 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
     let tags: Vec<&str> = trace.tags.iter().copied().collect();
     let mut report = match outcome {
         // repair_timing alone: its preamble, then the repair it made, the moves it would make
-        // (refused), or a CHECKED nothing-to-do with the endpoints it checked.
-        None if buffered.is_empty() && !timing_runs.is_empty() => match &timing_stop {
+        // (refused), or a CHECKED nothing-to-do with the endpoints it checked. A policy with no
+        // preamble that is refused has no run to show, and is refused all the same.
+        None if buffered.is_empty() && (!timing_runs.is_empty() || timing_stop.is_some()) => match &timing_stop {
             Some(reason) => json!({ "tool": "vyges-rsz", "status": "refused", "reason": reason }),
             None => {
                 let checked: u64 = timing_runs.iter().filter_map(|r| r["endpoints"].as_u64()).sum();
