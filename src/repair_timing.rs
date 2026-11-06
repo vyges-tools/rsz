@@ -84,6 +84,10 @@ pub struct Args {
     /// calls, as the reference's one timer does): the levels its incremental relevelization had
     /// reached, which a fresh levelization need not give. `None`: levelize from scratch.
     pub sta_levels: Option<std::collections::BTreeMap<String, i32>>,
+    /// `-vyges_placed_nets`: the repair runs under the placer's net predicate (global placement's
+    /// `findResizeSlacks`, which installs `placed_net_`), so `okToBufferNet` turns away a net the
+    /// placer does not place (`Resizer::isPlacedNet`, upstream f60847a4c5).
+    pub placed_nets: bool,
 }
 
 /// `MoveType`, by the name `moveName` prints.
@@ -189,6 +193,7 @@ impl Args {
             allow_setup_violations: false,
             path_group: None,
             sta_levels: None,
+            placed_nets: false,
         };
         let mut i = 0;
         while i < args.len() {
@@ -208,6 +213,7 @@ impl Args {
                 }
                 // Global placement's repair pass: the fraction as the placer holds it (`percent /
                 // 100.0f`, a float), not the command's double division.
+                "-vyges_placed_nets" => a.placed_nets = true,
                 "-vyges_repair_tns_fraction" => {
                     a.repair_tns_end_percent = value(i)?.parse().map_err(|_| "repair_timing -vyges_repair_tns_fraction: not a number".to_string())?;
                     i += 1;
@@ -757,6 +763,21 @@ mod tests {
     }
 
     use super::*;
+
+    /// `Resizer::isPlacedNet` (upstream f60847a4c5): `!placed_net_ || placed_net_(net)`. Only
+    /// global placement's repair installs the predicate (`-vyges_placed_nets`); without it every
+    /// net passes, under it a net of a signal type the placer skips is turned away.
+    #[test]
+    fn the_placed_net_predicate_is_installed_only_by_its_flag() {
+        assert!(!Args::parse(&["-setup".into()]).unwrap().placed_nets);
+        let a = Args::parse(&["-setup".into(), "-vyges_placed_nets".into()]).unwrap();
+        assert!(a.placed_nets);
+        let mut info = crate::timing::NetInfo::default();
+        info.unplaced_sig_type.insert("scan_en".to_string());
+        assert!(crate::timing::is_placed_net(&info, "scan_en", false), "no predicate: every net");
+        assert!(!crate::timing::is_placed_net(&info, "scan_en", a.placed_nets));
+        assert!(crate::timing::is_placed_net(&info, "n1", a.placed_nets));
+    }
 
     /// Rule (`resolvePathGroupName`, `findPathGroupType`, `pathGroupNames`): only the five names
     /// are groups, matched exactly; any other warns RSZ-0227, listing them in that order, and

@@ -4756,7 +4756,7 @@ impl Repair<'_, '_> {
     /// path index of 2 or more.
     fn is_applicable(&self, m: Move, st: &Stage, index: usize) -> bool {
         match m {
-            Move::Buffer => buffer_fanout_applicable(st.fanout) && self.design.ok_to_buffer_net(&st.pin),
+            Move::Buffer => buffer_fanout_applicable(st.fanout) && self.ok_to_buffer_net(&st.pin),
             Move::SizeUpMatch => index >= 2,
             // `RerouteGenerator::isApplicable`: a global router and its parasitics.
             Move::Reroute => self.design.global_routed(),
@@ -4772,7 +4772,7 @@ impl Repair<'_, '_> {
             self.debug("clone_move", 2, format!("REJECT CloneMove {}: Fanout {} <= {} min fanout", st.pin, st.fanout, clone::CLONE_MIN_FANOUT));
             return Ok(None);
         }
-        if !self.design.ok_to_buffer_net(&st.pin) {
+        if !self.ok_to_buffer_net(&st.pin) {
             self.debug("clone_move", 2, format!("REJECT CloneMove {}: Not OK to buffer net", st.pin));
             return Ok(None);
         }
@@ -4822,7 +4822,7 @@ impl Repair<'_, '_> {
             self.debug("split_load_move", 2, format!("REJECT SplitLoadMove {}: Fanout {} <= {} min fanout", st.pin, st.fanout, clone::CLONE_MIN_FANOUT));
             return Ok(None);
         }
-        if !self.design.ok_to_buffer_net(&st.pin) {
+        if !self.ok_to_buffer_net(&st.pin) {
             self.debug("split_load_move", 2, format!("REJECT SplitLoadMove {}: Not OK to buffer net", st.pin));
             return Ok(None);
         }
@@ -5027,6 +5027,12 @@ impl Repair<'_, '_> {
         self.design.swap_master(inst, &to).map_err(|e| Stop::error("RSZ-REPLACE", e))?;
         self.debug("size_up_match_move", 1, format!("ACCEPT SizeUpMatchMove {}: Replaced {cell} -> {to}", st.pin));
         Ok(Some(MoveResult { kind: Move::SizeUpMatch, count: 1, insts: vec![inst.clone()] }))
+    }
+
+    /// `Resizer::okToBufferNet(driver)`: the design's test, and `isPlacedNet` on the driver's net
+    /// (`!placed_net_ || placed_net_(net)`: under the placer's predicate, a SIGNAL or CLOCK net).
+    fn ok_to_buffer_net(&self, drvr_pin: &str) -> bool {
+        self.design.ok_to_buffer_net(drvr_pin) && self.design.as_design().pin_net(drvr_pin).is_none_or(|(net, _)| crate::timing::is_placed_net(self.design.net_info(), &net, self.args.placed_nets))
     }
 
     /// `MoveCommitter::commit` of an accepted candidate: recorded, and kept in the open level.
