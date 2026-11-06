@@ -100,6 +100,17 @@ impl Repair<'_, '_> {
         Ok(())
     }
 
+    /// `MoveCommitter::trackViolatorWithTimingInfo` where the pin's slack is the timer's now
+    /// (`Sta::slack(vertex)`, up to date on the edits so far), `endpoint_slack` the target's.
+    pub(super) fn trk_violator_with_timing_info(&mut self, pin: &str, endpoint_slack: f32) -> Result<(), Stop> {
+        if self.moves.is_none() {
+            return Ok(());
+        }
+        let id = self.trk_id(pin)?;
+        let pin_slack = self.trk_slacks(&[id])?.get(&id).copied().unwrap_or(0.0);
+        self.trk_violator(pin, pin_slack, endpoint_slack)
+    }
+
     /// `MoveCommitter::trackMoveAttempt`: a candidate whose estimate is legal, before its apply.
     pub(super) fn trk_attempt(&mut self, pin: &str, m: Move) -> Result<(), Stop> {
         if self.moves.is_none() {

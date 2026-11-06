@@ -4,10 +4,9 @@
 //! violates; each is swapped to its best VT-equivalent cell (`selectBetterRfDriveVtCell`) in one
 //! batch, then the timer is updated once.
 //!
-//! The reference commits the batch in its `unordered_map<Instance*>` order (heap addresses: its
-//! own debug order differs run to run, its results do not); a swap's cell depends only on the
-//! library, so the order can show only through the max-capacitance guard on a fanin net two swaps
-//! share — ours commits in discovery order.
+//! The batch commits in discovery order (upstream a5756aefab: a vector, where an
+//! `unordered_map<Instance*>` once gave a heap order) — the order shows through the
+//! max-capacitance guard on a fanin net two swaps share.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -29,6 +28,10 @@ struct CritInst {
     inst: String,
     cell: String,
     best: String,
+    /// `outputPin(inst)`: its first output pin (the instance's driver vertices in graph order).
+    out_pin: Option<String>,
+    /// `getInstanceSlack`: the target's slack.
+    slack: f32,
     fanin_caps: Vec<(String, Vec<CapCheck>)>,
 }
 
@@ -79,11 +82,13 @@ impl Repair<'_, '_> {
             if check_and_mark_vt_swappable(self.ctx, &dont_touch, &c.inst, &c.cell, &mut not_swappable).is_none() {
                 continue;
             }
-            // Level 2 tracks each swap against its output pin as the current endpoint, and the
-            // batch's moves are finalized against the LAST one — the order of an
-            // `unordered_map<Instance*>`, a heap order no capture records.
-            if self.moves.is_some() {
-                return Err(Stop::refused("RSZ-ABSENT", "the move tracker at level 2 over a CRIT_VT_SWAP batch (its moves credited to the last instance of a heap-ordered map): not modelled".into()));
+            // Level 2: each swap's output pin becomes the current endpoint and is tracked as a
+            // violator (`trackViolatorWithTimingInfo`: the pin's slack read now, the target's
+            // slack); the attempt is tracked before the apply, whatever the guard decides.
+            if let (true, Some(out)) = (self.moves.is_some(), c.out_pin.as_deref()) {
+                self.trk_set_current_endpoint(out)?;
+                self.trk_violator_with_timing_info(out, c.slack)?;
+                self.trk_attempt(out, Move::VtSwap)?;
             }
             if !replacement_preserves_max_cap(self.ctx.libs, &c.cell, &c.best, &c.fanin_caps) {
                 self.debug("vt_swap_move", 2, format!("REJECT VTSwapMove {}: {} -> {} violates max capacitance", c.inst, c.cell, c.best));
@@ -95,10 +100,16 @@ impl Repair<'_, '_> {
             changed = true;
             self.debug("swap_crit_vt", 1, format!("inst {} did crit VT swap", c.inst));
         }
+        // `acceptPendingMoves` / `rejectPendingMoves`, each with the tracker's flush.
         if changed {
             self.committer.accept_pending();
+            if let Some(m) = self.moves.as_mut() {
+                m.commit_moves();
+            }
             self.retime(&[])?;
             self.num_viols = collect_violating(&self.timing.ends, self.ctx.margin).len() as i64;
+        } else if let Some(m) = self.moves.as_mut() {
+            m.reject_moves();
         }
         Ok(changed)
     }
@@ -147,9 +158,11 @@ impl Repair<'_, '_> {
                         if let Some(best) = check_and_mark_vt_swappable(ctx, dont_touch, inst, cell, not_swappable) {
                             // `getInstanceSlack`: the least (`std::min`) slack over the output pins.
                             let mut inst_slack = f32::MAX;
+                            let mut out_pin = None;
                             for (u, ux) in g.vertices.iter().enumerate() {
                                 if ux.is_driver && matches!(&ux.conn, Conn::Inst(j, _) if j == k) {
                                     inst_slack = inst_slack.min(s.slack_of(u, MAX, None));
+                                    out_pin.get_or_insert_with(|| ux.name.clone());
                                 }
                             }
                             if fuzzy::less(inst_slack, margin) && crit_set.insert(inst.clone()) {
@@ -176,7 +189,7 @@ impl Repair<'_, '_> {
                                         .collect();
                                     fanin_caps.push((ux.port.clone().unwrap_or_default(), checks));
                                 }
-                                result.push(CritInst { inst: inst.clone(), cell: cell.clone(), best, fanin_caps });
+                                result.push(CritInst { inst: inst.clone(), cell: cell.clone(), best, out_pin, slack: inst_slack, fanin_caps });
                             }
                         }
                     }
