@@ -2891,7 +2891,7 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
             }
             // `SetupCritVtSwapPolicy`: nothing to do when skipped or with one VT category.
             "CRIT_VT_SWAP" => r.crit_vt_swap_phase()?,
-            "PARALLEL_EVAL" => r.parallel_eval_policy()?,
+            "PARALLEL_EVAL" => r.parallel_eval_policy(marker)?,
             other => return Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -phases: {other} is not modelled"))),
         }
     }

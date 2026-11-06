@@ -4,10 +4,15 @@
 //!
 //! Ported stage group by stage group, in the reference's order. Each stage is its own function
 //! named after the reference's, and `start` / `iterate` do nothing but call them, so a trace that
-//! diverges from the reference's points at one stage. Modelled so far: `start` (S1). The batch
-//! loop (`iterate`: collect, evaluate, select, commit, judge) is refused.
+//! diverges from the reference's points at one stage. Modelled so far: `start` (S1) and the
+//! target collection of a batch (S2: `collectTargetEndpoints`, `collectTargets`). Candidate
+//! generation onward (S3: `generateCandidates`) is refused.
 
-use super::{Repair, Stop};
+use std::collections::HashSet;
+
+use vyges_sta::fuzzy;
+
+use super::{PathView, Repair, Stop};
 use crate::repair_timing::{Effort, Move};
 
 /// `BatchPriorityConfig`: how stalled batches favour targets in shared violating cones.
@@ -203,6 +208,91 @@ pub fn for_parallel_eval(effort: Effort) -> MtConfig {
     c
 }
 
+/// `StallMonitor`: the batch stage's progress against its stall rules (the rules: S5). Here, what
+/// `reset` and `beginBatch` keep.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StallMonitor {
+    pub initial_tns: f32,
+    pub reference_period: f32,
+    pub stalled_batches: i32,
+    pub stalled_moves: i32,
+    pub last_batch_moves: i32,
+    pub wns_stall_batches: i32,
+    pub window_stalled: bool,
+    pub last_cap: i32,
+    pub failing_endpoints: usize,
+}
+
+impl StallMonitor {
+    /// `reset(initial_tns, reference_period)`.
+    pub fn reset(&mut self, initial_tns: f32, reference_period: f32) {
+        *self = StallMonitor { initial_tns, reference_period, last_cap: self.last_cap, failing_endpoints: self.failing_endpoints, ..StallMonitor::default() };
+    }
+
+    /// `beginBatch(cap, failing_endpoints)`.
+    pub fn begin_batch(&mut self, batch_cap: i32, failing_endpoints: usize) {
+        self.last_cap = batch_cap;
+        self.failing_endpoints = failing_endpoints;
+    }
+}
+
+/// `BatchScope`: the violating endpoints a batch draws from and its move cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchScope {
+    pub target_endpoints: usize,
+    pub batch_cap: i32,
+}
+
+/// `Target` in its path-driver view (`makePathDriverTarget`): a driver on an endpoint's worst path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Target {
+    pub driver_pin: String,
+    /// The pin of the path the driver was found on: the endpoint, or a latch D for a latch fanin
+    /// segment.
+    pub endpoint_pin: String,
+    /// The failing endpoint the target was collected for.
+    pub violated_endpoint_pin: String,
+    /// The path's transition at the driver.
+    pub driver_rf: usize,
+    /// The driver's index in its expanded path, root first.
+    pub path_index: usize,
+    /// The load the driver feeds on the path; none when the path ends at the driver.
+    pub load_pin: Option<String>,
+    /// The endpoint's slack as the collector holds it.
+    pub slack: f32,
+    /// `targetFanout`: the driver vertex's wire edges out.
+    pub fanout: usize,
+    /// The path's scene.
+    pub scene: usize,
+    /// The driver's instance and its cell.
+    pub inst: String,
+    pub cell: String,
+}
+
+/// `BatchPool`: the targets of one batch (a deque upstream, so they never move).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BatchPool {
+    pub targets: Vec<Target>,
+}
+
+/// `adaptiveBatchSize`: the failing endpoint count clamped to [min_cap, max_cap].
+pub fn adaptive_batch_size(failing_endpoint_count: usize, min_cap: i32, max_cap: i32) -> i32 {
+    failing_endpoint_count.max(min_cap as usize).min(max_cap as usize) as i32
+}
+
+/// `evaluationEndpointLimit`: endpoints per chunk, the cap times the factor, at least the floor.
+pub fn evaluation_endpoint_limit(batch_cap: i32, eval_endpoint_factor: i32, min_endpoints: i32) -> usize {
+    (batch_cap as usize * eval_endpoint_factor as usize).max(min_endpoints as usize)
+}
+
+/// The VYGP printer's `{:.9e}` as fmt (C++) prints it: the exponent signed, at least two digits.
+fn e9(v: f32) -> String {
+    let s = format!("{:.9e}", v);
+    let (m, e) = s.split_once('e').expect("Rust's {:e} always has an exponent");
+    let e: i32 = e.parse().expect("Rust's {:e} exponent is an integer");
+    format!("{m}e{}{:02}", if e < 0 { '-' } else { '+' }, e.abs())
+}
+
 /// The policy's run state (`SetupParallelEvalPolicy`'s members), as `start` leaves it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParallelEval {
@@ -231,6 +321,11 @@ pub struct ParallelEval {
     pub reference_period: f32,
     pub graph_vertices: usize,
     pub converged: bool,
+    pub stall: StallMonitor,
+    /// `critPathLoadPins`: every load pin on a collected worst path.
+    pub crit_path_load_pins: HashSet<String>,
+    /// The phase's progress-row marker (`phaseMarkerForIndex`).
+    pub marker: char,
 }
 
 /// `selectMoveSequence`'s exclusion: BufferToInverters has no gain estimate to rank it; Clone,
@@ -281,8 +376,8 @@ pub fn reference_period(sdc: &vyges_sta::sdc::Sdc, initial_wns: f32) -> f32 {
 
 impl Repair<'_, '_> {
     /// `Optimizer::run` for the policy: `start`, then `iterate` until converged, then `finish`.
-    pub(super) fn parallel_eval_policy(&mut self) -> Result<(), Stop> {
-        let mut pe = self.pe_start()?;
+    pub(super) fn parallel_eval_policy(&mut self, marker: char) -> Result<(), Stop> {
+        let mut pe = self.pe_start(marker)?;
         while !pe.converged {
             self.pe_iterate(&mut pe)?;
         }
@@ -290,7 +385,7 @@ impl Repair<'_, '_> {
     }
 
     /// `SetupParallelEvalPolicy::start`.
-    fn pe_start(&mut self) -> Result<ParallelEval, Stop> {
+    fn pe_start(&mut self, marker: char) -> Result<ParallelEval, Stop> {
         let config = for_parallel_eval(self.args.effort.unwrap_or(Effort::High));
         self.pe_optimization_policy_start();
         let mut pe = ParallelEval {
@@ -315,6 +410,9 @@ impl Repair<'_, '_> {
             reference_period: 0.0,
             graph_vertices: 0,
             converged: false,
+            stall: StallMonitor::default(),
+            crit_path_load_pins: HashSet::new(),
+            marker,
         };
         self.pe_select_move_sequence(&mut pe);
         pe_build_move_generators(&mut pe);
@@ -394,6 +492,7 @@ impl Repair<'_, '_> {
         pe.checkpoint_tns = self.timing.tns();
         pe.best_checkpoint_wns = pe.checkpoint_wns;
         pe.reference_period = reference_period(self.ctx.ssdc, pe.checkpoint_wns);
+        pe.stall.reset(pe.checkpoint_tns, pe.reference_period);
         pe.graph_vertices = self.pe_graph_vertices()?;
         self.debug("repair_setup", 1, format!("PARALLEL_EVAL reference clock period {:.3e}", pe.reference_period));
         Ok(())
@@ -406,9 +505,159 @@ impl Repair<'_, '_> {
         super::timed_all(ctx, self.design.as_design(), &mut self.timer, edits, |gs, _, _| Ok(gs[0].vertices.len()))
     }
 
-    /// `iterate`: the batch loop, not yet modelled.
-    fn pe_iterate(&mut self, _pe: &mut ParallelEval) -> Result<(), Stop> {
-        Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: the batches (collectTargetEndpoints onward) are not modelled".into()))
+    /// `iterate`: one batch. Collect, weigh, evaluate; then commit, judge, stop (S3 onward: not
+    /// modelled).
+    fn pe_iterate(&mut self, pe: &mut ParallelEval) -> Result<(), Stop> {
+        if pe.converged {
+            return Ok(());
+        }
+        if self.pe_finish_if_no_setup_violations(pe)? || pe_finish_at_max_area() {
+            return Ok(());
+        }
+        let scope = self.pe_collect_target_endpoints(pe)?;
+        // `analyzeBottlenecks`: the weights apply only while saved batches stall WNS, which no
+        // batch before the first commit does.
+        if pe.stall.wns_stall_batches > 0 {
+            return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: analyzeBottlenecks is not modelled".into()));
+        }
+        let _pool = self.pe_evaluate_targets(pe, scope)?;
+        Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: the batch commit (commitBatch onward) is not modelled".into()))
+    }
+
+    /// `finishIfNoSetupViolations`: WNS at or above the margin ends the run (its `finish`: not
+    /// modelled).
+    fn pe_finish_if_no_setup_violations(&mut self, _pe: &mut ParallelEval) -> Result<bool, Stop> {
+        if fuzzy::less(self.timing.worst().0, self.ctx.margin) {
+            return Ok(false);
+        }
+        Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL with no setup violation (finish): not modelled".into()))
+    }
+
+    /// `collectTargetEndpoints`: the collector re-initialized, the progress row (every batch
+    /// with -verbose, else the first), the endpoints the batch draws from (`-repair_tns` bounds
+    /// them) and its cap.
+    fn pe_collect_target_endpoints(&mut self, pe: &mut ParallelEval) -> Result<BatchScope, Stop> {
+        pe.rebuffer_targets_in_batch = 0;
+        self.trk_capture_pre_phase_slack()?;
+        self.pe_collector_init();
+        if self.args.verbose || pe.batch_index == 0 {
+            self.pe_print_row(&format!("{}{}", pe.batch_index, pe.marker));
+        }
+        let failing_endpoint_count = self.collector_violating;
+        let target_endpoints = failing_endpoint_count.min(pe.max_end_repairs);
+        let batch_cap = pe_effective_batch_cap(pe, failing_endpoint_count);
+        pe.stall.begin_batch(batch_cap, failing_endpoint_count);
+        let mut t = format!("VYGP|scope|{}|fep={failing_endpoint_count}|target_endpoints={target_endpoints}|cap={batch_cap}\n", pe.batch_index);
+        for (i, (pin, slack)) in self.collector_ends.iter().enumerate() {
+            t.push_str(&format!("VYGP|vend|{}|{i}|{pin}|{}\n", pe.batch_index, e9(*slack)));
+        }
+        pe_trace(&t);
+        Ok(BatchScope { target_endpoints, batch_cap })
+    }
+
+    /// `ProgressReporter::printRow` (no startpoint metrics): the collector's WNS, TNS, Viol and
+    /// worst endpoint.
+    fn pe_print_row(&mut self, label: &str) {
+        let (wns, en_tns, worst) = self.timing.row(self.ctx.margin);
+        let row = super::progress_row(
+            &super::Row {
+                iter: label,
+                removed: self.committer.total(Move::Unbuffer),
+                resized: self.committer.total(Move::SizeUp) + self.committer.total(Move::SizeDownFanout) + self.committer.total(Move::SizeUpMatch) + self.committer.total(Move::VtSwap),
+                inserted: self.committer.total(Move::Buffer) + self.committer.total(Move::SplitLoad),
+                cloned: self.committer.total(Move::Clone),
+                swaps: self.committer.total(Move::SwapPins),
+                area_growth_percent: self.area_growth_percent(),
+                wns,
+                st_tns: None,
+                en_tns,
+                viol: self.collector_violating,
+                worst: worst.as_deref().unwrap_or(""),
+            },
+            self.ctx.time_scale,
+        );
+        // A refused run reports no log: the trace keeps the row.
+        pe_trace(&format!("PE|line|{row}\n"));
+        self.report(row);
+    }
+
+    /// `evaluateTargets`: the endpoints evaluated worst first, a chunk at a time, the next chunk
+    /// only while the batch is not full. Here up to the first chunk's targets: generation (S3)
+    /// is refused.
+    fn pe_evaluate_targets(&mut self, pe: &mut ParallelEval, scope: BatchScope) -> Result<BatchPool, Stop> {
+        let cfg = pe.config.parallel_eval;
+        let chunk_endpoints = evaluation_endpoint_limit(scope.batch_cap, cfg.eval_endpoint_factor, cfg.eval_min_endpoints);
+        let mut pool = BatchPool::default();
+        let mut visited_pins: HashSet<String> = HashSet::new();
+        let mut next_endpoint = 0;
+        while next_endpoint < scope.target_endpoints {
+            let chunk_end = scope.target_endpoints.min(next_endpoint + chunk_endpoints);
+            let chunk = self.pe_collect_targets(pe, next_endpoint, chunk_end, &mut visited_pins)?;
+            pe_trace(&format!("VYGP|chunk|{}|{next_endpoint}|{chunk_end}|{}\n", pe.batch_index, chunk.len()));
+            next_endpoint = chunk_end;
+            if !chunk.is_empty() {
+                pool.targets.extend(chunk);
+                return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: candidate generation (prepareTargets, generateCandidates) is not modelled".into()));
+            }
+        }
+        Ok(pool)
+    }
+
+    /// `collectTargets`: the chunk's path-driver targets, each with its fanout.
+    fn pe_collect_targets(&mut self, pe: &mut ParallelEval, begin_endpoint: usize, end_endpoint: usize, visited_pins: &mut HashSet<String>) -> Result<Vec<Target>, Stop> {
+        let mut targets = self.pe_collect_crit_path_driver_pin_targets(pe, begin_endpoint, end_endpoint, visited_pins)?;
+        let mut t = String::new();
+        for target in &mut targets {
+            // `targetFanout` was read with the target (the driver stage's wire edges out).
+            t.push_str(&format!(
+                "VYGP|target|{}|{}|ep={}|vep={}|rf={}|slack={}|fanout={}|load={}|path_index={}\n",
+                pe.batch_index,
+                target.driver_pin,
+                target.endpoint_pin,
+                target.violated_endpoint_pin,
+                if target.driver_rf == 0 { '^' } else { 'v' },
+                e9(target.slack),
+                target.fanout,
+                target.load_pin.as_deref().unwrap_or("-"),
+                target.path_index
+            ));
+        }
+        pe_trace(&t);
+        Ok(targets)
+    }
+
+    /// `RepairTargetCollector::collectCritPathDriverPinTargets`: the violating endpoints, stably
+    /// re-sorted by fuzzy slack, `[begin, end)` of them; each endpoint's worst path's drivers
+    /// (`collectPathDriverTargets`), each taken once and only on an editable logic cell.
+    fn pe_collect_crit_path_driver_pin_targets(&mut self, pe: &mut ParallelEval, begin_endpoint: usize, end_endpoint: usize, visited_pins: &mut HashSet<String>) -> Result<Vec<Target>, Stop> {
+        let mut violated: Vec<(String, f32)> = self.collector_ends.clone();
+        // `stable_sort(pathEndpointLess)`: the collector's order kept on fuzzily equal slacks.
+        violated.sort_by(|a, b| if fuzzy::less(a.1, b.1) { std::cmp::Ordering::Less } else if fuzzy::less(b.1, a.1) { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal });
+        let end = end_endpoint.min(violated.len());
+        let want: Vec<String> = violated.get(begin_endpoint..end).unwrap_or_default().iter().map(|(p, _)| p.clone()).collect();
+        let edits = self.design.take_timer_edits();
+        let snap = super::snapshot(self.ctx, self.design.as_design(), &want, &mut self.timer, edits)?;
+        let dont_touch = self.design.net_info().dont_touch_insts.clone();
+        let mut targets = Vec::new();
+        for (pin, slack) in violated.get(begin_endpoint..end).unwrap_or_default() {
+            // `findWorstSlackPath`: none, no targets.
+            let Some(view) = snap.paths.get(pin) else { continue };
+            for target in pe_collect_path_driver_targets(pe, view, *slack) {
+                let editable = !dont_touch.contains(&target.inst) && self.pe_is_editable_logic_std_cell(&target.cell);
+                if visited_pins.contains(&target.driver_pin) || !editable {
+                    continue;
+                }
+                visited_pins.insert(target.driver_pin.clone());
+                targets.push(target);
+            }
+        }
+        Ok(targets)
+    }
+
+    /// `Resizer::isEditableLogicStdCell` (dont_touch tested by the caller): a logic standard cell
+    /// with a liberty cell.
+    fn pe_is_editable_logic_std_cell(&self, cell: &str) -> bool {
+        self.ctx.sizing.masters.get(cell).is_some_and(|m| m.logic_std) && self.ctx.libs.link_cell(cell).is_some()
     }
 
     /// The start state as the reference's profiler records it (`metadata.csv`, the
@@ -432,6 +681,61 @@ impl Repair<'_, '_> {
             s.push_str(&format!("PE|debug|{l}\n"));
         }
         let _ = std::fs::write(path, s);
+    }
+}
+
+/// `effectiveBatchCap` before the tail and the small-batch retry (S5): `adaptiveBatchSize`.
+fn pe_effective_batch_cap(pe: &ParallelEval, failing_endpoint_count: usize) -> i32 {
+    let cfg = pe.config.parallel_eval;
+    adaptive_batch_size(failing_endpoint_count, cfg.min_batch_cap, cfg.max_batch_cap)
+}
+
+/// `finishAtMaxArea`: `-max_utilization` is refused before the policy runs, so the design is
+/// always within it.
+fn pe_finish_at_max_area() -> bool {
+    false
+}
+
+/// `collectPathDriverTargets`: the path's drivers from its start (`collectExpandedPathDriver-
+/// Targets`), then each latch D segment's (`visitLatchFaninSegments`), all for the endpoint. A
+/// load pin on the path is a critical path load pin; a top-level port driver is no target.
+fn pe_collect_path_driver_targets(pe: &mut ParallelEval, view: &PathView, path_slack: f32) -> Vec<Target> {
+    let violated = view.stages.last().map(|s| s.pin.clone()).unwrap_or_default();
+    let mut targets = Vec::new();
+    for seg in std::iter::once(view).chain(view.latch_segments.iter()) {
+        let endpoint_pin = seg.stages.last().map(|s| s.pin.clone()).unwrap_or_default();
+        for (index, stage) in seg.stages.iter().enumerate().skip(seg.start) {
+            if !stage.is_driver {
+                pe.crit_path_load_pins.insert(stage.pin.clone());
+                continue;
+            }
+            if stage.top_port {
+                continue;
+            }
+            targets.push(Target {
+                driver_pin: stage.pin.clone(),
+                endpoint_pin: endpoint_pin.clone(),
+                violated_endpoint_pin: violated.clone(),
+                driver_rf: stage.rf,
+                path_index: index,
+                load_pin: seg.stages.get(index + 1).map(|s| s.pin.clone()),
+                slack: path_slack,
+                fanout: stage.fanout,
+                scene: seg.scene,
+                inst: stage.inst.clone().unwrap_or_default(),
+                cell: stage.cell.clone().unwrap_or_default(),
+            });
+        }
+    }
+    targets
+}
+
+/// The VYGP lines, appended to `VYGES_RSZ_PE_TRACE` (after the start state).
+fn pe_trace(lines: &str) {
+    let Some(path) = std::env::var_os("VYGES_RSZ_PE_TRACE") else { return };
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).create(true).open(path) {
+        let _ = f.write_all(lines.as_bytes());
     }
 }
 
@@ -459,6 +763,28 @@ mod tests {
 
     fn clock(name: &str, period: f32, source: &str) -> Clock {
         Clock::new(name, period, source, false)
+    }
+
+    #[test]
+    fn a_batch_takes_the_failing_count_clamped_and_a_chunk_twice_the_cap_at_least_256() {
+        // Upstream adaptiveBatchSize: std::clamp(failing endpoints, min_batch_cap 64, max_batch_cap
+        // 512). evaluationEndpointLimit: max(cap * eval_endpoint_factor 2, eval_min_endpoints 256).
+        let c = ParallelEvalConfig::default();
+        assert_eq!(adaptive_batch_size(0, c.min_batch_cap, c.max_batch_cap), 64);
+        assert_eq!(adaptive_batch_size(28, c.min_batch_cap, c.max_batch_cap), 64);
+        assert_eq!(adaptive_batch_size(300, c.min_batch_cap, c.max_batch_cap), 300);
+        assert_eq!(adaptive_batch_size(5000, c.min_batch_cap, c.max_batch_cap), 512);
+        assert_eq!(evaluation_endpoint_limit(64, c.eval_endpoint_factor, c.eval_min_endpoints), 256);
+        assert_eq!(evaluation_endpoint_limit(300, c.eval_endpoint_factor, c.eval_min_endpoints), 600);
+    }
+
+    #[test]
+    fn the_trace_prints_slacks_as_fmt_does_with_a_signed_two_digit_exponent() {
+        // fmt's {:.9e}: nine fraction digits, the exponent signed and at least two digits.
+        assert_eq!(e9(-(2.0f32).powi(-33)), "-1.164153218e-10");
+        assert_eq!(e9(-0.5), "-5.000000000e-01");
+        assert_eq!(e9(1.5), "1.500000000e+00");
+        assert_eq!(e9(0.0), "0.000000000e+00");
     }
 
     #[test]
