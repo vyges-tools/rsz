@@ -1788,6 +1788,12 @@ fn better_rf_drive_walk(equiv: &[String], cell: &str, weakens: impl Fn(&str, &st
     (running_best != cell).then(|| running_best.to_string())
 }
 
+/// `collectStartpointFanoutViolators`' startpoint (upstream f31077f4ab): collected when it
+/// violates, unless it is a top-level port (no liberty driver to repair; only its fanout counts).
+fn collects_startpoint(is_top_port: bool, rise_slack: f32, threshold: f32) -> bool {
+    !is_top_port && rise_slack < threshold
+}
+
 /// `selectBetterRfDriveVtCell`'s test of a candidate against the running best, scene by scene.
 fn weakens_drive(libs: &Libs, best: &str, cand: &str) -> bool {
     use vyges_sta::liberty::Direction;
@@ -3615,7 +3621,11 @@ impl Repair<'_, '_> {
             queue.push_back(pv);
             visited.insert(pv);
             if use_starts {
-                if rise_slack(pv) < threshold {
+                // The startpoint itself (a register output), unless it is a top-level input port:
+                // a port has no liberty driver to repair, so only its fanout is collected
+                // (upstream f31077f4ab; before it the port was collected too, and counted in the
+                // pass budget).
+                if collects_startpoint(top_port(pv), rise_slack(pv), threshold) {
                     found.push(pv);
                 }
                 while let Some(v) = queue.pop_front() {
@@ -6227,6 +6237,15 @@ mod tests {
         assert!(!path_improved(-0.1, -0.3, -0.3, -0.2));
         assert!(path_improved(-0.1, -0.2, -0.3, -0.2));
         assert!(!path_improved(-0.3, -0.2, -0.3, -0.2));
+    }
+
+    /// Upstream f31077f4ab: STARTPOINT_FANOUT collects a violating startpoint itself only when it
+    /// is no top-level port (an input port is skipped: its fanout is walked, it is not counted).
+    #[test]
+    fn a_top_port_startpoint_is_not_collected() {
+        assert!(collects_startpoint(false, -1.0, 0.0));
+        assert!(!collects_startpoint(true, -1.0, 0.0), "an input port");
+        assert!(!collects_startpoint(false, 0.0, 0.0), "not violating");
     }
 
     /// Upstream e8a60441a3 (`selectBetterRfDriveVtCell`): the best VT cell is not the LAST
