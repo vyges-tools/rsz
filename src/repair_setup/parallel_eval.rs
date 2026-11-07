@@ -303,6 +303,41 @@ pub struct Target {
     /// wire delay from the driver and its side-load weight. Upstream's map is lookup-only; this
     /// keeps the driver's wire-edge order.
     pub rebuffer_load_timing: Vec<RebufferLoadTiming>,
+    /// `GenerationTask::generators`: the generators `planGeneration` kept, in sequence order.
+    pub plan: Vec<Move>,
+}
+
+/// `MoveCandidate` as the batch reads it: its move, its `estimate()`, the printer's description
+/// and its `impact()`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Candidate {
+    pub kind: Move,
+    pub estimate: Estimate,
+    pub desc: String,
+    pub impact: MoveImpact,
+}
+
+/// `Estimate`: legality, the score the batch ranks by, and the parts the printer shows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Estimate {
+    pub legal: bool,
+    pub score: f32,
+    pub raw_gain: Option<f32>,
+    pub reason: &'static str,
+    pub tail_admissible: bool,
+    pub side_loss: Option<f32>,
+    pub sequential_penalty: Option<f32>,
+    pub sequential_side_loss: Option<f32>,
+}
+
+/// `MoveImpact`, the parts the printer shows: complete or not, the instances and nets the move
+/// writes, and the pins it reconnects.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MoveImpact {
+    pub complete: bool,
+    pub write_instances: Vec<String>,
+    pub write_nets: Vec<String>,
+    pub reconnect_pins: Vec<String>,
 }
 
 /// `RebufferLoadTiming`: one load of a rebuffer target's net as `collectLoadTiming` reads it.
@@ -775,9 +810,13 @@ impl Repair<'_, '_> {
                 let mut chunk = chunk;
                 pe_prewarm_targets(&chunk);
                 self.pe_prepare_targets(pe, &mut chunk)?;
-                self.pe_generate_candidates(pe, &mut chunk)?;
+                let mut evaluations = self.pe_generate_candidates(pe, &mut chunk)?;
+                pe_estimate_targets(pe, &chunk, &mut evaluations);
                 pool.targets.extend(chunk);
-                return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: candidate generation (generateCandidates) is not modelled".into()));
+                if let Some(m) = pe.generators.iter().find(|&&m| !generate_modelled(m)) {
+                    return Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -phases PARALLEL_EVAL: candidate generation for {} (generate, estimate) is not modelled", m.name())));
+                }
+                return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: the batch (makeBatchCandidates, BatchSelector) is not modelled".into()));
             }
         }
         Ok(pool)
@@ -812,11 +851,12 @@ impl Repair<'_, '_> {
         Ok(())
     }
 
-    /// `generateCandidates`, its main-thread half: `planGeneration` on each target in chunk order
-    /// (the skip rules, then each generator's `generatorAllowed`, `isApplicable` and
-    /// `prepareInputs`, all on the timer as preparation left it). Generation itself is refused
-    /// after; so is a run with a generator whose planning is not modelled yet.
-    fn pe_generate_candidates(&mut self, pe: &mut ParallelEval, targets: &mut [Target]) -> Result<(), Stop> {
+    /// `generateCandidates`: `planGeneration` on each target in chunk order (the skip rules, then
+    /// each generator's `generatorAllowed`, `isApplicable` and `prepareInputs`, all on the timer as
+    /// preparation left it), then each task's generators in plan order, collected in target then
+    /// generator order (`collectGenerated`). A run with a generator whose planning is not modelled
+    /// yet is refused.
+    fn pe_generate_candidates(&mut self, pe: &mut ParallelEval, targets: &mut [Target]) -> Result<Vec<Vec<Candidate>>, Stop> {
         let edits = self.design.take_timer_edits();
         let ctx = self.ctx;
         let facts: Vec<PlanFacts> = targets.iter().map(|t| self.pe_plan_facts(t)).collect();
@@ -825,18 +865,19 @@ impl Repair<'_, '_> {
         let committer = &self.committer;
         let setup_design = &self.design;
         let inst_id = |inst: &str| setup_design.inst_id(inst);
-        super::timed_all(ctx, design, &mut self.timer, edits, |gs, ss, _cs| {
+        let generated = super::timed_all(ctx, design, &mut self.timer, edits, |gs, ss, _cs| {
             let plan = PlanTimer { gs, ss, design, ctx, committer, inst_id: &inst_id };
             for (target, facts) in targets.iter_mut().zip(&facts) {
                 pe_plan_generation(pe, target, facts, &plan, &mut trace).map_err(|e| Stop::refused("RSZ-ABSENT", e))?;
             }
-            Ok(())
+            Ok(targets.iter().map(|target| pe_run_generators(target, &plan)).collect::<Vec<_>>())
         })?;
+        pe_collect_generated(pe, targets, &generated, &mut trace);
         pe_trace(&trace);
         if let Some(m) = pe.generators.iter().find(|&&m| !plan_modelled(m)) {
             return Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -phases PARALLEL_EVAL: planGeneration for {} (isApplicable, prepareInputs) is not modelled", m.name())));
         }
-        Ok(())
+        Ok(generated.into_iter().map(|per_generator| per_generator.into_iter().flatten().collect()).collect())
     }
 
     /// What planning reads off the database and the committer rather than the timer — nothing
@@ -1005,6 +1046,7 @@ fn pe_collect_path_driver_targets(pe: &mut ParallelEval, view: &PathView, path_s
             size_down_fanout_loads: Vec::new(),
             rebuffer_net: None,
             rebuffer_load_timing: Vec::new(),
+            plan: Vec::new(),
             });
         }
     }
@@ -1068,11 +1110,146 @@ fn pe_plan_generation(pe: &mut ParallelEval, target: &mut Target, facts: &PlanFa
         pe_prepare_inputs(m, target, facts, plan, &pe.config, &pe.crit_path_load_pins)?;
         trace.push_str(&format!("VYGP|inputs|{b}|{pin}|{}|{}\n", m.name(), pe_inputs_line(m, target)));
         planned.push(m.name());
+        target.plan.push(m);
     }
     if pe.generators.iter().all(|&m| plan_modelled(m)) {
         trace.push_str(&format!("VYGP|plan|{b}|{pin}|gens={}\n", planned.join(",")));
     }
     Ok(())
+}
+
+/// The generators whose `generate` and candidate `estimate` are modelled.
+fn generate_modelled(m: Move) -> bool {
+    matches!(m, Move::Unbuffer)
+}
+
+/// A task's generators in plan order (`MoveGenerator::generate`): per generator its candidates,
+/// none for one not modelled yet.
+fn pe_run_generators(target: &Target, plan: &PlanTimer<'_, '_, '_>) -> Vec<Vec<Candidate>> {
+    target.plan.iter().map(|&m| if generate_modelled(m) { pe_generate(m, target, plan) } else { Vec::new() }).collect()
+}
+
+/// `collectGenerated`: per target, per generator in plan order, the trace's candidate count.
+fn pe_collect_generated(pe: &ParallelEval, targets: &[Target], generated: &[Vec<Vec<Candidate>>], trace: &mut String) {
+    for (target, per_generator) in targets.iter().zip(generated) {
+        for (&m, candidates) in target.plan.iter().zip(per_generator) {
+            if generate_modelled(m) {
+                trace.push_str(&format!("VYGP|gen|{}|{}|{}|n={}\n", pe.batch_index, target.driver_pin, m.name(), candidates.len()));
+            }
+        }
+    }
+}
+
+/// `MoveGenerator::generate` with each candidate's `estimate()`, `vygDescribe()` and `impact()`.
+fn pe_generate(m: Move, target: &Target, plan: &PlanTimer<'_, '_, '_>) -> Vec<Candidate> {
+    match m {
+        // UnbufferMtGenerator: one removal when the prepared gain is positive.
+        Move::Unbuffer => unbuffer_mt_generate(target, || unbuffer_mt_impact(target, plan)),
+        _ => Vec::new(),
+    }
+}
+
+/// `UnbufferMtGenerator::generate`: one removal when `prepareInputs` left a gain above zero (none
+/// for a gain of zero, a negative one, or none at all).
+fn unbuffer_mt_generate(target: &Target, impact: impl FnOnce() -> MoveImpact) -> Vec<Candidate> {
+    match target.unbuffer_gain {
+        Some(gain) if gain > 0.0 => vec![Candidate { kind: Move::Unbuffer, estimate: unbuffer_mt_estimate(gain), desc: "remove".into(), impact: impact() }],
+        _ => Vec::new(),
+    }
+}
+
+/// `UnbufferMtCandidate::estimate`: always legal, scored by the prepared gain.
+fn unbuffer_mt_estimate(gain: f32) -> Estimate {
+    Estimate { legal: true, score: gain, raw_gain: Some(gain), reason: "estimate_legal", tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None }
+}
+
+/// `UnbufferMtCandidate::impact`: complete; the buffer written; its input then output net written
+/// (when connected); the other pins of the net `removeBuffer` drops reconnect — the input net's
+/// when the output net is kept (it has a top-level port and the input net has none), else the
+/// output net's — in the net's connected-pin order.
+fn unbuffer_mt_impact(target: &Target, plan: &PlanTimer<'_, '_, '_>) -> MoveImpact {
+    let g = &plan.gs[0];
+    let ports = plan.ctx.libs.link_cell(&target.cell).and_then(|c| c.buffer_ports()).map(|(i, o)| (i.name.clone(), o.name.clone()));
+    let net_of = |port: &str| {
+        let pin = format!("{}/{port}", target.inst);
+        g.vertices.iter().position(|x| x.name == pin).and_then(|v| g.vertex_net[v])
+    };
+    match ports {
+        Some((input, output)) => unbuffer_impact_on(&g.netlist, &target.inst, net_of(&input), net_of(&output)),
+        None => MoveImpact { complete: true, write_instances: vec![target.inst.clone()], ..MoveImpact::default() },
+    }
+}
+
+/// [`unbuffer_mt_impact`] on the netlist, given the buffer's input and output nets.
+fn unbuffer_impact_on(nl: &vyges_sta::netlist::Netlist, buffer: &str, in_net: Option<usize>, out_net: Option<usize>) -> MoveImpact {
+    use vyges_sta::netlist::Conn;
+    let mut impact = MoveImpact { complete: true, write_instances: vec![buffer.to_string()], ..MoveImpact::default() };
+    let has_port = |net: Option<usize>| net.is_some_and(|n| nl.nets[n].pins.iter().any(|c| matches!(c, Conn::Port(_))));
+    // removeBufferKeepsOutputNet: the output net survives when it reaches a top-level port and
+    // the input net does not; then the input net's pins move.
+    let moved = if has_port(out_net) && !has_port(in_net) { in_net } else { out_net };
+    for net in [in_net, out_net].into_iter().flatten() {
+        impact.write_nets.push(nl.nets[net].name.clone());
+        if Some(net) != moved {
+            continue;
+        }
+        for c in &nl.nets[net].pins {
+            if matches!(c, Conn::Inst(k, _) if nl.insts[*k].0 == buffer) {
+                continue;
+            }
+            impact.reconnect_pins.push(nl.pin_name(c));
+        }
+    }
+    impact
+}
+
+/// `estimateTargets`: each target's candidates estimated in order (done at generation here; the
+/// estimates read nothing the other targets change), the tail's permissive rule — a candidate
+/// that is not legal but tail-admissible becomes legal (`wns_tail_permissive`) — and the best: the
+/// first legal candidate with a strictly greater score. The trace prints every candidate, then
+/// the best, per target; the best only once every generator is modelled.
+fn pe_estimate_targets(pe: &ParallelEval, targets: &[Target], evaluations: &mut [Vec<Candidate>]) {
+    let all = pe.generators.iter().all(|&m| generate_modelled(m));
+    let mut trace = String::new();
+    for (target, candidates) in targets.iter().zip(evaluations.iter_mut()) {
+        let best = estimate_target(candidates);
+        for (index, c) in candidates.iter().enumerate() {
+            trace.push_str(&pe_cand_line(pe.batch_index, &target.driver_pin, index, c));
+        }
+        if let (true, Some((m, score))) = (all, best) {
+            trace.push_str(&format!("VYGP|best|{}|{}|{}|{}\n", pe.batch_index, target.driver_pin, m.name(), e9i(score)));
+        }
+    }
+    pe_trace(&trace);
+}
+
+/// One target of `estimateTargets`: the permissive tail rule on each candidate in order, and the
+/// best — the first legal candidate whose score is strictly greater than the best so far.
+fn estimate_target(candidates: &mut [Candidate]) -> Option<(Move, f32)> {
+    let mut best: Option<(Move, f32)> = None;
+    for c in candidates.iter_mut() {
+        if !c.estimate.legal && c.estimate.tail_admissible {
+            c.estimate.legal = true;
+            c.estimate.reason = "wns_tail_permissive";
+        }
+        if c.estimate.legal && best.is_none_or(|(_, s)| c.estimate.score > s) {
+            best = Some((c.kind, c.estimate.score));
+        }
+    }
+    best
+}
+
+/// The trace's candidate line: estimate, description and impact as the printer writes them.
+fn pe_cand_line(batch: i32, driver_pin: &str, index: usize, c: &Candidate) -> String {
+    let opt = |v: Option<f32>| v.map_or_else(|| "-".to_string(), e9i);
+    let e = &c.estimate;
+    let i = &c.impact;
+    let list = |xs: &[String]| xs.iter().map(|x| format!(",{x}")).collect::<String>();
+    format!(
+        "VYGP|cand|{batch}|{driver_pin}|{index}|{}|legal={}|score={}|raw={}|reason={}|tail={}|side={}|seq={}|seqside={}|desc={}|impact={}:wi{}:wn{}:rp{}\n",
+        c.kind.name(), u8::from(e.legal), e9i(e.score), opt(e.raw_gain), e.reason, u8::from(e.tail_admissible), opt(e.side_loss), opt(e.sequential_penalty), opt(e.sequential_side_loss), c.desc,
+        if i.complete { "c" } else { "i" }, list(&i.write_instances), list(&i.write_nets), list(&i.reconnect_pins)
+    )
 }
 
 /// What `prepareInputs` reads while a chunk is planned: the timer, the database and the committer.
@@ -2072,6 +2249,7 @@ mod tests {
             size_down_fanout_loads: Vec::new(),
             rebuffer_net: None,
             rebuffer_load_timing: Vec::new(),
+            plan: Vec::new(),
         }
     }
 
@@ -2264,4 +2442,66 @@ mod tests {
         t.unbuffer_gain = Some(0.25);
         assert_eq!(pe_inputs_line(Move::Unbuffer, &t), "gain=2.500000000e-01");
     }
+
+    // UnbufferMtGenerator::generate: one candidate only for a prepared gain above zero; its
+    // estimate is always legal, scored and raw-gained by that gain, reason estimate_legal, with no
+    // tail, side or sequential terms; vygDescribe is "remove".
+    #[test]
+    fn unbuffer_mt_generates_one_legal_removal_for_a_positive_gain() {
+        let mut t = target_at(0);
+        for gain in [None, Some(0.0), Some(-1e-12)] {
+            t.unbuffer_gain = gain;
+            assert!(unbuffer_mt_generate(&t, MoveImpact::default).is_empty(), "{gain:?}");
+        }
+        t.unbuffer_gain = Some(2.5e-11);
+        let c = unbuffer_mt_generate(&t, MoveImpact::default);
+        assert_eq!(c.len(), 1);
+        assert_eq!((c[0].kind, c[0].desc.as_str()), (Move::Unbuffer, "remove"));
+        assert_eq!(c[0].estimate, Estimate { legal: true, score: 2.5e-11, raw_gain: Some(2.5e-11), reason: "estimate_legal", tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None });
+    }
+
+    // UnbufferMtCandidate::impact: complete; the buffer written; its input then output net
+    // written; the moved net's pins other than the buffer's reconnect, in the net's pin order. The
+    // moved net is the output one, unless removeBufferKeepsOutputNet (the output net reaches a top
+    // port and the input net does not), then the input one; port pins count as pins.
+    #[test]
+    fn unbuffer_mt_impact_reconnects_the_dropped_nets_other_pins() {
+        use vyges_sta::netlist::{inst, Conn, Net, Netlist, PortDir};
+        let net = |name: &str, pins: Vec<Conn>| std::sync::Arc::new(Net { name: name.into(), pins });
+        let pin = |k: usize, p: &str| Conn::Inst(k, p.into());
+        let nl = Netlist {
+            insts: vec![inst("d", "INV"), inst("b", "BUF"), inst("l1", "INV"), inst("l2", "INV")],
+            ports: vec![("out".into(), PortDir::Output), ("in".into(), PortDir::Input)],
+            nets: vec![net("n_in", vec![pin(0, "ZN"), pin(1, "A")]), net("n_out", vec![pin(2, "A"), pin(1, "Z"), pin(3, "A")])],
+        };
+        let i = unbuffer_impact_on(&nl, "b", Some(0), Some(1));
+        assert!(i.complete);
+        assert_eq!(i.write_instances, ["b"]);
+        assert_eq!(i.write_nets, ["n_in", "n_out"]);
+        assert_eq!(i.reconnect_pins, ["l1/A", "l2/A"]);
+        // The output net reaches a port: the input net's driver moves instead.
+        let mut kept = nl.clone();
+        kept.nets[1] = net("n_out", vec![pin(2, "A"), pin(1, "Z"), Conn::Port(0)]);
+        assert_eq!(unbuffer_impact_on(&kept, "b", Some(0), Some(1)).reconnect_pins, ["d/ZN"]);
+        // Both nets reach a port: the output net's pins move, its port among them.
+        kept.nets[0] = net("n_in", vec![pin(0, "ZN"), pin(1, "A"), Conn::Port(1)]);
+        assert_eq!(unbuffer_impact_on(&kept, "b", Some(0), Some(1)).reconnect_pins, ["l1/A", "out"]);
+        // An unconnected input: only the output net is written.
+        assert_eq!(unbuffer_impact_on(&nl, "b", None, Some(1)).write_nets, ["n_out"]);
+    }
+
+    // estimateTargets: a candidate not legal but tail-admissible becomes legal
+    // (wns_tail_permissive); the best is the first legal candidate with a strictly greater score.
+    #[test]
+    fn estimate_target_keeps_the_first_of_equal_scores_and_admits_the_tail() {
+        let c = |kind: Move, legal: bool, tail: bool, score: f32| Candidate { kind, estimate: Estimate { legal, score, raw_gain: None, reason: "x", tail_admissible: tail, side_loss: None, sequential_penalty: None, sequential_side_loss: None }, desc: String::new(), impact: MoveImpact::default() };
+        let mut cs = vec![c(Move::Unbuffer, false, false, 9.0), c(Move::SizeUp, true, false, 2.0), c(Move::SwapPins, true, false, 2.0), c(Move::VtSwap, false, true, 3.0)];
+        assert_eq!(estimate_target(&mut cs), Some((Move::VtSwap, 3.0)));
+        assert_eq!((cs[3].estimate.legal, cs[3].estimate.reason), (true, "wns_tail_permissive"));
+        assert_eq!((cs[0].estimate.legal, cs[0].estimate.reason), (false, "x"));
+        cs.truncate(3);
+        assert_eq!(estimate_target(&mut cs), Some((Move::SizeUp, 2.0)));
+        assert_eq!(estimate_target(&mut cs[..1]), None);
+    }
+
 }
