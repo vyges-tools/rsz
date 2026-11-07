@@ -1120,7 +1120,7 @@ fn pe_plan_generation(pe: &mut ParallelEval, target: &mut Target, facts: &PlanFa
 
 /// The generators whose `generate` and candidate `estimate` are modelled.
 fn generate_modelled(m: Move) -> bool {
-    matches!(m, Move::Unbuffer)
+    matches!(m, Move::Unbuffer | Move::SwapPins)
 }
 
 /// A task's generators in plan order (`MoveGenerator::generate`): per generator its candidates,
@@ -1145,6 +1145,7 @@ fn pe_generate(m: Move, target: &Target, plan: &PlanTimer<'_, '_, '_>) -> Vec<Ca
     match m {
         // UnbufferMtGenerator: one removal when the prepared gain is positive.
         Move::Unbuffer => unbuffer_mt_generate(target, || unbuffer_mt_impact(target, plan)),
+        Move::SwapPins => swap_pins_mt_generate(target),
         _ => Vec::new(),
     }
 }
@@ -1201,6 +1202,57 @@ fn unbuffer_impact_on(nl: &vyges_sta::netlist::Netlist, buffer: &str, in_net: Op
         }
     }
     impact
+}
+
+/// `SwapPinsMtGenerator::generate`: the critical signal moves to the equivalent input with the
+/// fastest arc when it beats its own — the first of equal delays wins — else no candidate.
+fn swap_pins_mt_generate(target: &Target) -> Vec<Candidate> {
+    let Some(input) = &target.swap_pins_input else { return Vec::new() };
+    let mut swap: Option<&SwapPinsEquivalent> = None;
+    let mut best_delay = input.input_delay;
+    for equivalent in &input.equivalents {
+        if equivalent.delay < best_delay {
+            swap = Some(equivalent);
+            best_delay = equivalent.delay;
+        }
+    }
+    let Some(swap) = swap else { return Vec::new() };
+    let estimate = swap_pins_mt_estimate(input, swap, target.estimator_context.as_ref());
+    vec![Candidate { kind: Move::SwapPins, estimate, desc: swap.port.clone(), impact: swap_pins_mt_impact(target, input, swap) }]
+}
+
+/// `SwapPinsMtCandidate::estimate`: the gain is the input's delay less the swap's. Without a side
+/// pin, legal iff the gain is above zero. With one, the displaced signal loses the gain: its loss
+/// below zero slack, weighted, is charged (`side_loss`) and the score is the gain less it; not
+/// legal for a gain at or below zero (`estimate_non_improving`), then for a displaced slack below
+/// `sideSlackFloor(gain)` (`side_slack_floor_violation`), then, tail-admissible, for a score at or
+/// below zero (`side_loss_non_improving`).
+fn swap_pins_mt_estimate(input: &SwapPinsInput, swap: &SwapPinsEquivalent, context: Option<&crate::delay_estimator::EstimatorContext>) -> Estimate {
+    let gain = input.input_delay - swap.delay;
+    let plain = |legal: bool| Estimate { legal, score: gain, raw_gain: Some(gain), reason: if legal { "estimate_legal" } else { "estimate_non_improving" }, tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None };
+    let (Some(_), Some(context)) = (&swap.pin, context) else { return plain(gain > 0.0) };
+    let victim_after = swap.slack - gain;
+    let side_loss = context.fanin_side_loss_weight * (swap.slack.min(0.0) - victim_after.min(0.0));
+    let adjusted_gain = gain - side_loss;
+    let mut e = Estimate { legal: adjusted_gain > 0.0, score: adjusted_gain, raw_gain: Some(gain), reason: "estimate_legal", tail_admissible: false, side_loss: Some(side_loss), sequential_penalty: None, sequential_side_loss: None };
+    if gain <= 0.0 {
+        e.legal = false;
+        e.reason = "estimate_non_improving";
+    } else if victim_after < context.side_slack_floor_for(gain) {
+        e.legal = false;
+        e.reason = "side_slack_floor_violation";
+    } else if !e.legal {
+        e.reason = "side_loss_non_improving";
+        e.tail_admissible = true;
+    }
+    e
+}
+
+/// `SwapPinsMtCandidate::impact`: complete; the driver written; its path input pin, then the
+/// swap's input pin, reconnect (no net is written).
+fn swap_pins_mt_impact(target: &Target, input: &SwapPinsInput, swap: &SwapPinsEquivalent) -> MoveImpact {
+    let pin = |port: &str| format!("{}/{port}", target.inst);
+    MoveImpact { complete: true, write_instances: vec![target.inst.clone()], write_nets: Vec::new(), reconnect_pins: vec![pin(&input.input_port), pin(&swap.port)] }
 }
 
 /// `estimateTargets`: each target's candidates estimated in order (done at generation here; the
@@ -2512,6 +2564,57 @@ mod tests {
         cs.truncate(3);
         assert_eq!(estimate_target(&mut cs, true), Some((Move::SizeUp, 2.0)));
         assert_eq!(estimate_target(&mut cs[..1], true), None);
+    }
+
+
+    // SwapPinsMtGenerator::generate: the equivalent with the smallest delay below the input's
+    // own, the first of equal delays; none when no equivalent is faster.
+    #[test]
+    fn swap_pins_mt_generates_the_first_fastest_equivalent() {
+        let eq = |port: &str, delay: f32| SwapPinsEquivalent { port: port.into(), delay, pin: None, slack: 0.0 };
+        let mut t = target_at(0);
+        t.inst = "u".into();
+        assert!(swap_pins_mt_generate(&t).is_empty());
+        t.swap_pins_input = Some(SwapPinsInput { input_port: "A".into(), input_delay: 0.5, equivalents: vec![eq("B", 0.5), eq("C", 0.25), eq("D", 0.25), eq("E", 0.3)] });
+        let c = swap_pins_mt_generate(&t);
+        assert_eq!(c.len(), 1);
+        assert_eq!((c[0].kind, c[0].desc.as_str()), (Move::SwapPins, "C"));
+        assert_eq!(c[0].impact, MoveImpact { complete: true, write_instances: vec!["u".into()], write_nets: vec![], reconnect_pins: vec!["u/A".into(), "u/C".into()] });
+        assert_eq!((c[0].estimate.legal, c[0].estimate.score, c[0].estimate.side_loss), (true, 0.25, None));
+        t.swap_pins_input.as_mut().unwrap().equivalents = vec![eq("B", 0.5), eq("C", 0.75)];
+        assert!(swap_pins_mt_generate(&t).is_empty());
+    }
+
+    // SwapPinsMtCandidate::estimate with the side model: side_loss = weight * (min(slack, 0) -
+    // min(slack - gain, 0)), score = gain - side_loss; a displaced slack below
+    // side_slack_floor - margin * gain is side_slack_floor_violation; a score at or below zero
+    // otherwise is side_loss_non_improving and tail-admissible.
+    #[test]
+    fn swap_pins_mt_charges_the_displaced_signal() {
+        let mut ctx = crate::delay_estimator::EstimatorContext::new(1);
+        (ctx.fanin_side_loss_weight, ctx.side_slack_floor, ctx.side_floor_margin) = (3.0, -10.0, 1.0);
+        let input = SwapPinsInput { input_port: "A".into(), input_delay: 2.0, equivalents: vec![] };
+        let sw = |slack: f32| SwapPinsEquivalent { port: "B".into(), delay: 1.0, pin: Some("u/B".into()), slack };
+        // Slack 4 stays above zero after the gain of 1: no loss.
+        let e = swap_pins_mt_estimate(&input, &sw(4.0), Some(&ctx));
+        assert_eq!((e.legal, e.score, e.raw_gain, e.side_loss, e.reason, e.tail_admissible), (true, 1.0, Some(1.0), Some(0.0), "estimate_legal", false));
+        // Slack 0.5 falls to -0.5: loss 3 * 0.5 = 1.5, score -0.5.
+        let e = swap_pins_mt_estimate(&input, &sw(0.5), Some(&ctx));
+        assert_eq!((e.legal, e.score, e.side_loss, e.reason, e.tail_admissible), (false, -0.5, Some(1.5), "side_loss_non_improving", true));
+        // Slack -9.5 falls to -10.5, above the floor -10 - 1 * 1 = -11: the loss rules.
+        let e = swap_pins_mt_estimate(&input, &sw(-9.5), Some(&ctx));
+        assert_eq!(e.reason, "side_loss_non_improving");
+        // Slack -10.5 falls to -11.5 < -11: the floor.
+        let e = swap_pins_mt_estimate(&input, &sw(-10.5), Some(&ctx));
+        assert_eq!((e.legal, e.reason, e.tail_admissible), (false, "side_slack_floor_violation", false));
+        // A gain at or below zero is non-improving first.
+        let slow = SwapPinsInput { input_delay: 1.0, ..input.clone() };
+        let e = swap_pins_mt_estimate(&slow, &sw(-10.5), Some(&ctx));
+        assert_eq!((e.legal, e.reason, e.side_loss), (false, "estimate_non_improving", Some(0.0)));
+        // No side pin: the plain estimate.
+        let plain = SwapPinsEquivalent { pin: None, ..sw(-10.5) };
+        let e = swap_pins_mt_estimate(&slow, &plain, Some(&ctx));
+        assert_eq!((e.legal, e.score, e.side_loss, e.reason), (false, 0.0, None, "estimate_non_improving"));
     }
 
 }

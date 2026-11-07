@@ -121,6 +121,11 @@ pub struct EstimatorContext {
 }
 
 impl EstimatorContext {
+    /// `sideSlackFloor(gain)`: the side slack floor less the margin times the gain above zero.
+    pub fn side_slack_floor_for(&self, gain: f32) -> f32 {
+        self.side_slack_floor - self.side_floor_margin * gain.max(0.0)
+    }
+
     pub(crate) fn new(delay_estimation_levels: i32) -> EstimatorContext {
         EstimatorContext {
             path_stages: Vec::new(),
