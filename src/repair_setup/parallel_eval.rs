@@ -296,6 +296,22 @@ pub struct Target {
     /// `size_down_fanout_loads` (`SizeDownFanoutMtGenerator::prepareInputs`): the loads that
     /// can step down, in ranked order; empty until prepared.
     pub size_down_fanout_loads: Vec<SizeDownFanoutLoad>,
+    /// `rebuffer_net` (`RebufferMtGenerator::prepareInputs`): the driver's net as a buffered net
+    /// and its root; none when the net cannot be rebuffered or was not prepared.
+    pub rebuffer_net: Option<(crate::buffered_net::BufferedNet, usize)>,
+    /// `rebuffer_load_timing` (`collectLoadTiming`): per load with a finite slack, its slack, the
+    /// wire delay from the driver and its side-load weight. Upstream's map is lookup-only; this
+    /// keeps the driver's wire-edge order.
+    pub rebuffer_load_timing: Vec<RebufferLoadTiming>,
+}
+
+/// `RebufferLoadTiming`: one load of a rebuffer target's net as `collectLoadTiming` reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RebufferLoadTiming {
+    pub pin: String,
+    pub slack: f32,
+    pub wire_delay: f32,
+    pub weight: f32,
 }
 
 /// `SplitLoadMtInput`: the loads a new buffer takes, the cell it is sized to, and the split
@@ -987,6 +1003,8 @@ fn pe_collect_path_driver_targets(pe: &mut ParallelEval, view: &PathView, path_s
                 input_cap_budgets: None,
                 split_load_input: None,
             size_down_fanout_loads: Vec::new(),
+            rebuffer_net: None,
+            rebuffer_load_timing: Vec::new(),
             });
         }
     }
@@ -1020,7 +1038,7 @@ struct PlanFacts {
 /// The generators whose `isApplicable` and `prepareInputs` are modelled: the others are left out
 /// of the plan, and the run is refused after the chunk is planned.
 fn plan_modelled(m: Move) -> bool {
-    matches!(m, Move::Unbuffer | Move::SwapPins | Move::SizeUp | Move::VtSwap | Move::SplitLoad | Move::SizeDownFanout)
+    matches!(m, Move::Unbuffer | Move::SwapPins | Move::SizeUp | Move::VtSwap | Move::SplitLoad | Move::SizeDownFanout | Move::Buffer)
 }
 
 /// `planGeneration`: per generator in `move_sequence_` order, `generatorAllowed`, `isApplicable`
@@ -1085,6 +1103,9 @@ fn pe_tail_unbuffer_allowed(_pe: &ParallelEval) -> bool {
     false
 }
 
+/// `kRebufferMaxFanout`: RebufferMt plans trees for fewer loads than this.
+const REBUFFER_MAX_FANOUT: usize = 20;
+
 /// `MoveGenerator::isApplicable` and its overrides. Every target here is in the path-driver
 /// view, which the base check asks for.
 fn pe_is_applicable(m: Move, target: &Target, facts: &PlanFacts) -> bool {
@@ -1102,6 +1123,9 @@ fn pe_is_applicable(m: Move, target: &Target, facts: &PlanFacts) -> bool {
         // SplitLoadMtGenerator: a context, more than kSplitLoadMinFanout (the legacy split's 8)
         // loads, and a net that accepts a buffer.
         Move::SplitLoad => target.estimator_context.is_some() && target.fanout > crate::clone::CLONE_MIN_FANOUT && facts.ok_to_buffer_net,
+        // RebufferMtGenerator: one to kRebufferMaxFanout - 1 (19) loads, a net that accepts a
+        // buffer, and an estimator context.
+        Move::Buffer => target.fanout >= 1 && target.fanout < REBUFFER_MAX_FANOUT && facts.ok_to_buffer_net && target.estimator_context.is_some(),
         // SizeDownFanoutMtGenerator: an estimator context.
         Move::SizeDownFanout => target.estimator_context.is_some(),
         Move::SwapPins => target.path_index > 0 && facts.driver_liberty && !facts.driver_is_buffer && !facts.driver_is_inverter && !target.inst.is_empty() && !facts.dont_touch && !facts.pins_swapped,
@@ -1121,9 +1145,70 @@ fn pe_prepare_inputs(m: Move, target: &mut Target, facts: &PlanFacts, plan: &Pla
         Move::SizeUp | Move::VtSwap => prepare_input_cap_budgets(target, gs, design, ctx),
         Move::SplitLoad => split_load_mt_prepare_inputs(target, gs, ss, design, ctx, crit, cfg)?,
         Move::SizeDownFanout => size_down_fanout_mt_prepare_inputs(target, plan)?,
+        Move::Buffer => rebuffer_mt_prepare_inputs(target, plan, cfg, crit)?,
         _ => {}
     }
     Ok(())
+}
+
+/// `RebufferMtGenerator::prepareInputs`: `Rebuffer::makeBufferedNet(driver)` — none for a top-level
+/// port driver, a pin off a net or without a liberty port, or a net with a top-level output port;
+/// else `Resizer::makeBufferedNet` at the rebuffer's scene (`cmdScene`, scene 0) — then, with the
+/// side-load model on, the loads' timing (`collectLoadTiming`), else none.
+/// ⚠️ Upstream warns for a top-level port driver (RSZ-2020) and a failed buffered net here; the
+/// run is refused before either would be compared.
+fn rebuffer_mt_prepare_inputs(target: &mut Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtConfig, crit: &HashSet<String>) -> Result<(), String> {
+    target.rebuffer_net = rebuffer_make_buffered_net(plan, &target.driver_pin)?;
+    target.rebuffer_load_timing.clear();
+    if cfg.rebuffer_mt_side_loads {
+        target.rebuffer_load_timing = rebuffer_collect_load_timing(target, plan, cfg, crit);
+    }
+    Ok(())
+}
+
+/// `Rebuffer::makeBufferedNet` (see [`rebuffer_mt_prepare_inputs`]).
+fn rebuffer_make_buffered_net(plan: &PlanTimer<'_, '_, '_>, drvr_pin: &str) -> Result<Option<(crate::buffered_net::BufferedNet, usize)>, String> {
+    let (g, design, ctx) = (&plan.gs[0], plan.design, plan.ctx);
+    let Some(drvr) = g.vertices.iter().position(|x| x.name == drvr_pin && x.is_driver) else { return Ok(None) };
+    let vx = &g.vertices[drvr];
+    let Some(lib) = vx.lib else { return Ok(None) };
+    let Some(net) = g.vertex_net[drvr] else { return Ok(None) };
+    let (Some(cell), Some(port)) = (vx.cell.as_deref(), vx.port.as_deref()) else { return Ok(None) };
+    if g.libs[lib].cells.get(cell).is_none_or(|c| c.port(port).is_none()) {
+        return Ok(None);
+    }
+    let top_out = g.netlist.nets[net].pins.iter().any(|c| matches!(c, vyges_sta::netlist::Conn::Port(k) if g.netlist.ports[*k].1 == vyges_sta::netlist::PortDir::Output));
+    if top_out {
+        return Ok(None);
+    }
+    let Some(shape) = design.net_shape(&g.netlist.nets[net].name, &vx.name) else { return Ok(None) };
+    let bctx = crate::buffered_net::Ctx { graph: g, libs: ctx.libs, sdc: ctx.env, limits: ctx.limits, dbu: ctx.dbu, rc: ctx.wire_rc };
+    crate::buffered_net::make_buffered_net(&bctx, &shape)
+}
+
+/// `collectLoadTiming`: per wire edge out of the driver, a load whose slack (over every scene, at
+/// the target arc's min/max) is finite: that slack, the edge's wire delay for the arc's output
+/// transition at the arc's scene, and the load's side weight (`sideLoadWeight`).
+fn rebuffer_collect_load_timing(target: &Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtConfig, crit: &HashSet<String>) -> Vec<RebufferLoadTiming> {
+    let mut out = Vec::new();
+    let Some(context) = target.estimator_context.as_ref() else { return out };
+    let arc = &context.target().arc;
+    let Some(out_rf) = plan.ctx.libs.scene_cell(arc.scene, &arc.cell).map(|c| c.arc_sets[arc.set].arcs[arc.arc].to_rf) else { return out };
+    let g = &plan.gs[arc.scene];
+    let Some(drvr) = g.vertices.iter().position(|x| x.name == target.driver_pin && x.is_driver) else { return out };
+    let weights = crate::delay_estimator::FaninSideLoadOptions { critical_load_pins: crit, off_path_weight: cfg.fanin_side_offpath_weight };
+    for &e in &g.out_edges[drvr] {
+        if !matches!(g.edges[e].kind, vyges_sta::graph::EdgeKind::Wire) {
+            continue;
+        }
+        let pin = &g.vertices[g.edges[e].to].name;
+        let slack = pe_slack_over_scenes(plan.gs, plan.ss, pin, false);
+        if crate::delay_estimator::delay_inf(slack) {
+            continue;
+        }
+        out.push(RebufferLoadTiming { pin: pin.clone(), slack, wire_delay: g.delay[e][out_rf][MAX], weight: crate::delay_estimator::side_load_weight(pin, &weights) });
+    }
+    out
 }
 
 /// `SizeDownFanoutMtGenerator::prepareInputs`: the driver's liberty port, then `measureLoads` —
@@ -1579,6 +1664,17 @@ fn pe_inputs_line(m: Move, target: &Target) -> String {
                 s
             }
         },
+        Move::Buffer => {
+            // The printer sorts the map's rows as text.
+            let mut rows: Vec<String> = target.rebuffer_load_timing.iter().map(|l| format!("{}:{}:{}:{}", l.pin, e9i(l.slack), e9i(l.wire_delay), e9i(l.weight))).collect();
+            rows.sort();
+            let mut s = format!("net={}|timing={}", target.rebuffer_net.is_some() as i32, rows.len());
+            for r in rows {
+                s.push('|');
+                s.push_str(&r);
+            }
+            s
+        }
         Move::SizeDownFanout => {
             let mut s = format!("loads={}", target.size_down_fanout_loads.len());
             for l in &target.size_down_fanout_loads {
@@ -1974,6 +2070,8 @@ mod tests {
             input_cap_budgets: None,
             split_load_input: None,
             size_down_fanout_loads: Vec::new(),
+            rebuffer_net: None,
+            rebuffer_load_timing: Vec::new(),
         }
     }
 
@@ -2056,6 +2154,35 @@ mod tests {
         let mut u = target_at(2);
         u.fanout = 9;
         assert!(!pe_is_applicable(Move::SplitLoad, &u, &facts()));
+    }
+
+    #[test]
+    fn a_rebuffer_target_has_one_to_nineteen_loads_a_bufferable_net_and_a_context() {
+        // Rule (RebufferMtGenerator::isApplicable): fanout >= 1 and below kRebufferMaxFanout (20),
+        // okToBufferNet on the driver, and an estimator context.
+        let mut t = with_context(target_at(2));
+        for (fanout, ok) in [(0, false), (1, true), (19, true), (20, false)] {
+            t.fanout = fanout;
+            assert_eq!(pe_is_applicable(Move::Buffer, &t, &facts()), ok, "fanout {fanout}");
+        }
+        t.fanout = 3;
+        assert!(!pe_is_applicable(Move::Buffer, &t, &PlanFacts { ok_to_buffer_net: false, ..facts() }));
+        let mut u = target_at(2);
+        u.fanout = 3;
+        assert!(!pe_is_applicable(Move::Buffer, &u, &facts()));
+    }
+
+    #[test]
+    fn the_trace_prints_rebuffer_inputs_with_the_rows_sorted_as_text() {
+        // The printer: net=1 when a buffered net was made, the row count, then the rows
+        // pin:slack:wire delay:weight sorted as strings (the map has no order of its own).
+        let mut t = target_at(2);
+        assert_eq!(pe_inputs_line(Move::Buffer, &t), "net=0|timing=0");
+        t.rebuffer_load_timing = vec![
+            RebufferLoadTiming { pin: "u2/A".into(), slack: 0.5, wire_delay: 0.0, weight: 1.0 },
+            RebufferLoadTiming { pin: "u10/A".into(), slack: -0.5, wire_delay: 0.25, weight: 0.0 },
+        ];
+        assert_eq!(pe_inputs_line(Move::Buffer, &t), "net=0|timing=2|u10/A:-5.000000000e-01:2.500000000e-01:0.000000000e+00|u2/A:5.000000000e-01:0.000000000e+00:1.000000000e+00");
     }
 
     #[test]
