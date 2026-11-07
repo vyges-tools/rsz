@@ -121,7 +121,7 @@ pub struct EstimatorContext {
 }
 
 impl EstimatorContext {
-    fn new(delay_estimation_levels: i32) -> EstimatorContext {
+    pub(crate) fn new(delay_estimation_levels: i32) -> EstimatorContext {
         EstimatorContext {
             path_stages: Vec::new(),
             target_stage_index: 0,

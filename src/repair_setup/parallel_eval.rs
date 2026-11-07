@@ -289,6 +289,17 @@ pub struct Target {
     pub unbuffer_gain: Option<f32>,
     /// `swap_pins_input` (`SwapPinsMtGenerator::prepareInputs`).
     pub swap_pins_input: Option<SwapPinsInput>,
+    /// `input_cap_budgets` (`prepareInputCapBudgets`, SizeUp's and VtSwap's prepareInputs).
+    pub input_cap_budgets: Option<Vec<InputCapBudget>>,
+}
+
+/// `Resizer::InputCapBudget`: an input port of the current cell, its capacitance, and the least
+/// `maxCapIncrease` of its net's drivers (infinite without a limit).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InputCapBudget {
+    pub port: String,
+    pub current_cap: f32,
+    pub max_cap_increase: f32,
 }
 
 /// `SwapPinsMtInput`: the input the path enters through, its delay, and the equivalent inputs
@@ -735,6 +746,9 @@ impl Repair<'_, '_> {
             driver_is_inverter: self.ctx.libs.link_cell(&target.cell).is_some_and(|c| c.is_inverter()),
             dont_touch: self.design.net_info().dont_touch_insts.contains(&target.inst),
             pins_swapped: self.committer.has_moves(Move::SwapPins, inst),
+            fixed: self.design.net_info().fixed_insts.contains(&target.inst),
+            logic_std: self.ctx.sizing.masters.get(&target.cell).is_some_and(|m| m.logic_std),
+            vt_swappable: self.ctx.vt_category_count >= 2 && self.ctx.sizing.masters.contains_key(&target.cell) && self.ctx.sizing.vt_equiv_cells(&target.cell, self.ctx.vt_category_count).len() > 1,
             driver_liberty: target.driver_pin.rsplit_once('/').is_some_and(|(_, port)| self.ctx.libs.link_cell(&target.cell).is_some_and(|c| c.port(port).is_some())),
             // UnbufferMtGenerator::isApplicable: the moves that block a serial removal (a resize
             // does not).
@@ -876,6 +890,7 @@ fn pe_collect_path_driver_targets(pe: &mut ParallelEval, view: &PathView, path_s
                 prepare_why: String::new(),
                 unbuffer_gain: None,
                 swap_pins_input: None,
+                input_cap_budgets: None,
             });
         }
     }
@@ -893,6 +908,13 @@ struct PlanFacts {
     pins_swapped: bool,
     /// `network->libertyPort(driver_pin)` exists (a liberty cell with that port).
     driver_liberty: bool,
+    /// `Resizer::isFixed(inst)`.
+    fixed: bool,
+    /// `isLogicStdCell(inst)`.
+    logic_std: bool,
+    /// `staToDb(cell)` is a master and `getVTEquivCells(cell)` has more than the cell, with at
+    /// least two VT categories.
+    vt_swappable: bool,
     unbuffer_blocked: bool,
     can_remove_buffer: bool,
 }
@@ -900,7 +922,7 @@ struct PlanFacts {
 /// The generators whose `isApplicable` and `prepareInputs` are modelled: the others are left out
 /// of the plan, and the run is refused after the chunk is planned.
 fn plan_modelled(m: Move) -> bool {
-    matches!(m, Move::Unbuffer | Move::SwapPins)
+    matches!(m, Move::Unbuffer | Move::SwapPins | Move::SizeUp | Move::VtSwap)
 }
 
 /// `planGeneration`: per generator in `move_sequence_` order, `generatorAllowed`, `isApplicable`
@@ -963,6 +985,11 @@ fn pe_is_applicable(m: Move, target: &Target, facts: &PlanFacts) -> bool {
         Move::Unbuffer => target.path_index >= 2 && facts.driver_is_buffer && !target.inst.is_empty() && !facts.unbuffer_blocked,
         // SwapPinsMtGenerator: the path enters the gate through an input, the gate has inputs to
         // swap (not a buffer or inverter), and it may change and has not been swapped.
+        // SizeUpMtGenerator: a changeable, unfixed instance with an estimator context.
+        Move::SizeUp => !target.inst.is_empty() && !facts.dont_touch && !facts.fixed && target.estimator_context.is_some(),
+        // VtSwapMtGenerator (path-driver or instance view): a context, a changeable logic
+        // standard cell with a liberty cell, two VT categories, a master, and a VT equivalent.
+        Move::VtSwap => target.estimator_context.is_some() && !target.inst.is_empty() && !target.cell.is_empty() && !facts.dont_touch && facts.logic_std && facts.vt_swappable,
         Move::SwapPins => target.path_index > 0 && facts.driver_liberty && !facts.driver_is_buffer && !facts.driver_is_inverter && !target.inst.is_empty() && !facts.dont_touch && !facts.pins_swapped,
         _ => true,
     }
@@ -974,9 +1001,45 @@ fn pe_prepare_inputs(m: Move, target: &mut Target, facts: &PlanFacts, gs: &[vyge
     match m {
         Move::Unbuffer => unbuffer_mt_prepare_inputs(target, facts, gs, ss, design, ctx),
         Move::SwapPins => swap_pins_mt_prepare_inputs(target, gs, ss, design, ctx, cfg)?,
+        // SizeUpMt also builds its replacement options here (a cache generate reads; it decides
+        // nothing yet).
+        Move::SizeUp | Move::VtSwap => prepare_input_cap_budgets(target, gs, design, ctx),
         _ => {}
     }
     Ok(())
+}
+
+/// `prepareInputCapBudgets`: `Resizer::inputCapBudgets(inst)` once per target (the second
+/// cell-swap generator reuses it): per pin of the instance in pin order, an input with a liberty
+/// port on a net — its capacitance (`inputPinCapacitance`) and the least `maxCapIncrease` over the
+/// net's drivers (the capacitance check over every scene; a violating driver allows nothing, one
+/// without a limit allows anything).
+fn prepare_input_cap_budgets(target: &mut Target, gs: &[vyges_sta::graph::Graph<'_>], design: &dyn super::Design, ctx: &super::Ctx<'_>) {
+    if target.input_cap_budgets.is_some() {
+        return;
+    }
+    let mut budgets = Vec::new();
+    let g = &gs[0];
+    if let (Some(cell), Some(pins)) = (ctx.libs.link_cell(&target.cell), ctx.master_pins.get(&target.cell)) {
+        let sc = crate::timing::Scenes::new(gs);
+        let parasitics: Vec<&HashMap<String, vyges_sta::graph::NetParasitics>> = (0..gs.len()).map(|k| design.parasitics(k)).collect();
+        let clocks: std::collections::BTreeSet<usize> = g.ideal_clock.iter().copied().collect();
+        for port in pins {
+            let Some(p) = cell.port(port).filter(|p| matches!(p.direction, vyges_sta::liberty::Direction::Input | vyges_sta::liberty::Direction::Bidirect)) else { continue };
+            let pin = format!("{}/{port}", target.inst);
+            let Some(u) = g.vertices.iter().position(|x| x.name == pin && !x.is_driver) else { continue };
+            if g.vertex_net[u].is_none() {
+                continue;
+            }
+            let mut budget = InputCapBudget { port: p.name.clone(), current_cap: super::input_pin_capacitance(cell, port), max_cap_increase: f32::INFINITY };
+            for d in crate::timing::net_drivers(g, u) {
+                let (cap, max_cap, slack, limited, _) = crate::timing::check_capacitance(&sc, d, &parasitics, &clocks, ctx.limits);
+                budget.max_cap_increase = budget.max_cap_increase.min(super::max_cap_increase(cap, max_cap, slack, limited));
+            }
+            budgets.push(budget);
+        }
+    }
+    target.input_cap_budgets = Some(budgets);
 }
 
 /// `pathInputPort`: the from-port of the arc the target's path takes into the driver, when it is
@@ -1089,6 +1152,16 @@ fn unbuffer_mt_prepare_inputs(target: &mut Target, facts: &PlanFacts, gs: &[vyge
 fn pe_inputs_line(m: Move, target: &Target) -> String {
     match m {
         Move::Unbuffer => format!("gain={}", target.unbuffer_gain.map_or("-".into(), e9i)),
+        Move::SizeUp | Move::VtSwap => match &target.input_cap_budgets {
+            None => "budgets=-".into(),
+            Some(b) => {
+                let mut s = format!("budgets={}", b.len());
+                for x in b {
+                    s.push_str(&format!("|{}:{}:{}", x.port, e9i(x.current_cap), e9i(x.max_cap_increase)));
+                }
+                s
+            }
+        },
         Move::SwapPins => match &target.swap_pins_input {
             None => "swap=-".into(),
             Some(sp) => {
@@ -1414,6 +1487,7 @@ mod tests {
             prepare_why: String::new(),
             unbuffer_gain: None,
             swap_pins_input: None,
+            input_cap_budgets: None,
         }
     }
 
@@ -1439,7 +1513,47 @@ mod tests {
     }
 
     fn facts() -> PlanFacts {
-        PlanFacts { driver_is_buffer: false, driver_is_inverter: false, dont_touch: false, pins_swapped: false, driver_liberty: true, unbuffer_blocked: false, can_remove_buffer: true }
+        PlanFacts { driver_is_buffer: false, driver_is_inverter: false, dont_touch: false, pins_swapped: false, driver_liberty: true, fixed: false, logic_std: true, vt_swappable: true, unbuffer_blocked: false, can_remove_buffer: true }
+    }
+
+    fn with_context(mut t: Target) -> Target {
+        t.estimator_context = Some(crate::delay_estimator::EstimatorContext::new(2));
+        t
+    }
+
+    #[test]
+    fn a_size_up_target_is_a_changeable_unfixed_instance_with_a_context() {
+        // Rule (SizeUpMtGenerator::isApplicable): an instance that is neither dont_touch nor fixed,
+        // and whose estimator context was built.
+        let t = with_context(target_at(2));
+        assert!(pe_is_applicable(Move::SizeUp, &t, &facts()));
+        assert!(!pe_is_applicable(Move::SizeUp, &target_at(2), &facts()));
+        assert!(!pe_is_applicable(Move::SizeUp, &t, &PlanFacts { dont_touch: true, ..facts() }));
+        assert!(!pe_is_applicable(Move::SizeUp, &t, &PlanFacts { fixed: true, ..facts() }));
+    }
+
+    #[test]
+    fn a_vt_swap_target_is_a_changeable_logic_cell_with_a_vt_equivalent_and_a_context() {
+        // Rule (VtSwapMtGenerator::isApplicable): a context; not dont_touch; a logic standard cell;
+        // two VT categories, a master, and more than one VT-equivalent cell. A fixed instance may
+        // still change VT (same footprint).
+        let t = with_context(target_at(2));
+        assert!(pe_is_applicable(Move::VtSwap, &t, &facts()));
+        assert!(pe_is_applicable(Move::VtSwap, &t, &PlanFacts { fixed: true, ..facts() }));
+        assert!(!pe_is_applicable(Move::VtSwap, &target_at(2), &facts()));
+        assert!(!pe_is_applicable(Move::VtSwap, &t, &PlanFacts { dont_touch: true, ..facts() }));
+        assert!(!pe_is_applicable(Move::VtSwap, &t, &PlanFacts { logic_std: false, ..facts() }));
+        assert!(!pe_is_applicable(Move::VtSwap, &t, &PlanFacts { vt_swappable: false, ..facts() }));
+    }
+
+    #[test]
+    fn the_trace_prints_input_cap_budgets_as_the_printer_does() {
+        // The printer: `budgets=-` before the budgets are taken; else the count and per input
+        // port:current_cap:max_cap_increase, an unlimited increase as `inf`.
+        let mut t = target_at(2);
+        assert_eq!(pe_inputs_line(Move::SizeUp, &t), "budgets=-");
+        t.input_cap_budgets = Some(vec![InputCapBudget { port: "A".into(), current_cap: 0.5, max_cap_increase: f32::INFINITY }]);
+        assert_eq!(pe_inputs_line(Move::VtSwap, &t), "budgets=1|A:5.000000000e-01:inf");
     }
 
     #[test]
