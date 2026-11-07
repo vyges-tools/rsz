@@ -1129,7 +1129,7 @@ fn pe_plan_generation(pe: &mut ParallelEval, target: &mut Target, facts: &PlanFa
 
 /// The generators whose `generate` and candidate `estimate` are modelled.
 fn generate_modelled(m: Move) -> bool {
-    matches!(m, Move::Unbuffer | Move::SwapPins | Move::SizeUp | Move::VtSwap | Move::SizeDownFanout)
+    matches!(m, Move::Unbuffer | Move::SwapPins | Move::SizeUp | Move::VtSwap | Move::SizeDownFanout | Move::SplitLoad)
 }
 
 /// A task's generators in plan order (`MoveGenerator::generate`): per generator its candidates,
@@ -1158,6 +1158,7 @@ fn pe_generate(m: Move, target: &Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtC
         Move::SizeUp => size_up_mt_generate(target, plan.ctx, cfg),
         Move::VtSwap => vt_swap_mt_generate(target, plan.ctx, cfg),
         Move::SizeDownFanout => Ok(size_down_fanout_mt_generate(target, plan.ctx.libs, cfg)),
+        Move::SplitLoad => Ok(split_load_mt_generate(target, plan.ctx.libs, cfg)),
         _ => Ok(Vec::new()),
     }
 }
@@ -1492,6 +1493,59 @@ fn fits_delay_budget(delay_budget: f32, worst_delay_change: f32) -> bool {
 fn size_down_fanout_mt_estimate_of(d: &crate::delay_estimator::DelayEstimate, score_scale: f32) -> Estimate {
     let raw = (d.legal || d.reason == crate::delay_estimator::FailReason::EstimateNonImproving).then_some(d.arrival_impr);
     Estimate { legal: d.legal, score: d.arrival_impr * score_scale, raw_gain: raw, reason: d.reason.name(), tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None }
+}
+
+/// `SplitLoadMtGenerator::generate`: one split when `prepareInputs` left an input.
+fn split_load_mt_generate(target: &Target, libs: &crate::preamble::Libs, cfg: &MtConfig) -> Vec<Candidate> {
+    let (Some(input), Some(context)) = (&target.split_load_input, &target.estimator_context) else { return Vec::new() };
+    let dash = |c: &str| if c.is_empty() { "-".to_string() } else { c.to_string() };
+    vec![Candidate {
+        kind: Move::SplitLoad,
+        estimate: split_load_mt_estimate(libs, context, input, cfg.split_load_mt_score_scale),
+        desc: format!("{}/{}", dash(&input.buffer_cell), dash(&input.resized_cell)),
+        impact: split_load_mt_impact(target, input),
+    }]
+}
+
+/// `SplitLoadMtCandidate::estimate`: the driver sheds the moved loads (`estimateLoadChange`); a
+/// reject keeps its scaled score and, non-improving, its raw gain. Else the moved loads arrive
+/// through the faster driver (its arc delay at the reduced load) and the new buffer (the resized
+/// cell at the current slew on the moved pin and wire cap; either missing:
+/// `missing_buffer_timing_arc`), and pay that delay as side loads (`chargeMovedLoads`); the gain
+/// less the side loss, scaled, is the score; a gain left at or below zero is
+/// `side_loss_non_improving`, tail-admissible for a positive own gain.
+fn split_load_mt_estimate(libs: &crate::preamble::Libs, context: &crate::delay_estimator::EstimatorContext, input: &SplitLoadInput, score_scale: f32) -> Estimate {
+    use crate::delay_estimator::{self as de, FailReason};
+    let stage = context.target();
+    let mut d = de::estimate_load_change(libs, context, input.target_load_delta);
+    let none = Estimate { legal: false, score: 0.0, raw_gain: None, reason: "", tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None };
+    if !d.legal {
+        return Estimate { score: d.arrival_impr * score_scale, raw_gain: (d.reason == FailReason::EstimateNonImproving).then_some(d.arrival_impr), reason: d.reason.name(), ..none };
+    }
+    let driver_delay = de::find_arc_delay(libs, &stage.arc, stage.input_slew, de::load_after_change(stage.load_cap, input.target_load_delta), &stage.arc.cell);
+    let buffer_delay = de::find_buffer_delay(libs, context, &input.resized_cell, stage.current_slew, input.moved_pin_cap + input.moved_wire_cap);
+    let (Some(driver_delay), Some(buffer_delay)) = (driver_delay, buffer_delay) else { return Estimate { reason: FailReason::MissingBufferTimingArc.name(), ..none } };
+    let moved_delta = driver_delay - stage.current_model_delay + buffer_delay;
+    de::charge_moved_loads(context, &input.moved_loads, moved_delta, &mut d);
+    split_load_mt_score(&d, score_scale)
+}
+
+/// The end of [`split_load_mt_estimate`]: legal when the estimate is and the gain less the side
+/// loss is above zero; scored by that times the scale.
+fn split_load_mt_score(d: &crate::delay_estimator::DelayEstimate, score_scale: f32) -> Estimate {
+    let gain = d.arrival_impr - d.side_loss;
+    let mut e = Estimate { legal: d.legal && gain > 0.0, score: gain * score_scale, raw_gain: Some(d.arrival_impr), reason: d.reason.name(), tail_admissible: false, side_loss: Some(d.side_loss), sequential_penalty: None, sequential_side_loss: None };
+    if d.legal && gain <= 0.0 {
+        e.reason = "side_loss_non_improving";
+        e.tail_admissible = d.arrival_impr > 0.0;
+    }
+    e
+}
+
+/// `SplitLoadMtCandidate::impact`: complete; the driver and its net written; the moved load pins
+/// reconnect, in order.
+fn split_load_mt_impact(target: &Target, input: &SplitLoadInput) -> MoveImpact {
+    MoveImpact { complete: true, write_instances: vec![target.inst.clone()], write_nets: vec![input.drvr_net.clone()], reconnect_pins: input.load_pins.clone() }
 }
 
 /// `estimateTargets`: each target's candidates estimated in order (done at generation here; the
@@ -2967,6 +3021,31 @@ mod tests {
         assert_eq!(size_down_fanout_mt_step_down(&load(true, 0.5, Some(-1.0))), None);
         assert_eq!(size_down_fanout_mt_step_down(&load(false, 1.5, Some(-1.0))), None);
         assert_eq!(size_down_fanout_mt_step_down(&load(false, 0.5, None)), None);
+    }
+
+
+    // SplitLoadMtCandidate::estimate, its end: gain = own gain - side loss; legal when the estimate
+    // is and gain > 0; score = gain * scale; raw gain and side loss always; a legal estimate whose
+    // gain is at or below zero is side_loss_non_improving, tail-admissible for a positive own gain.
+    #[test]
+    fn split_load_mt_scores_the_gain_less_the_moved_loads_loss() {
+        use crate::delay_estimator::FailReason as F;
+        let e = split_load_mt_score(&delay_estimate(true, 2.0, F::EstimateLegal, 2, 0.5), 0.5);
+        assert_eq!((e.legal, e.score, e.raw_gain, e.side_loss, e.reason, e.tail_admissible), (true, 0.75, Some(2.0), Some(0.5), "estimate_legal", false));
+        let e = split_load_mt_score(&delay_estimate(true, 2.0, F::EstimateLegal, 2, 3.0), 0.5);
+        assert_eq!((e.legal, e.score, e.reason, e.tail_admissible), (false, -0.5, "side_loss_non_improving", true));
+        // A floor reject from the moved loads stays as it is.
+        let e = split_load_mt_score(&delay_estimate(false, 2.0, F::SideSlackFloorViolation, 2, 0.5), 0.5);
+        assert_eq!((e.legal, e.reason, e.tail_admissible, e.side_loss), (false, "side_slack_floor_violation", false, Some(0.5)));
+    }
+
+    // SplitLoadMtCandidate::impact: the driver and its net written, the moved load pins in order.
+    #[test]
+    fn split_load_mt_writes_the_driver_and_its_net_and_moves_the_loads() {
+        let mut t = target_at(0);
+        t.inst = "u".into();
+        let input = SplitLoadInput { drvr_net: "n".into(), drvr_loc: (0, 0), load_pins: vec!["b/A".into(), "a/A".into()], buffer_cell: "BUF".into(), resized_cell: "BUF".into(), moved_pin_cap: 0.0, target_wire_cap_saved: 0.0, moved_wire_cap: 0.0, target_load_delta: 0.0, moved_loads: vec![] };
+        assert_eq!(split_load_mt_impact(&t, &input), MoveImpact { complete: true, write_instances: vec!["u".into()], write_nets: vec!["n".into()], reconnect_pins: vec!["b/A".into(), "a/A".into()] });
     }
 
 }

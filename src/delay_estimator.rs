@@ -164,6 +164,7 @@ pub enum FailReason {
     MissingCandidateTimingArc,
     SideSlackFloorViolation,
     DualRfNonImproving,
+    MissingBufferTimingArc,
 }
 
 impl FailReason {
@@ -184,6 +185,7 @@ impl FailReason {
             FailReason::MissingCandidateTimingArc => "missing_candidate_timing_arc",
             FailReason::SideSlackFloorViolation => "side_slack_floor_violation",
             FailReason::DualRfNonImproving => "dual_rf_non_improving",
+            FailReason::MissingBufferTimingArc => "missing_buffer_timing_arc",
         }
     }
 }
@@ -1090,6 +1092,12 @@ fn apply_fanin_side_loss(context: &EstimatorContext, candidate_scene_cell: &Cell
 /// change on the neighbour's load — each stage's slew carried to the next; the improvement
 /// against the current total delay; then, when legal, the dual transition check, and the fanin
 /// side loss from the neighbour's delay and slew deltas.
+/// The target net's load after a load change, floored at zero (`std::max(load_cap + delta, 0)`,
+/// as `estimateWindow` and `SplitLoadMtCandidate::estimate` both take it).
+pub fn load_after_change(load_cap: f32, target_load_delta: f32) -> f32 {
+    (load_cap + target_load_delta).max(0.0)
+}
+
 fn estimate_window(libs: &Libs, context: &EstimatorContext, candidate_cell: &str, target_load_delta: f32) -> DelayEstimate {
     let stages = &context.path_stages;
     let target_index = context.target_stage_index;
@@ -1117,7 +1125,7 @@ fn estimate_window(libs: &Libs, context: &EstimatorContext, candidate_cell: &str
         let load_cap = if is_fanin_neighbor {
             stage.load_cap + target_input_cap_delta
         } else if is_target {
-            (stage.load_cap + target_load_delta).max(0.0)
+            load_after_change(stage.load_cap, target_load_delta)
         } else {
             stage.load_cap
         };
@@ -1143,6 +1151,62 @@ fn estimate_window(libs: &Libs, context: &EstimatorContext, candidate_cell: &str
     }
     apply_fanin_side_loss(context, candidate_scene_cell, fanin_delay_delta, fanin_slew_delta, &mut estimate);
     estimate
+}
+
+/// `lookupBufferDelayAndSlew`: on the buffer's scene cell at the target arc's scene, over the
+/// non-check arc sets from its buffer input to its buffer output, the arcs whose input and output
+/// transitions are both the target arc's output transition; the largest table delay (max: a
+/// strictly greater one replaces the first) and its slew. None without the cell, its buffer ports
+/// or such an arc.
+pub fn lookup_buffer_delay_and_slew(libs: &Libs, target_stage: &DelayStageState, buffer_cell: &str, input_slew: f32, load_cap: f32) -> Option<(f32, f32)> {
+    let scene_cell = libs.scene_cell(target_stage.arc.scene, buffer_cell)?;
+    let (input, output) = scene_cell.buffer_ports()?;
+    let (input, output) = (input.name.clone(), output.name.clone());
+    let ref_cell = libs.scene_cell(target_stage.arc.scene, &target_stage.arc.cell)?;
+    let out_rf = arc_set_of(ref_cell, target_stage.arc.set).arcs[target_stage.arc.arc].to_rf;
+    let mut found: Option<(f32, f32)> = None;
+    for (si, set) in scene_cell.arc_sets.iter().enumerate() {
+        if set.from != input || set.to != output || set.role.is_timing_check() {
+            continue;
+        }
+        for (k, arc) in set.arcs.iter().enumerate() {
+            if arc.from_rf != out_rf || arc.to_rf != out_rf {
+                continue;
+            }
+            let Some((delay, slew)) = gate_delay_and_slew(scene_cell, si, k, input_slew, load_cap) else { continue };
+            if found.is_none_or(|(d, _)| delay > d) {
+                found = Some((delay, slew));
+            }
+        }
+    }
+    found
+}
+
+/// `DelayEstimator::findArcDelay`: the table delay of `cell` on the arc (exact match).
+pub fn find_arc_delay(libs: &Libs, arc: &SelectedArc, input_slew: f32, load_cap: f32, cell: &str) -> Option<f32> {
+    lookup_arc_delay_and_slew(libs, arc, input_slew, load_cap, cell, false, None).map(|(d, _)| d)
+}
+
+/// `DelayEstimator::findBufferDelay`: [`lookup_buffer_delay_and_slew`] at the context's target.
+pub fn find_buffer_delay(libs: &Libs, context: &EstimatorContext, buffer_cell: &str, input_slew: f32, load_cap: f32) -> Option<f32> {
+    lookup_buffer_delay_and_slew(libs, context.target(), buffer_cell, input_slew, load_cap).map(|(d, _)| d)
+}
+
+/// `DelayEstimator::chargeMovedLoads`: the moved loads charged like the fanin side loads — each
+/// loses `weight * (min(slack, 0) - min(slack - delta, 0))`, then [`charge_side_loss`] with their
+/// count and worst slack after. Nothing for no loads.
+pub fn charge_moved_loads(context: &EstimatorContext, loads: &[SideLoad], delay_delta: f32, estimate: &mut DelayEstimate) {
+    if loads.is_empty() {
+        return;
+    }
+    let mut loss = 0.0f32;
+    let mut worst_slack_after = f32::INFINITY;
+    for load in loads {
+        let slack_after = load.slack - delay_delta;
+        loss += load.weight * (load.slack.min(0.0) - slack_after.min(0.0));
+        worst_slack_after = worst_slack_after.min(slack_after);
+    }
+    charge_side_loss(context, loads.len() as i32, loss, worst_slack_after, estimate);
 }
 
 /// `DelayEstimator::estimate`: [`estimate_window`] with the candidate at the target.
@@ -1344,6 +1408,35 @@ mod tests {
         let loss = 1.0 * (0.0 - (0.5f32 - d).min(0.0)) + 0.5 * (-1.0 - (-1.0f32 - d));
         assert_eq!(e.side_paths_evaluated, 2);
         assert!((e.side_loss - 2.0 * loss).abs() < 1e-6, "{} vs {}", e.side_loss, 2.0 * loss);
+    }
+
+
+    // estimateWindow / SplitLoad: the target load after the change, floored at zero.
+    #[test]
+    fn a_load_change_is_floored_at_zero() {
+        assert_eq!(load_after_change(2.0, -0.5), 1.5);
+        assert_eq!(load_after_change(1.0, -3.0), 0.0);
+    }
+
+    // chargeMovedLoads: the moved loads' weighted loss below zero slack, then chargeSideLoss (the
+    // fanin weight, the floor on the worst slack after); nothing for no loads.
+    #[test]
+    fn moved_loads_are_charged_like_side_loads() {
+        let mut ctx = EstimatorContext::new(1);
+        (ctx.fanin_side_loss_weight, ctx.side_slack_floor, ctx.side_floor_margin) = (2.0, -10.0, 1.0);
+        let load = |slack: f32, weight: f32| SideLoad { pin: "x/A".into(), slack, weight };
+        let mut e = make_estimate(5.0, 3.0);
+        charge_moved_loads(&ctx, &[], 1.0, &mut e);
+        assert_eq!((e.side_paths_evaluated, e.side_loss), (0, 0.0));
+        charge_moved_loads(&ctx, &[load(0.5, 1.0), load(-1.0, 0.5)], 1.0, &mut e);
+        assert_eq!(e.side_paths_evaluated, 2);
+        assert!((e.side_loss - 2.0 * (0.5 + 0.5)).abs() < 1e-6, "{}", e.side_loss);
+        assert!(e.legal);
+        // The floor here is -10 - 1 * 2 (the own gain): -12 after keeps it, -13.5 breaks it.
+        charge_moved_loads(&ctx, &[load(-11.0, 1.0)], 1.0, &mut e);
+        assert!(e.legal);
+        charge_moved_loads(&ctx, &[load(-12.5, 1.0)], 1.0, &mut e);
+        assert_eq!((e.legal, e.reason), (false, FailReason::SideSlackFloorViolation));
     }
 
 }
