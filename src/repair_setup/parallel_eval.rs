@@ -1129,7 +1129,7 @@ fn pe_plan_generation(pe: &mut ParallelEval, target: &mut Target, facts: &PlanFa
 
 /// The generators whose `generate` and candidate `estimate` are modelled.
 fn generate_modelled(m: Move) -> bool {
-    matches!(m, Move::Unbuffer | Move::SwapPins | Move::SizeUp | Move::VtSwap)
+    matches!(m, Move::Unbuffer | Move::SwapPins | Move::SizeUp | Move::VtSwap | Move::SizeDownFanout)
 }
 
 /// A task's generators in plan order (`MoveGenerator::generate`): per generator its candidates,
@@ -1157,6 +1157,7 @@ fn pe_generate(m: Move, target: &Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtC
         Move::SwapPins => Ok(swap_pins_mt_generate(target)),
         Move::SizeUp => size_up_mt_generate(target, plan.ctx, cfg),
         Move::VtSwap => vt_swap_mt_generate(target, plan.ctx, cfg),
+        Move::SizeDownFanout => Ok(size_down_fanout_mt_generate(target, plan.ctx.libs, cfg)),
         _ => Ok(Vec::new()),
     }
 }
@@ -1448,6 +1449,49 @@ fn vt_swap_mt_generate(target: &Target, ctx: &super::Ctx<'_>, cfg: &MtConfig) ->
 /// `VtSwapMtGenerator::selectCandidateCells`: the VT-equivalent cells but the current one.
 fn select_candidate_cells(ctx: &super::Ctx<'_>, current: &str) -> Vec<String> {
     ctx.sizing.vt_equiv_cells(current, ctx.vt_category_count).into_iter().filter(|c| c != current).collect()
+}
+
+/// `SizeDownFanoutMtGenerator::generate`: per prepared load, its one drive step down when it keeps
+/// the output limits, fits the load's delay budget and has a target load change.
+fn size_down_fanout_mt_generate(target: &Target, libs: &crate::preamble::Libs, cfg: &MtConfig) -> Vec<Candidate> {
+    let Some(context) = &target.estimator_context else { return Vec::new() };
+    let mut candidates = Vec::new();
+    for load in &target.size_down_fanout_loads {
+        let step_down = &load.step_down;
+        let Some(delta) = size_down_fanout_mt_step_down(load) else { continue };
+        let d = crate::delay_estimator::estimate_load_change(libs, context, delta);
+        candidates.push(Candidate {
+            kind: Move::SizeDownFanout,
+            estimate: size_down_fanout_mt_estimate_of(&d, cfg.size_down_fanout_mt_score_scale),
+            desc: format!("{}/{}", load.pin, if step_down.cell.is_empty() { "-" } else { &step_down.cell }),
+            impact: MoveImpact { complete: true, write_instances: vec![load.inst.clone()], ..MoveImpact::default() },
+        });
+    }
+    candidates
+}
+
+/// The step down's target load change when `generate` keeps it: it keeps the output limits,
+/// fits the delay budget, and has a load change.
+fn size_down_fanout_mt_step_down(load: &SizeDownFanoutLoad) -> Option<f32> {
+    let step_down = &load.step_down;
+    if step_down.violates_output_limits || !fits_delay_budget(load.delay_budget, step_down.worst_delay_change) {
+        return None;
+    }
+    step_down.target_load_delta
+}
+
+/// `fitsDelayBudget` (Mt): a positive budget bounds the delay change; zero or a negative one
+/// allows no growth.
+fn fits_delay_budget(delay_budget: f32, worst_delay_change: f32) -> bool {
+    if delay_budget > 0.0 { worst_delay_change <= delay_budget } else { worst_delay_change <= 0.0 }
+}
+
+/// `SizeDownFanoutMtCandidate::estimate`: the window estimate of the load change on the target
+/// net, legal as it says; the raw gain when legal or non-improving; scored by the gain times the
+/// score scale. No side costs.
+fn size_down_fanout_mt_estimate_of(d: &crate::delay_estimator::DelayEstimate, score_scale: f32) -> Estimate {
+    let raw = (d.legal || d.reason == crate::delay_estimator::FailReason::EstimateNonImproving).then_some(d.arrival_impr);
+    Estimate { legal: d.legal, score: d.arrival_impr * score_scale, raw_gain: raw, reason: d.reason.name(), tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None }
 }
 
 /// `estimateTargets`: each target's candidates estimated in order (done at generation here; the
@@ -2882,6 +2926,47 @@ mod tests {
         assert!(cell_fits_input_cap_budgets(&cell, &[b("A", 5.0, 0.0)]));
         // A port the replacement lacks reads 0: a decrease always fits.
         assert!(cell_fits_input_cap_budgets(&cell, &[b("B", 1.0, 0.0)]));
+    }
+
+
+    // fitsDelayBudget (Mt): a positive budget bounds the change (inclusive); zero or a negative one
+    // allows none.
+    #[test]
+    fn a_step_down_fits_a_positive_budget_or_no_growth() {
+        assert!(fits_delay_budget(2.0, 2.0));
+        assert!(!fits_delay_budget(2.0, 2.5));
+        assert!(fits_delay_budget(0.0, 0.0));
+        assert!(!fits_delay_budget(0.0, 0.1));
+        assert!(fits_delay_budget(-1.0, -0.5));
+        assert!(!fits_delay_budget(-1.0, 0.5));
+    }
+
+    // SizeDownFanoutMtCandidate::estimate: legal as the load-change estimate says, score = gain *
+    // scale, raw gain when legal or non-improving only, no side terms.
+    #[test]
+    fn size_down_fanout_mt_scores_the_scaled_load_change_gain() {
+        use crate::delay_estimator::FailReason as F;
+        let e = size_down_fanout_mt_estimate_of(&delay_estimate(true, 2.0, F::EstimateLegal, 1, 0.5), 0.75);
+        assert_eq!((e.legal, e.score, e.raw_gain, e.reason, e.side_loss, e.tail_admissible), (true, 1.5, Some(2.0), "estimate_legal", None, false));
+        let e = size_down_fanout_mt_estimate_of(&delay_estimate(false, -2.0, F::EstimateNonImproving, 0, 0.0), 0.75);
+        assert_eq!((e.legal, e.score, e.raw_gain), (false, -1.5, Some(-2.0)));
+        let e = size_down_fanout_mt_estimate_of(&delay_estimate(false, 2.0, F::SideSlackFloorViolation, 1, 0.5), 0.75);
+        assert_eq!((e.legal, e.score, e.raw_gain, e.reason), (false, 1.5, None, "side_slack_floor_violation"));
+    }
+
+    // SizeDownFanoutMtGenerator::generate: a load's step down is kept unless it violates the
+    // output limits, misses the delay budget or has no target load delta.
+    #[test]
+    fn size_down_fanout_mt_keeps_a_fitting_step_down() {
+        let load = |violates: bool, change: f32, delta: Option<f32>| SizeDownFanoutLoad {
+            inst: "a".into(), pin: "a/A".into(), port: "A".into(), cell: "INVx2".into(), load_slack: 0.0, delay_budget: 1.0, input_cap: 0.0,
+            step_down: SizeDownFanoutCellOption { cell: "INVx1".into(), input_cap: 0.0, violates_output_limits: violates, worst_delay_change: change, target_load_delta: delta },
+        };
+        assert_eq!(size_down_fanout_mt_step_down(&load(false, 0.5, Some(-1.0))), Some(-1.0));
+        assert_eq!(size_down_fanout_mt_step_down(&load(false, 1.0, Some(-1.0))), Some(-1.0));
+        assert_eq!(size_down_fanout_mt_step_down(&load(true, 0.5, Some(-1.0))), None);
+        assert_eq!(size_down_fanout_mt_step_down(&load(false, 1.5, Some(-1.0))), None);
+        assert_eq!(size_down_fanout_mt_step_down(&load(false, 0.5, None)), None);
     }
 
 }
