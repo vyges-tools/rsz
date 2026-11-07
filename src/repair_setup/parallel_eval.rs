@@ -865,13 +865,22 @@ impl Repair<'_, '_> {
         let committer = &self.committer;
         let setup_design = &self.design;
         let inst_id = |inst: &str| setup_design.inst_id(inst);
+        let cfg = pe.config;
         let generated = super::timed_all(ctx, design, &mut self.timer, edits, |gs, ss, _cs| {
             let plan = PlanTimer { gs, ss, design, ctx, committer, inst_id: &inst_id };
             for (target, facts) in targets.iter_mut().zip(&facts) {
                 pe_plan_generation(pe, target, facts, &plan, &mut trace).map_err(|e| Stop::refused("RSZ-ABSENT", e))?;
             }
-            Ok(targets.iter().map(|target| pe_run_generators(target, &plan)).collect::<Vec<_>>())
+            Ok(targets.iter().map(|target| pe_run_generators(target, &plan, &cfg)).collect::<Result<Vec<_>, Stop>>())
         })?;
+        // A generator that reaches an unported part refuses the run after the plan lines print.
+        let generated = match generated {
+            Ok(g) => g,
+            Err(e) => {
+                pe_trace(&trace);
+                return Err(e);
+            }
+        };
         pe_collect_generated(pe, targets, &generated, &mut trace);
         pe_trace(&trace);
         if let Some(m) = pe.generators.iter().find(|&&m| !plan_modelled(m)) {
@@ -1120,13 +1129,13 @@ fn pe_plan_generation(pe: &mut ParallelEval, target: &mut Target, facts: &PlanFa
 
 /// The generators whose `generate` and candidate `estimate` are modelled.
 fn generate_modelled(m: Move) -> bool {
-    matches!(m, Move::Unbuffer | Move::SwapPins)
+    matches!(m, Move::Unbuffer | Move::SwapPins | Move::SizeUp | Move::VtSwap)
 }
 
 /// A task's generators in plan order (`MoveGenerator::generate`): per generator its candidates,
 /// none for one not modelled yet.
-fn pe_run_generators(target: &Target, plan: &PlanTimer<'_, '_, '_>) -> Vec<Vec<Candidate>> {
-    target.plan.iter().map(|&m| if generate_modelled(m) { pe_generate(m, target, plan) } else { Vec::new() }).collect()
+fn pe_run_generators(target: &Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtConfig) -> Result<Vec<Vec<Candidate>>, Stop> {
+    target.plan.iter().map(|&m| if generate_modelled(m) { pe_generate(m, target, plan, cfg) } else { Ok(Vec::new()) }).collect()
 }
 
 /// `collectGenerated`: per target, per generator in plan order, the trace's candidate count.
@@ -1141,12 +1150,14 @@ fn pe_collect_generated(pe: &ParallelEval, targets: &[Target], generated: &[Vec<
 }
 
 /// `MoveGenerator::generate` with each candidate's `estimate()`, `vygDescribe()` and `impact()`.
-fn pe_generate(m: Move, target: &Target, plan: &PlanTimer<'_, '_, '_>) -> Vec<Candidate> {
+fn pe_generate(m: Move, target: &Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtConfig) -> Result<Vec<Candidate>, Stop> {
     match m {
         // UnbufferMtGenerator: one removal when the prepared gain is positive.
-        Move::Unbuffer => unbuffer_mt_generate(target, || unbuffer_mt_impact(target, plan)),
-        Move::SwapPins => swap_pins_mt_generate(target),
-        _ => Vec::new(),
+        Move::Unbuffer => Ok(unbuffer_mt_generate(target, || unbuffer_mt_impact(target, plan))),
+        Move::SwapPins => Ok(swap_pins_mt_generate(target)),
+        Move::SizeUp => size_up_mt_generate(target, plan.ctx, cfg),
+        Move::VtSwap => vt_swap_mt_generate(target, plan.ctx, cfg),
+        _ => Ok(Vec::new()),
     }
 }
 
@@ -1253,6 +1264,190 @@ fn swap_pins_mt_estimate(input: &SwapPinsInput, swap: &SwapPinsEquivalent, conte
 fn swap_pins_mt_impact(target: &Target, input: &SwapPinsInput, swap: &SwapPinsEquivalent) -> MoveImpact {
     let pin = |port: &str| format!("{}/{port}", target.inst);
     MoveImpact { complete: true, write_instances: vec![target.inst.clone()], write_nets: Vec::new(), reconnect_pins: vec![pin(&input.input_port), pin(&swap.port)] }
+}
+
+/// `SizeUpMtGenerator::generate`: the size-up options of the target arc's output port, scene
+/// and min/max, each replacement kept when it fits the instance's input cap budgets.
+fn size_up_mt_generate(target: &Target, ctx: &super::Ctx<'_>, cfg: &MtConfig) -> Result<Vec<Candidate>, Stop> {
+    let Some(context) = &target.estimator_context else { return Ok(Vec::new()) };
+    let replacements = build_size_up_options(ctx, cfg, &context.target().arc)?;
+    let budgets = target.input_cap_budgets.as_deref().unwrap_or(&[]);
+    let mut candidates = Vec::new();
+    for replacement in replacements {
+        if !replacement_fits_input_cap_budgets(ctx, budgets, &replacement) {
+            continue;
+        }
+        let estimate = size_up_mt_estimate(ctx.libs, target, &replacement, cfg.size_up_mt_score_scale)?;
+        candidates.push(Candidate { kind: Move::SizeUp, estimate, impact: cell_swap_impact(target), desc: replacement });
+    }
+    Ok(candidates)
+}
+
+/// `SizeUpMtGenerator::buildSizeUpOptions`: the swappable cells of the arc's cell, each other than
+/// it, with a master, of the same VT class (`cellVTType`, so VT changes stay VtSwap's), with the
+/// output port at the scene, passing the dual-RF drive guard (when on), and whose drive
+/// resistance is at most the current one and, when the ratio limit is on (a positive
+/// `size_up_mt_max_drive_ratio` and drive), at least the current over the ratio.
+fn build_size_up_options(ctx: &super::Ctx<'_>, cfg: &MtConfig, arc: &crate::delay_estimator::SelectedArc) -> Result<Vec<String>, Stop> {
+    let mut replacements = Vec::new();
+    let Some((_, drvr_port)) = crate::delay_estimator::arc_ports(ctx.libs, arc) else { return Ok(replacements) };
+    let cell = &arc.cell;
+    let swappable = ctx.sizing.swappable_cells(cell)?;
+    if swappable.is_empty() {
+        return Ok(replacements);
+    }
+    let Some(scene_cell) = ctx.libs.scene_cell(arc.scene, cell).filter(|c| c.port(&drvr_port).is_some()) else { return Ok(replacements) };
+    let drive_r = scene_cell.drive_resistance(&drvr_port);
+    let max_ratio = cfg.size_up_mt_max_drive_ratio;
+    let limit_ratio = max_ratio > 0.0 && drive_r > 0.0;
+    let min_drive_r = if limit_ratio { drive_r / max_ratio } else { 0.0 };
+    let current_master = ctx.sizing.masters.get(cell.as_str());
+    for name in &swappable {
+        if name == cell {
+            continue;
+        }
+        let (Some(current), Some(master)) = (current_master, ctx.sizing.masters.get(name.as_str())) else { continue };
+        if crate::sizing::implant_set(current) != crate::sizing::implant_set(master) {
+            continue;
+        }
+        let Some(corner) = ctx.libs.scene_cell(arc.scene, name).filter(|c| c.port(&drvr_port).is_some()) else { continue };
+        if cfg.dual_rf_drive_guard && !drive_res_no_higher_on_both_rf(scene_cell, corner, &drvr_port) {
+            continue;
+        }
+        let swappable_drive_r = corner.drive_resistance(&drvr_port);
+        if swappable_drive_r <= drive_r && (!limit_ratio || swappable_drive_r >= min_drive_r) {
+            replacements.push(name.clone());
+        }
+    }
+    Ok(replacements)
+}
+
+/// `driveResNoHigherOnBothRf`: the candidate's drive resistance is no higher at rise and at fall.
+fn drive_res_no_higher_on_both_rf(current: &vyges_sta::liberty::Cell, candidate: &vyges_sta::liberty::Cell, port: &str) -> bool {
+    use vyges_sta::liberty::{FALL, RISE};
+    super::drive_resistance_rf(candidate, port, RISE) <= super::drive_resistance_rf(current, port, RISE) && super::drive_resistance_rf(candidate, port, FALL) <= super::drive_resistance_rf(current, port, FALL)
+}
+
+/// `Resizer::replacementFitsInputCapBudgets`: per budget, the replacement's port of that name
+/// (its largest max capacitance over rise and fall, 0 without the port) may not grow the cap past
+/// the budget's increase.
+fn replacement_fits_input_cap_budgets(ctx: &super::Ctx<'_>, budgets: &[InputCapBudget], replacement: &str) -> bool {
+    ctx.libs.link_cell(replacement).is_some_and(|cell| cell_fits_input_cap_budgets(cell, budgets))
+}
+
+/// [`replacement_fits_input_cap_budgets`] on the replacement's link cell.
+fn cell_fits_input_cap_budgets(cell: &vyges_sta::liberty::Cell, budgets: &[InputCapBudget]) -> bool {
+    budgets.iter().all(|b| {
+        let new_cap = cell.port(&b.port).map_or(0.0, |p| p.capacitance.iter().fold(0.0f32, |m, rf| m.max(rf[vyges_sta::liberty::MAX])));
+        let cap_delta = new_cap - b.current_cap;
+        !(cap_delta > 0.0 && cap_delta > b.max_cap_increase)
+    })
+}
+
+/// `MoveCandidate::cellSwapImpact`: complete, the instance written (its pins' nets only enter
+/// the timing cone, which the trace does not print).
+fn cell_swap_impact(target: &Target) -> MoveImpact {
+    MoveImpact { complete: true, write_instances: vec![target.inst.clone()], ..MoveImpact::default() }
+}
+
+/// `SizeUpMtCandidate::estimate`: the window estimate of the replacement, scored by the gain
+/// times the score scale. Not legal: the score kept, the raw gain only for a non-improving
+/// estimate, tail-admissible for the opposite-transition reject with a positive score. Legal: the
+/// cell swap's side costs.
+fn size_up_mt_estimate(libs: &crate::preamble::Libs, target: &Target, replacement: &str, score_scale: f32) -> Result<Estimate, Stop> {
+    let Some(context) = &target.estimator_context else { return Err(Stop::refused("RSZ-ABSENT", "SizeUpMt estimate without an estimator context".into())) };
+    let d = crate::delay_estimator::estimate(libs, context, replacement);
+    size_up_mt_estimate_of(target, &d, score_scale)
+}
+
+/// [`size_up_mt_estimate`] from the window estimate.
+fn size_up_mt_estimate_of(target: &Target, d: &crate::delay_estimator::DelayEstimate, score_scale: f32) -> Result<Estimate, Stop> {
+    use crate::delay_estimator::FailReason;
+    let score = d.arrival_impr * score_scale;
+    if !d.legal {
+        return Ok(Estimate { legal: false, score, raw_gain: (d.reason == FailReason::EstimateNonImproving).then_some(d.arrival_impr), reason: d.reason.name(), tail_admissible: d.reason == FailReason::DualRfNonImproving && score > 0.0, side_loss: None, sequential_penalty: None, sequential_side_loss: None });
+    }
+    let mut e = Estimate { legal: d.legal, score, raw_gain: Some(d.arrival_impr), reason: d.reason.name(), tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None };
+    charge_cell_swap_side_costs(target, d, score_scale, &mut e)?;
+    Ok(e)
+}
+
+/// `VtSwapMtCandidate::estimate`: the window estimate of the VT cell. Not legal: a non-improving
+/// estimate keeps its gain as score and raw gain, any other reject scores 0 with none. Legal:
+/// scored by the gain, then the cell swap's side costs at score scale 1.
+fn vt_swap_mt_estimate(libs: &crate::preamble::Libs, target: &Target, cell: &str) -> Result<Estimate, Stop> {
+    let Some(context) = &target.estimator_context else { return Err(Stop::refused("RSZ-ABSENT", "VtSwapMt estimate without an estimator context".into())) };
+    let d = crate::delay_estimator::estimate(libs, context, cell);
+    vt_swap_mt_estimate_of(target, &d)
+}
+
+/// [`vt_swap_mt_estimate`] from the window estimate.
+fn vt_swap_mt_estimate_of(target: &Target, d: &crate::delay_estimator::DelayEstimate) -> Result<Estimate, Stop> {
+    use crate::delay_estimator::FailReason;
+    if !d.legal {
+        let raw = (d.reason == FailReason::EstimateNonImproving).then_some(d.arrival_impr);
+        return Ok(Estimate { legal: false, score: raw.unwrap_or(0.0), raw_gain: raw, reason: d.reason.name(), tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None });
+    }
+    let mut e = Estimate { legal: true, score: d.arrival_impr, raw_gain: Some(d.arrival_impr), reason: "estimate_legal", tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None };
+    charge_cell_swap_side_costs(target, d, 1.0, &mut e)?;
+    Ok(e)
+}
+
+/// `MoveCandidate::chargeCellSwapSideCosts`: with a sequential timing estimator on the target its
+/// penalty comes off first — not modelled, so such a target refuses the run; then, when the
+/// estimate charged side paths, their loss: the score is the gain less it times the scale, and a
+/// gain left at or below zero is `side_loss_non_improving`, tail-admissible when the own gain is
+/// positive.
+fn charge_cell_swap_side_costs(target: &Target, d: &crate::delay_estimator::DelayEstimate, score_scale: f32, e: &mut Estimate) -> Result<(), Stop> {
+    if target.sequential_estimator {
+        return Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -phases PARALLEL_EVAL: the SequentialTimingEstimator (chargeCellSwapSideCosts on {}) is not modelled", target.driver_pin)));
+    }
+    let mut adjusted_gain = d.arrival_impr;
+    if d.side_paths_evaluated > 0 {
+        e.side_loss = Some(d.side_loss);
+        adjusted_gain -= d.side_loss;
+        e.score = adjusted_gain * score_scale;
+        if adjusted_gain <= 0.0 {
+            e.legal = false;
+            e.reason = "side_loss_non_improving";
+            e.tail_admissible = d.arrival_impr > 0.0;
+        }
+    }
+    Ok(())
+}
+
+/// `VtSwapMtGenerator::generate`: the VT equivalents of the instance's cell other than it
+/// (`selectCandidateCells`), each kept when it passes the dual-RF drive guard (when on and the
+/// candidate has the arc's output port at its scene) and fits the input cap budgets.
+fn vt_swap_mt_generate(target: &Target, ctx: &super::Ctx<'_>, cfg: &MtConfig) -> Result<Vec<Candidate>, Stop> {
+    let Some(context) = &target.estimator_context else { return Ok(Vec::new()) };
+    let arc = &context.target().arc;
+    let budgets = target.input_cap_budgets.as_deref().unwrap_or(&[]);
+    let output = crate::delay_estimator::arc_ports(ctx.libs, arc).map(|(_, o)| o);
+    let current_scene = ctx.libs.scene_cell(arc.scene, &arc.cell);
+    let mut candidates = Vec::new();
+    for cell in select_candidate_cells(ctx, &target.cell) {
+        if cfg.dual_rf_drive_guard {
+            if let (Some(out), Some(current)) = (&output, current_scene) {
+                if let Some(candidate) = ctx.libs.scene_cell(arc.scene, &cell).filter(|c| c.port(out).is_some()) {
+                    if !drive_res_no_higher_on_both_rf(current, candidate, out) {
+                        continue;
+                    }
+                }
+            }
+        }
+        if !replacement_fits_input_cap_budgets(ctx, budgets, &cell) {
+            continue;
+        }
+        let estimate = vt_swap_mt_estimate(ctx.libs, target, &cell)?;
+        candidates.push(Candidate { kind: Move::VtSwap, estimate, impact: cell_swap_impact(target), desc: cell });
+    }
+    Ok(candidates)
+}
+
+/// `VtSwapMtGenerator::selectCandidateCells`: the VT-equivalent cells but the current one.
+fn select_candidate_cells(ctx: &super::Ctx<'_>, current: &str) -> Vec<String> {
+    ctx.sizing.vt_equiv_cells(current, ctx.vt_category_count).into_iter().filter(|c| c != current).collect()
 }
 
 /// `estimateTargets`: each target's candidates estimated in order (done at generation here; the
@@ -2615,6 +2810,78 @@ mod tests {
         let plain = SwapPinsEquivalent { pin: None, ..sw(-10.5) };
         let e = swap_pins_mt_estimate(&slow, &plain, Some(&ctx));
         assert_eq!((e.legal, e.score, e.side_loss, e.reason), (false, 0.0, None, "estimate_non_improving"));
+    }
+
+
+    fn delay_estimate(legal: bool, arrival_impr: f32, reason: crate::delay_estimator::FailReason, side_paths_evaluated: i32, side_loss: f32) -> crate::delay_estimator::DelayEstimate {
+        crate::delay_estimator::DelayEstimate { legal, candidate_delay: 0.0, arrival_impr, side_paths_evaluated, side_loss, reason }
+    }
+
+    // SizeUpMtCandidate::estimate: score = gain * scale. Not legal: the score kept, raw gain only
+    // for estimate_non_improving, tail-admissible only for dual_rf_non_improving with a positive
+    // score, no side loss. Legal: chargeCellSwapSideCosts — with side paths, side_loss is the
+    // window's, score = (gain - loss) * scale, and a gain left at or below zero is
+    // side_loss_non_improving, tail-admissible when the own gain is positive.
+    #[test]
+    fn size_up_mt_scores_the_scaled_gain_less_the_side_loss() {
+        use crate::delay_estimator::FailReason as F;
+        let t = with_context(target_at(0));
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(false, -2.0, F::EstimateNonImproving, 0, 0.0), 0.5).unwrap();
+        assert_eq!((e.legal, e.score, e.raw_gain, e.reason, e.tail_admissible, e.side_loss), (false, -1.0, Some(-2.0), "estimate_non_improving", false, None));
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(false, 2.0, F::SideSlackFloorViolation, 1, 0.5), 0.5).unwrap();
+        assert_eq!((e.legal, e.score, e.raw_gain, e.reason, e.tail_admissible, e.side_loss), (false, 1.0, None, "side_slack_floor_violation", false, None));
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(false, 2.0, F::DualRfNonImproving, 1, 0.5), 0.5).unwrap();
+        assert_eq!((e.reason, e.tail_admissible), ("dual_rf_non_improving", true));
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(false, -2.0, F::DualRfNonImproving, 1, 0.5), 0.5).unwrap();
+        assert!(!e.tail_admissible);
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 0, 0.0), 0.5).unwrap();
+        assert_eq!((e.legal, e.score, e.raw_gain, e.reason, e.side_loss), (true, 1.0, Some(2.0), "estimate_legal", None));
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 2, 0.5), 0.5).unwrap();
+        assert_eq!((e.legal, e.score, e.side_loss), (true, 0.75, Some(0.5)));
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 2, 3.0), 0.5).unwrap();
+        assert_eq!((e.legal, e.score, e.reason, e.tail_admissible, e.side_loss), (false, -0.5, "side_loss_non_improving", true, Some(3.0)));
+    }
+
+    // VtSwapMtCandidate::estimate (makeRejectedEstimate): a non-improving estimate keeps its gain as
+    // score and raw gain, any other reject scores 0 with no raw gain; legal is scored by the gain at
+    // scale 1, then the side costs.
+    #[test]
+    fn vt_swap_mt_keeps_the_gain_only_of_a_non_improving_reject() {
+        use crate::delay_estimator::FailReason as F;
+        let t = with_context(target_at(0));
+        let e = vt_swap_mt_estimate_of(&t, &delay_estimate(false, -2.0, F::EstimateNonImproving, 0, 0.0)).unwrap();
+        assert_eq!((e.legal, e.score, e.raw_gain, e.reason), (false, -2.0, Some(-2.0), "estimate_non_improving"));
+        let e = vt_swap_mt_estimate_of(&t, &delay_estimate(false, 2.0, F::DualRfNonImproving, 1, 0.5)).unwrap();
+        assert_eq!((e.legal, e.score, e.raw_gain, e.reason, e.tail_admissible), (false, 0.0, None, "dual_rf_non_improving", false));
+        let e = vt_swap_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 1, 0.5)).unwrap();
+        assert_eq!((e.legal, e.score, e.raw_gain, e.side_loss), (true, 1.5, Some(2.0), Some(0.5)));
+    }
+
+    // chargeCellSwapSideCosts: a target with a sequential timing estimator refuses (not modelled),
+    // never guessed.
+    #[test]
+    fn a_sequential_target_refuses_the_cell_swap_side_costs() {
+        use crate::delay_estimator::FailReason as F;
+        let mut t = with_context(target_at(0));
+        t.sequential_estimator = true;
+        assert!(size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 0, 0.0), 0.5).is_err());
+        // Not reached for a rejected estimate.
+        assert!(size_up_mt_estimate_of(&t, &delay_estimate(false, 2.0, F::EstimateNonImproving, 0, 0.0), 0.5).is_ok());
+    }
+
+    // replacementFitsInputCapBudgets: per budget, the replacement port's largest max cap (0 without
+    // the port) less the current cap may grow only up to max_cap_increase.
+    #[test]
+    fn a_replacement_fits_unless_an_input_grows_past_its_budget() {
+        use vyges_sta::liberty::{Cell, Port};
+        let cell = Cell { ports: vec![Port { name: "A".into(), capacitance: [[1.0, 3.0], [2.0, 4.0]], ..Default::default() }], ..Cell::default() };
+        let b = |port: &str, current_cap: f32, max_cap_increase: f32| InputCapBudget { port: port.into(), current_cap, max_cap_increase };
+        assert!(cell_fits_input_cap_budgets(&cell, &[]));
+        assert!(cell_fits_input_cap_budgets(&cell, &[b("A", 2.0, 2.0)]));
+        assert!(!cell_fits_input_cap_budgets(&cell, &[b("A", 2.0, 1.5)]));
+        assert!(cell_fits_input_cap_budgets(&cell, &[b("A", 5.0, 0.0)]));
+        // A port the replacement lacks reads 0: a decrease always fits.
+        assert!(cell_fits_input_cap_budgets(&cell, &[b("B", 1.0, 0.0)]));
     }
 
 }

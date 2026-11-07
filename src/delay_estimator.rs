@@ -980,6 +980,14 @@ fn estimate_receiver_input_slew(driver: &DelayStageState, receiver: &DelayStageS
     candidate_output_slew * current_receiver_input_slew / current_driver_output_slew
 }
 
+/// `SelectedArc::inputPort()` and `outputPort()` names: the arc set's from and to ports on the
+/// arc's scene cell.
+pub fn arc_ports(libs: &Libs, arc: &SelectedArc) -> Option<(String, String)> {
+    let cell = libs.scene_cell(arc.scene, &arc.cell)?;
+    let set = arc_set_of(cell, arc.set);
+    Some((set.from.clone(), set.to.clone()))
+}
+
 /// `makeEstimate`.
 fn make_estimate(current_delay: f32, candidate_delay: f32) -> DelayEstimate {
     let arrival_impr = current_delay - candidate_delay;
