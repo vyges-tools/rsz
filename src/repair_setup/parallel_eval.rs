@@ -1204,15 +1204,14 @@ fn unbuffer_impact_on(nl: &vyges_sta::netlist::Netlist, buffer: &str, in_net: Op
 }
 
 /// `estimateTargets`: each target's candidates estimated in order (done at generation here; the
-/// estimates read nothing the other targets change), the tail's permissive rule — a candidate
-/// that is not legal but tail-admissible becomes legal (`wns_tail_permissive`) — and the best: the
-/// first legal candidate with a strictly greater score. The trace prints every candidate, then
+/// estimates read nothing the other targets change), then `estimateTarget` on each. The trace prints every candidate, then
 /// the best, per target; the best only once every generator is modelled.
 fn pe_estimate_targets(pe: &ParallelEval, targets: &[Target], evaluations: &mut [Vec<Candidate>]) {
     let all = pe.generators.iter().all(|&m| generate_modelled(m));
+    let permissive = pe_wns_tail_active(pe);
     let mut trace = String::new();
     for (target, candidates) in targets.iter().zip(evaluations.iter_mut()) {
-        let best = estimate_target(candidates);
+        let best = estimate_target(candidates, permissive);
         for (index, c) in candidates.iter().enumerate() {
             trace.push_str(&pe_cand_line(pe.batch_index, &target.driver_pin, index, c));
         }
@@ -1223,12 +1222,19 @@ fn pe_estimate_targets(pe: &ParallelEval, targets: &[Target], evaluations: &mut 
     pe_trace(&trace);
 }
 
-/// One target of `estimateTargets`: the permissive tail rule on each candidate in order, and the
-/// best — the first legal candidate whose score is strictly greater than the best so far.
-fn estimate_target(candidates: &mut [Candidate]) -> Option<(Move, f32)> {
+/// `WnsTail::active()`: false until the tail starts. The tail starts after a stalled batch, never
+/// before batch 1, and the run is refused before batch 1 (the batch is not modelled yet).
+fn pe_wns_tail_active(_pe: &ParallelEval) -> bool {
+    false
+}
+
+/// `estimateTarget`: while the WNS tail is active (`permissive`), a candidate not legal but
+/// tail-admissible becomes legal (`wns_tail_permissive`); the best is the first legal candidate
+/// whose score is strictly greater than the best so far.
+fn estimate_target(candidates: &mut [Candidate], permissive: bool) -> Option<(Move, f32)> {
     let mut best: Option<(Move, f32)> = None;
     for c in candidates.iter_mut() {
-        if !c.estimate.legal && c.estimate.tail_admissible {
+        if permissive && !c.estimate.legal && c.estimate.tail_admissible {
             c.estimate.legal = true;
             c.estimate.reason = "wns_tail_permissive";
         }
@@ -2490,18 +2496,22 @@ mod tests {
         assert_eq!(unbuffer_impact_on(&nl, "b", None, Some(1)).write_nets, ["n_out"]);
     }
 
-    // estimateTargets: a candidate not legal but tail-admissible becomes legal
-    // (wns_tail_permissive); the best is the first legal candidate with a strictly greater score.
+    // estimateTarget: while the WNS tail is active (permissive), a candidate not legal but
+    // tail-admissible becomes legal (wns_tail_permissive), else it stays rejected; the best is the
+    // first legal candidate with a strictly greater score.
     #[test]
     fn estimate_target_keeps_the_first_of_equal_scores_and_admits_the_tail() {
         let c = |kind: Move, legal: bool, tail: bool, score: f32| Candidate { kind, estimate: Estimate { legal, score, raw_gain: None, reason: "x", tail_admissible: tail, side_loss: None, sequential_penalty: None, sequential_side_loss: None }, desc: String::new(), impact: MoveImpact::default() };
         let mut cs = vec![c(Move::Unbuffer, false, false, 9.0), c(Move::SizeUp, true, false, 2.0), c(Move::SwapPins, true, false, 2.0), c(Move::VtSwap, false, true, 3.0)];
-        assert_eq!(estimate_target(&mut cs), Some((Move::VtSwap, 3.0)));
+        let mut strict = cs.clone();
+        assert_eq!(estimate_target(&mut strict, false), Some((Move::SizeUp, 2.0)));
+        assert_eq!((strict[3].estimate.legal, strict[3].estimate.reason), (false, "x"));
+        assert_eq!(estimate_target(&mut cs, true), Some((Move::VtSwap, 3.0)));
         assert_eq!((cs[3].estimate.legal, cs[3].estimate.reason), (true, "wns_tail_permissive"));
         assert_eq!((cs[0].estimate.legal, cs[0].estimate.reason), (false, "x"));
         cs.truncate(3);
-        assert_eq!(estimate_target(&mut cs), Some((Move::SizeUp, 2.0)));
-        assert_eq!(estimate_target(&mut cs[..1]), None);
+        assert_eq!(estimate_target(&mut cs, true), Some((Move::SizeUp, 2.0)));
+        assert_eq!(estimate_target(&mut cs[..1], true), None);
     }
 
 }
