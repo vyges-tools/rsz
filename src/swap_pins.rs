@@ -22,11 +22,11 @@ use vyges_sta::liberty::{Cell, Direction, Model, Port};
 use crate::timing::INF;
 
 /// `PortDirection` as the reference's reader sets it: an output with a `three_state` is tristate.
-fn is_output(p: &Port) -> bool {
+pub fn is_output(p: &Port) -> bool {
     p.direction == Direction::Output && !p.is_any_tristate()
 }
 
-fn is_input(p: &Port) -> bool {
+pub fn is_input(p: &Port) -> bool {
     p.direction == Direction::Input
 }
 
@@ -118,7 +118,31 @@ fn simulate(expr: &FuncExpr, port: &dyn Fn(&str) -> Option<bool>) -> Result<bool
 /// the best so far becomes the swap. Returns the swap (the current input when none), the base
 /// delay (0 when no arc) and the swap's delay (0 when no arc).
 pub fn find_swap_pin_candidate(cell: &Cell, scene_cell: &Cell, input_port: &str, drvr_port: &str, equiv_ports: &[String], load_cap: f32, in_slew: &dyn Fn(&str, usize) -> f32) -> (String, f32, f32) {
-    let mut port_delays: HashMap<&str, f32> = HashMap::new();
+    let (mut base_delay, port_delays) = swap_pin_delays(cell, scene_cell, input_port, drvr_port, load_cap, in_slew);
+    let reference_delay = base_delay;
+    let mut swap_port = input_port.to_string();
+    for port in equiv_ports {
+        let is_in = cell.port(port).is_some_and(is_input);
+        let Some(&port_delay) = port_delays.get(port) else { continue };
+        if !is_in || port == input_port || port == drvr_port {
+            continue;
+        }
+        if port_delay < base_delay {
+            swap_port = port.clone();
+            base_delay = port_delay;
+        }
+    }
+    let base_out = if reference_delay != -INF { reference_delay } else { 0.0 };
+    let swap_out = if base_delay != -INF { base_delay } else { 0.0 };
+    (swap_port, base_out, swap_out)
+}
+
+/// `Resizer::swapPinDelays(input_port, drvr_port, load_cap, scene)`: over the non-check arcs into
+/// the driver port, each at its input transition's slew (the instance's annotated input slew, else
+/// the target slew) and the scene's model: the current input's largest delay (from −INF), and each
+/// other from-port's largest delay (a lookup map).
+pub fn swap_pin_delays(cell: &Cell, scene_cell: &Cell, input_port: &str, drvr_port: &str, load_cap: f32, in_slew: &dyn Fn(&str, usize) -> f32) -> (f32, HashMap<String, f32>) {
+    let mut port_delays: HashMap<String, f32> = HashMap::new();
     let mut base_delay = -INF;
     for set in cell.arc_sets.iter().filter(|s| s.to == drvr_port && !s.role.is_timing_check()) {
         // `gateDelay(arc, .., scene)` reads `arc->sceneArc(scene)`'s model: the scene cell's set
@@ -131,30 +155,14 @@ pub fn find_swap_pin_candidate(cell: &Cell, scene_cell: &Cell, input_port: &str,
             let port = set.from.as_str();
             if port == input_port {
                 base_delay = base_delay.max(gate_delay);
-            } else if !port_delays.contains_key(port) {
-                port_delays.insert(port, gate_delay);
+            } else if let Some(d) = port_delays.get_mut(port) {
+                *d = d.max(gate_delay);
             } else {
-                let d = port_delays[port].max(gate_delay);
-                port_delays.insert(port, d);
+                port_delays.insert(port.to_string(), gate_delay);
             }
         }
     }
-    let reference_delay = base_delay;
-    let mut swap_port = input_port.to_string();
-    for port in equiv_ports {
-        let is_in = cell.port(port).is_some_and(is_input);
-        let Some(&port_delay) = port_delays.get(port.as_str()) else { continue };
-        if !is_in || port == input_port || port == drvr_port {
-            continue;
-        }
-        if port_delay < base_delay {
-            swap_port = port.clone();
-            base_delay = port_delay;
-        }
-    }
-    let base_out = if reference_delay != -INF { reference_delay } else { 0.0 };
-    let swap_out = if base_delay != -INF { base_delay } else { 0.0 };
-    (swap_port, base_out, swap_out)
+    (base_delay, port_delays)
 }
 
 /// `LibertyCell::findTimingArcSet(link_set)` on a scene cell (`makeSceneMap`): the set with the

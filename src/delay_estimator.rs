@@ -180,7 +180,7 @@ pub struct FaninSideLoadOptions<'a> {
 const INF: f32 = 1e30;
 
 /// `delayInf` (`fuzzyInf`): fuzzily plus or minus the timer's infinity.
-fn delay_inf(x: f32) -> bool {
+pub fn delay_inf(x: f32) -> bool {
     vyges_sta::fuzzy::equal(x, INF) || vyges_sta::fuzzy::equal(x, -INF)
 }
 

@@ -9,7 +9,9 @@
 //! preparation (S3a: `prewarmTargets`, `prepareTargets`). Candidate generation onward
 //! (`generateCandidates`) is refused.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+use vyges_sta::liberty::MAX;
 
 use vyges_sta::fuzzy;
 
@@ -285,6 +287,27 @@ pub struct Target {
     /// `unbuffer_gain` (`UnbufferMtGenerator::prepareInputs`): the removal's estimated gain, when
     /// the buffer is eligible.
     pub unbuffer_gain: Option<f32>,
+    /// `swap_pins_input` (`SwapPinsMtGenerator::prepareInputs`).
+    pub swap_pins_input: Option<SwapPinsInput>,
+}
+
+/// `SwapPinsMtInput`: the input the path enters through, its delay, and the equivalent inputs
+/// that can take the critical signal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SwapPinsInput {
+    pub input_port: String,
+    pub input_delay: f32,
+    pub equivalents: Vec<SwapPinsEquivalent>,
+}
+
+/// `SwapPinsMtInput::Equivalent`: the port and its delay; with the side model, the pin and the
+/// slack of the signal it displaces (none and 0 otherwise).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SwapPinsEquivalent {
+    pub port: String,
+    pub delay: f32,
+    pub pin: Option<String>,
+    pub slack: f32,
 }
 
 /// `PrepareCacheMask`: what `prepareTarget` builds (bit 1 is unused upstream).
@@ -691,7 +714,7 @@ impl Repair<'_, '_> {
         let mut trace = String::new();
         super::timed_all(ctx, design, &mut self.timer, edits, |gs, ss, _cs| {
             for (target, facts) in targets.iter_mut().zip(&facts) {
-                pe_plan_generation(pe, target, facts, gs, ss, design, ctx, &mut trace);
+                pe_plan_generation(pe, target, facts, gs, ss, design, ctx, &mut trace).map_err(|e| Stop::refused("RSZ-ABSENT", e))?;
             }
             Ok(())
         })?;
@@ -709,6 +732,10 @@ impl Repair<'_, '_> {
         let buffer_ports = self.ctx.libs.link_cell(&target.cell).filter(|c| c.is_buffer()).and_then(|c| c.buffer_ports()).map(|(i, o)| (i.name.clone(), o.name.clone()));
         PlanFacts {
             driver_is_buffer: buffer_ports.is_some(),
+            driver_is_inverter: self.ctx.libs.link_cell(&target.cell).is_some_and(|c| c.is_inverter()),
+            dont_touch: self.design.net_info().dont_touch_insts.contains(&target.inst),
+            pins_swapped: self.committer.has_moves(Move::SwapPins, inst),
+            driver_liberty: target.driver_pin.rsplit_once('/').is_some_and(|(_, port)| self.ctx.libs.link_cell(&target.cell).is_some_and(|c| c.port(port).is_some())),
             // UnbufferMtGenerator::isApplicable: the moves that block a serial removal (a resize
             // does not).
             unbuffer_blocked: [Move::SwapPins, Move::Clone, Move::SplitLoad, Move::Buffer].into_iter().any(|m| self.committer.has_moves(m, inst)),
@@ -848,6 +875,7 @@ fn pe_collect_path_driver_targets(pe: &mut ParallelEval, view: &PathView, path_s
                 sequential_estimator: false,
                 prepare_why: String::new(),
                 unbuffer_gain: None,
+                swap_pins_input: None,
             });
         }
     }
@@ -856,8 +884,15 @@ fn pe_collect_path_driver_targets(pe: &mut ParallelEval, view: &PathView, path_s
 
 /// See [`Repair::pe_plan_facts`].
 struct PlanFacts {
-    /// The driver's liberty cell is a buffer.
+    /// The driver's liberty cell is a buffer, an inverter.
     driver_is_buffer: bool,
+    driver_is_inverter: bool,
+    /// `Resizer::dontTouch(driver instance)`.
+    dont_touch: bool,
+    /// `committer_.hasMoves(kSwapPins, driver instance)`.
+    pins_swapped: bool,
+    /// `network->libertyPort(driver_pin)` exists (a liberty cell with that port).
+    driver_liberty: bool,
     unbuffer_blocked: bool,
     can_remove_buffer: bool,
 }
@@ -865,7 +900,7 @@ struct PlanFacts {
 /// The generators whose `isApplicable` and `prepareInputs` are modelled: the others are left out
 /// of the plan, and the run is refused after the chunk is planned.
 fn plan_modelled(m: Move) -> bool {
-    matches!(m, Move::Unbuffer)
+    matches!(m, Move::Unbuffer | Move::SwapPins)
 }
 
 /// `planGeneration`: per generator in `move_sequence_` order, `generatorAllowed`, `isApplicable`
@@ -873,7 +908,7 @@ fn plan_modelled(m: Move) -> bool {
 /// tabu checks come first: both are empty until a batch is undone or missed, and only the first
 /// chunk of batch 0 is planned here.
 #[allow(clippy::too_many_arguments)]
-fn pe_plan_generation(pe: &mut ParallelEval, target: &mut Target, facts: &PlanFacts, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], design: &dyn super::Design, ctx: &super::Ctx<'_>, trace: &mut String) {
+fn pe_plan_generation(pe: &mut ParallelEval, target: &mut Target, facts: &PlanFacts, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], design: &dyn super::Design, ctx: &super::Ctx<'_>, trace: &mut String) -> Result<(), String> {
     let pin = target.driver_pin.clone();
     let b = pe.batch_index;
     let mut planned = Vec::new();
@@ -892,13 +927,14 @@ fn pe_plan_generation(pe: &mut ParallelEval, target: &mut Target, facts: &PlanFa
         if m == Move::Buffer {
             pe.rebuffer_targets_in_batch += 1;
         }
-        pe_prepare_inputs(m, target, facts, gs, ss, design, ctx);
+        pe_prepare_inputs(m, target, facts, gs, ss, design, ctx, &pe.config)?;
         trace.push_str(&format!("VYGP|inputs|{b}|{pin}|{}|{}\n", m.name(), pe_inputs_line(m, target)));
         planned.push(m.name());
     }
     if pe.generators.iter().all(|&m| plan_modelled(m)) {
         trace.push_str(&format!("VYGP|plan|{b}|{pin}|gens={}\n", planned.join(",")));
     }
+    Ok(())
 }
 
 /// `generatorAllowed`: Rebuffer within `rebuffer_max_targets` per batch; Unbuffer only when the
@@ -925,16 +961,91 @@ fn pe_is_applicable(m: Move, target: &Target, facts: &PlanFacts) -> bool {
         // UnbufferMtGenerator: the buffer and the stage that drives it on the path; a buffer's
         // liberty port; no move committed on it that blocks a removal.
         Move::Unbuffer => target.path_index >= 2 && facts.driver_is_buffer && !target.inst.is_empty() && !facts.unbuffer_blocked,
+        // SwapPinsMtGenerator: the path enters the gate through an input, the gate has inputs to
+        // swap (not a buffer or inverter), and it may change and has not been swapped.
+        Move::SwapPins => target.path_index > 0 && facts.driver_liberty && !facts.driver_is_buffer && !facts.driver_is_inverter && !target.inst.is_empty() && !facts.dont_touch && !facts.pins_swapped,
         _ => true,
     }
 }
 
 /// `MoveGenerator::prepareInputs`: the generator's live timer reads, stored on the target.
 #[allow(clippy::too_many_arguments)]
-fn pe_prepare_inputs(m: Move, target: &mut Target, facts: &PlanFacts, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], design: &dyn super::Design, ctx: &super::Ctx<'_>) {
-    if m == Move::Unbuffer {
-        unbuffer_mt_prepare_inputs(target, facts, gs, ss, design, ctx);
+fn pe_prepare_inputs(m: Move, target: &mut Target, facts: &PlanFacts, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], design: &dyn super::Design, ctx: &super::Ctx<'_>, cfg: &MtConfig) -> Result<(), String> {
+    match m {
+        Move::Unbuffer => unbuffer_mt_prepare_inputs(target, facts, gs, ss, design, ctx),
+        Move::SwapPins => swap_pins_mt_prepare_inputs(target, gs, ss, design, ctx, cfg)?,
+        _ => {}
     }
+    Ok(())
+}
+
+/// `pathInputPort`: the from-port of the arc the target's path takes into the driver, when it is
+/// not an output.
+fn pe_path_input_port(target: &Target, g: &vyges_sta::graph::Graph<'_>, search: &vyges_sta::search::Search<'_, '_>, ctx: &super::Ctx<'_>) -> Option<String> {
+    let find = |pin: &str, is_driver: bool| g.vertices.iter().position(|x| x.name == pin && x.is_driver == is_driver);
+    let chain = super::refind_chain(&target.path, find, &search.paths).ok()?;
+    let prev = chain.get(target.path_index)?.1.prev?;
+    let port = super::edge_arc_set(g, prev.edge)?.from.clone();
+    let cell = ctx.libs.link_cell(&target.cell)?;
+    cell.port(&port).filter(|p| !crate::swap_pins::is_output(p)).map(|_| port)
+}
+
+/// `SwapPinsMtGenerator::prepareInputs`: the path's input, its equivalent inputs (`equivCellPins`,
+/// in port order), the arc delays at the gate's input slews and load (`swapPinDelays`; nothing
+/// when the input has no arc), then each equivalent input that has a delay, is an input and is
+/// neither the path's input nor the driver — with the side model on and a context built, the pin
+/// it is on and that pin's slack when constrained.
+fn swap_pins_mt_prepare_inputs(target: &mut Target, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], design: &dyn super::Design, ctx: &super::Ctx<'_>, cfg: &MtConfig) -> Result<(), String> {
+    let scene = target.scene;
+    let g = &gs[scene];
+    let Some(input_port) = pe_path_input_port(target, g, &ss[scene], ctx) else { return Ok(()) };
+    let Some(cell) = ctx.libs.link_cell(&target.cell) else { return Ok(()) };
+    let Some((_, drvr_port)) = target.driver_pin.rsplit_once('/') else { return Ok(()) };
+    let equiv_ports = crate::swap_pins::equiv_cell_pins(cell, &input_port)?;
+    if equiv_ports.is_empty() {
+        return Ok(());
+    }
+    let Some(drvr) = g.vertices.iter().position(|x| x.name == target.driver_pin && x.is_driver) else { return Ok(()) };
+    let load_cap = g.load_cap(drvr, design.parasitics(scene));
+    // annotateInputSlews(drvr, scene): the instance's input pins' timed slews.
+    let prefix = format!("{}/", target.inst);
+    let mut annotated: HashMap<String, [f32; 2]> = HashMap::new();
+    for (u, ux) in g.vertices.iter().enumerate() {
+        let Some(port) = ux.name.strip_prefix(&prefix) else { continue };
+        if !ux.is_driver && cell.port(port).is_some_and(crate::swap_pins::is_input) {
+            annotated.insert(port.to_string(), [g.slew[u][0][MAX], g.slew[u][1][MAX]]);
+        }
+    }
+    let tgt = ctx.sizing.tgt_slews;
+    let in_slew = |port: &str, rf: usize| annotated.get(port).map_or(tgt[rf], |s| s[rf]);
+    let scene_cell = ctx.libs.scene_cell(scene, &target.cell).unwrap_or(cell);
+    let (input_delay, port_delays) = crate::swap_pins::swap_pin_delays(cell, scene_cell, &input_port, drvr_port, load_cap, &in_slew);
+    if input_delay == -super::INF {
+        return Ok(());
+    }
+    let side_model = cfg.fanin_side_loss && target.estimator_context.is_some();
+    let mut equivalents = Vec::new();
+    for port in &equiv_ports {
+        let Some(&delay) = port_delays.get(port) else { continue };
+        if !cell.port(port).is_some_and(crate::swap_pins::is_input) || *port == input_port || port == drvr_port {
+            continue;
+        }
+        let mut equivalent = SwapPinsEquivalent { port: port.clone(), delay, pin: None, slack: 0.0 };
+        if side_model {
+            let pin = format!("{prefix}{port}");
+            // `Sta::slack(pinLoadVertex(pin), max)`: over every scene.
+            if let Some(v0) = gs[0].vertices.iter().position(|x| x.name == pin && !x.is_driver) {
+                let slack = super::slack_over_scenes(gs, ss, v0, MAX, None);
+                if !crate::delay_estimator::delay_inf(slack) {
+                    equivalent.pin = Some(pin);
+                    equivalent.slack = slack;
+                }
+            }
+        }
+        equivalents.push(equivalent);
+    }
+    target.swap_pins_input = Some(SwapPinsInput { input_port, input_delay, equivalents });
+    Ok(())
 }
 
 /// `UnbufferMtGenerator::prepareInputs`: `isEligible` (driver and path context, the fanout and
@@ -978,6 +1089,16 @@ fn unbuffer_mt_prepare_inputs(target: &mut Target, facts: &PlanFacts, gs: &[vyge
 fn pe_inputs_line(m: Move, target: &Target) -> String {
     match m {
         Move::Unbuffer => format!("gain={}", target.unbuffer_gain.map_or("-".into(), e9i)),
+        Move::SwapPins => match &target.swap_pins_input {
+            None => "swap=-".into(),
+            Some(sp) => {
+                let mut s = format!("swap={}|in_delay={}|equiv={}", sp.input_port, e9i(sp.input_delay), sp.equivalents.len());
+                for e in &sp.equivalents {
+                    s.push_str(&format!("|{}:{}:{}:{}", e.port, e9i(e.delay), e.pin.as_deref().unwrap_or("-"), e9i(e.slack)));
+                }
+                s
+            }
+        },
         _ => String::new(),
     }
 }
@@ -1292,6 +1413,7 @@ mod tests {
             sequential_estimator: false,
             prepare_why: String::new(),
             unbuffer_gain: None,
+            swap_pins_input: None,
         }
     }
 
@@ -1316,12 +1438,40 @@ mod tests {
         }
     }
 
+    fn facts() -> PlanFacts {
+        PlanFacts { driver_is_buffer: false, driver_is_inverter: false, dont_touch: false, pins_swapped: false, driver_liberty: true, unbuffer_blocked: false, can_remove_buffer: true }
+    }
+
+    #[test]
+    fn a_swap_pins_target_is_a_changeable_gate_with_inputs_to_swap_entered_through_an_input() {
+        // Rule (SwapPinsMtGenerator::isApplicable): a path index past the root, a liberty driver
+        // port, a cell that is neither buffer nor inverter, not dont_touch, not swapped before.
+        let ok = facts();
+        assert!(pe_is_applicable(Move::SwapPins, &target_at(1), &ok));
+        assert!(!pe_is_applicable(Move::SwapPins, &target_at(0), &ok));
+        assert!(!pe_is_applicable(Move::SwapPins, &target_at(1), &PlanFacts { driver_liberty: false, ..facts() }));
+        assert!(!pe_is_applicable(Move::SwapPins, &target_at(1), &PlanFacts { driver_is_buffer: true, ..facts() }));
+        assert!(!pe_is_applicable(Move::SwapPins, &target_at(1), &PlanFacts { driver_is_inverter: true, ..facts() }));
+        assert!(!pe_is_applicable(Move::SwapPins, &target_at(1), &PlanFacts { dont_touch: true, ..facts() }));
+        assert!(!pe_is_applicable(Move::SwapPins, &target_at(1), &PlanFacts { pins_swapped: true, ..facts() }));
+    }
+
+    #[test]
+    fn the_trace_prints_swap_pins_inputs_as_the_printer_does() {
+        // The printer: `swap=-` without inputs; else the input, its delay, the count, and per
+        // equivalent port:delay:pin:slack (pin `-` and slack 0 without the side model).
+        let mut t = target_at(1);
+        assert_eq!(pe_inputs_line(Move::SwapPins, &t), "swap=-");
+        t.swap_pins_input = Some(SwapPinsInput { input_port: "A".into(), input_delay: 0.5, equivalents: vec![SwapPinsEquivalent { port: "B".into(), delay: 0.25, pin: None, slack: 0.0 }] });
+        assert_eq!(pe_inputs_line(Move::SwapPins, &t), "swap=A|in_delay=5.000000000e-01|equiv=1|B:2.500000000e-01:-:0.000000000e+00");
+    }
+
     #[test]
     fn an_unbuffer_target_is_a_buffer_two_stages_in_that_no_blocking_move_touched() {
         // Rule (UnbufferMtGenerator::isApplicable): the path holds the buffer and the stage that
         // drives it (path index 2 or more), the driver's cell is a buffer, and no SwapPins, Clone,
         // SplitLoad or Buffer move is committed on the instance (a resize does not block).
-        let facts = |buffer: bool, blocked: bool| PlanFacts { driver_is_buffer: buffer, unbuffer_blocked: blocked, can_remove_buffer: true };
+        let facts = |buffer: bool, blocked: bool| PlanFacts { driver_is_buffer: buffer, unbuffer_blocked: blocked, ..facts() };
         assert!(pe_is_applicable(Move::Unbuffer, &target_at(2), &facts(true, false)));
         assert!(!pe_is_applicable(Move::Unbuffer, &target_at(1), &facts(true, false)));
         assert!(!pe_is_applicable(Move::Unbuffer, &target_at(2), &facts(false, false)));
