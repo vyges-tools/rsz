@@ -156,6 +156,14 @@ pub enum FailReason {
     MissingOutputPort,
     MissingCurrentPortMap,
     MissingCurrentTimingArc,
+    /// The estimate's own reasons (`estimateWindow`, `applyDualRfCheck`, `chargeSideLoss`).
+    None,
+    EstimateLegal,
+    EstimateNonImproving,
+    MissingCandidatePort,
+    MissingCandidateTimingArc,
+    SideSlackFloorViolation,
+    DualRfNonImproving,
 }
 
 impl FailReason {
@@ -169,6 +177,13 @@ impl FailReason {
             FailReason::MissingOutputPort => "missing_output_port",
             FailReason::MissingCurrentPortMap => "missing_current_port_map",
             FailReason::MissingCurrentTimingArc => "missing_current_timing_arc",
+            FailReason::None => "",
+            FailReason::EstimateLegal => "estimate_legal",
+            FailReason::EstimateNonImproving => "estimate_non_improving",
+            FailReason::MissingCandidatePort => "missing_candidate_port",
+            FailReason::MissingCandidateTimingArc => "missing_candidate_timing_arc",
+            FailReason::SideSlackFloorViolation => "side_slack_floor_violation",
+            FailReason::DualRfNonImproving => "dual_rf_non_improving",
         }
     }
 }
@@ -211,11 +226,21 @@ pub struct DelayEstimate {
     pub legal: bool,
     pub candidate_delay: f32,
     pub arrival_impr: f32,
-    /// `reason == kEstimateNonImproving`: computed, not improving (its score is kept).
-    pub non_improving: bool,
+    pub side_paths_evaluated: i32,
+    /// The weighted slack loss of the side paths below zero slack; zero when none.
+    pub side_loss: f32,
+    pub reason: FailReason,
 }
 
-const REJECTED: DelayEstimate = DelayEstimate { legal: false, candidate_delay: 0.0, arrival_impr: 0.0, non_improving: false };
+/// `{.legal = false, .reason = reason}`.
+fn rejected(reason: FailReason) -> DelayEstimate {
+    DelayEstimate { legal: false, candidate_delay: 0.0, arrival_impr: 0.0, side_paths_evaluated: 0, side_loss: 0.0, reason }
+}
+
+/// `kSideSlewDelayFactor`: the share of a side gate's input slew growth added to its delay.
+const SIDE_SLEW_DELAY_FACTOR: f32 = 0.3;
+/// `kSideSlewPerDelay`: the slew growth per delay growth of a side net off the selected arc.
+const SIDE_SLEW_PER_DELAY: f32 = 1.4;
 
 /// `kSlewMatchAbsTolerance`, `kSlewMatchRelTolerance`, `kMinSlewRatioDenominator`.
 const SLEW_MATCH_ABS_TOLERANCE: f32 = 1.0e-15;
@@ -958,25 +983,120 @@ fn estimate_receiver_input_slew(driver: &DelayStageState, receiver: &DelayStageS
 /// `makeEstimate`.
 fn make_estimate(current_delay: f32, candidate_delay: f32) -> DelayEstimate {
     let arrival_impr = current_delay - candidate_delay;
-    DelayEstimate { legal: arrival_impr > 0.0, candidate_delay, arrival_impr, non_improving: arrival_impr <= 0.0 }
+    let legal = arrival_impr > 0.0;
+    DelayEstimate { legal, candidate_delay, arrival_impr, side_paths_evaluated: 0, side_loss: 0.0, reason: if legal { FailReason::EstimateLegal } else { FailReason::EstimateNonImproving } }
 }
 
-/// `DelayEstimator::estimate` → `estimateWindow`: the window's stages from the fanin neighbour
-/// on table-modelled with the candidate at the target (its input cap on the neighbour's load),
-/// each stage's slew carried to the next; the improvement against the current total delay.
-pub fn estimate(libs: &Libs, context: &EstimatorContext, candidate_cell: &str) -> DelayEstimate {
+/// `oppositeRfSideLoss`: the opposite transition's slack lost below zero to a delay growth.
+fn opposite_rf_side_loss(opposite_slack: f32, delay_delta: f32) -> f32 {
+    if !opposite_slack.is_finite() || delay_delta <= 0.0 {
+        return 0.0;
+    }
+    opposite_slack.min(0.0) - (opposite_slack - delay_delta).min(0.0)
+}
+
+/// `applyDualRfCheck`: the opposite output transition charged like a side path — the worst
+/// delay growth over its arcs the candidate also has (relaxed match), when positive and the
+/// opposite slack is finite, costs its loss below zero slack; a slack after below
+/// `sideSlackFloor(arrival_impr)` rejects (`dual_rf_non_improving`).
+fn apply_dual_rf_check(libs: &Libs, context: &EstimatorContext, candidate_cell: &str, estimate: &mut DelayEstimate) {
+    let target = context.target();
+    if target.opposite_rf_arcs.is_empty() {
+        return;
+    }
+    let Some(ref_cell) = libs.scene_cell(target.arc.scene, &target.arc.cell) else { return };
+    let mut worst_delta = f32::NEG_INFINITY;
+    for opposite in &target.opposite_rf_arcs {
+        let Some((delay, _)) = lookup_arc_delay_and_slew_for_arc(libs, target.arc.scene, ref_cell, opposite.set, opposite.arc, opposite.input_slew, target.load_cap, candidate_cell, true, None) else { continue };
+        worst_delta = worst_delta.max(delay - opposite.current_model_delay);
+    }
+    if !worst_delta.is_finite() {
+        return;
+    }
+    if worst_delta <= 0.0 || !context.opposite_rf_slack.is_finite() {
+        return;
+    }
+    let slack_after = context.opposite_rf_slack - worst_delta;
+    estimate.side_loss += opposite_rf_side_loss(context.opposite_rf_slack, worst_delta);
+    estimate.side_paths_evaluated += 1;
+    if slack_after < context.side_slack_floor_for(estimate.arrival_impr) {
+        estimate.legal = false;
+        estimate.reason = FailReason::DualRfNonImproving;
+    }
+}
+
+/// `chargeSideLoss`: `side_paths` more side paths, their loss weighted by
+/// `fanin_side_loss_weight` (added: the dual check may have charged one), and a worst slack after
+/// below `sideSlackFloor(arrival_impr)` rejects (`side_slack_floor_violation`).
+fn charge_side_loss(context: &EstimatorContext, side_paths: i32, loss: f32, worst_slack_after: f32, estimate: &mut DelayEstimate) {
+    estimate.side_paths_evaluated += side_paths;
+    estimate.side_loss += loss * context.fanin_side_loss_weight;
+    if worst_slack_after < context.side_slack_floor_for(estimate.arrival_impr) {
+        estimate.legal = false;
+        estimate.reason = FailReason::SideSlackFloorViolation;
+    }
+}
+
+/// `applyFaninSideLoss`: the fanin drivers' delay growth charged to the recorded side loads. On
+/// the selected arc's net the window's fanin delay and slew deltas; off it, `delay_per_cap` times
+/// the candidate's input cap change and `kSideSlewPerDelay` of that as slew (a port the candidate
+/// lacks is skipped). A delta at or below zero is skipped; else `kSideSlewDelayFactor` of the
+/// positive slew growth is added, and each load loses `weight * (min(slack, 0) - min(slack -
+/// delta, 0))`.
+fn apply_fanin_side_loss(context: &EstimatorContext, candidate_scene_cell: &Cell, selected_fanin_delay_delta: f32, selected_fanin_slew_delta: f32, estimate: &mut DelayEstimate) {
+    if context.fanin_side_nets.is_empty() {
+        return;
+    }
+    let mut loss = 0.0f32;
+    let mut worst_slack_after = f32::INFINITY;
+    let mut side_paths = 0;
+    for side_net in &context.fanin_side_nets {
+        let mut delay_delta = selected_fanin_delay_delta;
+        let mut slew_delta = selected_fanin_slew_delta;
+        if !side_net.selected_arc {
+            if candidate_scene_cell.port(&side_net.input_port).is_none() {
+                continue;
+            }
+            delay_delta = side_net.delay_per_cap * (port_capacitance(candidate_scene_cell, &side_net.input_port) - side_net.input_cap);
+            slew_delta = SIDE_SLEW_PER_DELAY * delay_delta;
+        }
+        if delay_delta <= 0.0 {
+            continue;
+        }
+        delay_delta += SIDE_SLEW_DELAY_FACTOR * slew_delta.max(0.0);
+        for side in &side_net.loads {
+            let slack_after = side.slack - delay_delta;
+            loss += side.weight * (side.slack.min(0.0) - slack_after.min(0.0));
+            worst_slack_after = worst_slack_after.min(slack_after);
+            side_paths += 1;
+        }
+    }
+    if side_paths == 0 {
+        return;
+    }
+    charge_side_loss(context, side_paths, loss, worst_slack_after, estimate);
+}
+
+/// `estimateWindow`: the window's stages from the fanin neighbour on table-modelled — the
+/// candidate at the target (with `target_load_delta` on its load, floored at zero), its input cap
+/// change on the neighbour's load — each stage's slew carried to the next; the improvement
+/// against the current total delay; then, when legal, the dual transition check, and the fanin
+/// side loss from the neighbour's delay and slew deltas.
+fn estimate_window(libs: &Libs, context: &EstimatorContext, candidate_cell: &str, target_load_delta: f32) -> DelayEstimate {
     let stages = &context.path_stages;
     let target_index = context.target_stage_index;
     let target = &stages[target_index];
-    let Some(ref_cell) = libs.scene_cell(target.arc.scene, &target.arc.cell) else { return REJECTED };
+    let Some(ref_cell) = libs.scene_cell(target.arc.scene, &target.arc.cell) else { return rejected(FailReason::MissingCandidatePort) };
     let input_port = arc_set_of(ref_cell, target.arc.set).from.clone();
-    let Some(candidate_scene_cell) = libs.scene_cell(target.arc.scene, candidate_cell) else { return REJECTED };
+    let Some(candidate_scene_cell) = libs.scene_cell(target.arc.scene, candidate_cell) else { return rejected(FailReason::MissingCandidatePort) };
     if candidate_scene_cell.port(&input_port).is_none() {
-        return REJECTED;
+        return rejected(FailReason::MissingCandidatePort);
     }
     let target_input_cap_delta = port_capacitance(candidate_scene_cell, &input_port) - port_capacitance(ref_cell, &input_port);
     let current_total_delay = context.current_total_delay;
     let mut candidate_total_delay = 0.0f32;
+    let mut fanin_delay_delta = 0.0f32;
+    let mut fanin_slew_delta = 0.0f32;
     let mut propagated: Option<f32> = None;
     for (i, stage) in stages.iter().enumerate() {
         if i + 1 < target_index {
@@ -986,18 +1106,47 @@ pub fn estimate(libs: &Libs, context: &EstimatorContext, candidate_cell: &str) -
         let is_target = i == target_index;
         let is_fanin_neighbor = i + 1 == target_index;
         let cell = if is_target { candidate_cell } else { stage.arc.cell.as_str() };
-        let load_cap = if is_fanin_neighbor { stage.load_cap + target_input_cap_delta } else { stage.load_cap };
+        let load_cap = if is_fanin_neighbor {
+            stage.load_cap + target_input_cap_delta
+        } else if is_target {
+            (stage.load_cap + target_load_delta).max(0.0)
+        } else {
+            stage.load_cap
+        };
         let input_slew = match propagated {
             Some(p) => estimate_receiver_input_slew(&stages[i - 1], stage, p),
             None => stage.input_slew,
         };
+        let fail_reason = if is_target { FailReason::MissingCandidateTimingArc } else { FailReason::MissingCurrentTimingArc };
         let mut relaxed_flag = false;
-        let Some((model_stage_delay, stage_slew)) = lookup_arc_delay_and_slew(libs, &stage.arc, input_slew, load_cap, cell, is_target, if is_target { Some(&mut relaxed_flag) } else { None }) else { return REJECTED };
+        let Some((model_stage_delay, stage_slew)) = lookup_arc_delay_and_slew(libs, &stage.arc, input_slew, load_cap, cell, is_target, if is_target { Some(&mut relaxed_flag) } else { None }) else { return rejected(fail_reason) };
         let stage_delay = stage.current_delay + (model_stage_delay - stage.current_model_delay);
         candidate_total_delay += stage_delay;
-        propagated = Some(estimate_output_slew(libs, stage, cell, input_slew, load_cap, stage_slew, is_target, if is_target { Some(&mut relaxed_flag) } else { None }));
+        let output_slew = estimate_output_slew(libs, stage, cell, input_slew, load_cap, stage_slew, is_target, if is_target { Some(&mut relaxed_flag) } else { None });
+        propagated = Some(output_slew);
+        if is_fanin_neighbor {
+            fanin_delay_delta = stage_delay - stage.current_delay;
+            fanin_slew_delta = output_slew - stage.current_slew;
+        }
     }
-    make_estimate(current_total_delay, candidate_total_delay)
+    let mut estimate = make_estimate(current_total_delay, candidate_total_delay);
+    if estimate.legal {
+        apply_dual_rf_check(libs, context, candidate_cell, &mut estimate);
+    }
+    apply_fanin_side_loss(context, candidate_scene_cell, fanin_delay_delta, fanin_slew_delta, &mut estimate);
+    estimate
+}
+
+/// `DelayEstimator::estimate`: [`estimate_window`] with the candidate at the target.
+pub fn estimate(libs: &Libs, context: &EstimatorContext, candidate_cell: &str) -> DelayEstimate {
+    estimate_window(libs, context, candidate_cell, 0.0)
+}
+
+/// `DelayEstimator::estimateLoadChange`: [`estimate_window`] with the current cell and a load
+/// change on the target net.
+pub fn estimate_load_change(libs: &Libs, context: &EstimatorContext, target_load_delta: f32) -> DelayEstimate {
+    let cell = context.target().arc.cell.clone();
+    estimate_window(libs, context, &cell, target_load_delta)
 }
 
 #[cfg(test)]
@@ -1111,4 +1260,82 @@ mod tests {
         assert_eq!(interpolate_sta_slew_bias(&m, 9.0), 0.0);
         assert_eq!(interpolate(1.0, 5.0, 1.0, 9.0, 3.0), 5.0);
     }
+
+    // oppositeRfSideLoss: min(slack, 0) - min(slack - delta, 0); zero for a delta at or below zero
+    // or a slack that is not finite (either infinity).
+    #[test]
+    fn the_opposite_transition_loses_only_below_zero_slack() {
+        assert_eq!(opposite_rf_side_loss(2.0, 3.0), 1.0);
+        assert_eq!(opposite_rf_side_loss(-1.0, 3.0), 3.0);
+        assert_eq!(opposite_rf_side_loss(5.0, 3.0), 0.0);
+        assert_eq!(opposite_rf_side_loss(-1.0, 0.0), 0.0);
+        assert_eq!(opposite_rf_side_loss(f32::INFINITY, 3.0), 0.0);
+        assert_eq!(opposite_rf_side_loss(f32::NEG_INFINITY, 3.0), 0.0);
+    }
+
+    // chargeSideLoss: the paths and the weighted loss accumulate onto what is there; a worst
+    // slack after below side_slack_floor - margin * max(arrival_impr, 0) rejects with
+    // side_slack_floor_violation.
+    #[test]
+    fn charge_side_loss_accumulates_and_checks_the_floor() {
+        let mut ctx = EstimatorContext::new(1);
+        (ctx.fanin_side_loss_weight, ctx.side_slack_floor, ctx.side_floor_margin) = (3.0, -10.0, 1.0);
+        let mut e = make_estimate(5.0, 3.0);
+        e.side_paths_evaluated = 1;
+        e.side_loss = 0.5;
+        charge_side_loss(&ctx, 2, 1.0, -11.5, &mut e);
+        assert_eq!((e.side_paths_evaluated, e.side_loss, e.legal, e.reason), (3, 3.5, true, FailReason::EstimateLegal));
+        charge_side_loss(&ctx, 1, 0.0, -12.5, &mut e);
+        assert_eq!((e.legal, e.reason), (false, FailReason::SideSlackFloorViolation));
+    }
+
+    // applyFaninSideLoss: off the selected arc, delay = delay_per_cap * cap change and slew = 1.4 *
+    // delay; a delta at or below zero is skipped; else 0.3 * max(slew, 0) is added and each load
+    // loses weight * (min(slack, 0) - min(slack - delta, 0)).
+    #[test]
+    fn fanin_side_loss_charges_each_side_load() {
+        let mut ctx = EstimatorContext::new(1);
+        ctx.fanin_side_loss_weight = 2.0;
+        let load = |slack: f32, weight: f32| SideLoad { pin: "x/A".into(), slack, weight };
+        ctx.fanin_side_nets = vec![
+            FaninSideNet { input_port: "A".into(), input_cap: 0.0, delay_per_cap: 0.0, selected_arc: true, loads: vec![load(0.5, 1.0), load(-1.0, 0.5)] },
+            FaninSideNet { input_port: "B".into(), input_cap: 0.0, delay_per_cap: 0.0, selected_arc: true, loads: vec![load(-5.0, 1.0)] },
+        ];
+        let cell = Cell::default();
+        let mut e = make_estimate(5.0, 3.0);
+        // Delay 1, slew 2: delta 1 + 0.3 * 2 = 1.6 per load.
+        apply_fanin_side_loss(&ctx, &cell, 1.0, 2.0, &mut e);
+        let loss = 1.0 * (0.0 - (0.5f32 - 1.6).min(0.0)) + 0.5 * (-1.0 - (-1.0f32 - 1.6)) + 1.0 * (-5.0 - (-5.0f32 - 1.6));
+        assert_eq!(e.side_paths_evaluated, 3);
+        assert!((e.side_loss - 2.0 * loss).abs() < 1e-6, "{} vs {}", e.side_loss, 2.0 * loss);
+        // A delay at or below zero skips the net.
+        let mut e = make_estimate(5.0, 3.0);
+        apply_fanin_side_loss(&ctx, &cell, 0.0, 2.0, &mut e);
+        assert_eq!((e.side_paths_evaluated, e.side_loss), (0, 0.0));
+        // A negative slew adds nothing: delta 1 per load.
+        let mut e = make_estimate(5.0, 3.0);
+        apply_fanin_side_loss(&ctx, &cell, 1.0, -2.0, &mut e);
+        let loss = 1.0 * (0.0 - (0.5f32 - 1.0).min(0.0)) + 0.5 * (-1.0 - (-1.0f32 - 1.0)) + 1.0 * (-5.0 - (-5.0f32 - 1.0));
+        assert!((e.side_loss - 2.0 * loss).abs() < 1e-6, "{} vs {}", e.side_loss, 2.0 * loss);
+        // Off the selected arc a port the candidate lacks is skipped.
+        ctx.fanin_side_nets[0].selected_arc = false;
+        ctx.fanin_side_nets[1].selected_arc = false;
+        let mut e = make_estimate(5.0, 3.0);
+        apply_fanin_side_loss(&ctx, &cell, 1.0, 2.0, &mut e);
+        assert_eq!(e.side_paths_evaluated, 0);
+        // Off the arc with the port: delay 0.5 * (2 - 1) = 0.5, slew 1.4 * 0.5 = 0.7, delta 0.5 +
+        // 0.3 * 0.7 = 0.71; the selected-arc deltas are ignored. Only net A's two loads count.
+        let port = vyges_sta::liberty::Port { name: "A".into(), capacitance: [[2.0; 2]; 2], ..Default::default() };
+        let with_a = Cell { ports: vec![port], ..Cell::default() };
+        (ctx.fanin_side_nets[0].input_cap, ctx.fanin_side_nets[0].delay_per_cap) = (1.0, 0.5);
+        // Net B's port is not on the candidate: skipped, though a zero cap would read as growth.
+        (ctx.fanin_side_nets[1].input_cap, ctx.fanin_side_nets[1].delay_per_cap) = (1.0, -0.5);
+        let mut e = make_estimate(5.0, 3.0);
+        apply_fanin_side_loss(&ctx, &with_a, 9.0, 9.0, &mut e);
+        let d = 0.5f32 + 0.3 * (1.4 * 0.5);
+        let loss = 1.0 * (0.0 - (0.5f32 - d).min(0.0)) + 0.5 * (-1.0 - (-1.0f32 - d));
+        assert_eq!(e.side_paths_evaluated, 2);
+        assert!((e.side_loss - 2.0 * loss).abs() < 1e-6, "{} vs {}", e.side_loss, 2.0 * loss);
+    }
+
 }
