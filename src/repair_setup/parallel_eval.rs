@@ -293,6 +293,9 @@ pub struct Target {
     pub input_cap_budgets: Option<Vec<InputCapBudget>>,
     /// `split_load_input` (`SplitLoadMtGenerator::prepareInputs`).
     pub split_load_input: Option<SplitLoadInput>,
+    /// `size_down_fanout_loads` (`SizeDownFanoutMtGenerator::prepareInputs`): the loads that
+    /// can step down, in ranked order; empty until prepared.
+    pub size_down_fanout_loads: Vec<SizeDownFanoutLoad>,
 }
 
 /// `SplitLoadMtInput`: the loads a new buffer takes, the cell it is sized to, and the split
@@ -310,6 +313,45 @@ pub struct SplitLoadInput {
     pub moved_wire_cap: f32,
     pub target_load_delta: f32,
     pub moved_loads: Vec<crate::delay_estimator::SideLoad>,
+}
+
+/// `SizeDownFanoutMtLoad`: one fanout load of the target driver that may change cell, the slack
+/// it may spend, and the one-step-smaller cell it is measured against.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SizeDownFanoutLoad {
+    pub inst: String,
+    pub pin: String,
+    pub port: String,
+    pub cell: String,
+    pub load_slack: f32,
+    /// A register's worst output slack; else the worse of the pin's and the instance's worst
+    /// input slack.
+    pub delay_budget: f32,
+    /// The load port's capacitance at the target's scene.
+    pub input_cap: f32,
+    pub step_down: SizeDownFanoutCellOption,
+}
+
+/// `SizeDownFanoutMtCellOption`: the smaller cell, its input capacitance, whether it breaks an
+/// output's cap or slew limit, the worst output delay change (0 when it does), and the input
+/// capacitance change at the target arc's scene (none when either cell lacks the port there).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SizeDownFanoutCellOption {
+    pub cell: String,
+    pub input_cap: f32,
+    pub violates_output_limits: bool,
+    pub worst_delay_change: f32,
+    pub target_load_delta: Option<f32>,
+}
+
+/// `SizeDownOutput`: one output of a fanout load as it is timed now.
+#[derive(Debug, Clone, PartialEq)]
+struct SizeDownOutput {
+    pin: String,
+    port: String,
+    cap: f32,
+    slew_factor: f32,
+    delay: f32,
 }
 
 /// `Resizer::InputCapBudget`: an input port of the current cell, its capacitance, and the least
@@ -764,9 +806,13 @@ impl Repair<'_, '_> {
         let facts: Vec<PlanFacts> = targets.iter().map(|t| self.pe_plan_facts(t)).collect();
         let design = self.design.as_design();
         let mut trace = String::new();
+        let committer = &self.committer;
+        let setup_design = &self.design;
+        let inst_id = |inst: &str| setup_design.inst_id(inst);
         super::timed_all(ctx, design, &mut self.timer, edits, |gs, ss, _cs| {
+            let plan = PlanTimer { gs, ss, design, ctx, committer, inst_id: &inst_id };
             for (target, facts) in targets.iter_mut().zip(&facts) {
-                pe_plan_generation(pe, target, facts, gs, ss, design, ctx, &mut trace).map_err(|e| Stop::refused("RSZ-ABSENT", e))?;
+                pe_plan_generation(pe, target, facts, &plan, &mut trace).map_err(|e| Stop::refused("RSZ-ABSENT", e))?;
             }
             Ok(())
         })?;
@@ -940,6 +986,7 @@ fn pe_collect_path_driver_targets(pe: &mut ParallelEval, view: &PathView, path_s
                 swap_pins_input: None,
                 input_cap_budgets: None,
                 split_load_input: None,
+            size_down_fanout_loads: Vec::new(),
             });
         }
     }
@@ -973,7 +1020,7 @@ struct PlanFacts {
 /// The generators whose `isApplicable` and `prepareInputs` are modelled: the others are left out
 /// of the plan, and the run is refused after the chunk is planned.
 fn plan_modelled(m: Move) -> bool {
-    matches!(m, Move::Unbuffer | Move::SwapPins | Move::SizeUp | Move::VtSwap | Move::SplitLoad)
+    matches!(m, Move::Unbuffer | Move::SwapPins | Move::SizeUp | Move::VtSwap | Move::SplitLoad | Move::SizeDownFanout)
 }
 
 /// `planGeneration`: per generator in `move_sequence_` order, `generatorAllowed`, `isApplicable`
@@ -981,7 +1028,7 @@ fn plan_modelled(m: Move) -> bool {
 /// tabu checks come first: both are empty until a batch is undone or missed, and only the first
 /// chunk of batch 0 is planned here.
 #[allow(clippy::too_many_arguments)]
-fn pe_plan_generation(pe: &mut ParallelEval, target: &mut Target, facts: &PlanFacts, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], design: &dyn super::Design, ctx: &super::Ctx<'_>, trace: &mut String) -> Result<(), String> {
+fn pe_plan_generation(pe: &mut ParallelEval, target: &mut Target, facts: &PlanFacts, plan: &PlanTimer<'_, '_, '_>, trace: &mut String) -> Result<(), String> {
     let pin = target.driver_pin.clone();
     let b = pe.batch_index;
     let mut planned = Vec::new();
@@ -1000,7 +1047,7 @@ fn pe_plan_generation(pe: &mut ParallelEval, target: &mut Target, facts: &PlanFa
         if m == Move::Buffer {
             pe.rebuffer_targets_in_batch += 1;
         }
-        pe_prepare_inputs(m, target, facts, gs, ss, design, ctx, &pe.config, &pe.crit_path_load_pins)?;
+        pe_prepare_inputs(m, target, facts, plan, &pe.config, &pe.crit_path_load_pins)?;
         trace.push_str(&format!("VYGP|inputs|{b}|{pin}|{}|{}\n", m.name(), pe_inputs_line(m, target)));
         planned.push(m.name());
     }
@@ -1008,6 +1055,17 @@ fn pe_plan_generation(pe: &mut ParallelEval, target: &mut Target, facts: &PlanFa
         trace.push_str(&format!("VYGP|plan|{b}|{pin}|gens={}\n", planned.join(",")));
     }
     Ok(())
+}
+
+/// What `prepareInputs` reads while a chunk is planned: the timer, the database and the committer.
+struct PlanTimer<'p, 'g, 's> {
+    gs: &'p [vyges_sta::graph::Graph<'g>],
+    ss: &'p [vyges_sta::search::Search<'g, 's>],
+    design: &'p dyn super::Design,
+    ctx: &'p super::Ctx<'p>,
+    committer: &'p super::Committer,
+    /// The instance's odb id, as the committer keys its moves.
+    inst_id: &'p dyn Fn(&str) -> u32,
 }
 
 /// `generatorAllowed`: Rebuffer within `rebuffer_max_targets` per batch; Unbuffer only when the
@@ -1044,6 +1102,8 @@ fn pe_is_applicable(m: Move, target: &Target, facts: &PlanFacts) -> bool {
         // SplitLoadMtGenerator: a context, more than kSplitLoadMinFanout (the legacy split's 8)
         // loads, and a net that accepts a buffer.
         Move::SplitLoad => target.estimator_context.is_some() && target.fanout > crate::clone::CLONE_MIN_FANOUT && facts.ok_to_buffer_net,
+        // SizeDownFanoutMtGenerator: an estimator context.
+        Move::SizeDownFanout => target.estimator_context.is_some(),
         Move::SwapPins => target.path_index > 0 && facts.driver_liberty && !facts.driver_is_buffer && !facts.driver_is_inverter && !target.inst.is_empty() && !facts.dont_touch && !facts.pins_swapped,
         _ => true,
     }
@@ -1051,7 +1111,8 @@ fn pe_is_applicable(m: Move, target: &Target, facts: &PlanFacts) -> bool {
 
 /// `MoveGenerator::prepareInputs`: the generator's live timer reads, stored on the target.
 #[allow(clippy::too_many_arguments)]
-fn pe_prepare_inputs(m: Move, target: &mut Target, facts: &PlanFacts, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], design: &dyn super::Design, ctx: &super::Ctx<'_>, cfg: &MtConfig, crit: &HashSet<String>) -> Result<(), String> {
+fn pe_prepare_inputs(m: Move, target: &mut Target, facts: &PlanFacts, plan: &PlanTimer<'_, '_, '_>, cfg: &MtConfig, crit: &HashSet<String>) -> Result<(), String> {
+    let (gs, ss, design, ctx) = (plan.gs, plan.ss, plan.design, plan.ctx);
     match m {
         Move::Unbuffer => unbuffer_mt_prepare_inputs(target, facts, gs, ss, design, ctx),
         Move::SwapPins => swap_pins_mt_prepare_inputs(target, gs, ss, design, ctx, cfg)?,
@@ -1059,9 +1120,191 @@ fn pe_prepare_inputs(m: Move, target: &mut Target, facts: &PlanFacts, gs: &[vyge
         // nothing yet).
         Move::SizeUp | Move::VtSwap => prepare_input_cap_budgets(target, gs, design, ctx),
         Move::SplitLoad => split_load_mt_prepare_inputs(target, gs, ss, design, ctx, crit, cfg)?,
+        Move::SizeDownFanout => size_down_fanout_mt_prepare_inputs(target, plan)?,
         _ => {}
     }
     Ok(())
+}
+
+/// `SizeDownFanoutMtGenerator::prepareInputs`: the driver's liberty port, then `measureLoads` —
+/// the wire fanouts not sized down already, by slack (greater first, then name), each measured
+/// at the target's scene (`measureLoad`): it may change (`resolveLoad`), its delay budget
+/// (`computeDelayBudget`), its swappable cells ranked (`rankSwappableCells`), the one step down
+/// (the largest smaller input pin at no more area; the last of equal ones), its outputs as timed
+/// now (`measureOutputs`) and the step's measurements (`measureCellOption`). A load with no step
+/// down is left out.
+fn size_down_fanout_mt_prepare_inputs(target: &mut Target, plan: &PlanTimer<'_, '_, '_>) -> Result<(), String> {
+    let (gs, ss, ctx) = (plan.gs, plan.ss, plan.ctx);
+    let scene = target.scene;
+    let g = &gs[scene];
+    // resolveDriverContext.
+    let Some(drvr) = g.vertices.iter().position(|x| x.name == target.driver_pin && x.is_driver) else { return Ok(()) };
+    let Some(drvr_cell) = ctx.libs.link_cell(&target.cell) else { return Ok(()) };
+    let Some(drvr_port) = target.driver_pin.rsplit_once('/').map(|(_, p)| p).filter(|p| drvr_cell.port(p).is_some()) else { return Ok(()) };
+    let drvr_res = drvr_cell.drive_resistance(drvr_port);
+    let Some(arc_scene) = target.estimator_context.as_ref().map(|c| c.target().arc.scene) else { return Ok(()) };
+    // sortedFanoutSlacks.
+    let mut fanouts: Vec<(usize, f32)> = Vec::new();
+    for &e in &g.out_edges[drvr] {
+        if !matches!(g.edges[e].kind, vyges_sta::graph::EdgeKind::Wire) {
+            continue;
+        }
+        let v = g.edges[e].to;
+        if let vyges_sta::netlist::Conn::Inst(k, _) = &g.vertices[v].conn {
+            if plan.committer.has_moves(Move::SizeDownFanout, (plan.inst_id)(&g.netlist.insts[*k].0)) {
+                continue;
+            }
+        }
+        fanouts.push((v, pe_slack_over_scenes(gs, ss, &g.vertices[v].name, false)));
+    }
+    crate::order::libcxx_sort_by(&mut fanouts, |a, b| a.1 > b.1 || (a.1 == b.1 && g.vertices[a.0].name < g.vertices[b.0].name))
+        .map_err(|e| format!("the size-down fanout sort over {} loads falls back to heap sort: not modelled", e.len))?;
+    let mut loads = Vec::new();
+    for (v, slack) in fanouts {
+        if let Some(load) = size_down_measure_load(plan, scene, arc_scene, drvr_res, v, slack)? {
+            loads.push(load);
+        }
+    }
+    target.size_down_fanout_loads = loads;
+    Ok(())
+}
+
+/// `Sta::slack(vertex, max)`: the pin's worst slack over every scene (its load vertex, or its
+/// driver vertex when `driver`).
+fn pe_slack_over_scenes(gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], pin: &str, driver: bool) -> f32 {
+    let g0 = &gs[0];
+    let v = g0.vertices.iter().position(|x| x.name == pin && x.is_driver == driver).or_else(|| g0.vertices.iter().position(|x| x.name == pin));
+    v.map_or(super::INF, |v| super::slack_over_scenes(gs, ss, v, MAX, None))
+}
+
+/// `measureLoad` (see [`size_down_fanout_mt_prepare_inputs`]).
+fn size_down_measure_load(plan: &PlanTimer<'_, '_, '_>, scene: usize, arc_scene: usize, drvr_res: f32, v: usize, load_slack: f32) -> Result<Option<SizeDownFanoutLoad>, String> {
+    let (gs, ss, design, ctx) = (plan.gs, plan.ss, plan.design, plan.ctx);
+    let g = &gs[scene];
+    let x = &g.vertices[v];
+    // resolveLoad: a liberty port on an instance that is neither dont_touch nor fixed, of a
+    // logic standard cell, with a port at the scene.
+    let (Some(cell_name), Some(port)) = (x.cell.clone(), x.port.clone()) else { return Ok(None) };
+    let Some(cell) = ctx.libs.link_cell(&cell_name) else { return Ok(None) };
+    let vyges_sta::netlist::Conn::Inst(k, _) = &x.conn else { return Ok(None) };
+    let (inst, master) = (&g.netlist.insts[*k].0, &g.netlist.insts[*k].1);
+    let ni = design.net_info();
+    if ni.dont_touch_insts.contains(inst) || ni.fixed_insts.contains(inst) || !ctx.sizing.masters.get(&cell_name).is_some_and(|m| m.logic_std) {
+        return Ok(None);
+    }
+    let at_scene = |k: usize, n: &str| ctx.libs.scene_cell(k, n).or_else(|| ctx.libs.link_cell(n));
+    let Some(scene_cell) = at_scene(scene, &cell_name) else { return Ok(None) };
+    let Some(input_cap) = super::port_capacitance(scene_cell, &port) else { return Ok(None) };
+    let pins = ctx.master_pins.get(master).map_or(&[][..], |p| p.as_slice());
+    let pin_of = |p: &str| g.netlist.pin_name(&vyges_sta::netlist::Conn::Inst(*k, p.to_string()));
+    let direction = |p: &str| cell.port(p).map(|q| q.direction);
+    // computeDelayBudget: a register spends its worst output slack; a gate the worse of the
+    // pin's slack and its worst input slack.
+    let sequential = !cell.sequentials.is_empty() || cell.has_seq_bank;
+    let delay_budget = if sequential {
+        pins.iter().filter(|p| direction(p) == Some(vyges_sta::liberty::Direction::Output)).fold(super::INF, |w, p| crate::rebuffer::std_min(w, pe_slack_over_scenes(gs, ss, &pin_of(p), true)))
+    } else {
+        let worst_input = pins.iter().filter(|p| direction(p) == Some(vyges_sta::liberty::Direction::Input)).fold(super::INF, |w, p| crate::rebuffer::std_min(w, pe_slack_over_scenes(gs, ss, &pin_of(p), false)));
+        crate::rebuffer::std_min(load_slack, worst_input)
+    };
+    // rankSwappableCells: by input capacitance at the scene, then the higher worst intrinsic
+    // delay first; a cell without the port last.
+    let mut swaps: Vec<String> = if cell.is_buffer() {
+        if ctx.fast_buffers.contains(&cell_name) {
+            let mut v: Vec<String> = ctx.fast_buffers.to_vec();
+            v.sort_by(|a, b| {
+                let (ca, cb) = (ctx.libs.link_cell(a).map_or(0.0, |c| c.area), ctx.libs.link_cell(b).map_or(0.0, |c| c.area));
+                ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal).then_with(|| a.cmp(b))
+            });
+            v
+        } else {
+            Vec::new()
+        }
+    } else {
+        ctx.sizing.swappable_cells(&cell_name).map_err(|e| format!("{e:?}"))?
+    };
+    if swaps.len() > 1 {
+        let key = |n: &str| -> Option<(f32, f32)> {
+            let c = at_scene(scene, n)?;
+            Some((super::port_capacitance(c, &port)?, super::worst_intrinsic_delay(c, &port)))
+        };
+        crate::order::libcxx_sort_by(&mut swaps, |a, b| match (key(a), key(b)) {
+            (Some((c1, i1)), Some((c2, i2))) => (c1, i2) < (c2, i1),
+            (x, _) => x.is_some(),
+        })
+        .map_err(|e| format!("the swappable cell sort over {} cells falls back to heap sort: not modelled", e.len))?;
+    }
+    // candidateInputCap: INF without the port at the scene.
+    let cap_of = |n: &str| at_scene(scene, n).and_then(|c| super::port_capacitance(c, &port)).unwrap_or(super::INF);
+    let mut step: Option<(String, f32)> = None;
+    for s in &swaps {
+        let c = cap_of(s);
+        if *s == cell_name || c >= input_cap || ctx.libs.link_cell(s).map_or(super::INF, |c| c.area) > cell.area {
+            continue;
+        }
+        if step.as_ref().is_none_or(|(_, sc)| c >= *sc) {
+            step = Some((s.clone(), c));
+        }
+    }
+    let Some((step, step_cap)) = step else { return Ok(None) };
+    // measureOutputs: per output pin in pin order, its load at the scene, its slew over every
+    // scene and transition, the Elmore slew factor and the gate delay now.
+    let mut outputs = Vec::new();
+    for p in pins.iter().filter(|p| direction(p) == Some(vyges_sta::liberty::Direction::Output)) {
+        let name = pin_of(p);
+        let Some(vo) = g.vertices.iter().position(|y| y.name == name && !y.is_driver).or_else(|| g.vertices.iter().position(|y| y.name == name)) else { continue };
+        let cap = g.load_cap(vo, design.parasitics(scene));
+        let mut slew = -super::INF;
+        for gk in gs {
+            if let Some(w) = gk.vertices.iter().position(|y| y.name == name && !y.is_driver).or_else(|| gk.vertices.iter().position(|y| y.name == name)) {
+                slew = slew.max(gk.slew[w][0][MAX]).max(gk.slew[w][1][MAX]);
+            }
+        }
+        let res = cell.drive_resistance(p);
+        let slew_factor = if res <= 0.0 || cap <= 0.0 { 0.0 } else { slew / (res * cap) };
+        let delay = super::gate_delay(ctx.sizing, scene_cell, p, cap);
+        outputs.push(SizeDownOutput { pin: name, port: p.clone(), cap, slew_factor, delay });
+    }
+    // measureCellOption.
+    let mut option = SizeDownFanoutCellOption { cell: step.clone(), input_cap: step_cap, violates_output_limits: size_down_violates_output_limits(ctx, scene, &outputs, &step), worst_delay_change: 0.0, target_load_delta: None };
+    if !option.violates_output_limits {
+        // computeWorstDelayChange: the driver gains from the smaller pin, but for a register.
+        let drvr_delta = -drvr_res * (input_cap - step_cap);
+        let step_scene = at_scene(scene, &step);
+        let mut worst = -super::INF;
+        for o in &outputs {
+            let new_delay = step_scene.map_or(-super::INF, |c| super::gate_delay(ctx.sizing, c, &o.port, o.cap));
+            let change = if sequential { new_delay - o.delay } else { new_delay + drvr_delta - o.delay };
+            worst = crate::rebuffer::std_max(worst, change);
+        }
+        option.worst_delay_change = worst;
+    }
+    let cur = at_scene(arc_scene, &cell_name).and_then(|c| super::port_capacitance(c, &port));
+    let new = at_scene(arc_scene, &step).and_then(|c| super::port_capacitance(c, &port));
+    if let (Some(cur), Some(new)) = (cur, new) {
+        option.target_load_delta = Some(new - cur);
+    }
+    Ok(Some(SizeDownFanoutLoad { inst: inst.clone(), pin: x.name.clone(), port, cell: cell_name, load_slack, delay_budget, input_cap, step_down: option }))
+}
+
+/// `violatesOutputLimits`: the cell lacks an output's port, or the output's load is over the
+/// port's max capacitance, or its Elmore-scaled slew over the port's slew limit at the scene.
+fn size_down_violates_output_limits(ctx: &super::Ctx<'_>, scene: usize, outputs: &[SizeDownOutput], cell: &str) -> bool {
+    let Some(c) = ctx.libs.link_cell(cell) else { return true };
+    for o in outputs {
+        let Some(p) = c.port(&o.port) else { return true };
+        if p.max_capacitance.is_some_and(|m| m > 0.0 && o.cap > m) {
+            return true;
+        }
+        let new_slew = o.slew_factor * c.drive_resistance(&o.port) * o.cap;
+        if let Some(lib) = ctx.libs.scene_library(scene, cell).or_else(|| ctx.libs.default_library()) {
+            let (max_slew, exists) = crate::timing::find_slew_limit(lib, p.direction, p.max_transition, ctx.limits);
+            if exists && new_slew > max_slew {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// `SplitLoadMtGenerator::prepareInputs`: the ranked fanouts (`collectRankedFanoutSlacks`), the
@@ -1336,6 +1579,26 @@ fn pe_inputs_line(m: Move, target: &Target) -> String {
                 s
             }
         },
+        Move::SizeDownFanout => {
+            let mut s = format!("loads={}", target.size_down_fanout_loads.len());
+            for l in &target.size_down_fanout_loads {
+                let d = &l.step_down;
+                s.push_str(&format!(
+                    "|{}:{}:slack={}:budget={}:cap={}:down={}:{}:{}:{}:{}",
+                    l.pin,
+                    l.cell,
+                    e9i(l.load_slack),
+                    e9i(l.delay_budget),
+                    e9i(l.input_cap),
+                    d.cell,
+                    e9i(d.input_cap),
+                    d.violates_output_limits as i32,
+                    e9i(d.worst_delay_change),
+                    d.target_load_delta.map_or("-".into(), e9i)
+                ));
+            }
+            s
+        }
         Move::SplitLoad => match &target.split_load_input {
             None => "split=-".into(),
             Some(i) => {
@@ -1710,6 +1973,7 @@ mod tests {
             swap_pins_input: None,
             input_cap_budgets: None,
             split_load_input: None,
+            size_down_fanout_loads: Vec::new(),
         }
     }
 
@@ -1792,6 +2056,29 @@ mod tests {
         let mut u = target_at(2);
         u.fanout = 9;
         assert!(!pe_is_applicable(Move::SplitLoad, &u, &facts()));
+    }
+
+    #[test]
+    fn a_size_down_fanout_target_needs_only_a_context() {
+        // Rule (SizeDownFanoutMtGenerator::isApplicable): the base check and an estimator
+        // context; the driver's own cell, dont_touch or fixity do not matter (its loads change).
+        let t = with_context(target_at(0));
+        assert!(pe_is_applicable(Move::SizeDownFanout, &t, &PlanFacts { dont_touch: true, fixed: true, logic_std: false, ..facts() }));
+        assert!(!pe_is_applicable(Move::SizeDownFanout, &target_at(0), &facts()));
+    }
+
+    #[test]
+    fn the_trace_prints_size_down_loads_as_the_printer_does() {
+        // The printer: `loads=N`, then per load pin:cell:slack:budget:cap and the step down's
+        // cell:cap:violates:worst change:target delta (`-` when unset).
+        let mut t = target_at(0);
+        assert_eq!(pe_inputs_line(Move::SizeDownFanout, &t), "loads=0");
+        let step_down = SizeDownFanoutCellOption { cell: "INV_X1".into(), input_cap: 0.25, violates_output_limits: true, worst_delay_change: 0.0, target_load_delta: None };
+        t.size_down_fanout_loads = vec![SizeDownFanoutLoad { inst: "u1".into(), pin: "u1/A".into(), port: "A".into(), cell: "INV_X2".into(), load_slack: 0.5, delay_budget: -0.5, input_cap: 1.0, step_down }];
+        assert_eq!(
+            pe_inputs_line(Move::SizeDownFanout, &t),
+            "loads=1|u1/A:INV_X2:slack=5.000000000e-01:budget=-5.000000000e-01:cap=1.000000000e+00:down=INV_X1:2.500000000e-01:1:0.000000000e+00:-"
+        );
     }
 
     #[test]
