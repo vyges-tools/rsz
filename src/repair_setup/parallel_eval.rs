@@ -4,15 +4,17 @@
 //!
 //! Ported stage group by stage group, in the reference's order. Each stage is its own function
 //! named after the reference's, and `start` / `iterate` do nothing but call them, so a trace that
-//! diverges from the reference's points at one stage. Modelled so far: `start` (S1) and the
-//! target collection of a batch (S2: `collectTargetEndpoints`, `collectTargets`). Candidate
-//! generation onward (S3: `generateCandidates`) is refused.
+//! diverges from the reference's points at one stage. Modelled so far: `start` (S1), the
+//! target collection of a batch (S2: `collectTargetEndpoints`, `collectTargets`) and the targets'
+//! preparation (S3a: `prewarmTargets`, `prepareTargets`). Candidate generation onward
+//! (`generateCandidates`) is refused.
 
 use std::collections::HashSet;
 
 use vyges_sta::fuzzy;
 
 use super::{PathView, Repair, Stop};
+use crate::delay_estimator::{ContextOptions, EstimatorContext, FaninSideLoadOptions, PathPin, Reader};
 use crate::repair_timing::{Effort, Move};
 
 /// `BatchPriorityConfig`: how stalled batches favour targets in shared violating cones.
@@ -267,6 +269,38 @@ pub struct Target {
     /// The driver's instance and its cell.
     pub inst: String,
     pub cell: String,
+    /// The path the driver was found on (its segment's pins and tags), with its start index
+    /// (`endpoint_path`, `PathExpanded::startIndex`).
+    pub(super) path: Vec<super::ChainKey>,
+    pub(super) path_start: usize,
+    /// That segment's latch D path expanded on its own (`latchDataPath`): the next segment.
+    pub(super) latch_data_path: Option<(Vec<super::ChainKey>, usize)>,
+    /// `estimator_context` (`prepareEstimatorContext`).
+    pub estimator_context: Option<EstimatorContext>,
+    /// `sequential_timing_estimator` is set (`prepareSequentialEstimator`); its contents are not
+    /// modelled yet.
+    pub sequential_estimator: bool,
+    /// Why the context build left the target without one (the trace's `why=`).
+    pub prepare_why: String,
+}
+
+/// `PrepareCacheMask`: what `prepareTarget` builds (bit 1 is unused upstream).
+pub const ESTIMATOR_CONTEXT_CACHE: u8 = 1 << 0;
+pub const SEQUENTIAL_ESTIMATOR_CACHE: u8 = 1 << 2;
+
+/// `MoveGenerator::prepareRequirements` of each Mt generator: SizeUp and VtSwap read the context
+/// and the flip-flop checks, Unbuffer nothing, the others the context.
+fn prepare_requirements(m: Move) -> u8 {
+    match m {
+        Move::SizeUp | Move::VtSwap => ESTIMATOR_CONTEXT_CACHE | SEQUENTIAL_ESTIMATOR_CACHE,
+        Move::Unbuffer => 0,
+        _ => ESTIMATOR_CONTEXT_CACHE,
+    }
+}
+
+/// `accumulatePrepareRequirements`: the union over the run's generators.
+fn accumulate_prepare_requirements(generators: &[Move]) -> u8 {
+    generators.iter().fold(0, |mask, &m| mask | prepare_requirements(m))
 }
 
 /// `BatchPool`: the targets of one batch (a deque upstream, so they never move).
@@ -596,11 +630,43 @@ impl Repair<'_, '_> {
             pe_trace(&format!("VYGP|chunk|{}|{next_endpoint}|{chunk_end}|{}\n", pe.batch_index, chunk.len()));
             next_endpoint = chunk_end;
             if !chunk.is_empty() {
+                let mut chunk = chunk;
+                pe_prewarm_targets(&chunk);
+                self.pe_prepare_targets(pe, &mut chunk)?;
                 pool.targets.extend(chunk);
-                return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: candidate generation (prepareTargets, generateCandidates) is not modelled".into()));
+                return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: candidate generation (generateCandidates) is not modelled".into()));
             }
         }
         Ok(pool)
+    }
+
+    /// `OptimizationPolicy::prepareTargets`: the mask of what the run's generators read, then
+    /// `prepareTarget` on each target in chunk order — all on the timer as the collection left
+    /// it (nothing is edited in between).
+    fn pe_prepare_targets(&mut self, pe: &mut ParallelEval, targets: &mut [Target]) -> Result<(), Stop> {
+        let mask = accumulate_prepare_requirements(&pe.generators);
+        let edits = self.design.take_timer_edits();
+        let ctx = self.ctx;
+        let (equiv, dont_use) = (ctx.sizing.equiv, ctx.sizing.dont_use);
+        let pin_id = self.design.net_info().pin_id.clone();
+        let cfg = pe.config;
+        let levels = ctx.policy.delay_estimation_levels;
+        let slew_bias = ctx.policy.sta_slew_bias;
+        let crit = &pe.crit_path_load_pins;
+        let design = self.design.as_design();
+        let mut trace = String::new();
+        super::timed_all(ctx, design, &mut self.timer, edits, |gs, ss, cs| {
+            // `worstSlack(maxAnalysisMode)`, read live for each context.
+            let ends = super::setup_ends(ctx, gs, ss, cs)?;
+            let (wns, _) = crate::repair_timing::worst_slack(&ends);
+            for target in targets.iter_mut() {
+                pe_prepare_target(target, mask, gs, ss, cs, design, ctx, &PrepareInputs { equiv, dont_use, pin_id: &pin_id, crit, cfg: &cfg, levels, slew_bias, wns });
+                trace.push_str(&pe_prepared_lines(target, mask, ctx.libs));
+            }
+            Ok(())
+        })?;
+        pe_trace(&trace);
+        Ok(())
     }
 
     /// `collectTargets`: the chunk's path-driver targets, each with its fanout.
@@ -702,8 +768,11 @@ fn pe_finish_at_max_area() -> bool {
 fn pe_collect_path_driver_targets(pe: &mut ParallelEval, view: &PathView, path_slack: f32) -> Vec<Target> {
     let violated = view.stages.last().map(|s| s.pin.clone()).unwrap_or_default();
     let mut targets = Vec::new();
-    for seg in std::iter::once(view).chain(view.latch_segments.iter()) {
+    let segments: Vec<&PathView> = std::iter::once(view).chain(view.latch_segments.iter()).collect();
+    for (k, seg) in segments.iter().enumerate() {
         let endpoint_pin = seg.stages.last().map(|s| s.pin.clone()).unwrap_or_default();
+        // The segment's latch D path is the segment walked after it.
+        let latch_data_path = segments.get(k + 1).map(|d| (d.chain.clone(), d.start));
         for (index, stage) in seg.stages.iter().enumerate().skip(seg.start) {
             if !stage.is_driver {
                 pe.crit_path_load_pins.insert(stage.pin.clone());
@@ -724,10 +793,175 @@ fn pe_collect_path_driver_targets(pe: &mut ParallelEval, view: &PathView, path_s
                 scene: seg.scene,
                 inst: stage.inst.clone().unwrap_or_default(),
                 cell: stage.cell.clone().unwrap_or_default(),
+                path: seg.chain.clone(),
+                path_start: seg.start,
+                latch_data_path: latch_data_path.clone(),
+                estimator_context: None,
+                sequential_estimator: false,
+                prepare_why: String::new(),
             });
         }
     }
     targets
+}
+
+/// `prewarmTargets`: the swappable and VT-equivalent cell caches; it decides nothing.
+fn pe_prewarm_targets(_targets: &[Target]) {}
+
+/// What `prepareTarget` reads besides the timer.
+struct PrepareInputs<'a> {
+    equiv: &'a crate::sizing::EquivCells,
+    dont_use: &'a std::collections::BTreeSet<String>,
+    pin_id: &'a std::collections::HashMap<String, u64>,
+    crit: &'a HashSet<String>,
+    cfg: &'a MtConfig,
+    levels: i32,
+    slew_bias: bool,
+    /// `worstSlack(max)` now.
+    wns: f32,
+}
+
+/// `prepareTarget(target, mask)`: the context, then the sequential estimator, as the mask asks.
+#[allow(clippy::too_many_arguments)]
+fn pe_prepare_target(target: &mut Target, mask: u8, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], cs: &[std::collections::BTreeSet<usize>], design: &dyn super::Design, ctx: &super::Ctx<'_>, inputs: &PrepareInputs<'_>) {
+    if mask & ESTIMATOR_CONTEXT_CACHE != 0 {
+        pe_prepare_estimator_context(target, gs, ss, cs, design, ctx, inputs);
+    }
+    if mask & SEQUENTIAL_ESTIMATOR_CACHE != 0 {
+        pe_prepare_sequential_estimator(target, ctx);
+    }
+}
+
+/// `prepareEstimatorContext` → `buildPolicyContext`: `DelayEstimator::buildContext` with the
+/// latch fanin, the fanin side loads (critical load pins weigh 1) and the opposite transition as
+/// the config has them; then, with any side model on, the side-path floor at the worst slack.
+#[allow(clippy::too_many_arguments)]
+fn pe_prepare_estimator_context(target: &mut Target, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], cs: &[std::collections::BTreeSet<usize>], design: &dyn super::Design, ctx: &super::Ctx<'_>, inputs: &PrepareInputs<'_>) {
+    if target.estimator_context.is_some() {
+        return;
+    }
+    target.prepare_why = String::new();
+    let scene = target.scene;
+    let (g, search) = (&gs[scene], &ss[scene]);
+    let find = |pin: &str, is_driver: bool| g.vertices.iter().position(|x| x.name == pin && x.is_driver == is_driver);
+    let pins = |keys: &[super::ChainKey]| -> Option<Vec<PathPin>> {
+        let chain = super::refind_chain(keys, find, &search.paths).ok()?;
+        Some(chain.iter().map(|(v, p)| PathPin { vertex: *v, in_edge: p.prev.map(|x| (x.edge, x.arc)) }).collect())
+    };
+    let Some(path) = pins(&target.path) else {
+        target.prepare_why = "fail:path_gone".into();
+        return;
+    };
+    let latch = target.latch_data_path.as_ref().and_then(|(keys, start)| pins(keys).map(|p| (p, *start)));
+    let slack = |v: usize, rf: Option<usize>| {
+        let vx = &g.vertices[v];
+        let v0 = if scene == 0 { Some(v) } else { gs[0].vertices.iter().position(|x| x.name == vx.name && x.is_driver == vx.is_driver) };
+        v0.map_or(super::INF, |v0| super::slack_over_scenes(gs, ss, v0, vyges_sta::liberty::MAX, rf))
+    };
+    let reader = Reader { libs: ctx.libs, g, parasitics: design.parasitics(scene), scene, equiv: inputs.equiv, dont_use: inputs.dont_use, slack: &slack, clock_pins: &cs[scene], pin_id: inputs.pin_id, master_pins: ctx.master_pins };
+    let index = target.path_index;
+    let cfg = inputs.cfg;
+    let options = ContextOptions {
+        delay_levels: inputs.levels,
+        use_sta_slew_bias: inputs.slew_bias,
+        latch_data_path: latch.as_ref().map(|(p, s)| (p.as_slice(), *s)),
+        fanin_side_loads: cfg.fanin_side_loss.then_some(FaninSideLoadOptions { critical_load_pins: inputs.crit, off_path_weight: cfg.fanin_side_offpath_weight }),
+        dual_rf_eval: cfg.dual_rf_eval,
+    };
+    match reader.build_context(&path, target.path_start, index, &options) {
+        Ok(mut context) => {
+            if cfg.fanin_side_loss || cfg.dual_rf_eval || cfg.rebuffer_mt_side_loads {
+                // Side paths may not be pushed below the current worst slack.
+                context.side_slack_floor = inputs.wns;
+                context.side_floor_margin = cfg.side_floor_margin;
+                context.fanin_side_loss_weight = cfg.fanin_side_loss_weight;
+            }
+            target.estimator_context = Some(context);
+            // `"fail:" + failReasonName(kNone)`: the printer's line after a built context.
+            target.prepare_why = "fail:".into();
+        }
+        Err(reason) => target.prepare_why = format!("fail:{}", reason.name()),
+    }
+}
+
+/// `prepareSequentialEstimator`: with a context, on a flip-flop target
+/// (`SequentialTimingEstimator::prepare`: a cell whose sequentials are all registers). What it
+/// prepares — the setup/hold checks per candidate cell — is not modelled yet.
+fn pe_prepare_sequential_estimator(target: &mut Target, ctx: &super::Ctx<'_>) {
+    if target.sequential_estimator || target.estimator_context.is_none() {
+        return;
+    }
+    target.sequential_estimator = ctx.libs.link_cell(&target.cell).is_some_and(|c| !c.sequentials.is_empty() && c.sequentials.iter().all(|(_, is_register, _)| *is_register));
+}
+
+/// The VYGP printer's `{:.9e}` of a value that may be infinite (fmt prints `inf`).
+fn e9i(v: f32) -> String {
+    if v.is_infinite() {
+        return if v > 0.0 { "inf".into() } else { "-inf".into() };
+    }
+    e9(v)
+}
+
+/// `RiseFall::shortName`.
+fn rf_short(rf: usize) -> char {
+    if rf == 0 { '^' } else { 'v' }
+}
+
+/// The VYGP `prep`, `pctx`, `pstage` and `pfsn` lines of a prepared target.
+fn pe_prepared_lines(target: &Target, mask: u8, libs: &crate::preamble::Libs) -> String {
+    let drv = &target.driver_pin;
+    let why = if mask & ESTIMATOR_CONTEXT_CACHE == 0 { "nomask" } else { target.prepare_why.as_str() };
+    let mut s = format!("VYGP|prep|{drv}|mask={mask}|ctx={}|why={why}|seq={}\n", target.estimator_context.is_some() as i32, target.sequential_estimator as i32);
+    let Some(c) = &target.estimator_context else { return s };
+    s.push_str(&format!(
+        "VYGP|pctx|{drv}|stages={}|tsi={}|levels={}|floor={}|margin={}|fslw={}|opp={}|total={}|fsn={}\n",
+        c.path_stages.len(),
+        c.target_stage_index,
+        c.delay_estimation_levels,
+        e9i(c.side_slack_floor),
+        e9i(c.side_floor_margin),
+        e9i(c.fanin_side_loss_weight),
+        e9i(c.opposite_rf_slack),
+        e9i(c.current_total_delay),
+        c.fanin_side_nets.len()
+    ));
+    for (k, st) in c.path_stages.iter().enumerate() {
+        let cell = libs.scene_cell(st.arc.scene, &st.arc.cell);
+        // An arc of the stage's cell: `port>rf` of its from port and output transition.
+        let arc_name = |set: usize, arc: usize| cell.map_or("->-".to_string(), |c| format!("{}>{}", c.arc_sets[set].from, rf_short(c.arc_sets[set].arcs[arc].to_rf)));
+        let sel = cell.map(|c| &c.arc_sets[st.arc.set]);
+        let merge: Vec<String> = st.output_slew_merge_arcs.iter().map(|m| format!("{}:{}:{}", arc_name(m.set, m.arc), e9i(m.input_slew), e9i(m.current_model_slew))).collect();
+        let opp: Vec<String> = st.opposite_rf_arcs.iter().map(|o| format!("{}:{}:{}", arc_name(o.set, o.arc), e9i(o.input_slew), e9i(o.current_model_delay))).collect();
+        let bias = match (st.sta_slew_bias.valid, st.sta_slew_bias.table_worst_arc, cell) {
+            (true, Some((set, _)), Some(c)) => format!("1:{}:{}{}", c.arc_sets[set].from, e9i(st.sta_slew_bias.input_slew), st.sta_slew_bias.samples.iter().map(|b| format!(":{}/{}/{}", e9i(b.load_cap), e9i(b.table_slew), e9i(b.sta_slew))).collect::<String>()),
+            (true, ..) => "1:?".into(),
+            _ => "0".into(),
+        };
+        s.push_str(&format!(
+            "VYGP|pstage|{drv}|{k}|{}|pi={}|cell={}|in={}|out={}|irf={}|orf={}|slew={}|cap={}|cmd={}|cd={}|cwd={}|cms={}|cs={}|merge={}|bias={bias}|opparcs={}\n",
+            st.driver_pin,
+            st.path_index,
+            st.arc.cell,
+            sel.map_or("-", |a| a.from.as_str()),
+            sel.map_or("-", |a| a.to.as_str()),
+            sel.map_or('-', |a| rf_short(a.arcs[st.arc.arc].from_rf)),
+            sel.map_or('-', |a| rf_short(a.arcs[st.arc.arc].to_rf)),
+            e9i(st.input_slew),
+            e9i(st.load_cap),
+            e9i(st.current_model_delay),
+            e9i(st.current_delay),
+            e9i(st.current_wire_delay),
+            e9i(st.current_model_slew),
+            e9i(st.current_slew),
+            merge.join(","),
+            opp.join(",")
+        ));
+    }
+    for (k, n) in c.fanin_side_nets.iter().enumerate() {
+        let loads: Vec<String> = n.loads.iter().map(|l| format!("{}:{}:{}", l.pin, e9i(l.slack), e9i(l.weight))).collect();
+        s.push_str(&format!("VYGP|pfsn|{drv}|{k}|port={}|cap={}|dpc={}|sel={}|loads={}\n", n.input_port, e9i(n.input_cap), e9i(n.delay_per_cap), n.selected_arc as i32, loads.join(",")));
+    }
+    s
 }
 
 /// The VYGP lines, appended to `VYGES_RSZ_PE_TRACE` (after the start state).
@@ -833,5 +1067,31 @@ mod tests {
         for m in [Move::SizeUp, Move::Buffer, Move::VtSwap, Move::SwapPins, Move::SplitLoad, Move::SizeDownFanout, Move::Unbuffer] {
             assert!(has_mt_form(m) && has_generator(m), "{m:?}");
         }
+    }
+
+    #[test]
+    fn the_prepare_mask_is_the_union_of_every_generators_requirements() {
+        // Upstream accumulatePrepareRequirements ORs each generator's prepareRequirements: SizeUpMt
+        // and VtSwapMt ask for the estimator context and the sequential estimator, UnbufferMt for
+        // nothing, every other Mt generator for the context alone. The mask is run-wide, so an
+        // Unbuffer-only run prepares nothing and one SizeUp makes every target build both.
+        assert_eq!(accumulate_prepare_requirements(&[Move::Unbuffer]), 0);
+        assert_eq!(accumulate_prepare_requirements(&[]), 0);
+        assert_eq!(accumulate_prepare_requirements(&[Move::SwapPins, Move::Unbuffer]), ESTIMATOR_CONTEXT_CACHE);
+        for m in [Move::SwapPins, Move::SplitLoad, Move::SizeDownFanout, Move::Buffer] {
+            assert_eq!(prepare_requirements(m), ESTIMATOR_CONTEXT_CACHE, "{m:?}");
+        }
+        assert_eq!(accumulate_prepare_requirements(&[Move::Unbuffer, Move::VtSwap]), ESTIMATOR_CONTEXT_CACHE | SEQUENTIAL_ESTIMATOR_CACHE);
+        // kEstimatorContextCache is bit 0, kSequentialEstimatorCache bit 2 (the trace's mask=5).
+        assert_eq!(prepare_requirements(Move::SizeUp), 5);
+    }
+
+    #[test]
+    fn the_trace_prints_an_infinite_value_as_fmt_does() {
+        // fmt {:.9e} of +-infinity is `inf` / `-inf`: an unset side floor is -inf, an unset opposite
+        // slack +inf.
+        assert_eq!(e9i(f32::NEG_INFINITY), "-inf");
+        assert_eq!(e9i(f32::INFINITY), "inf");
+        assert_eq!(e9i(1.0), "1.000000000e+00");
     }
 }

@@ -1,11 +1,12 @@
 //! `DelayEstimator`: a target stage's (and its fanin/fanout neighbours') timing captured from the
 //! timer once (`buildContext`), then each candidate cell scored on the Liberty table models alone
-//! (`estimate`) — the arrival improvement over the stage window. Upstream keeps it after c4fef946416 removed the MT policies that scored with it; nothing here calls it.
+//! (`estimate`) — the arrival improvement over the stage window. PARALLEL_EVAL's
+//! `prepareTargets` builds a context per target (S3a); the estimate is not called yet.
 //!
 //! The functions are the reference's, in its order. The builder reads one scene's graph after a
 //! timer update; the estimate reads only the libraries and the captured state.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use vyges_sta::dcalc::{Dmp, Thresholds};
 use vyges_sta::graph::{EdgeKind, Graph, NetParasitics};
@@ -25,7 +26,7 @@ pub struct SelectedArc {
 }
 
 /// One non-path arc whose slew merges into the driver's output transition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OutputSlewMergeArc {
     pub set: usize,
     pub arc: usize,
@@ -34,7 +35,7 @@ pub struct OutputSlewMergeArc {
 }
 
 /// `SlewBiasSample`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct SlewBiasSample {
     pub load_cap: f32,
     pub table_slew: f32,
@@ -43,7 +44,7 @@ pub struct SlewBiasSample {
 
 /// `SlewBiasModel`: the timer's driver slew against the table's at three loads, for the arc whose
 /// table slew is the worst at all three.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SlewBiasModel {
     pub valid: bool,
     /// `table_worst_arc` (set, arc) on the stage's current cell.
@@ -52,8 +53,18 @@ pub struct SlewBiasModel {
     pub samples: [SlewBiasSample; 3],
 }
 
+/// `OppositeRfArc`: a target cell arc from the selected input to the OPPOSITE output transition,
+/// with its current table delay (the dual rise/fall check).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OppositeRfArc {
+    pub set: usize,
+    pub arc: usize,
+    pub input_slew: f32,
+    pub current_model_delay: f32,
+}
+
 /// `DelayStageState`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DelayStageState {
     pub arc: SelectedArc,
     pub driver_pin: String,
@@ -61,26 +72,132 @@ pub struct DelayStageState {
     pub load_cap: f32,
     pub current_model_delay: f32,
     pub current_delay: f32,
+    /// The path's wire delay after the driver (`currentPathWireDelay`).
+    pub current_wire_delay: f32,
     pub current_model_slew: f32,
     pub current_slew: f32,
     pub output_slew_merge_arcs: Vec<OutputSlewMergeArc>,
     pub sta_slew_bias: SlewBiasModel,
-    pub path_index: usize,
+    /// Target stage only, with dual_rf_eval.
+    pub opposite_rf_arcs: Vec<OppositeRfArc>,
+    /// The stage's index in the target's expanded path; -1 for a latch fanin stage, which has
+    /// none.
+    pub path_index: i32,
 }
 
-/// `ArcDelayState`.
-#[derive(Debug, Clone)]
-pub struct ArcDelayState {
+/// `SideLoad`: a load pin whose slack pays for the delay a candidate adds to it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SideLoad {
+    pub pin: String,
+    pub slack: f32,
+    pub weight: f32,
+}
+
+/// `FaninSideNet`: one input net of the target instance and its other loads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FaninSideNet {
+    pub input_port: String,
+    pub input_cap: f32,
+    pub delay_per_cap: f32,
+    pub selected_arc: bool,
+    pub loads: Vec<SideLoad>,
+}
+
+/// `EstimatorContext`: the target stage and its window, its fanin side nets, and the side-path
+/// floor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EstimatorContext {
     pub path_stages: Vec<DelayStageState>,
     pub target_stage_index: usize,
     pub delay_estimation_levels: i32,
+    pub fanin_side_nets: Vec<FaninSideNet>,
+    /// `-inf` until the policy sets the global worst slack.
+    pub side_slack_floor: f32,
+    pub side_floor_margin: f32,
+    pub fanin_side_loss_weight: f32,
+    /// `+inf` unless the opposite output transition has a finite slack.
+    pub opposite_rf_slack: f32,
     pub current_total_delay: f32,
 }
 
-impl ArcDelayState {
+impl EstimatorContext {
+    fn new(delay_estimation_levels: i32) -> EstimatorContext {
+        EstimatorContext {
+            path_stages: Vec::new(),
+            target_stage_index: 0,
+            delay_estimation_levels,
+            fanin_side_nets: Vec::new(),
+            side_slack_floor: f32::NEG_INFINITY,
+            side_floor_margin: 1.0,
+            fanin_side_loss_weight: 1.0,
+            opposite_rf_slack: f32::INFINITY,
+            current_total_delay: 0.0,
+        }
+    }
+
     pub fn target(&self) -> &DelayStageState {
         &self.path_stages[self.target_stage_index]
     }
+}
+
+/// `FailReason`, the values a context build can fail with, and `failReasonName`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailReason {
+    MissingTargetInstance,
+    PathIndexOutOfRange,
+    MissingPrevTimingArc,
+    MissingArcTransition,
+    MissingSceneOrMinMax,
+    MissingOutputPort,
+    MissingCurrentPortMap,
+    MissingCurrentTimingArc,
+}
+
+impl FailReason {
+    pub fn name(self) -> &'static str {
+        match self {
+            FailReason::MissingTargetInstance => "missing_target_instance",
+            FailReason::PathIndexOutOfRange => "path_index_out_of_range",
+            FailReason::MissingPrevTimingArc => "missing_prev_timing_arc",
+            FailReason::MissingArcTransition => "missing_arc_transition",
+            FailReason::MissingSceneOrMinMax => "missing_scene_or_minmax",
+            FailReason::MissingOutputPort => "missing_output_port",
+            FailReason::MissingCurrentPortMap => "missing_current_port_map",
+            FailReason::MissingCurrentTimingArc => "missing_current_timing_arc",
+        }
+    }
+}
+
+/// `FaninSideLoadOptions`: loads on a violating worst path (`critical_load_pins`) weigh 1, the
+/// others `off_path_weight`.
+#[derive(Debug, Clone, Copy)]
+pub struct FaninSideLoadOptions<'a> {
+    pub critical_load_pins: &'a HashSet<String>,
+    pub off_path_weight: f32,
+}
+
+/// The timer's infinity (`sta::INF`).
+const INF: f32 = 1e30;
+
+/// `delayInf` (`fuzzyInf`): fuzzily plus or minus the timer's infinity.
+fn delay_inf(x: f32) -> bool {
+    vyges_sta::fuzzy::equal(x, INF) || vyges_sta::fuzzy::equal(x, -INF)
+}
+
+/// `sideLoadWeight`.
+fn side_load_weight(pin: &str, options: &FaninSideLoadOptions<'_>) -> f32 {
+    if options.critical_load_pins.contains(pin) { 1.0 } else { options.off_path_weight }
+}
+
+/// What `buildContext` adds past the window: each optional stage of the reference's builder.
+pub struct ContextOptions<'a> {
+    pub delay_levels: i32,
+    pub use_sta_slew_bias: bool,
+    /// `include_latch_fanin`, and the latch D segment of the target's path (`latchDataPath`,
+    /// expanded on its own) with its start index.
+    pub latch_data_path: Option<(&'a [PathPin], usize)>,
+    pub fanin_side_loads: Option<FaninSideLoadOptions<'a>>,
+    pub dual_rf_eval: bool,
 }
 
 /// `DelayEstimate`.
@@ -109,14 +226,22 @@ pub struct PathPin {
 }
 
 /// What the builder reads: the libraries, one scene's graph and parasitics, and the equivalent
-/// cells and dont_use list of `maxTargetInputCapDelta`.
+/// cells and dont_use list of `maxTargetInputCapDelta`; for the side loads and the opposite
+/// transition, the timer's slacks, the clock network, the pin ids (`PinSet` order) and each
+/// master's terminal order (`pinIterator`).
 pub struct Reader<'a, 'g> {
     pub libs: &'a Libs,
     pub g: &'g Graph<'g>,
     pub parasitics: &'a HashMap<String, NetParasitics>,
     pub scene: usize,
     pub equiv: &'a crate::sizing::EquivCells,
-    pub dont_use: &'a std::collections::BTreeSet<String>,
+    pub dont_use: &'a BTreeSet<String>,
+    /// `Sta::slack(vertex[, rf], max)` of a vertex of `g`.
+    pub slack: &'a dyn Fn(usize, Option<usize>) -> f32,
+    /// `Sta::isClock(pin)`: the vertices of `g` in a clock network.
+    pub clock_pins: &'a BTreeSet<usize>,
+    pub pin_id: &'a HashMap<String, u64>,
+    pub master_pins: &'a HashMap<String, Vec<String>>,
 }
 
 fn arc_set_of(cell: &Cell, set: usize) -> &ArcSet {
@@ -246,36 +371,43 @@ impl Reader<'_, '_> {
         }
     }
 
-    /// The arc set of a gate edge (the to vertex's cell).
+    /// The arc set of a gate edge as the graph holds it (`Edge::timingArcSet`, `Path::prevArc`'s).
     fn edge_set(&self, e: usize) -> Option<(usize, &ArcSet)> {
         let EdgeKind::Gate { set } = self.g.edges[e].kind else { return None };
         let vx = &self.g.vertices[self.g.edges[e].to];
-        let cell = self.g.libs.get(vx.lib?)?.cells.get(vx.cell.as_deref()?)?;
-        Some((set, &cell.arc_sets[set]))
+        vx.lib?;
+        vx.cell.as_deref()?;
+        Some((set, self.g.arc_set(e, set)))
     }
 
-    /// `buildSelectedArc`: the path's arc into the driver (`selectedPathArc`: a gate arc with both
-    /// edges), its ports on the current scene cell, and the first exactly matching arc over the
-    /// sets between them.
-    fn build_selected_arc(&self, path: &[PathPin], start: usize, index: usize) -> Option<SelectedArc> {
-        if index < start || index >= path.len() {
-            return None;
-        }
+    /// `buildSelectedArc`: the driver's output port, its current scene cell, the path's arc into
+    /// the driver (`selectedPathArc`: a gate arc), its ports on that cell, and the first exactly
+    /// matching arc over the sets between them.
+    fn build_selected_arc(&self, path: &[PathPin], start: usize, index: usize) -> Result<SelectedArc, FailReason> {
         let v = path[index].vertex;
         let vx = &self.g.vertices[v];
-        let (cell_name, out_port) = (vx.cell.as_deref()?, vx.port.as_deref()?);
-        let current = self.cell(cell_name)?;
-        let (e, k) = path[index].in_edge?;
-        let (_, path_set) = self.edge_set(e)?;
+        // `network->libertyPort(driver_pin)`: an instance pin of a liberty cell.
+        let (Some(cell_name), Some(out_port)) = (vx.cell.as_deref(), vx.port.as_deref()) else { return Err(FailReason::MissingOutputPort) };
+        if vx.lib.is_none() {
+            return Err(FailReason::MissingOutputPort);
+        }
+        let current = self.cell(cell_name).ok_or(FailReason::MissingCurrentPortMap)?;
+        // `selectedPathArc`.
+        if index < start || index >= path.len() {
+            return Err(FailReason::PathIndexOutOfRange);
+        }
+        let (e, k) = path[index].in_edge.ok_or(FailReason::MissingPrevTimingArc)?;
+        // A wire arc has no liberty ports.
+        let (_, path_set) = self.edge_set(e).ok_or(FailReason::MissingPrevTimingArc)?;
         if current.port(&path_set.from).is_none() || current.port(out_port).is_none() || path_set.to != out_port {
-            return None;
+            return Err(FailReason::MissingCurrentPortMap);
         }
         for (si, set) in arc_sets_for_ref_ports(current, path_set) {
             if let Some(a) = find_matching_arc(path_set, k, set) {
-                return Some(SelectedArc { scene: self.scene, cell: current.name.clone(), set: si, arc: a });
+                return Ok(SelectedArc { scene: self.scene, cell: current.name.clone(), set: si, arc: a });
             }
         }
-        None
+        Err(FailReason::MissingCurrentTimingArc)
     }
 
     /// `inputSlewOrZero`: the instance's pin of the arc's input port, `edgeFromSlew` at it.
@@ -332,75 +464,114 @@ impl Reader<'_, '_> {
         out
     }
 
+    /// `currentPathWireDelay`: the wire edge into the next pin of the path, at the arc's output
+    /// transition (0 at the path's end or without a wire edge).
+    fn current_path_wire_delay(&self, path: &[PathPin], index: usize, out_rf: usize) -> f32 {
+        let Some(next) = path.get(index + 1) else { return 0.0 };
+        let Some((e, _)) = next.in_edge else { return 0.0 };
+        if !matches!(self.g.edges[e].kind, EdgeKind::Wire) {
+            return 0.0;
+        }
+        // `wireArcDelay(edge, rf)`: a wire edge's arc per transition, rise then fall.
+        self.g.delay[e].get(out_rf).map_or(0.0, |d| d[MAX])
+    }
+
     /// `buildDelayStageState`.
-    fn build_delay_stage_state(&self, path: &[PathPin], start: usize, index: usize) -> Option<DelayStageState> {
+    fn build_delay_stage_state(&self, path: &[PathPin], start: usize, index: usize) -> Result<DelayStageState, FailReason> {
         let arc = self.build_selected_arc(path, start, index)?;
         let driver = path[index].vertex;
         let input_slew = self.input_slew(driver, &arc);
         let load_cap = self.g.load_cap(driver, self.parasitics);
-        let (current_model_delay, current_slew_table) = lookup_arc_delay_and_slew(self.libs, &arc, input_slew, load_cap, &arc.cell, false, None)?;
+        let (current_model_delay, current_slew_table) = lookup_arc_delay_and_slew(self.libs, &arc, input_slew, load_cap, &arc.cell, false, None).ok_or(FailReason::MissingCurrentTimingArc)?;
         // `pathGraphCellDelayOrModelDelay`: the graph's delay of the path's arc.
-        let (e, k) = path[index].in_edge?;
-        let current_delay = self.g.delay[e][k][MAX];
+        let current_delay = match path[index].in_edge {
+            Some((e, k)) => self.g.delay[e][k][MAX],
+            None => current_model_delay,
+        };
+        let out_rf = arc_set_of(self.cell(&arc.cell).ok_or(FailReason::MissingCurrentTimingArc)?, arc.set).arcs[arc.arc].to_rf;
+        let current_wire_delay = self.current_path_wire_delay(path, index, out_rf);
         let merges = self.collect_output_slew_merge_arcs(driver, &arc, load_cap);
+        // The merged model slew over every arc to the output transition (`min_max->compare`: max,
+        // strictly greater).
         let mut current_model_slew = current_slew_table;
         for m in &merges {
             if m.current_model_slew > current_model_slew {
                 current_model_slew = m.current_model_slew;
             }
         }
-        let out_rf = arc_set_of(self.cell(&arc.cell)?, arc.set).arcs[arc.arc].to_rf;
-        Some(DelayStageState {
+        Ok(DelayStageState {
             driver_pin: self.g.vertices[driver].name.clone(),
             input_slew,
             load_cap,
             current_model_delay,
             current_delay,
+            current_wire_delay,
             current_model_slew,
             current_slew: self.g.slew[driver][out_rf][MAX],
             output_slew_merge_arcs: merges,
             sta_slew_bias: SlewBiasModel::default(),
-            path_index: index,
+            opposite_rf_arcs: Vec::new(),
+            path_index: index as i32,
             arc,
         })
     }
 
-    /// `buildDelayStageStateFromPath`: a stage with an instance (not a top-level port).
-    fn build_delay_stage_state_from_path(&self, path: &[PathPin], start: usize, index: usize) -> Option<DelayStageState> {
+    /// `buildDelayStageStateFromPath`: the path's index in range and its pin on an instance.
+    fn build_delay_stage_state_from_path(&self, path: &[PathPin], start: usize, index: usize) -> Result<DelayStageState, FailReason> {
         if index < start || index >= path.len() {
-            return None;
+            return Err(FailReason::PathIndexOutOfRange);
         }
         if !matches!(self.g.vertices[path[index].vertex].conn, vyges_sta::netlist::Conn::Inst(..)) {
-            return None;
+            return Err(FailReason::MissingTargetInstance);
         }
         self.build_delay_stage_state(path, start, index)
     }
 
+    /// The instance of a vertex (`network->instance(pin)`), `None` on a top-level port.
+    fn inst_of(&self, v: usize) -> Option<usize> {
+        match self.g.vertices[v].conn {
+            vyges_sta::netlist::Conn::Inst(k, _) => Some(k),
+            vyges_sta::netlist::Conn::Port(_) => None,
+        }
+    }
+
+    fn inst_of_pin(&self, name: &str) -> Option<usize> {
+        self.vertex_of(name, true).or_else(|| self.vertex_of(name, false)).and_then(|v| self.inst_of(v))
+    }
+
     /// `collectPathStages`: the target, with up to `levels` valid stages before it (nearest first
-    /// found, kept in path order) and after it.
-    fn collect_path_stages(&self, path: &[PathPin], start: usize, target_index: usize, levels: i32, target: DelayStageState) -> ArcDelayState {
+    /// found, kept in path order) and after it — a later stage on the target's own instance (an
+    /// output-to-output arc) is skipped; the total is the sum of the stages' delays in order.
+    fn collect_path_stages(&self, path: &[PathPin], start: usize, target_index: usize, levels: i32, target: DelayStageState) -> EstimatorContext {
+        let mut context = EstimatorContext::new(levels);
         if levels == 0 {
-            return ArcDelayState { current_total_delay: target.current_delay, path_stages: vec![target], target_stage_index: 0, delay_estimation_levels: 0 };
+            context.current_total_delay = target.current_delay;
+            context.path_stages = vec![target];
+            return context;
         }
         let levels = levels as usize;
         let mut fanin = Vec::new();
         let mut i = target_index;
         while i > start && fanin.len() < levels {
             i -= 1;
-            if let Some(s) = self.build_delay_stage_state_from_path(path, start, i) {
+            if let Ok(s) = self.build_delay_stage_state_from_path(path, start, i) {
                 fanin.push(s);
             }
         }
         fanin.reverse();
+        let target_inst = self.inst_of_pin(&target.driver_pin);
         let mut stages = fanin;
-        let target_stage_index = stages.len();
+        context.target_stage_index = stages.len();
         stages.push(target);
         let mut found = 0;
         let mut i = target_index + 1;
         while i < path.len() && found < levels {
-            if let Some(s) = self.build_delay_stage_state_from_path(path, start, i) {
-                stages.push(s);
-                found += 1;
+            if let Ok(s) = self.build_delay_stage_state_from_path(path, start, i) {
+                let fanout_inst = self.inst_of(path[i].vertex);
+                if !(fanout_inst.is_some() && target_inst.is_some() && fanout_inst == target_inst) {
+                    stages.push(s);
+                    found += 1;
+                }
             }
             i += 1;
         }
@@ -408,7 +579,51 @@ impl Reader<'_, '_> {
         for s in &stages {
             total += s.current_delay;
         }
-        ArcDelayState { path_stages: stages, target_stage_index, delay_estimation_levels: levels as i32, current_total_delay: total }
+        context.path_stages = stages;
+        context.current_total_delay = total;
+        context
+    }
+
+    /// `includeLatchFaninStages`: a target whose arc is a latch D -> Q at the path's start takes
+    /// the stages that drive the latch D (its data path expanded on its own) in front of its
+    /// window. The D pin's driver must reach it by a wire and sit on another instance; the
+    /// stages, none on the target's instance, have no index in the target's path.
+    fn include_latch_fanin_stages(&self, path: &[PathPin], start: usize, latch_data_path: Option<(&[PathPin], usize)>, context: &mut EstimatorContext) -> Result<(), FailReason> {
+        let target = context.target();
+        let role = self.cell(&target.arc.cell).map(|c| arc_set_of(c, target.arc.set).role);
+        if role != Some(Role::LatchDtoQ) || target.path_index != start as i32 {
+            return Ok(());
+        }
+        let _ = path;
+        // `latchDataPathMatches`: the Q path's previous path is the latch D path.
+        let Some((data, data_start)) = latch_data_path else { return Err(FailReason::MissingPrevTimingArc) };
+        let target_inst = self.inst_of_pin(&target.driver_pin);
+        if data.len() < 2 {
+            return Err(FailReason::MissingPrevTimingArc);
+        }
+        let driver_index = data.len() - 2;
+        let d = &data[data.len() - 1];
+        let wire = d.in_edge.is_some_and(|(e, _)| matches!(self.g.edges[e].kind, EdgeKind::Wire) && self.g.edges[e].from == data[driver_index].vertex && self.g.edges[e].to == d.vertex);
+        if driver_index < data_start || !wire || self.inst_of(data[driver_index].vertex) == target_inst {
+            return Err(FailReason::MissingPrevTimingArc);
+        }
+        let driver_stage = self.build_delay_stage_state_from_path(data, data_start, driver_index)?;
+        let additional_levels = context.delay_estimation_levels.max(1) - 1;
+        let mut fanin = self.collect_path_stages(data, data_start, driver_index, additional_levels, driver_stage);
+        for stage in &mut fanin.path_stages {
+            // A feedback segment must not bring the resized driver back.
+            if self.inst_of_pin(&stage.driver_pin) == target_inst {
+                return Err(FailReason::MissingPrevTimingArc);
+            }
+            stage.path_index = -1;
+        }
+        let n = fanin.path_stages.len();
+        let mut stages = fanin.path_stages;
+        stages.append(&mut context.path_stages);
+        context.path_stages = stages;
+        context.target_stage_index += n;
+        context.current_total_delay += fanin.current_total_delay;
+        Ok(())
     }
 
     /// `maxTargetInputCapDelta`: over the link cell's equivalent cells (not dont_use, link cells),
@@ -503,20 +718,159 @@ impl Reader<'_, '_> {
         m
     }
 
-    /// `DelayEstimator::buildContext`: the target stage (it must be valid), its window, and the
-    /// fanin neighbour's slew bias.
-    pub fn build_context(&self, path: &[PathPin], start: usize, index: usize, levels: i32, slew_bias: bool) -> Option<ArcDelayState> {
-        let target = self.build_delay_stage_state(path, start, index)?;
-        let mut context = self.collect_path_stages(path, start, index, levels.max(0), target);
-        if slew_bias && context.target_stage_index > 0 {
-            // `prepareFaninNeighborSlewBias`.
-            let delta = self.max_target_input_cap_delta(context.target());
-            if delta > 0.0 {
-                let k = context.target_stage_index - 1;
-                context.path_stages[k].sta_slew_bias = self.build_slew_bias_model(&context.path_stages[k], delta);
+    /// `prepareFaninNeighborSlewBias`: the fanin neighbour's slew bias over the target's input
+    /// cap growth. (`DelayEstimatorCache` memoizes both reads on every input they depend on, so a
+    /// recomputation gives what a hit returns.)
+    fn prepare_fanin_neighbor_slew_bias(&self, context: &mut EstimatorContext) {
+        if context.target_stage_index == 0 {
+            return;
+        }
+        let delta = self.max_target_input_cap_delta(context.target());
+        if delta <= 0.0 {
+            return;
+        }
+        let k = context.target_stage_index - 1;
+        context.path_stages[k].sta_slew_bias = self.build_slew_bias_model(&context.path_stages[k], delta);
+    }
+
+    /// `collectFaninSideLoads`: each input net of the target, in the instance's pin order — an
+    /// input pin (not a clock) with a liberty port and a net. The selected-arc net (the target's
+    /// selected input, driven by the fanin stage) leaves out the target pin; any other net needs
+    /// its first driver's (`PinSet` order) drive resistance > 0. Its loads in `PinSet` order, each
+    /// with a finite slack; a net without loads is dropped.
+    fn collect_fanin_side_loads(&self, target_inst: usize, options: &FaninSideLoadOptions<'_>, context: &mut EstimatorContext) {
+        let target = context.target();
+        let Some(target_cell) = self.cell(&target.arc.cell) else { return };
+        let selected_input_port = arc_set_of(target_cell, target.arc.set).from.clone();
+        let selected_fanin_pin = (context.target_stage_index >= 1).then(|| context.path_stages[context.target_stage_index - 1].driver_pin.clone());
+        let nl: &vyges_sta::netlist::Netlist = &self.g.netlist;
+        let (inst_name, link_name) = (&nl.insts[target_inst].0, &nl.insts[target_inst].1);
+        let Some(link) = self.libs.link_cell(link_name) else { return };
+        let id = |name: &str| self.pin_id.get(name).copied().unwrap_or(u64::MAX);
+        // `network->net(pin)`: the vertex's net (a load vertex for an input, else the driver's).
+        let net_of = |pin: &str| self.vertex_of(pin, false).or_else(|| self.vertex_of(pin, true)).and_then(|v| self.g.vertex_net[v]);
+        let ports: Vec<String> = self.master_pins.get(link_name).cloned().unwrap_or_default();
+        let mut nets = Vec::new();
+        for port_name in &ports {
+            let Some(port) = link.port(port_name) else { continue };
+            if port.direction != vyges_sta::liberty::Direction::Input {
+                continue;
+            }
+            let input_pin = format!("{inst_name}/{port_name}");
+            if self.vertex_of(&input_pin, false).is_some_and(|v| self.clock_pins.contains(&v)) {
+                continue;
+            }
+            let Some(net) = net_of(&input_pin) else { continue };
+            let selected_arc = *port_name == selected_input_port && selected_fanin_pin.as_deref().is_some_and(|f| net_of(f) == Some(net));
+            let mut delay_per_cap = 0.0;
+            if !selected_arc {
+                // `network->drivers(net)`, a `PinSet`: its first pin by id.
+                let mut drivers: Vec<String> = nl.nets[net].pins.iter().map(|c| nl.pin_name(c)).filter(|n| self.vertex_of(n, true).is_some()).collect();
+                drivers.sort_by_key(|n| id(n));
+                let Some(driver) = drivers.first() else { continue };
+                let Some(dv) = self.vertex_of(driver, true) else { continue };
+                let dx = &self.g.vertices[dv];
+                let Some((dcell, dport)) = dx.cell.as_deref().zip(dx.port.as_deref()) else { continue };
+                let Some(dlink) = self.libs.link_cell(dcell) else { continue };
+                if dlink.port(dport).is_none() {
+                    continue;
+                }
+                delay_per_cap = dlink.drive_resistance(dport);
+                if delay_per_cap <= 0.0 {
+                    continue;
+                }
+            }
+            let mut pins: Vec<String> = nl.nets[net].pins.iter().map(|c| nl.pin_name(c)).collect();
+            pins.sort_by_key(|n| id(n));
+            let mut loads = Vec::new();
+            for pin in pins {
+                if selected_arc && pin == input_pin {
+                    continue;
+                }
+                // `isLoad` → `pinLoadVertex`.
+                let Some(v) = self.vertex_of(&pin, false) else { continue };
+                let slack = (self.slack)(v, None);
+                if delay_inf(slack) {
+                    continue;
+                }
+                loads.push(SideLoad { weight: side_load_weight(&pin, options), pin, slack });
+            }
+            if loads.is_empty() {
+                continue;
+            }
+            nets.push(FaninSideNet { input_port: port_name.clone(), input_cap: port_capacitance(link, port_name), delay_per_cap, selected_arc, loads });
+        }
+        context.fanin_side_nets = nets;
+    }
+
+    /// `collectOppositeRfArcs`: over the driver's in-edges (as the graph iterates them) from the
+    /// selected input to the selected output, each non-check arc to the OPPOSITE transition with
+    /// its match on the current cell and its table delay at the stage load; with any, the
+    /// driver's worst slack at that transition when finite.
+    fn collect_opposite_rf_arcs(&self, context: &mut EstimatorContext) {
+        let k = context.target_stage_index;
+        let target = &context.path_stages[k];
+        let Some(driver) = self.vertex_of(&target.driver_pin, true) else { return };
+        let Some(current) = self.cell(&target.arc.cell) else { return };
+        let sel = arc_set_of(current, target.arc.set);
+        let (input_name, output_name) = (sel.from.clone(), sel.to.clone());
+        let opposite_rf = 1 - sel.arcs[target.arc.arc].to_rf;
+        let load_cap = target.load_cap;
+        let mut arcs = Vec::new();
+        for &e in self.g.in_edges[driver].iter().rev() {
+            let Some((_, set)) = self.edge_set(e) else { continue };
+            if set.role.is_timing_check() || set.to != output_name || set.from != input_name {
+                continue;
+            }
+            for (gk, ga) in set.arcs.iter().enumerate() {
+                if ga.to_rf != opposite_rf {
+                    continue;
+                }
+                // `findCellTimingArcLike(graph_arc, current_cell)`.
+                let mut like = None;
+                for (si, cset) in arc_sets_for_ref_ports(current, set) {
+                    if cset.role.is_timing_check() {
+                        continue;
+                    }
+                    if let Some(a) = find_matching_arc(set, gk, cset) {
+                        like = Some((si, a));
+                        break;
+                    }
+                }
+                let Some((si, a)) = like else { continue };
+                let input_slew = self.edge_from_slew(self.g.edges[e].from, ga.from_rf, set.role);
+                let Some((delay, _)) = gate_delay_and_slew(current, si, a, input_slew, load_cap) else { continue };
+                arcs.push(OppositeRfArc { set: si, arc: a, input_slew, current_model_delay: delay });
             }
         }
-        Some(context)
+        if arcs.is_empty() {
+            return;
+        }
+        context.path_stages[k].opposite_rf_arcs = arcs;
+        let slack = (self.slack)(driver, Some(opposite_rf));
+        if !delay_inf(slack) {
+            context.opposite_rf_slack = slack;
+        }
+    }
+
+    /// `DelayEstimator::buildContext`: the target stage (it must be valid), its window, the latch
+    /// fanin stages, the fanin neighbour's slew bias, the fanin side loads and the opposite
+    /// transition's arcs, in that order.
+    pub fn build_context(&self, path: &[PathPin], start: usize, index: usize, options: &ContextOptions<'_>) -> Result<EstimatorContext, FailReason> {
+        let target_inst = self.inst_of(path[index].vertex).ok_or(FailReason::MissingTargetInstance)?;
+        let target = self.build_delay_stage_state(path, start, index)?;
+        let mut context = self.collect_path_stages(path, start, index, options.delay_levels.max(0), target);
+        self.include_latch_fanin_stages(path, start, options.latch_data_path, &mut context)?;
+        if options.use_sta_slew_bias {
+            self.prepare_fanin_neighbor_slew_bias(&mut context);
+        }
+        if let Some(side) = &options.fanin_side_loads {
+            self.collect_fanin_side_loads(target_inst, side, &mut context);
+        }
+        if options.dual_rf_eval {
+            self.collect_opposite_rf_arcs(&mut context);
+        }
+        Ok(context)
     }
 }
 
@@ -594,7 +948,7 @@ fn make_estimate(current_delay: f32, candidate_delay: f32) -> DelayEstimate {
 /// `DelayEstimator::estimate` → `estimateWindow`: the window's stages from the fanin neighbour
 /// on table-modelled with the candidate at the target (its input cap on the neighbour's load),
 /// each stage's slew carried to the next; the improvement against the current total delay.
-pub fn estimate(libs: &Libs, context: &ArcDelayState, candidate_cell: &str) -> DelayEstimate {
+pub fn estimate(libs: &Libs, context: &EstimatorContext, candidate_cell: &str) -> DelayEstimate {
     let stages = &context.path_stages;
     let target_index = context.target_stage_index;
     let target = &stages[target_index];
@@ -645,14 +999,51 @@ mod tests {
             load_cap: 0.0,
             current_model_delay: 0.0,
             current_delay: 0.0,
+            current_wire_delay: 0.0,
             current_model_slew: 0.0,
             current_slew,
             output_slew_merge_arcs: Vec::new(),
             sta_slew_bias: SlewBiasModel::default(),
+            opposite_rf_arcs: Vec::new(),
             path_index: 0,
         };
         assert_eq!(estimate_receiver_input_slew(&st(0.0, 2e-11), &st(3e-11, 0.0), 4e-11), 4e-11 * 3e-11 / 2e-11);
         assert_eq!(estimate_receiver_input_slew(&st(0.0, 0.0), &st(1e-11, 0.0), 1e-11), 1e-11 * 1e-11 / 1e-15);
+    }
+
+    // Rule (sideLoadWeight): a side load on a violating endpoint's worst path (a critical path load
+    // pin) moves its endpoint one for one and weighs 1; any other load weighs off_path_weight.
+    #[test]
+    fn a_side_load_weighs_one_on_a_worst_path_else_the_off_path_weight() {
+        let crit: HashSet<String> = ["u1/A".to_string()].into_iter().collect();
+        let o = FaninSideLoadOptions { critical_load_pins: &crit, off_path_weight: 0.25 };
+        assert_eq!(side_load_weight("u1/A", &o), 1.0);
+        assert_eq!(side_load_weight("u2/A", &o), 0.25);
+    }
+
+    // Rule (delayInf = fuzzyInf): a slack fuzzily at +-INF (1e30) is infinite and a side load
+    // with it is skipped; a large finite slack is not.
+    #[test]
+    fn an_unconstrained_slack_is_infinite_to_the_side_load_collector() {
+        assert!(delay_inf(1e30) && delay_inf(-1e30) && delay_inf(1e30 * (1.0 + 1e-7)));
+        assert!(!delay_inf(1e20) && !delay_inf(0.0));
+    }
+
+    // Rule (failReasonName): the names the prepare_reject_<reason> events and the printer use.
+    #[test]
+    fn the_fail_reasons_print_as_failreasonname_does() {
+        assert_eq!(FailReason::MissingPrevTimingArc.name(), "missing_prev_timing_arc");
+        assert_eq!(FailReason::MissingSceneOrMinMax.name(), "missing_scene_or_minmax");
+        assert_eq!(FailReason::MissingCurrentPortMap.name(), "missing_current_port_map");
+    }
+
+    // A fresh context (`EstimatorContext{}`): no side floor (-inf), margin and weight 1, the
+    // opposite slack +inf.
+    #[test]
+    fn a_new_context_has_no_floor_and_no_opposite_slack() {
+        let c = EstimatorContext::new(1);
+        assert_eq!((c.side_slack_floor, c.side_floor_margin, c.fanin_side_loss_weight, c.opposite_rf_slack), (f32::NEG_INFINITY, 1.0, 1.0, f32::INFINITY));
+        assert_eq!(c.delay_estimation_levels, 1);
     }
 
     // Rule (interpolateStaSlewBias): the bias is linear between the samples, the load clamped to
