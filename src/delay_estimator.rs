@@ -687,7 +687,7 @@ impl Reader<'_, '_> {
         let Some(current) = self.cell(&stage.arc.cell) else { return SlewBiasModel::default() };
         let out_rf = arc_set_of(current, stage.arc.set).arcs[stage.arc.arc].to_rf;
         // `findParasitic` and `isPiModel`.
-        let Some((c2, rpi, c1)) = self.g.reduced_pi(driver, out_rf, MAX, self.parasitics) else { return SlewBiasModel::default() };
+        let Some((c2, rpi, c1)) = find_parasitic_pi(self.g, driver, out_rf, self.parasitics) else { return SlewBiasModel::default() };
         let Some(lib) = self.g.vertices[driver].lib.and_then(|l| self.g.libs.get(l)) else { return SlewBiasModel::default() };
         let Model::Gate(model) = &current.arc_sets[worst.0].arcs[worst.1].model else { return SlewBiasModel::default() };
         let th = Thresholds { vth: lib.output_threshold[out_rf], vl: lib.slew_lower_threshold[out_rf], vh: lib.slew_upper_threshold[out_rf], slew_derate: lib.slew_derate };
@@ -874,6 +874,17 @@ impl Reader<'_, '_> {
     }
 }
 
+/// `ArcDelayCalc::findParasitic(driver, rf, scene, max)` as the slew bias reads it
+/// (`LumpedCapDelayCalc::findParasitic`, which the DMP calculator inherits): no parasitic when
+/// the driver's net has a `set_load` (it takes precedence over parasitics), else the net's
+/// reduced pi model.
+fn find_parasitic_pi(g: &Graph<'_>, driver: usize, rf: usize, parasitics: &HashMap<String, NetParasitics>) -> Option<(f32, f32, f32)> {
+    if g.sdc.net_wire_cap.contains_key(&g.vertices[driver].name) {
+        return None;
+    }
+    g.reduced_pi(driver, rf, MAX, parasitics)
+}
+
 /// `slewBias`, `interpolate`, `interpolateStaSlewBias`.
 fn interpolate(x0: f32, y0: f32, x1: f32, y1: f32, x: f32) -> f32 {
     if x1 <= x0 {
@@ -1009,6 +1020,43 @@ mod tests {
         };
         assert_eq!(estimate_receiver_input_slew(&st(0.0, 2e-11), &st(3e-11, 0.0), 4e-11), 4e-11 * 3e-11 / 2e-11);
         assert_eq!(estimate_receiver_input_slew(&st(0.0, 0.0), &st(1e-11, 0.0), 1e-11), 1e-11 * 1e-11 / 1e-15);
+    }
+
+    // Rule (LumpedCapDelayCalc::findParasitic, through buildSlewBiasModel's "missing Pi
+    // parasitic"): a driver whose net has a set_load has no parasitic for the slew bias even when
+    // the estimator made a pi model for the net; without the set_load the pi model is found.
+    // Witness: repair_setup8 under PARALLEL_EVAL, where `set_load 1.0 l2q` makes the reference
+    // skip the latch Q stage's bias.
+    #[test]
+    fn a_net_set_load_hides_the_pi_model_from_the_slew_bias() {
+        use vyges_sta::netlist::{inst, Conn, Net, Netlist, PortDir};
+        const D: &str = r#"cell_rise (t) { values ("0.01, 0.01", "0.01, 0.01"); } rise_transition (t) { values ("0.01, 0.01", "0.01, 0.01"); }
+          cell_fall (t) { values ("0.01, 0.01", "0.01, 0.01"); } fall_transition (t) { values ("0.01, 0.01", "0.01, 0.01"); }"#;
+        let lib = format!(
+            r#"library (t) {{ time_unit : "1ns"; capacitive_load_unit (1, pf);
+          lu_table_template (t) {{ variable_1 : input_net_transition; variable_2 : total_output_net_capacitance; index_1 ("0, 1"); index_2 ("0, 1"); }}
+          cell (buf) {{ pin (A) {{ direction : input; capacitance : 0.001; }}
+            pin (Z) {{ direction : output; function : "A"; timing () {{ related_pin : "A"; timing_sense : positive_unate; {D} }} }} }} }}"#
+        );
+        let libs = vec![vyges_sta::liberty::Library::read(&vyges_sta::liberty_parse::parse(&lib).unwrap()).unwrap()];
+        let i = |k: usize, p: &str| Conn::Inst(k, p.into());
+        let netlist = Netlist {
+            insts: vec![inst("u1", "buf"), inst("u2", "buf")],
+            ports: vec![("a".into(), PortDir::Input), ("y".into(), PortDir::Output)],
+            nets: vec![
+                Net { name: "a".into(), pins: vec![Conn::Port(0), i(0, "A")] }.into(),
+                Net { name: "n1".into(), pins: vec![i(0, "Z"), i(1, "A")] }.into(),
+                Net { name: "y".into(), pins: vec![i(1, "Z"), Conn::Port(1)] }.into(),
+            ],
+        };
+        let mut g = Graph::build(&libs, &netlist).unwrap();
+        let pi = vyges_sta::parasitics::PiElmore { c2: 1e-15, rpi: 10.0, c1: 2e-15, elmore: Vec::new() };
+        let mut par = HashMap::new();
+        par.insert("n1".to_string(), NetParasitics { node_names: vec!["u1/Z".into(), "u2/A".into()], pi: Some(pi), ..Default::default() });
+        let u1z = g.vertices.iter().position(|v| v.name == "u1/Z").unwrap();
+        assert_eq!(find_parasitic_pi(&g, u1z, 0, &par), Some((1e-15, 10.0, 2e-15)));
+        g.sdc.net_wire_cap.insert("u1/Z".into(), [Some((1e-12, false)); 2]);
+        assert_eq!(find_parasitic_pi(&g, u1z, 0, &par), None);
     }
 
     // Rule (sideLoadWeight): a side load on a violating endpoint's worst path (a critical path load
