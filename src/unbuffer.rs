@@ -208,7 +208,7 @@ pub enum Verdict {
     /// `loadExpandedPath` failed.
     NoPathContext,
     /// The context resolved: the buffer, the pins, and each timer guard's outcome.
-    Resolved(Resolved),
+    Resolved(Box<Resolved>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -225,6 +225,9 @@ pub struct Resolved {
     /// `estimatedSlackOK`'s `remove_buffer` debug lines (level 1) and its verdict.
     pub slack_lines: Vec<String>,
     pub slack_ok: bool,
+    /// The scene the slack guard timed at (`slack_scene`): the capacitance check's, else the
+    /// fallback the caller gave (none: the legacy generator's, which then refuses).
+    pub slack_scene: Option<usize>,
 }
 
 /// A stage of the expanded path as the probe reads it.
@@ -238,7 +241,10 @@ pub struct PathStage<'s> {
 
 /// `UnbufferGenerator::isEligible`'s timer half on the driver at `index` of the path — `None`
 /// when `validTarget` fails (a silent rejection). `fanout`: the target's wire fanout.
-pub fn probe(ctx: &Ctx<'_>, t: &Timer<'_, '_>, stages: &[PathStage<'_>], index: usize, fanout: usize) -> Option<Verdict> {
+/// `fallback_scene`: the scene the slack guard times at when the previous driver has no
+/// capacitance limit — none for the legacy generator (its slack guard then refuses), the path's
+/// scene for the PARALLEL_EVAL one (`UnbufferMtGenerator::isEligible`).
+pub fn probe(ctx: &Ctx<'_>, t: &Timer<'_, '_>, stages: &[PathStage<'_>], index: usize, fanout: usize, fallback_scene: Option<usize>) -> Option<Verdict> {
     // validTarget: one upstream driver stage and one buffer stage on the path.
     if index < 2 {
         return None;
@@ -261,12 +267,15 @@ pub fn probe(ctx: &Ctx<'_>, t: &Timer<'_, '_>, stages: &[PathStage<'_>], index: 
         cap_reject: None,
         slack_lines: Vec::new(),
         slack_ok: false,
+        slack_scene: None,
     };
     let buffer_in = t.index.get(&format!("{inst}/{in_port}")).copied();
     let Some(buffer_in) = buffer_in else { return Some(Verdict::NoPathContext) };
     r.fanout_reject = passes_fanout_guard(ctx, t, inst, prev.vertex, fanout);
     let (cap_reject, slack_scene) = passes_cap_guard(ctx, t, cell, cell_name, inst, prev.vertex, st.vertex);
     r.cap_reject = cap_reject;
+    let slack_scene = slack_scene.or(fallback_scene);
+    r.slack_scene = slack_scene;
     let p = SlackParams { driver: st.vertex, driver_rf: st.rf, prev: prev.vertex, prev_rf: prev.rf, driver_input: buffer_in, inst, cell };
     let (ok, lines) = match (t.multi, slack_scene) {
         // Several corners: the slack guard times everything at the capacitance guard's scene
@@ -286,7 +295,59 @@ pub fn probe(ctx: &Ctx<'_>, t: &Timer<'_, '_>, stages: &[PathStage<'_>], index: 
     };
     r.slack_ok = ok;
     r.slack_lines = lines;
-    Some(Verdict::Resolved(r))
+    Some(Verdict::Resolved(Box::new(r)))
+}
+
+/// `UnbufferMtGenerator`'s `estimateRemovalGain`: the delay the removal saves — the buffer's own
+/// delay at its load, less the previous driver's slowdown from the merged load, less the Elmore
+/// delay of the longer wire the previous driver then drives — at the slack guard's scene. 0 when
+/// `computeNewDelaysSlews` cannot run. `locate`: `dbNetwork::location(pin)`.
+pub fn estimate_removal_gain(ctx: &Ctx<'_>, t: &Timer<'_, '_>, stages: &[PathStage<'_>], index: usize, r: &Resolved, locate: &dyn Fn(&str) -> (i32, i32)) -> f32 {
+    let st = &stages[index];
+    let prev = &stages[index - 2];
+    let Some(k) = r.slack_scene else { return 0.0 };
+    let Some(cell) = ctx.libs.link_cell(&r.cell) else { return 0.0 };
+    // The timer, the vertices and the buffer's cell at the slack scene.
+    let tk = match t.multi {
+        Some(_) => t.at_scene(k),
+        None => Timer { ..*t },
+    };
+    let at = |v: usize| tk.index.get(&t.g.vertices[v].name).copied();
+    let (Some(driver), Some(prev_v), Some(driver_input)) = (at(st.vertex), at(prev.vertex), tk.index.get(&format!("{}/{}", r.inst, r.in_port)).copied()) else { return 0.0 };
+    let scene_cell = if t.multi.is_some() { ctx.libs.scene_cell(k, &r.cell).unwrap_or(cell) } else { cell };
+    let p = SlackParams { driver, driver_rf: st.rf, prev: prev_v, prev_rf: prev.rf, driver_input, inst: &r.inst, cell: scene_cell };
+    let Some((old_delay, new_delay, _, _, _, _)) = compute_new_delays_slews(ctx, &tk, &p) else { return 0.0 };
+    let slowdown = new_delay[prev.rf] - old_delay[prev.rf];
+    // `bufferDelay(cell, rf, loadCap(driver), scene, max)`: `gateDelays` at the target slews
+    // (computeNewDelaysSlews reset the annotated ones).
+    let Some((_, output)) = scene_cell.buffer_ports() else { return 0.0 };
+    let saved = crate::rebuffer::gate_delays(scene_cell, &output.name, tk.g.load_cap(driver, tk.parasitics), ctx.tgt_slews).0[st.rf];
+    // `maxLoadManhattenDistance(prev driver)` over its out edges, then the buffer's loads seen
+    // from the previous driver.
+    let g = tk.g;
+    let prev_loc = locate(&g.vertices[prev_v].name);
+    let old_dist = g.out_edges[prev_v].iter().map(|&e| manhattan(prev_loc, locate(&g.vertices[g.edges[e].to].name))).fold(0, i32::max);
+    let mut new_dist = old_dist;
+    for &e in &g.out_edges[driver] {
+        let load = g.edges[e].to;
+        if load == driver || g.vertices[load].is_driver {
+            continue;
+        }
+        new_dist = new_dist.max(manhattan(prev_loc, locate(&g.vertices[load].name)));
+    }
+    // `wireSignalResistance` / `wireSignalCapacitance`: the mean of the layers' directions.
+    let wire_res = (ctx.wire_rc.h_res + ctx.wire_rc.v_res) / 2.0;
+    let wire_cap = (ctx.wire_rc.h_cap + ctx.wire_rc.v_cap) / 2.0;
+    let wire_delay = |dist: i32| {
+        let length = f64::from(dist) / (f64::from(ctx.dbu) * 1e6);
+        0.5 * (length * wire_res) * (length * wire_cap)
+    };
+    let longer_wire = (wire_delay(new_dist) - wire_delay(old_dist)) as f32;
+    saved - slowdown - longer_wire
+}
+
+fn manhattan(a: (i32, i32), b: (i32, i32)) -> i32 {
+    (a.0 - b.0).abs() + (a.1 - b.1).abs()
 }
 
 /// `passesFanoutGuard`: the previous driver's fanout after it takes the buffer's loads, against

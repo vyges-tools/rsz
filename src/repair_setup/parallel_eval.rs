@@ -282,6 +282,9 @@ pub struct Target {
     pub sequential_estimator: bool,
     /// Why the context build left the target without one (the trace's `why=`).
     pub prepare_why: String,
+    /// `unbuffer_gain` (`UnbufferMtGenerator::prepareInputs`): the removal's estimated gain, when
+    /// the buffer is eligible.
+    pub unbuffer_gain: Option<f32>,
 }
 
 /// `PrepareCacheMask`: what `prepareTarget` builds (bit 1 is unused upstream).
@@ -362,6 +365,38 @@ pub struct ParallelEval {
     pub marker: char,
 }
 
+impl ParallelEval {
+    /// The policy's members as constructed, before `start` fills them.
+    pub fn new(config: MtConfig, marker: char) -> ParallelEval {
+        ParallelEval {
+            config,
+            record_crit_path_load_pins: config.fanin_side_loss,
+            move_sequence: Vec::new(),
+            unbuffer_in_sequence: false,
+            generators: Vec::new(),
+            selector: config.parallel_eval.selector,
+            committed_moves: 0,
+            batch_index: 0,
+            tentative_moves: 0,
+            checkpoint_misses: 0,
+            small_batch_retry_started: false,
+            max_utilization_warned: false,
+            batch_journal_open: false,
+            rebuffer_targets_in_batch: 0,
+            max_end_repairs: usize::MAX,
+            checkpoint_wns: 0.0,
+            checkpoint_tns: 0.0,
+            best_checkpoint_wns: 0.0,
+            reference_period: 0.0,
+            graph_vertices: 0,
+            converged: false,
+            stall: StallMonitor::default(),
+            crit_path_load_pins: HashSet::new(),
+            marker,
+        }
+    }
+}
+
 /// `selectMoveSequence`'s exclusion: BufferToInverters has no gain estimate to rank it; Clone,
 /// SizeUpMatch and Reroute have no Mt form.
 fn has_mt_form(m: Move) -> bool {
@@ -422,32 +457,7 @@ impl Repair<'_, '_> {
     fn pe_start(&mut self, marker: char) -> Result<ParallelEval, Stop> {
         let config = for_parallel_eval(self.args.effort.unwrap_or(Effort::High));
         self.pe_optimization_policy_start();
-        let mut pe = ParallelEval {
-            config,
-            record_crit_path_load_pins: config.fanin_side_loss,
-            move_sequence: Vec::new(),
-            unbuffer_in_sequence: false,
-            generators: Vec::new(),
-            selector: config.parallel_eval.selector,
-            committed_moves: 0,
-            batch_index: 0,
-            tentative_moves: 0,
-            checkpoint_misses: 0,
-            small_batch_retry_started: false,
-            max_utilization_warned: false,
-            batch_journal_open: false,
-            rebuffer_targets_in_batch: 0,
-            max_end_repairs: usize::MAX,
-            checkpoint_wns: 0.0,
-            checkpoint_tns: 0.0,
-            best_checkpoint_wns: 0.0,
-            reference_period: 0.0,
-            graph_vertices: 0,
-            converged: false,
-            stall: StallMonitor::default(),
-            crit_path_load_pins: HashSet::new(),
-            marker,
-        };
+        let mut pe = ParallelEval::new(config, marker);
         self.pe_select_move_sequence(&mut pe);
         pe_build_move_generators(&mut pe);
         // The reserve follows the margin the targets are collected with: in before the copy.
@@ -463,7 +473,6 @@ impl Repair<'_, '_> {
         self.pe_trace_start(&pe);
         Ok(pe)
     }
-
     /// `OptimizationPolicy::start` for an experimental policy: RSZ-2024.
     fn pe_optimization_policy_start(&mut self) {
         self.report("[WARNING RSZ-2024] Experimental repair setup policy 'SetupParallelEvalPolicy' selected. Do not use this for production.".into());
@@ -633,6 +642,7 @@ impl Repair<'_, '_> {
                 let mut chunk = chunk;
                 pe_prewarm_targets(&chunk);
                 self.pe_prepare_targets(pe, &mut chunk)?;
+                self.pe_generate_candidates(pe, &mut chunk)?;
                 pool.targets.extend(chunk);
                 return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: candidate generation (generateCandidates) is not modelled".into()));
             }
@@ -667,6 +677,44 @@ impl Repair<'_, '_> {
         })?;
         pe_trace(&trace);
         Ok(())
+    }
+
+    /// `generateCandidates`, its main-thread half: `planGeneration` on each target in chunk order
+    /// (the skip rules, then each generator's `generatorAllowed`, `isApplicable` and
+    /// `prepareInputs`, all on the timer as preparation left it). Generation itself is refused
+    /// after; so is a run with a generator whose planning is not modelled yet.
+    fn pe_generate_candidates(&mut self, pe: &mut ParallelEval, targets: &mut [Target]) -> Result<(), Stop> {
+        let edits = self.design.take_timer_edits();
+        let ctx = self.ctx;
+        let facts: Vec<PlanFacts> = targets.iter().map(|t| self.pe_plan_facts(t)).collect();
+        let design = self.design.as_design();
+        let mut trace = String::new();
+        super::timed_all(ctx, design, &mut self.timer, edits, |gs, ss, _cs| {
+            for (target, facts) in targets.iter_mut().zip(&facts) {
+                pe_plan_generation(pe, target, facts, gs, ss, design, ctx, &mut trace);
+            }
+            Ok(())
+        })?;
+        pe_trace(&trace);
+        if let Some(m) = pe.generators.iter().find(|&&m| !plan_modelled(m)) {
+            return Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -phases PARALLEL_EVAL: planGeneration for {} (isApplicable, prepareInputs) is not modelled", m.name())));
+        }
+        Ok(())
+    }
+
+    /// What planning reads off the database and the committer rather than the timer — nothing
+    /// edits either while a chunk is planned, so it is read up front.
+    fn pe_plan_facts(&self, target: &Target) -> PlanFacts {
+        let inst = self.design.inst_id(&target.inst);
+        let buffer_ports = self.ctx.libs.link_cell(&target.cell).filter(|c| c.is_buffer()).and_then(|c| c.buffer_ports()).map(|(i, o)| (i.name.clone(), o.name.clone()));
+        PlanFacts {
+            driver_is_buffer: buffer_ports.is_some(),
+            // UnbufferMtGenerator::isApplicable: the moves that block a serial removal (a resize
+            // does not).
+            unbuffer_blocked: [Move::SwapPins, Move::Clone, Move::SplitLoad, Move::Buffer].into_iter().any(|m| self.committer.has_moves(m, inst)),
+            // `canRemoveBuffer(buffer, true)`.
+            can_remove_buffer: buffer_ports.is_some_and(|(i, o)| self.ctx.sizing.masters.get(&target.cell).is_some_and(|m| m.logic_std) && self.design.can_remove_buffer(&target.inst, &i, &o)),
+        }
     }
 
     /// `collectTargets`: the chunk's path-driver targets, each with its fanout.
@@ -799,10 +847,139 @@ fn pe_collect_path_driver_targets(pe: &mut ParallelEval, view: &PathView, path_s
                 estimator_context: None,
                 sequential_estimator: false,
                 prepare_why: String::new(),
+                unbuffer_gain: None,
             });
         }
     }
     targets
+}
+
+/// See [`Repair::pe_plan_facts`].
+struct PlanFacts {
+    /// The driver's liberty cell is a buffer.
+    driver_is_buffer: bool,
+    unbuffer_blocked: bool,
+    can_remove_buffer: bool,
+}
+
+/// The generators whose `isApplicable` and `prepareInputs` are modelled: the others are left out
+/// of the plan, and the run is refused after the chunk is planned.
+fn plan_modelled(m: Move) -> bool {
+    matches!(m, Move::Unbuffer)
+}
+
+/// `planGeneration`: per generator in `move_sequence_` order, `generatorAllowed`, `isApplicable`
+/// (else `skip_not_applicable`), then `prepareInputs`; the plan's generators in that order. The
+/// tabu checks come first: both are empty until a batch is undone or missed, and only the first
+/// chunk of batch 0 is planned here.
+#[allow(clippy::too_many_arguments)]
+fn pe_plan_generation(pe: &mut ParallelEval, target: &mut Target, facts: &PlanFacts, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], design: &dyn super::Design, ctx: &super::Ctx<'_>, trace: &mut String) {
+    let pin = target.driver_pin.clone();
+    let b = pe.batch_index;
+    let mut planned = Vec::new();
+    for m in pe.generators.clone() {
+        if !plan_modelled(m) {
+            continue;
+        }
+        if !pe_generator_allowed(pe, m) {
+            trace.push_str(&format!("VYGP|deny|{b}|{pin}|{}|rebuffer_in_batch={}\n", m.name(), pe.rebuffer_targets_in_batch));
+            continue;
+        }
+        if !pe_is_applicable(m, target, facts) {
+            trace.push_str(&format!("VYGP|na|{b}|{pin}|{}\n", m.name()));
+            continue;
+        }
+        if m == Move::Buffer {
+            pe.rebuffer_targets_in_batch += 1;
+        }
+        pe_prepare_inputs(m, target, facts, gs, ss, design, ctx);
+        trace.push_str(&format!("VYGP|inputs|{b}|{pin}|{}|{}\n", m.name(), pe_inputs_line(m, target)));
+        planned.push(m.name());
+    }
+    if pe.generators.iter().all(|&m| plan_modelled(m)) {
+        trace.push_str(&format!("VYGP|plan|{b}|{pin}|gens={}\n", planned.join(",")));
+    }
+}
+
+/// `generatorAllowed`: Rebuffer within `rebuffer_max_targets` per batch; Unbuffer only when the
+/// sequence asks for it or the tail allows its own removal generator (single-move batches after
+/// the greedy stall — never in batch 0, the tail is reset with the run); the rest always.
+fn pe_generator_allowed(pe: &ParallelEval, m: Move) -> bool {
+    match m {
+        Move::Buffer => pe.rebuffer_targets_in_batch < pe.config.parallel_eval.rebuffer_max_targets,
+        Move::Unbuffer => pe.unbuffer_in_sequence || pe_tail_unbuffer_allowed(pe),
+        _ => true,
+    }
+}
+
+/// `ParallelEvalState::unbufferAllowed`: `active && batch_cap == 1 && greedy_stalled`. The tail
+/// is not modelled: it is inactive from `resetRunState` until a later batch stalls.
+fn pe_tail_unbuffer_allowed(_pe: &ParallelEval) -> bool {
+    false
+}
+
+/// `MoveGenerator::isApplicable` and its overrides. Every target here is in the path-driver
+/// view, which the base check asks for.
+fn pe_is_applicable(m: Move, target: &Target, facts: &PlanFacts) -> bool {
+    match m {
+        // UnbufferMtGenerator: the buffer and the stage that drives it on the path; a buffer's
+        // liberty port; no move committed on it that blocks a removal.
+        Move::Unbuffer => target.path_index >= 2 && facts.driver_is_buffer && !target.inst.is_empty() && !facts.unbuffer_blocked,
+        _ => true,
+    }
+}
+
+/// `MoveGenerator::prepareInputs`: the generator's live timer reads, stored on the target.
+#[allow(clippy::too_many_arguments)]
+fn pe_prepare_inputs(m: Move, target: &mut Target, facts: &PlanFacts, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], design: &dyn super::Design, ctx: &super::Ctx<'_>) {
+    if m == Move::Unbuffer {
+        unbuffer_mt_prepare_inputs(target, facts, gs, ss, design, ctx);
+    }
+}
+
+/// `UnbufferMtGenerator::prepareInputs`: `isEligible` (driver and path context, the fanout and
+/// capacitance guards, the slack guard at the capacitance check's scene or else the path's,
+/// `canRemoveBuffer`), then `estimateRemovalGain`.
+fn unbuffer_mt_prepare_inputs(target: &mut Target, facts: &PlanFacts, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], design: &dyn super::Design, ctx: &super::Ctx<'_>) {
+    let scene = target.scene;
+    let g = &gs[scene];
+    let find = |pin: &str, is_driver: bool| g.vertices.iter().position(|x| x.name == pin && x.is_driver == is_driver);
+    let Ok(chain) = super::refind_chain(&target.path, find, &ss[scene].paths) else { return };
+    let owned: Vec<(Option<String>, Option<String>, Option<String>)> = chain
+        .iter()
+        .map(|(v, p)| {
+            let vx = &g.vertices[*v];
+            let inst = match &vx.conn {
+                vyges_sta::netlist::Conn::Inst(k, _) => Some(g.netlist.insts[*k].0.clone()),
+                vyges_sta::netlist::Conn::Port(_) => None,
+            };
+            let in_port = p.prev.and_then(|prev| super::edge_arc_set(g, prev.edge)).map(|set| set.from.clone());
+            (inst, vx.cell.clone(), in_port)
+        })
+        .collect();
+    let stages: Vec<crate::unbuffer::PathStage<'_>> = chain
+        .iter()
+        .zip(&owned)
+        .map(|((v, p), (inst, cell, in_port))| crate::unbuffer::PathStage { vertex: *v, rf: p.tag.rf, inst: inst.as_deref(), cell: cell.as_deref(), in_port: in_port.as_deref() })
+        .collect();
+    let index = target.path_index;
+    let ideal: std::collections::BTreeSet<usize> = g.ideal_clock.iter().copied().collect();
+    let locate = |pin: &str| design.pin_location(pin);
+    target.unbuffer_gain = super::with_unbuffer_timer(ctx, gs, ss, design, scene, &ideal, |uctx, t| {
+        let Some(crate::unbuffer::Verdict::Resolved(r)) = crate::unbuffer::probe(uctx, t, &stages, index, target.fanout, Some(scene)) else { return None };
+        if r.fanout_reject.is_some() || r.cap_reject.is_some() || !r.slack_ok || !facts.can_remove_buffer {
+            return None;
+        }
+        Some(crate::unbuffer::estimate_removal_gain(uctx, t, &stages, index, &r, &locate))
+    });
+}
+
+/// The VYGP printer's `prepareInputs` summary for one generator.
+fn pe_inputs_line(m: Move, target: &Target) -> String {
+    match m {
+        Move::Unbuffer => format!("gain={}", target.unbuffer_gain.map_or("-".into(), e9i)),
+        _ => String::new(),
+    }
 }
 
 /// `prewarmTargets`: the swappable and VT-equivalent cell caches; it decides nothing.
@@ -1093,5 +1270,70 @@ mod tests {
         assert_eq!(e9i(f32::NEG_INFINITY), "-inf");
         assert_eq!(e9i(f32::INFINITY), "inf");
         assert_eq!(e9i(1.0), "1.000000000e+00");
+    }
+
+    fn target_at(path_index: usize) -> Target {
+        Target {
+            driver_pin: "b1/Z".into(),
+            endpoint_pin: "r1/D".into(),
+            violated_endpoint_pin: "r1/D".into(),
+            driver_rf: 0,
+            path_index,
+            load_pin: None,
+            slack: -1e-10,
+            fanout: 1,
+            scene: 0,
+            inst: "b1".into(),
+            cell: "BUF_X1".into(),
+            path: Vec::new(),
+            path_start: 0,
+            latch_data_path: None,
+            estimator_context: None,
+            sequential_estimator: false,
+            prepare_why: String::new(),
+            unbuffer_gain: None,
+        }
+    }
+
+    #[test]
+    fn a_rebuffer_target_budget_and_the_unbuffer_sequence_rule_gate_the_generators() {
+        // Rule (generatorAllowed): BufferMove runs on at most rebuffer_max_targets targets per
+        // batch (the count is taken before it is raised); UnbufferMove runs when the sequence
+        // names it, or when the tail allows its own removal generator (never in batch 0: the tail
+        // is reset with the run); every other move always runs.
+        let mut pe = ParallelEval::new(for_parallel_eval(Effort::High), 'P');
+        let max = pe.config.parallel_eval.rebuffer_max_targets;
+        pe.rebuffer_targets_in_batch = max - 1;
+        assert!(pe_generator_allowed(&pe, Move::Buffer));
+        pe.rebuffer_targets_in_batch = max;
+        assert!(!pe_generator_allowed(&pe, Move::Buffer));
+        pe.unbuffer_in_sequence = false;
+        assert!(!pe_generator_allowed(&pe, Move::Unbuffer));
+        pe.unbuffer_in_sequence = true;
+        assert!(pe_generator_allowed(&pe, Move::Unbuffer));
+        for m in [Move::SizeUp, Move::VtSwap, Move::SwapPins, Move::SplitLoad, Move::SizeDownFanout] {
+            assert!(pe_generator_allowed(&pe, m), "{m:?}");
+        }
+    }
+
+    #[test]
+    fn an_unbuffer_target_is_a_buffer_two_stages_in_that_no_blocking_move_touched() {
+        // Rule (UnbufferMtGenerator::isApplicable): the path holds the buffer and the stage that
+        // drives it (path index 2 or more), the driver's cell is a buffer, and no SwapPins, Clone,
+        // SplitLoad or Buffer move is committed on the instance (a resize does not block).
+        let facts = |buffer: bool, blocked: bool| PlanFacts { driver_is_buffer: buffer, unbuffer_blocked: blocked, can_remove_buffer: true };
+        assert!(pe_is_applicable(Move::Unbuffer, &target_at(2), &facts(true, false)));
+        assert!(!pe_is_applicable(Move::Unbuffer, &target_at(1), &facts(true, false)));
+        assert!(!pe_is_applicable(Move::Unbuffer, &target_at(2), &facts(false, false)));
+        assert!(!pe_is_applicable(Move::Unbuffer, &target_at(2), &facts(true, true)));
+    }
+
+    #[test]
+    fn the_trace_prints_an_unset_unbuffer_gain_as_a_dash() {
+        // The printer's vygOpt: an unset optional prints `-`, a set one {:.9e}.
+        let mut t = target_at(2);
+        assert_eq!(pe_inputs_line(Move::Unbuffer, &t), "gain=-");
+        t.unbuffer_gain = Some(0.25);
+        assert_eq!(pe_inputs_line(Move::Unbuffer, &t), "gain=2.500000000e-01");
     }
 }

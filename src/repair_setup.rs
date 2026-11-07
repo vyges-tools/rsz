@@ -1622,6 +1622,26 @@ fn annotate_load_slacks(gs: &[Graph<'_>], ss: &[Search<'_, '_>], bn: &crate::buf
 /// ([`unbuffer::probe`]), taken while the timer is at hand.
 #[allow(clippy::too_many_arguments)]
 fn probe_unbuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], _cs: &[BTreeSet<usize>], design: &dyn Design, scene: usize, ideal: &BTreeSet<usize>, chain: &[(usize, vyges_sta::search::Path)], stages: &mut [Stage]) {
+    let verdicts: Vec<Option<unbuffer::Verdict>> = with_unbuffer_timer(ctx, gs, ss, design, scene, ideal, |uctx, t| {
+        let path: Vec<unbuffer::PathStage<'_>> = chain
+            .iter()
+            .zip(stages.iter())
+            .map(|((v, _), st)| unbuffer::PathStage { vertex: *v, rf: st.rf, inst: st.inst.as_deref(), cell: st.cell.as_deref(), in_port: st.in_port.as_deref() })
+            .collect();
+        (0..stages.len())
+            .map(|i| {
+                let st = &stages[i];
+                (i > 0 && st.is_driver && !st.top_port).then(|| unbuffer::probe(uctx, t, &path, i, st.fanout, None)).flatten()
+            })
+            .collect()
+    });
+    for (st, v) in stages.iter_mut().zip(verdicts) {
+        st.unbuffer = v;
+    }
+}
+
+/// The unbuffer probe's context and its timer at `scene` (every scene's too, with several).
+fn with_unbuffer_timer<R>(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], design: &dyn Design, scene: usize, ideal: &BTreeSet<usize>, read: impl FnOnce(&unbuffer::Ctx<'_>, &unbuffer::Timer<'_, '_>) -> R) -> R {
     let (g, search) = (&gs[scene], &ss[scene]);
     let index: HashMap<String, usize> = g.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect();
     let steiner = |net: &str, drvr: &str| design.net_shape(net, drvr);
@@ -1651,20 +1671,7 @@ fn probe_unbuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], _cs: &
         pin_addr: ctx.pin_addr,
         hierarchy: ctx.hierarchy,
     };
-    let path: Vec<unbuffer::PathStage<'_>> = chain
-        .iter()
-        .zip(stages.iter())
-        .map(|((v, _), st)| unbuffer::PathStage { vertex: *v, rf: st.rf, inst: st.inst.as_deref(), cell: st.cell.as_deref(), in_port: st.in_port.as_deref() })
-        .collect();
-    let verdicts: Vec<Option<unbuffer::Verdict>> = (0..stages.len())
-        .map(|i| {
-            let st = &stages[i];
-            (i > 0 && st.is_driver && !st.top_port).then(|| unbuffer::probe(&uctx, &t, &path, i, st.fanout)).flatten()
-        })
-        .collect();
-    for (st, v) in stages.iter_mut().zip(verdicts) {
-        st.unbuffer = v;
-    }
+    read(&uctx, &t)
 }
 
 /// `SetupLegacyBase::rankPathDrivers`: from the start index, every driver that is not a top-level
@@ -5330,7 +5337,7 @@ impl Repair<'_, '_> {
                 self.debug("unbuffer_move", 4, format!("buffer {} is not removed because path context did not resolve", network_name(&inst, self.ctx.hierarchy)));
                 return Ok(None);
             }
-            Some(unbuffer::Verdict::Resolved(r)) => r.clone(),
+            Some(unbuffer::Verdict::Resolved(r)) => (**r).clone(),
         };
         if let Some(why) = self.committer.blocking_buffer_removal(self.design.inst_id(&r.inst)) {
             self.debug("unbuffer_move", 4, format!("buffer {} is not removed because {why}", network_name(&r.inst, self.ctx.hierarchy)));
