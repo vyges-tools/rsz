@@ -185,7 +185,7 @@ pub fn delay_inf(x: f32) -> bool {
 }
 
 /// `sideLoadWeight`.
-fn side_load_weight(pin: &str, options: &FaninSideLoadOptions<'_>) -> f32 {
+pub fn side_load_weight(pin: &str, options: &FaninSideLoadOptions<'_>) -> f32 {
     if options.critical_load_pins.contains(pin) { 1.0 } else { options.off_path_weight }
 }
 

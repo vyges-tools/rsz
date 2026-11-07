@@ -291,6 +291,25 @@ pub struct Target {
     pub swap_pins_input: Option<SwapPinsInput>,
     /// `input_cap_budgets` (`prepareInputCapBudgets`, SizeUp's and VtSwap's prepareInputs).
     pub input_cap_budgets: Option<Vec<InputCapBudget>>,
+    /// `split_load_input` (`SplitLoadMtGenerator::prepareInputs`).
+    pub split_load_input: Option<SplitLoadInput>,
+}
+
+/// `SplitLoadMtInput`: the loads a new buffer takes, the cell it is sized to, and the split
+/// model — the moved loads' capacitance and slack budgets, and the wire capacitance each net
+/// gains or loses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SplitLoadInput {
+    pub drvr_net: String,
+    pub drvr_loc: (i32, i32),
+    pub load_pins: Vec<String>,
+    pub buffer_cell: String,
+    pub resized_cell: String,
+    pub moved_pin_cap: f32,
+    pub target_wire_cap_saved: f32,
+    pub moved_wire_cap: f32,
+    pub target_load_delta: f32,
+    pub moved_loads: Vec<crate::delay_estimator::SideLoad>,
 }
 
 /// `Resizer::InputCapBudget`: an input port of the current cell, its capacitance, and the least
@@ -747,6 +766,7 @@ impl Repair<'_, '_> {
             dont_touch: self.design.net_info().dont_touch_insts.contains(&target.inst),
             pins_swapped: self.committer.has_moves(Move::SwapPins, inst),
             fixed: self.design.net_info().fixed_insts.contains(&target.inst),
+            ok_to_buffer_net: self.ok_to_buffer_net(&target.driver_pin),
             logic_std: self.ctx.sizing.masters.get(&target.cell).is_some_and(|m| m.logic_std),
             vt_swappable: self.ctx.vt_category_count >= 2 && self.ctx.sizing.masters.contains_key(&target.cell) && self.ctx.sizing.vt_equiv_cells(&target.cell, self.ctx.vt_category_count).len() > 1,
             driver_liberty: target.driver_pin.rsplit_once('/').is_some_and(|(_, port)| self.ctx.libs.link_cell(&target.cell).is_some_and(|c| c.port(port).is_some())),
@@ -891,6 +911,7 @@ fn pe_collect_path_driver_targets(pe: &mut ParallelEval, view: &PathView, path_s
                 unbuffer_gain: None,
                 swap_pins_input: None,
                 input_cap_budgets: None,
+                split_load_input: None,
             });
         }
     }
@@ -910,6 +931,8 @@ struct PlanFacts {
     driver_liberty: bool,
     /// `Resizer::isFixed(inst)`.
     fixed: bool,
+    /// `Resizer::okToBufferNet(driver_pin)`.
+    ok_to_buffer_net: bool,
     /// `isLogicStdCell(inst)`.
     logic_std: bool,
     /// `staToDb(cell)` is a master and `getVTEquivCells(cell)` has more than the cell, with at
@@ -922,7 +945,7 @@ struct PlanFacts {
 /// The generators whose `isApplicable` and `prepareInputs` are modelled: the others are left out
 /// of the plan, and the run is refused after the chunk is planned.
 fn plan_modelled(m: Move) -> bool {
-    matches!(m, Move::Unbuffer | Move::SwapPins | Move::SizeUp | Move::VtSwap)
+    matches!(m, Move::Unbuffer | Move::SwapPins | Move::SizeUp | Move::VtSwap | Move::SplitLoad)
 }
 
 /// `planGeneration`: per generator in `move_sequence_` order, `generatorAllowed`, `isApplicable`
@@ -949,7 +972,7 @@ fn pe_plan_generation(pe: &mut ParallelEval, target: &mut Target, facts: &PlanFa
         if m == Move::Buffer {
             pe.rebuffer_targets_in_batch += 1;
         }
-        pe_prepare_inputs(m, target, facts, gs, ss, design, ctx, &pe.config)?;
+        pe_prepare_inputs(m, target, facts, gs, ss, design, ctx, &pe.config, &pe.crit_path_load_pins)?;
         trace.push_str(&format!("VYGP|inputs|{b}|{pin}|{}|{}\n", m.name(), pe_inputs_line(m, target)));
         planned.push(m.name());
     }
@@ -990,6 +1013,9 @@ fn pe_is_applicable(m: Move, target: &Target, facts: &PlanFacts) -> bool {
         // VtSwapMtGenerator (path-driver or instance view): a context, a changeable logic
         // standard cell with a liberty cell, two VT categories, a master, and a VT equivalent.
         Move::VtSwap => target.estimator_context.is_some() && !target.inst.is_empty() && !target.cell.is_empty() && !facts.dont_touch && facts.logic_std && facts.vt_swappable,
+        // SplitLoadMtGenerator: a context, more than kSplitLoadMinFanout (the legacy split's 8)
+        // loads, and a net that accepts a buffer.
+        Move::SplitLoad => target.estimator_context.is_some() && target.fanout > crate::clone::CLONE_MIN_FANOUT && facts.ok_to_buffer_net,
         Move::SwapPins => target.path_index > 0 && facts.driver_liberty && !facts.driver_is_buffer && !facts.driver_is_inverter && !target.inst.is_empty() && !facts.dont_touch && !facts.pins_swapped,
         _ => true,
     }
@@ -997,16 +1023,136 @@ fn pe_is_applicable(m: Move, target: &Target, facts: &PlanFacts) -> bool {
 
 /// `MoveGenerator::prepareInputs`: the generator's live timer reads, stored on the target.
 #[allow(clippy::too_many_arguments)]
-fn pe_prepare_inputs(m: Move, target: &mut Target, facts: &PlanFacts, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], design: &dyn super::Design, ctx: &super::Ctx<'_>, cfg: &MtConfig) -> Result<(), String> {
+fn pe_prepare_inputs(m: Move, target: &mut Target, facts: &PlanFacts, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], design: &dyn super::Design, ctx: &super::Ctx<'_>, cfg: &MtConfig, crit: &HashSet<String>) -> Result<(), String> {
     match m {
         Move::Unbuffer => unbuffer_mt_prepare_inputs(target, facts, gs, ss, design, ctx),
         Move::SwapPins => swap_pins_mt_prepare_inputs(target, gs, ss, design, ctx, cfg)?,
         // SizeUpMt also builds its replacement options here (a cache generate reads; it decides
         // nothing yet).
         Move::SizeUp | Move::VtSwap => prepare_input_cap_budgets(target, gs, design, ctx),
+        Move::SplitLoad => split_load_mt_prepare_inputs(target, gs, ss, design, ctx, crit, cfg)?,
         _ => {}
     }
     Ok(())
+}
+
+/// `SplitLoadMtGenerator::prepareInputs`: the ranked fanouts (`collectRankedFanoutSlacks`), the
+/// less critical half without top-level ports in that order (`chooseSplitLoads`), the lowest-drive
+/// buffer and the driver's net; then the split model at the target arc's scene
+/// (`buildLoadSplitModel`), the buffer sized for the moved load (`findTargetCell`), and the
+/// target's load change.
+fn split_load_mt_prepare_inputs(target: &mut Target, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], design: &dyn super::Design, ctx: &super::Ctx<'_>, crit: &HashSet<String>, cfg: &MtConfig) -> Result<(), String> {
+    let scene = target.scene;
+    let g = &gs[scene];
+    let Some(drvr) = g.vertices.iter().position(|x| x.name == target.driver_pin && x.is_driver) else { return Ok(()) };
+    let fanout_slacks = super::fanout_slacks(gs, scene, drvr, target.driver_rf, true, ss);
+    if fanout_slacks.is_empty() {
+        return Ok(());
+    }
+    let load_pins: Vec<String> = fanout_slacks[..fanout_slacks.len() / 2].iter().filter(|f| !f.top_port).map(|f| f.pin.clone()).collect();
+    if load_pins.is_empty() {
+        return Ok(());
+    }
+    let buffer_cell = ctx.lowest_buffer.to_string();
+    let Some(net) = g.vertex_net[drvr] else { return Ok(()) };
+    if buffer_cell.is_empty() {
+        return Ok(());
+    }
+    let Some(context) = target.estimator_context.as_ref() else { return Ok(()) };
+    let arc_scene = context.target().arc.scene;
+    let mut input = SplitLoadInput {
+        drvr_net: g.netlist.nets[net].name.clone(),
+        drvr_loc: design.pin_location(&target.driver_pin),
+        load_pins,
+        buffer_cell,
+        resized_cell: String::new(),
+        moved_pin_cap: 0.0,
+        target_wire_cap_saved: 0.0,
+        moved_wire_cap: 0.0,
+        target_load_delta: 0.0,
+        moved_loads: Vec::new(),
+    };
+    let weights = crate::delay_estimator::FaninSideLoadOptions { critical_load_pins: crit, off_path_weight: cfg.fanin_side_offpath_weight };
+    build_load_split_model(&mut input, g, gs, ss, design, ctx, arc_scene, net, &weights);
+    // apply() resizes the new buffer to its load's target slew: the estimate scores that cell.
+    input.resized_cell = ctx.sizing.find_target_cell(&input.buffer_cell, input.moved_pin_cap + input.moved_wire_cap, false).map_err(|e| format!("{e:?}"))?;
+    let Some(scene_buffer) = ctx.libs.scene_cell(arc_scene, &input.resized_cell).or_else(|| ctx.libs.link_cell(&input.resized_cell)) else { return Ok(()) };
+    let Some((buffer_input, _)) = scene_buffer.buffer_ports() else { return Ok(()) };
+    input.target_load_delta = super::port_capacitance(scene_buffer, &buffer_input.name).unwrap_or(0.0) - input.moved_pin_cap - input.target_wire_cap_saved;
+    target.split_load_input = Some(input);
+    Ok(())
+}
+
+/// `buildLoadSplitModel`: over the driver net's load pins in pin-id order (a PinSet), the
+/// half-perimeters of all, kept and moved pins with the driver; each moved pin's capacitance at
+/// the arc's scene and, when constrained, its slack and weight; the wire capacitance the target
+/// net saves and the new net gets.
+#[allow(clippy::too_many_arguments)]
+fn build_load_split_model(input: &mut SplitLoadInput, g: &vyges_sta::graph::Graph<'_>, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], design: &dyn super::Design, ctx: &super::Ctx<'_>, arc_scene: usize, net: usize, weights: &crate::delay_estimator::FaninSideLoadOptions<'_>) {
+    let cap_per_meter = (ctx.wire_rc.h_cap + ctx.wire_rc.v_cap) / 2.0;
+    let moved: HashSet<&str> = input.load_pins.iter().map(String::as_str).collect();
+    let (mut all_box, mut kept_box, mut moved_box) = (BoundingBox::default(), BoundingBox::default(), BoundingBox::default());
+    for b in [&mut all_box, &mut kept_box, &mut moved_box] {
+        b.add(input.drvr_loc);
+    }
+    let nl = &g.netlist;
+    let pin_id = &design.net_info().pin_id;
+    let mut pins: Vec<String> = nl.nets[net].pins.iter().map(|c| nl.pin_name(c)).collect();
+    pins.sort_by_key(|p| pin_id.get(p).copied().unwrap_or(u64::MAX));
+    for pin in &pins {
+        let Some(v) = g.vertices.iter().position(|x| x.name == *pin && !x.is_driver) else { continue };
+        if !pe_is_load(g, v) {
+            continue;
+        }
+        let location = design.pin_location(pin);
+        all_box.add(location);
+        if !moved.contains(pin.as_str()) {
+            kept_box.add(location);
+            continue;
+        }
+        moved_box.add(location);
+        let vx = &g.vertices[v];
+        if let (Some(cell), Some(port)) = (vx.cell.as_deref(), vx.port.as_deref()) {
+            if let Some(c) = ctx.libs.scene_cell(arc_scene, cell).or_else(|| ctx.libs.link_cell(cell)) {
+                input.moved_pin_cap += super::port_capacitance(c, port).unwrap_or(0.0);
+            }
+        }
+        // The moved load keeps its slack as the budget for the new driver's extra delay.
+        let slack = gs[0].vertices.iter().position(|x| x.name == *pin && !x.is_driver).map_or(super::INF, |v0| super::slack_over_scenes(gs, ss, v0, MAX, None));
+        if crate::delay_estimator::delay_inf(slack) {
+            continue;
+        }
+        input.moved_loads.push(crate::delay_estimator::SideLoad { pin: pin.clone(), slack, weight: crate::delay_estimator::side_load_weight(pin, weights) });
+    }
+    let meters_per_dbu = 1.0 / (f64::from(ctx.dbu) * 1e6);
+    input.target_wire_cap_saved = (cap_per_meter * meters_per_dbu * f64::from((all_box.half_perimeter() - kept_box.half_perimeter()).max(0))) as f32;
+    input.moved_wire_cap = (cap_per_meter * meters_per_dbu * f64::from(moved_box.half_perimeter())) as f32;
+}
+
+/// `Network::isLoad`: an instance input (or bidirectional) pin, or a top-level output port — the
+/// graph's load vertices (a flat netlist has no hierarchical pins).
+fn pe_is_load(g: &vyges_sta::graph::Graph<'_>, v: usize) -> bool {
+    let vx = &g.vertices[v];
+    !vx.is_driver
+}
+
+/// The split model's `BoundingBox`: half-perimeter of the points added, 0 when empty.
+#[derive(Debug, Clone, Copy, Default)]
+struct BoundingBox {
+    rect: Option<(i32, i32, i32, i32)>,
+}
+
+impl BoundingBox {
+    fn add(&mut self, (x, y): (i32, i32)) {
+        self.rect = Some(match self.rect {
+            None => (x, y, x, y),
+            Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x), y1.max(y)),
+        });
+    }
+
+    fn half_perimeter(&self) -> i32 {
+        self.rect.map_or(0, |(x0, y0, x1, y1)| (x1 - x0) + (y1 - y0))
+    }
 }
 
 /// `prepareInputCapBudgets`: `Resizer::inputCapBudgets(inst)` once per target (the second
@@ -1158,6 +1304,19 @@ fn pe_inputs_line(m: Move, target: &Target) -> String {
                 let mut s = format!("budgets={}", b.len());
                 for x in b {
                     s.push_str(&format!("|{}:{}:{}", x.port, e9i(x.current_cap), e9i(x.max_cap_increase)));
+                }
+                s
+            }
+        },
+        Move::SplitLoad => match &target.split_load_input {
+            None => "split=-".into(),
+            Some(i) => {
+                let mut s = format!(
+                    "split={}|loc={},{}|loads={}|buf={}|resized={}|moved_pin_cap={}|wire_saved={}|moved_wire={}|delta={}|moved={}",
+                    i.drvr_net, i.drvr_loc.0, i.drvr_loc.1, i.load_pins.len(), i.buffer_cell, i.resized_cell, e9i(i.moved_pin_cap), e9i(i.target_wire_cap_saved), e9i(i.moved_wire_cap), e9i(i.target_load_delta), i.moved_loads.len()
+                );
+                for l in &i.moved_loads {
+                    s.push_str(&format!("|{}:{}:{}", l.pin, e9i(l.slack), e9i(l.weight)));
                 }
                 s
             }
@@ -1488,6 +1647,7 @@ mod tests {
             unbuffer_gain: None,
             swap_pins_input: None,
             input_cap_budgets: None,
+            split_load_input: None,
         }
     }
 
@@ -1513,7 +1673,7 @@ mod tests {
     }
 
     fn facts() -> PlanFacts {
-        PlanFacts { driver_is_buffer: false, driver_is_inverter: false, dont_touch: false, pins_swapped: false, driver_liberty: true, fixed: false, logic_std: true, vt_swappable: true, unbuffer_blocked: false, can_remove_buffer: true }
+        PlanFacts { driver_is_buffer: false, driver_is_inverter: false, dont_touch: false, pins_swapped: false, driver_liberty: true, fixed: false, ok_to_buffer_net: true, logic_std: true, vt_swappable: true, unbuffer_blocked: false, can_remove_buffer: true }
     }
 
     fn with_context(mut t: Target) -> Target {
@@ -1554,6 +1714,34 @@ mod tests {
         assert_eq!(pe_inputs_line(Move::SizeUp, &t), "budgets=-");
         t.input_cap_budgets = Some(vec![InputCapBudget { port: "A".into(), current_cap: 0.5, max_cap_increase: f32::INFINITY }]);
         assert_eq!(pe_inputs_line(Move::VtSwap, &t), "budgets=1|A:5.000000000e-01:inf");
+    }
+
+    #[test]
+    fn a_split_load_target_has_a_context_more_than_eight_loads_and_a_bufferable_net() {
+        // Rule (SplitLoadMtGenerator::isApplicable): a context, a fanout above the legacy split's
+        // kSplitLoadMinFanout (8), and okToBufferNet on the driver.
+        let mut t = with_context(target_at(2));
+        t.fanout = 9;
+        assert!(pe_is_applicable(Move::SplitLoad, &t, &facts()));
+        t.fanout = 8;
+        assert!(!pe_is_applicable(Move::SplitLoad, &t, &facts()));
+        t.fanout = 9;
+        assert!(!pe_is_applicable(Move::SplitLoad, &t, &PlanFacts { ok_to_buffer_net: false, ..facts() }));
+        let mut u = target_at(2);
+        u.fanout = 9;
+        assert!(!pe_is_applicable(Move::SplitLoad, &u, &facts()));
+    }
+
+    #[test]
+    fn the_split_box_half_perimeter_grows_point_by_point_and_is_zero_empty() {
+        // The split model's BoundingBox: dx + dy of the points added; 0 before any.
+        let mut b = BoundingBox::default();
+        assert_eq!(b.half_perimeter(), 0);
+        b.add((10, 5));
+        assert_eq!(b.half_perimeter(), 0);
+        b.add((4, 9));
+        b.add((7, 1));
+        assert_eq!(b.half_perimeter(), 6 + 8);
     }
 
     #[test]
