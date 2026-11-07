@@ -636,6 +636,7 @@ impl Repair<'_, '_> {
         pe.rebuffer_targets_in_batch = 0;
         self.trk_capture_pre_phase_slack()?;
         self.pe_collector_init();
+        self.pe_scan_crit_path_load_pins(pe)?;
         if self.args.verbose || pe.batch_index == 0 {
             self.pe_print_row(&format!("{}{}", pe.batch_index, pe.marker));
         }
@@ -649,6 +650,27 @@ impl Repair<'_, '_> {
         }
         pe_trace(&t);
         Ok(BatchScope { target_endpoints, batch_cap })
+    }
+
+    /// `collectViolatingEndpoints`' crit-path scan: the set is cleared at every scan; with
+    /// `record_crit_path_load_pins_` (fanin side loss on) every violating endpoint's worst path adds
+    /// its load pins from the start index — side loads off this chunk's paths but on another
+    /// violating endpoint's worst path take the full weight. Target collection adds the paths it
+    /// expands on top, latch segments included.
+    fn pe_scan_crit_path_load_pins(&mut self, pe: &mut ParallelEval) -> Result<(), Stop> {
+        pe.crit_path_load_pins.clear();
+        if !pe.record_crit_path_load_pins {
+            return Ok(());
+        }
+        let want: Vec<String> = self.collector_ends.iter().map(|(p, _)| p.clone()).collect();
+        let edits = self.design.take_timer_edits();
+        let snap = super::snapshot(self.ctx, self.design.as_design(), &want, &mut self.timer, edits)?;
+        for pin in &want {
+            let Some(view) = snap.paths.get(pin) else { continue };
+            pe.crit_path_load_pins.extend(pe_path_load_pins(view));
+        }
+        pe_trace(&format!("VYGP|ev|scan_crit_path_load_pins|metric=|move=|count={}\n", pe.crit_path_load_pins.len()));
+        Ok(())
     }
 
     /// `ProgressReporter::printRow` (no startpoint metrics): the collector's WNS, TNS, Viol and
@@ -869,6 +891,12 @@ fn pe_effective_batch_cap(pe: &ParallelEval, failing_endpoint_count: usize) -> i
 /// always within it.
 fn pe_finish_at_max_area() -> bool {
     false
+}
+
+/// The load pins of an expanded path from its start index: the pins its vertices are not drivers
+/// of.
+fn pe_path_load_pins(view: &PathView) -> impl Iterator<Item = String> + '_ {
+    view.stages.iter().skip(view.start).filter(|s| !s.is_driver).map(|s| s.pin.clone())
 }
 
 /// `collectPathDriverTargets`: the path's drivers from its start (`collectExpandedPathDriver-
@@ -1623,6 +1651,40 @@ mod tests {
         assert_eq!(e9i(f32::NEG_INFINITY), "-inf");
         assert_eq!(e9i(f32::INFINITY), "inf");
         assert_eq!(e9i(1.0), "1.000000000e+00");
+    }
+
+    fn path_stage(pin: &str, is_driver: bool) -> super::super::Stage {
+        super::super::Stage {
+            pin: pin.into(),
+            is_driver,
+            top_port: false,
+            inst: None,
+            cell: None,
+            port: None,
+            load_delay: None,
+            arc_delay: None,
+            in_wire_delay: None,
+            in_port: None,
+            fanout: 1,
+            load_cap: 0.0,
+            fanin_caps: Vec::new(),
+            rf: 0,
+            unbuffer: None,
+            in_slews: Vec::new(),
+            rebuffer: None,
+            fanout_slacks: None,
+            split_slacks: None,
+        }
+    }
+
+    #[test]
+    fn the_crit_path_scan_takes_a_paths_load_pins_from_its_start_index() {
+        // Rule (collectViolatingEndpoints under record_crit_path_load_pins_): over a violating
+        // endpoint's expanded worst path from startIndex, every pin whose vertex is not a driver.
+        // The clock pins before the start index are not on it.
+        let stages = [("clk", true), ("r0/CK", false), ("r0/Q", true), ("u1/A", false), ("u1/Y", true), ("r1/D", false)].iter().map(|&(p, d)| path_stage(p, d)).collect();
+        let view = PathView { stages, start: 2, scene: 0, latch_segments: Vec::new(), chain: Vec::new() };
+        assert_eq!(pe_path_load_pins(&view).collect::<Vec<_>>(), vec!["u1/A", "r1/D"]);
     }
 
     fn target_at(path_index: usize) -> Target {
