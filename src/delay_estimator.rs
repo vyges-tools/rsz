@@ -274,6 +274,11 @@ pub struct Reader<'a, 'g> {
     pub clock_pins: &'a BTreeSet<usize>,
     pub pin_id: &'a HashMap<String, u64>,
     pub master_pins: &'a HashMap<String, Vec<String>>,
+    /// `buildContext`'s `min_max` (`SelectedArc::min_max`): the analysis point the stages read
+    /// their slews, delays and loads at. MAX for the policy's contexts; the sequential estimator
+    /// builds a hold data path's driver at MIN (levels 0, no slew bias, no side model — the
+    /// slew bias and the side loads read MAX only).
+    pub mm: usize,
 }
 
 fn arc_set_of(cell: &Cell, set: usize) -> &ArcSet {
@@ -300,13 +305,13 @@ fn is_relaxed_arc_match(ref_set: &ArcSet, ref_arc: usize, cand_set: &ArcSet, can
 }
 
 /// `findMatchingTimingArc(reference, candidate_set)` (exact): the first arc of the set that matches.
-fn find_matching_arc(ref_set: &ArcSet, ref_arc: usize, cand_set: &ArcSet) -> Option<usize> {
+pub(crate) fn find_matching_arc(ref_set: &ArcSet, ref_arc: usize, cand_set: &ArcSet) -> Option<usize> {
     (0..cand_set.arcs.len()).find(|&k| is_exact_arc_match(ref_set, ref_arc, cand_set, k))
 }
 
 /// `timingArcSetsForRefPorts`: the cell's arc sets from the reference arc's from port to its to
 /// port, in the cell's order (none when either port is missing).
-fn arc_sets_for_ref_ports<'c>(cell: &'c Cell, ref_set: &ArcSet) -> Vec<(usize, &'c ArcSet)> {
+pub(crate) fn arc_sets_for_ref_ports<'c>(cell: &'c Cell, ref_set: &ArcSet) -> Vec<(usize, &'c ArcSet)> {
     if cell.port(&ref_set.from).is_none() || cell.port(&ref_set.to).is_none() {
         return Vec::new();
     }
@@ -314,7 +319,7 @@ fn arc_sets_for_ref_ports<'c>(cell: &'c Cell, ref_set: &ArcSet) -> Vec<(usize, &
 }
 
 /// `gateDelayAndSlewFromTableModel` (no PVT scaling: the scene's library is its PVT).
-fn gate_delay_and_slew(cell: &Cell, set: usize, arc: usize, in_slew: f32, load_cap: f32) -> Option<(f32, f32)> {
+pub(crate) fn gate_delay_and_slew(cell: &Cell, set: usize, arc: usize, in_slew: f32, load_cap: f32) -> Option<(f32, f32)> {
     match &cell.arc_sets[set].arcs[arc].model {
         Model::Gate(m) => Some(m.gate_delay(in_slew, load_cap)),
         _ => None,
@@ -394,12 +399,12 @@ impl Reader<'_, '_> {
     }
 
     /// `GraphDelayCalc::edgeFromSlew`: an ideal clock's slew (0) for a clock-to-output arc from an
-    /// ideal clock pin, else the graph's max slew.
+    /// ideal clock pin, else the graph's slew at the stage's min/max.
     fn edge_from_slew(&self, from: usize, rf: usize, role: Role) -> f32 {
         if matches!(role, Role::RegClkToQ | Role::LatchEnToQ) && self.g.ideal_clock.contains(&from) {
             0.0
         } else {
-            self.g.slew[from][rf][MAX]
+            self.g.slew[from][rf][self.mm]
         }
     }
 
@@ -505,7 +510,7 @@ impl Reader<'_, '_> {
             return 0.0;
         }
         // `wireArcDelay(edge, rf)`: a wire edge's arc per transition, rise then fall.
-        self.g.delay[e].get(out_rf).map_or(0.0, |d| d[MAX])
+        self.g.delay[e].get(out_rf).map_or(0.0, |d| d[self.mm])
     }
 
     /// `buildDelayStageState`.
@@ -513,21 +518,21 @@ impl Reader<'_, '_> {
         let arc = self.build_selected_arc(path, start, index)?;
         let driver = path[index].vertex;
         let input_slew = self.input_slew(driver, &arc);
-        let load_cap = self.g.load_cap(driver, self.parasitics);
+        let load_cap = self.g.load_cap_mm(driver, self.parasitics, self.mm);
         let (current_model_delay, current_slew_table) = lookup_arc_delay_and_slew(self.libs, &arc, input_slew, load_cap, &arc.cell, false, None).ok_or(FailReason::MissingCurrentTimingArc)?;
         // `pathGraphCellDelayOrModelDelay`: the graph's delay of the path's arc.
         let current_delay = match path[index].in_edge {
-            Some((e, k)) => self.g.delay[e][k][MAX],
+            Some((e, k)) => self.g.delay[e][k][self.mm],
             None => current_model_delay,
         };
         let out_rf = arc_set_of(self.cell(&arc.cell).ok_or(FailReason::MissingCurrentTimingArc)?, arc.set).arcs[arc.arc].to_rf;
         let current_wire_delay = self.current_path_wire_delay(path, index, out_rf);
         let merges = self.collect_output_slew_merge_arcs(driver, &arc, load_cap);
-        // The merged model slew over every arc to the output transition (`min_max->compare`: max,
-        // strictly greater).
+        // The merged model slew over every arc to the output transition (`min_max->compare`:
+        // strictly greater at max, strictly less at min).
         let mut current_model_slew = current_slew_table;
         for m in &merges {
-            if m.current_model_slew > current_model_slew {
+            if min_max_compare(self.mm, m.current_model_slew, current_model_slew) {
                 current_model_slew = m.current_model_slew;
             }
         }
@@ -539,7 +544,7 @@ impl Reader<'_, '_> {
             current_delay,
             current_wire_delay,
             current_model_slew,
-            current_slew: self.g.slew[driver][out_rf][MAX],
+            current_slew: self.g.slew[driver][out_rf][self.mm],
             output_slew_merge_arcs: merges,
             sta_slew_bias: SlewBiasModel::default(),
             opposite_rf_arcs: Vec::new(),
@@ -903,6 +908,15 @@ impl Reader<'_, '_> {
             self.collect_opposite_rf_arcs(&mut context);
         }
         Ok(context)
+    }
+}
+
+/// `MinMax::compare(a, b)`: `a > b` at max, `a < b` at min.
+pub fn min_max_compare(mm: usize, a: f32, b: f32) -> bool {
+    if mm == MAX {
+        a > b
+    } else {
+        a < b
     }
 }
 
