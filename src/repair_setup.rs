@@ -38,6 +38,7 @@ use crate::timing::Limits;
 use crate::{clone, move_tracker, rebuffer, swap_pins, unbuffer};
 use crate::Stop;
 
+mod batch_selector;
 mod crit_vt_swap;
 mod parallel_eval;
 mod global_sizing;

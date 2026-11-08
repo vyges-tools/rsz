@@ -5,9 +5,10 @@
 //! Ported stage group by stage group, in the reference's order. Each stage is its own function
 //! named after the reference's, and `start` / `iterate` do nothing but call them, so a trace that
 //! diverges from the reference's points at one stage. Modelled so far: `start` (S1), the
-//! target collection of a batch (S2: `collectTargetEndpoints`, `collectTargets`) and the targets'
-//! preparation (S3a: `prewarmTargets`, `prepareTargets`). Candidate generation onward
-//! (`generateCandidates`) is refused.
+//! target collection of a batch (S2: `collectTargetEndpoints`, `collectTargets`), the targets'
+//! preparation (S3a: `prewarmTargets`, `prepareTargets`), candidate generation and estimation
+//! (S3b/S3c: `generateCandidates`, `estimateTargets`) and the batch candidates
+//! (`makeBatchCandidates`). The selection (`BatchSelector`) onward is refused.
 
 use std::collections::{HashMap, HashSet};
 
@@ -15,6 +16,7 @@ use vyges_sta::liberty::MAX;
 
 use vyges_sta::fuzzy;
 
+use super::batch_selector::BatchCandidate;
 use super::{PathView, Repair, Stop};
 use crate::sequential_timing::SequentialResult;
 use crate::delay_estimator::{ContextOptions, EstimatorContext, FaninSideLoadOptions, PathPin, Reader};
@@ -331,14 +333,103 @@ pub struct Estimate {
     pub sequential_side_loss: Option<f32>,
 }
 
-/// `MoveImpact`, the parts the printer shows: complete or not, the instances and nets the move
-/// writes, and the pins it reconnects.
+/// `MoveImpact`: complete or not (false when an estimator could not enumerate every read and
+/// write), the instances and nets the move writes, the pins and instances it reconnects, the
+/// instances and nets whose timing it can change, and those whose timing its estimate read.
+/// `BatchSelector` compares them by identity; here by name, the top instance as [`TOP_INSTANCE`].
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct MoveImpact {
     pub complete: bool,
     pub write_instances: Vec<String>,
     pub write_nets: Vec<String>,
     pub reconnect_pins: Vec<String>,
+    pub reconnect_instances: Vec<String>,
+    pub timing_effect_instances: Vec<String>,
+    pub timing_effect_nets: Vec<String>,
+    pub timing_dependency_instances: Vec<String>,
+    pub timing_dependency_nets: Vec<String>,
+}
+
+/// `Network::instance` of a top-level port: the top instance, which every port shares.
+pub const TOP_INSTANCE: &str = "<top>";
+
+/// `appendUnique`: a value that is set and not in the list yet goes on its end.
+fn append_unique(values: &mut Vec<String>, value: Option<String>) {
+    if let Some(value) = value {
+        if !values.contains(&value) {
+            values.push(value);
+        }
+    }
+}
+
+/// What a move's `impact()` reads off the network, by name over the timer's netlist: a pin's
+/// instance (`Network::instance`: the top instance for a top-level port), its net
+/// (`Network::net`: none when unconnected), and an instance's pins (`pinIterator`: its master's
+/// terminals in order, supply terminals skipped).
+pub struct ImpactNames<'a> {
+    pin_net: HashMap<String, &'a str>,
+    ports: HashSet<&'a str>,
+    inst_cell: HashMap<&'a str, &'a str>,
+    master_pins: &'a HashMap<String, Vec<String>>,
+}
+
+impl<'a> ImpactNames<'a> {
+    pub fn new(nl: &'a vyges_sta::netlist::Netlist, master_pins: &'a HashMap<String, Vec<String>>) -> ImpactNames<'a> {
+        let mut pin_net = HashMap::new();
+        for net in &nl.nets {
+            for c in &net.pins {
+                pin_net.insert(nl.pin_name(c), net.name.as_str());
+            }
+        }
+        ImpactNames { pin_net, ports: nl.ports.iter().map(|(p, _)| p.as_str()).collect(), inst_cell: nl.insts.iter().map(|i| (i.0.as_str(), i.1.as_str())).collect(), master_pins }
+    }
+
+    /// `network->instance(pin)`.
+    fn instance(&self, pin: &str) -> String {
+        if self.ports.contains(pin) {
+            return TOP_INSTANCE.to_string();
+        }
+        pin.rsplit_once('/').map_or(pin, |(inst, _)| inst).to_string()
+    }
+
+    /// `network->net(pin)`.
+    fn net(&self, pin: &str) -> Option<String> {
+        self.pin_net.get(pin).map(|n| (*n).to_string())
+    }
+
+    /// `network->pinIterator(inst)`.
+    fn pins(&self, inst: &str) -> Vec<String> {
+        let ports = self.inst_cell.get(inst).and_then(|cell| self.master_pins.get(*cell));
+        ports.map_or(Vec::new(), |ports| ports.iter().map(|p| format!("{inst}/{p}")).collect())
+    }
+}
+
+/// `MoveCandidate::impact`: none without an estimator context; else the instance and net of each
+/// path stage's driver are timing dependencies, each once.
+fn move_candidate_impact(target: &Target, names: &ImpactNames<'_>) -> MoveImpact {
+    let mut impact = MoveImpact::default();
+    let Some(context) = &target.estimator_context else { return impact };
+    for stage in &context.path_stages {
+        if stage.driver_pin.is_empty() {
+            continue;
+        }
+        append_unique(&mut impact.timing_dependency_instances, Some(names.instance(&stage.driver_pin)));
+        append_unique(&mut impact.timing_dependency_nets, names.net(&stage.driver_pin));
+    }
+    impact
+}
+
+/// `MoveCandidate::cellSwapImpact`: the base impact, complete; the instance written and in the
+/// effect cone, and every net on its pins (a new cell changes its input caps and output timing).
+fn cell_swap_impact(target: &Target, names: &ImpactNames<'_>, inst: &str) -> MoveImpact {
+    let mut impact = move_candidate_impact(target, names);
+    impact.complete = true;
+    append_unique(&mut impact.write_instances, Some(inst.to_string()));
+    append_unique(&mut impact.timing_effect_instances, Some(inst.to_string()));
+    for pin in names.pins(inst) {
+        append_unique(&mut impact.timing_effect_nets, names.net(&pin));
+    }
+    impact
 }
 
 /// `RebufferLoadTiming`: one load of a rebuffer target's net as `collectLoadTiming` reads it.
@@ -453,10 +544,40 @@ fn accumulate_prepare_requirements(generators: &[Move]) -> u8 {
     generators.iter().fold(0, |mask, &m| mask | prepare_requirements(m))
 }
 
-/// `BatchPool`: the targets of one batch (a deque upstream, so they never move).
+/// `BatchPool`: the targets of one batch (a deque upstream, so they never move), their
+/// evaluations index-aligned with them, and the batch candidates made from those.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BatchPool {
     pub targets: Vec<Target>,
+    pub evaluations: Vec<TargetEvaluation>,
+    pub candidates: Vec<BatchCandidate>,
+}
+
+impl BatchPool {
+    /// `BatchPool::adopt`: the chunk's targets go on the end of the pool.
+    fn adopt(&mut self, chunk: Vec<Target>) {
+        self.targets.extend(chunk);
+    }
+
+    /// `BatchPool::append`: the chunk's evaluations go on the end of the pool's.
+    fn append(&mut self, chunk_evaluations: Vec<TargetEvaluation>) {
+        self.evaluations.extend(chunk_evaluations);
+    }
+}
+
+/// `TargetEvaluation`: one target's candidates in generation order and the index of its best
+/// (`best_candidate`; its `best_estimate` is that candidate's estimate after `estimateTarget`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct TargetEvaluation {
+    pub candidates: Vec<Candidate>,
+    pub best: Option<usize>,
+}
+
+impl TargetEvaluation {
+    /// `bestCandidate()`, when `hasBestCandidate()`.
+    fn best_candidate(&self) -> Option<&Candidate> {
+        self.best.map(|k| &self.candidates[k])
+    }
 }
 
 /// `adaptiveBatchSize`: the failing endpoint count clamped to [min_cap, max_cap].
@@ -798,9 +919,9 @@ impl Repair<'_, '_> {
         self.report(row);
     }
 
-    /// `evaluateTargets`: the endpoints evaluated worst first, a chunk at a time, the next chunk
-    /// only while the batch is not full. Here up to the first chunk's targets: generation (S3)
-    /// is refused.
+    /// `evaluateTargets`: the endpoints evaluated worst first, a chunk at a time — prewarm,
+    /// prepare, adopt, generate, estimate, append — and the batch selected after every chunk; the
+    /// next chunk only while the batch is not full.
     fn pe_evaluate_targets(&mut self, pe: &mut ParallelEval, scope: BatchScope) -> Result<BatchPool, Stop> {
         let cfg = pe.config.parallel_eval;
         let chunk_endpoints = evaluation_endpoint_limit(scope.batch_cap, cfg.eval_endpoint_factor, cfg.eval_min_endpoints);
@@ -816,14 +937,15 @@ impl Repair<'_, '_> {
                 let mut chunk = chunk;
                 pe_prewarm_targets(&chunk);
                 self.pe_prepare_targets(pe, &mut chunk)?;
-                let mut evaluations = self.pe_generate_candidates(pe, &mut chunk)?;
-                pe_estimate_targets(pe, &chunk, &mut evaluations);
-                pool.targets.extend(chunk);
+                let generated = self.pe_generate_candidates(pe, &mut chunk)?;
+                let evaluations = pe_estimate_targets(pe, &chunk, generated);
                 if let Some(m) = pe.generators.iter().find(|&&m| !generate_modelled(m)) {
                     return Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -phases PARALLEL_EVAL: candidate generation for {} (generate, estimate) is not modelled", m.name())));
                 }
-                return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: the batch (makeBatchCandidates, BatchSelector) is not modelled".into()));
+                pool.adopt(chunk);
+                pool.append(evaluations);
             }
+            pe_select_batch(pe, &mut pool, scope.batch_cap)?;
         }
         Ok(pool)
     }
@@ -875,7 +997,8 @@ impl Repair<'_, '_> {
         let inst_id = |inst: &str| setup_design.inst_id(inst);
         let cfg = pe.config;
         let generated = super::timed_all(ctx, design, &mut self.timer, edits, |gs, ss, _cs| {
-            let plan = PlanTimer { gs, ss, design, ctx, committer, inst_id: &inst_id };
+            let names = ImpactNames::new(&gs[0].netlist, ctx.master_pins);
+            let plan = PlanTimer { gs, ss, design, ctx, committer, inst_id: &inst_id, names: &names };
             for (target, facts) in targets.iter_mut().zip(&facts) {
                 pe_plan_generation(pe, target, facts, &plan, &mut trace).map_err(|e| Stop::refused("RSZ-ABSENT", e))?;
             }
@@ -1166,11 +1289,11 @@ fn pe_generate(m: Move, target: &Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtC
     match m {
         // UnbufferMtGenerator: one removal when the prepared gain is positive.
         Move::Unbuffer => Ok(unbuffer_mt_generate(target, || unbuffer_mt_impact(target, plan))),
-        Move::SwapPins => Ok(swap_pins_mt_generate(target)),
-        Move::SizeUp => size_up_mt_generate(target, plan.ctx, cfg),
-        Move::VtSwap => vt_swap_mt_generate(target, plan.ctx, cfg),
-        Move::SizeDownFanout => Ok(size_down_fanout_mt_generate(target, plan.ctx.libs, cfg)),
-        Move::SplitLoad => Ok(split_load_mt_generate(target, plan.ctx.libs, cfg)),
+        Move::SwapPins => Ok(swap_pins_mt_generate(target, plan.names)),
+        Move::SizeUp => size_up_mt_generate(target, plan.ctx, cfg, plan.names),
+        Move::VtSwap => vt_swap_mt_generate(target, plan.ctx, cfg, plan.names),
+        Move::SizeDownFanout => Ok(size_down_fanout_mt_generate(target, plan.ctx.libs, cfg, plan.names)),
+        Move::SplitLoad => Ok(split_load_mt_generate(target, plan.ctx.libs, cfg, plan.names)),
         Move::Buffer => rebuffer_mt_generate(target, plan, cfg, rb),
         _ => Ok(Vec::new()),
     }
@@ -1326,13 +1449,26 @@ fn rebuffer_est_line(drvr: &str, d: &crate::delay_estimator::DelayEstimate, trac
 /// load reconnects, in load-path order.
 fn rebuffer_mt_impact(target: &Target, plan: &PlanTimer<'_, '_, '_>, p: &crate::rebuffer::TreePlan) -> MoveImpact {
     let net = plan.design.pin_net(&target.driver_pin).map(|(n, _)| n);
-    let mut reconnect: Vec<String> = Vec::new();
+    rebuffer_impact_on(move_candidate_impact(target, plan.names), plan.names, net, &target.driver_pin, p)
+}
+
+/// [`rebuffer_mt_impact`] given the base impact and the plan's flat net: complete; the net written
+/// and in the effect cone; the driver's instance written and in the effect cone; each load path's
+/// load pin reconnected, with its instance reconnected and in the effect cone (`appendReconnectedLoad`),
+/// each once.
+fn rebuffer_impact_on(mut impact: MoveImpact, names: &ImpactNames<'_>, net: Option<String>, driver_pin: &str, p: &crate::rebuffer::TreePlan) -> MoveImpact {
+    impact.complete = true;
+    append_unique(&mut impact.write_nets, net.clone());
+    append_unique(&mut impact.timing_effect_nets, net);
+    let driver_inst = names.instance(driver_pin);
+    append_unique(&mut impact.write_instances, Some(driver_inst.clone()));
+    append_unique(&mut impact.timing_effect_instances, Some(driver_inst));
     for lp in &p.load_paths {
-        if !reconnect.contains(&lp.load_pin) {
-            reconnect.push(lp.load_pin.clone());
-        }
+        append_unique(&mut impact.reconnect_pins, Some(lp.load_pin.clone()));
+        append_unique(&mut impact.reconnect_instances, Some(names.instance(&lp.load_pin)));
+        append_unique(&mut impact.timing_effect_instances, Some(names.instance(&lp.load_pin)));
     }
-    MoveImpact { complete: true, write_instances: vec![target.inst.clone()], write_nets: net.into_iter().collect(), reconnect_pins: reconnect }
+    impact
 }
 
 /// `UnbufferMtGenerator::generate`: one removal when `prepareInputs` left a gain above zero (none
@@ -1349,10 +1485,11 @@ fn unbuffer_mt_estimate(gain: f32) -> Estimate {
     Estimate { legal: true, score: gain, raw_gain: Some(gain), reason: "estimate_legal", tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None }
 }
 
-/// `UnbufferMtCandidate::impact`: complete; the buffer written; its input then output net written
-/// (when connected); the other pins of the net `removeBuffer` drops reconnect — the input net's
-/// when the output net is kept (it has a top-level port and the input net has none), else the
-/// output net's — in the net's connected-pin order.
+/// `UnbufferMtCandidate::impact`: the base impact, complete; the buffer written and in the effect
+/// cone; its input then output net written and in the effect cone (when connected); every other
+/// instance on them in the effect cone; the other pins of the net `removeBuffer` drops, and their
+/// instances, reconnect — the input net's when the output net is kept (it has a top-level port and
+/// the input net has none), else the output net's — in the net's connected-pin order.
 fn unbuffer_mt_impact(target: &Target, plan: &PlanTimer<'_, '_, '_>) -> MoveImpact {
     let g = &plan.gs[0];
     let ports = plan.ctx.libs.link_cell(&target.cell).and_then(|c| c.buffer_ports()).map(|(i, o)| (i.name.clone(), o.name.clone()));
@@ -1361,29 +1498,39 @@ fn unbuffer_mt_impact(target: &Target, plan: &PlanTimer<'_, '_, '_>) -> MoveImpa
         g.vertices.iter().position(|x| x.name == pin).and_then(|v| g.vertex_net[v])
     };
     match ports {
-        Some((input, output)) => unbuffer_impact_on(&g.netlist, &target.inst, net_of(&input), net_of(&output)),
-        None => MoveImpact { complete: true, write_instances: vec![target.inst.clone()], ..MoveImpact::default() },
+        Some((input, output)) => unbuffer_impact_on(move_candidate_impact(target, plan.names), &g.netlist, &target.inst, net_of(&input), net_of(&output)),
+        None => unbuffer_impact_on(move_candidate_impact(target, plan.names), &g.netlist, &target.inst, None, None),
     }
 }
 
-/// [`unbuffer_mt_impact`] on the netlist, given the buffer's input and output nets.
-fn unbuffer_impact_on(nl: &vyges_sta::netlist::Netlist, buffer: &str, in_net: Option<usize>, out_net: Option<usize>) -> MoveImpact {
+/// [`unbuffer_mt_impact`] on the netlist, given the base impact and the buffer's input and output
+/// nets. The lists are pushed, not kept unique, as the reference pushes them.
+fn unbuffer_impact_on(mut impact: MoveImpact, nl: &vyges_sta::netlist::Netlist, buffer: &str, in_net: Option<usize>, out_net: Option<usize>) -> MoveImpact {
     use vyges_sta::netlist::Conn;
-    let mut impact = MoveImpact { complete: true, write_instances: vec![buffer.to_string()], ..MoveImpact::default() };
+    impact.complete = true;
+    impact.write_instances.push(buffer.to_string());
+    impact.timing_effect_instances.push(buffer.to_string());
     let has_port = |net: Option<usize>| net.is_some_and(|n| nl.nets[n].pins.iter().any(|c| matches!(c, Conn::Port(_))));
     // removeBufferKeepsOutputNet: the output net survives when it reaches a top-level port and
     // the input net does not; then the input net's pins move.
     let moved = if has_port(out_net) && !has_port(in_net) { in_net } else { out_net };
     for net in [in_net, out_net].into_iter().flatten() {
         impact.write_nets.push(nl.nets[net].name.clone());
-        if Some(net) != moved {
-            continue;
-        }
+        impact.timing_effect_nets.push(nl.nets[net].name.clone());
         for c in &nl.nets[net].pins {
             if matches!(c, Conn::Inst(k, _) if nl.insts[*k].0 == buffer) {
                 continue;
             }
-            impact.reconnect_pins.push(nl.pin_name(c));
+            // `network->instance` of a port pin is the top instance.
+            let inst = match c {
+                Conn::Inst(k, _) => nl.insts[*k].0.clone(),
+                Conn::Port(_) => TOP_INSTANCE.to_string(),
+            };
+            if Some(net) == moved {
+                impact.reconnect_pins.push(nl.pin_name(c));
+                impact.reconnect_instances.push(inst.clone());
+            }
+            impact.timing_effect_instances.push(inst);
         }
     }
     impact
@@ -1391,7 +1538,7 @@ fn unbuffer_impact_on(nl: &vyges_sta::netlist::Netlist, buffer: &str, in_net: Op
 
 /// `SwapPinsMtGenerator::generate`: the critical signal moves to the equivalent input with the
 /// fastest arc when it beats its own — the first of equal delays wins — else no candidate.
-fn swap_pins_mt_generate(target: &Target) -> Vec<Candidate> {
+fn swap_pins_mt_generate(target: &Target, names: &ImpactNames<'_>) -> Vec<Candidate> {
     let Some(input) = &target.swap_pins_input else { return Vec::new() };
     let mut swap: Option<&SwapPinsEquivalent> = None;
     let mut best_delay = input.input_delay;
@@ -1403,7 +1550,7 @@ fn swap_pins_mt_generate(target: &Target) -> Vec<Candidate> {
     }
     let Some(swap) = swap else { return Vec::new() };
     let estimate = swap_pins_mt_estimate(input, swap, target.estimator_context.as_ref());
-    vec![Candidate { kind: Move::SwapPins, estimate, desc: swap.port.clone(), impact: swap_pins_mt_impact(target, input, swap) }]
+    vec![Candidate { kind: Move::SwapPins, estimate, desc: swap.port.clone(), impact: swap_pins_mt_impact(target, names, input, swap) }]
 }
 
 /// `SwapPinsMtCandidate::estimate`: the gain is the input's delay less the swap's. Without a side
@@ -1433,16 +1580,28 @@ fn swap_pins_mt_estimate(input: &SwapPinsInput, swap: &SwapPinsEquivalent, conte
     e
 }
 
-/// `SwapPinsMtCandidate::impact`: complete; the driver written; its path input pin, then the
-/// swap's input pin, reconnect (no net is written).
-fn swap_pins_mt_impact(target: &Target, input: &SwapPinsInput, swap: &SwapPinsEquivalent) -> MoveImpact {
-    let pin = |port: &str| format!("{}/{port}", target.inst);
-    MoveImpact { complete: true, write_instances: vec![target.inst.clone()], write_nets: Vec::new(), reconnect_pins: vec![pin(&input.input_port), pin(&swap.port)] }
+/// `SwapPinsMtCandidate::impact`: the base impact, complete; the driver written and in the effect
+/// cone; its path input pin, then the swap's input pin, reconnect (no net is written); the nets of
+/// those two pins and of the driver pin are in the effect cone, each once.
+fn swap_pins_mt_impact(target: &Target, names: &ImpactNames<'_>, input: &SwapPinsInput, swap: &SwapPinsEquivalent) -> MoveImpact {
+    let mut impact = move_candidate_impact(target, names);
+    impact.complete = true;
+    impact.write_instances.push(target.inst.clone());
+    impact.timing_effect_instances.push(target.inst.clone());
+    let driver_port = target.driver_pin.rsplit_once('/').map_or("", |(_, port)| port);
+    for port in [input.input_port.as_str(), swap.port.as_str(), driver_port] {
+        let pin = format!("{}/{port}", target.inst);
+        if port != driver_port {
+            impact.reconnect_pins.push(pin.clone());
+        }
+        append_unique(&mut impact.timing_effect_nets, names.net(&pin));
+    }
+    impact
 }
 
 /// `SizeUpMtGenerator::generate`: the size-up options of the target arc's output port, scene
 /// and min/max, each replacement kept when it fits the instance's input cap budgets.
-fn size_up_mt_generate(target: &Target, ctx: &super::Ctx<'_>, cfg: &MtConfig) -> Result<Vec<Candidate>, Stop> {
+fn size_up_mt_generate(target: &Target, ctx: &super::Ctx<'_>, cfg: &MtConfig, names: &ImpactNames<'_>) -> Result<Vec<Candidate>, Stop> {
     let Some(context) = &target.estimator_context else { return Ok(Vec::new()) };
     let replacements = build_size_up_options(ctx, cfg, &context.target().arc)?;
     let budgets = target.input_cap_budgets.as_deref().unwrap_or(&[]);
@@ -1452,7 +1611,7 @@ fn size_up_mt_generate(target: &Target, ctx: &super::Ctx<'_>, cfg: &MtConfig) ->
             continue;
         }
         let estimate = size_up_mt_estimate(ctx.libs, target, &replacement, cfg.size_up_mt_score_scale)?;
-        candidates.push(Candidate { kind: Move::SizeUp, estimate, impact: cell_swap_impact(target), desc: replacement });
+        candidates.push(Candidate { kind: Move::SizeUp, estimate, impact: cell_swap_impact(target, names, &target.inst), desc: replacement });
     }
     Ok(candidates)
 }
@@ -1520,10 +1679,6 @@ fn cell_fits_input_cap_budgets(cell: &vyges_sta::liberty::Cell, budgets: &[Input
 
 /// `MoveCandidate::cellSwapImpact`: complete, the instance written (its pins' nets only enter
 /// the timing cone, which the trace does not print).
-fn cell_swap_impact(target: &Target) -> MoveImpact {
-    MoveImpact { complete: true, write_instances: vec![target.inst.clone()], ..MoveImpact::default() }
-}
-
 /// `SizeUpMtCandidate::estimate`: the window estimate of the replacement, scored by the gain
 /// times the score scale. Not legal: the score kept, the raw gain only for a non-improving
 /// estimate, tail-admissible for the opposite-transition reject with a positive score. Legal: the
@@ -1607,7 +1762,7 @@ fn charge_cell_swap_side_costs(target: &Target, d: &crate::delay_estimator::Dela
 /// `VtSwapMtGenerator::generate`: the VT equivalents of the instance's cell other than it
 /// (`selectCandidateCells`), each kept when it passes the dual-RF drive guard (when on and the
 /// candidate has the arc's output port at its scene) and fits the input cap budgets.
-fn vt_swap_mt_generate(target: &Target, ctx: &super::Ctx<'_>, cfg: &MtConfig) -> Result<Vec<Candidate>, Stop> {
+fn vt_swap_mt_generate(target: &Target, ctx: &super::Ctx<'_>, cfg: &MtConfig, names: &ImpactNames<'_>) -> Result<Vec<Candidate>, Stop> {
     let Some(context) = &target.estimator_context else { return Ok(Vec::new()) };
     let arc = &context.target().arc;
     let budgets = target.input_cap_budgets.as_deref().unwrap_or(&[]);
@@ -1628,7 +1783,7 @@ fn vt_swap_mt_generate(target: &Target, ctx: &super::Ctx<'_>, cfg: &MtConfig) ->
             continue;
         }
         let estimate = vt_swap_mt_estimate(ctx.libs, target, &cell)?;
-        candidates.push(Candidate { kind: Move::VtSwap, estimate, impact: cell_swap_impact(target), desc: cell });
+        candidates.push(Candidate { kind: Move::VtSwap, estimate, impact: cell_swap_impact(target, names, &target.inst), desc: cell });
     }
     Ok(candidates)
 }
@@ -1640,7 +1795,7 @@ fn select_candidate_cells(ctx: &super::Ctx<'_>, current: &str) -> Vec<String> {
 
 /// `SizeDownFanoutMtGenerator::generate`: per prepared load, its one drive step down when it keeps
 /// the output limits, fits the load's delay budget and has a target load change.
-fn size_down_fanout_mt_generate(target: &Target, libs: &crate::preamble::Libs, cfg: &MtConfig) -> Vec<Candidate> {
+fn size_down_fanout_mt_generate(target: &Target, libs: &crate::preamble::Libs, cfg: &MtConfig, names: &ImpactNames<'_>) -> Vec<Candidate> {
     let Some(context) = &target.estimator_context else { return Vec::new() };
     let mut candidates = Vec::new();
     for load in &target.size_down_fanout_loads {
@@ -1651,10 +1806,18 @@ fn size_down_fanout_mt_generate(target: &Target, libs: &crate::preamble::Libs, c
             kind: Move::SizeDownFanout,
             estimate: size_down_fanout_mt_estimate_of(&d, cfg.size_down_fanout_mt_score_scale),
             desc: format!("{}/{}", load.pin, if step_down.cell.is_empty() { "-" } else { &step_down.cell }),
-            impact: MoveImpact { complete: true, write_instances: vec![load.inst.clone()], ..MoveImpact::default() },
+            impact: size_down_fanout_mt_impact(target, names, &load.inst),
         });
     }
     candidates
+}
+
+/// `SizeDownFanoutMtCandidate::impact`: the load's cell swap (`cellSwapImpact`), and the target
+/// driver's instance in the effect cone too (it sees the smaller pin).
+fn size_down_fanout_mt_impact(target: &Target, names: &ImpactNames<'_>, load_inst: &str) -> MoveImpact {
+    let mut impact = cell_swap_impact(target, names, load_inst);
+    append_unique(&mut impact.timing_effect_instances, Some(names.instance(&target.driver_pin)));
+    impact
 }
 
 /// The step down's target load change when `generate` keeps it: it keeps the output limits,
@@ -1682,14 +1845,14 @@ fn size_down_fanout_mt_estimate_of(d: &crate::delay_estimator::DelayEstimate, sc
 }
 
 /// `SplitLoadMtGenerator::generate`: one split when `prepareInputs` left an input.
-fn split_load_mt_generate(target: &Target, libs: &crate::preamble::Libs, cfg: &MtConfig) -> Vec<Candidate> {
+fn split_load_mt_generate(target: &Target, libs: &crate::preamble::Libs, cfg: &MtConfig, names: &ImpactNames<'_>) -> Vec<Candidate> {
     let (Some(input), Some(context)) = (&target.split_load_input, &target.estimator_context) else { return Vec::new() };
     let dash = |c: &str| if c.is_empty() { "-".to_string() } else { c.to_string() };
     vec![Candidate {
         kind: Move::SplitLoad,
         estimate: split_load_mt_estimate(libs, context, input, cfg.split_load_mt_score_scale),
         desc: format!("{}/{}", dash(&input.buffer_cell), dash(&input.resized_cell)),
-        impact: split_load_mt_impact(target, input),
+        impact: split_load_mt_impact(target, names, input),
     }]
 }
 
@@ -1728,29 +1891,113 @@ fn split_load_mt_score(d: &crate::delay_estimator::DelayEstimate, score_scale: f
     e
 }
 
-/// `SplitLoadMtCandidate::impact`: complete; the driver and its net written; the moved load pins
-/// reconnect, in order.
-fn split_load_mt_impact(target: &Target, input: &SplitLoadInput) -> MoveImpact {
-    MoveImpact { complete: true, write_instances: vec![target.inst.clone()], write_nets: vec![input.drvr_net.clone()], reconnect_pins: input.load_pins.clone() }
+/// `SplitLoadMtCandidate::impact`: the base impact, complete; the driver's instance and its net
+/// written and in the effect cone; the moved load pins reconnect, in order, their instances
+/// reconnected and in the effect cone, each once.
+fn split_load_mt_impact(target: &Target, names: &ImpactNames<'_>, input: &SplitLoadInput) -> MoveImpact {
+    let mut impact = move_candidate_impact(target, names);
+    impact.complete = true;
+    let driver = names.instance(&target.driver_pin);
+    append_unique(&mut impact.write_instances, Some(driver.clone()));
+    append_unique(&mut impact.timing_effect_instances, Some(driver));
+    append_unique(&mut impact.write_nets, Some(input.drvr_net.clone()));
+    append_unique(&mut impact.timing_effect_nets, Some(input.drvr_net.clone()));
+    for pin in &input.load_pins {
+        impact.reconnect_pins.push(pin.clone());
+        append_unique(&mut impact.reconnect_instances, Some(names.instance(pin)));
+        append_unique(&mut impact.timing_effect_instances, Some(names.instance(pin)));
+    }
+    impact
 }
 
 /// `estimateTargets`: each target's candidates estimated in order (done at generation here; the
 /// estimates read nothing the other targets change), then `estimateTarget` on each. The trace prints every candidate, then
 /// the best, per target; the best only once every generator is modelled.
-fn pe_estimate_targets(pe: &ParallelEval, targets: &[Target], evaluations: &mut [Vec<Candidate>]) {
+fn pe_estimate_targets(pe: &ParallelEval, targets: &[Target], generated: Vec<Vec<Candidate>>) -> Vec<TargetEvaluation> {
     let all = pe.generators.iter().all(|&m| generate_modelled(m));
     let permissive = pe_wns_tail_active(pe);
     let mut trace = String::new();
-    for (target, candidates) in targets.iter().zip(evaluations.iter_mut()) {
-        let best = estimate_target(candidates, permissive);
+    let mut evaluations = Vec::with_capacity(generated.len());
+    for (target, mut candidates) in targets.iter().zip(generated) {
+        let best = estimate_target(&mut candidates, permissive);
         for (index, c) in candidates.iter().enumerate() {
             trace.push_str(&pe_cand_line(pe.batch_index, &target.driver_pin, index, c));
         }
-        if let (true, Some((m, score))) = (all, best) {
-            trace.push_str(&format!("VYGP|best|{}|{}|{}|{}\n", pe.batch_index, target.driver_pin, m.name(), e9i(score)));
+        if let (true, Some(k)) = (all, best) {
+            trace.push_str(&format!("VYGP|best|{}|{}|{}|{}\n", pe.batch_index, target.driver_pin, candidates[k].kind.name(), e9i(candidates[k].estimate.score)));
         }
+        evaluations.push(TargetEvaluation { candidates, best });
     }
     pe_trace(&trace);
+    evaluations
+}
+
+/// `selectBatch`: the pool's batch candidates (`makeBatchCandidates`), then the selection
+/// (`BatchSelector::select`, not modelled yet: refused after the candidates print).
+fn pe_select_batch(pe: &ParallelEval, pool: &mut BatchPool, _batch_cap: i32) -> Result<(), Stop> {
+    pool.candidates = pe_make_batch_candidates(pe, &pool.targets, &pool.evaluations)?;
+    pe_trace(&(pe_batch_candidate_lines(pe, pool) + &pe_bc_lines(pe, pool)));
+    Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: the batch selection (BatchSelector) is not modelled".into()))
+}
+
+/// `makeBatchCandidates`: one batch candidate per evaluation with a best candidate, in pool order:
+/// its index, the best estimate's score as the local score, the priority score (the local score;
+/// a stalled batch weighs it by the target's share of the violating cone, `analyzeBottlenecks`,
+/// which is refused before any batch gets here), the target's endpoint slack, and the best
+/// candidate's impact.
+fn pe_make_batch_candidates(pe: &ParallelEval, targets: &[Target], evaluations: &[TargetEvaluation]) -> Result<Vec<BatchCandidate>, Stop> {
+    if pe_stall_weights_priority(pe) {
+        return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: bottleneckPriorityScore is not modelled".into()));
+    }
+    let mut candidates = Vec::with_capacity(evaluations.len());
+    for (index, evaluation) in evaluations.iter().enumerate() {
+        let Some(best) = evaluation.best_candidate() else { continue };
+        let local_score = best.estimate.score;
+        candidates.push(BatchCandidate { evaluation_index: index, local_score, priority_score: local_score, endpoint_slack: targets[index].slack, impact: best.impact.clone() });
+    }
+    Ok(candidates)
+}
+
+/// `StallMonitor::weightsPriority`: a saved batch left WNS unchanged, for at most
+/// `bottleneck_max_wns_stall_batches` such batches.
+fn pe_stall_weights_priority(pe: &ParallelEval) -> bool {
+    pe.stall.wns_stall_batches > 0 && pe.stall.wns_stall_batches <= pe.config.parallel_eval.priority.bottleneck_max_wns_stall_batches
+}
+
+/// The trace's batch-candidate lines as the printer writes them after `makeBatchCandidates`:
+/// `bmk` (weighted, count) and one `bimp` per candidate (its move and whole impact).
+fn pe_batch_candidate_lines(pe: &ParallelEval, pool: &BatchPool) -> String {
+    let list = |xs: &[String]| xs.iter().map(|x| format!(",{x}")).collect::<String>();
+    let mut t = format!("VYGP|bmk|{}|weighted={}|n={}\n", pe.batch_index, u8::from(pe_stall_weights_priority(pe)), pool.candidates.len());
+    for bc in &pool.candidates {
+        let i = &bc.impact;
+        let kind = pool.evaluations[bc.evaluation_index].best_candidate().map_or("-", |c| c.kind.name());
+        t.push_str(&format!(
+            "VYGP|bimp|{}|{}|{kind}|{}:wi{}:wn{}:rp{}:ri{}:tei{}:ten{}:tdi{}:tdn{}\n",
+            pe.batch_index,
+            bc.evaluation_index,
+            if i.complete { "c" } else { "i" },
+            list(&i.write_instances),
+            list(&i.write_nets),
+            list(&i.reconnect_pins),
+            list(&i.reconnect_instances),
+            list(&i.timing_effect_instances),
+            list(&i.timing_effect_nets),
+            list(&i.timing_dependency_instances),
+            list(&i.timing_dependency_nets)
+        ));
+    }
+    t
+}
+
+/// The trace's `bc` lines, printed after the selection: each batch candidate's scores and
+/// endpoint slack.
+fn pe_bc_lines(pe: &ParallelEval, pool: &BatchPool) -> String {
+    let mut t = String::new();
+    for bc in &pool.candidates {
+        t.push_str(&format!("VYGP|bc|{}|{}|local={}|priority={}|eslack={}\n", pe.batch_index, bc.evaluation_index, e9i(bc.local_score), e9i(bc.priority_score), e9i(bc.endpoint_slack)));
+    }
+    t
 }
 
 /// `WnsTail::active()`: false until the tail starts. The tail starts after a stalled batch, never
@@ -1762,18 +2009,18 @@ fn pe_wns_tail_active(_pe: &ParallelEval) -> bool {
 /// `estimateTarget`: while the WNS tail is active (`permissive`), a candidate not legal but
 /// tail-admissible becomes legal (`wns_tail_permissive`); the best is the first legal candidate
 /// whose score is strictly greater than the best so far.
-fn estimate_target(candidates: &mut [Candidate], permissive: bool) -> Option<(Move, f32)> {
-    let mut best: Option<(Move, f32)> = None;
-    for c in candidates.iter_mut() {
+fn estimate_target(candidates: &mut [Candidate], permissive: bool) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (k, c) in candidates.iter_mut().enumerate() {
         if permissive && !c.estimate.legal && c.estimate.tail_admissible {
             c.estimate.legal = true;
             c.estimate.reason = "wns_tail_permissive";
         }
         if c.estimate.legal && best.is_none_or(|(_, s)| c.estimate.score > s) {
-            best = Some((c.kind, c.estimate.score));
+            best = Some((k, c.estimate.score));
         }
     }
-    best
+    best.map(|(k, _)| k)
 }
 
 /// The trace's candidate line: estimate, description and impact as the printer writes them.
@@ -1798,6 +2045,8 @@ struct PlanTimer<'p, 'g, 's> {
     committer: &'p super::Committer,
     /// The instance's odb id, as the committer keys its moves.
     inst_id: &'p dyn Fn(&str) -> u32,
+    /// What the candidates' `impact()` reads off the network.
+    names: &'p ImpactNames<'p>,
 }
 
 /// `generatorAllowed`: Rebuffer within `rebuffer_max_targets` per batch; Unbuffer only when the
@@ -3053,20 +3302,32 @@ mod tests {
             ports: vec![("out".into(), PortDir::Output), ("in".into(), PortDir::Input)],
             nets: vec![net("n_in", vec![pin(0, "ZN"), pin(1, "A")]), net("n_out", vec![pin(2, "A"), pin(1, "Z"), pin(3, "A")])],
         };
-        let i = unbuffer_impact_on(&nl, "b", Some(0), Some(1));
+        let base = || MoveImpact { timing_dependency_nets: vec!["n_in".into()], ..MoveImpact::default() };
+        let i = unbuffer_impact_on(base(), &nl, "b", Some(0), Some(1));
         assert!(i.complete);
         assert_eq!(i.write_instances, ["b"]);
         assert_eq!(i.write_nets, ["n_in", "n_out"]);
         assert_eq!(i.reconnect_pins, ["l1/A", "l2/A"]);
+        // The moved net's instances reconnect; both nets' other instances (and the buffer, first)
+        // are in the effect cone, pushed as met; the base impact's dependencies are kept.
+        assert_eq!(i.reconnect_instances, ["l1", "l2"]);
+        assert_eq!(i.timing_effect_instances, ["b", "d", "l1", "l2"]);
+        assert_eq!(i.timing_effect_nets, ["n_in", "n_out"]);
+        assert_eq!(i.timing_dependency_nets, ["n_in"]);
         // The output net reaches a port: the input net's driver moves instead.
         let mut kept = nl.clone();
         kept.nets[1] = net("n_out", vec![pin(2, "A"), pin(1, "Z"), Conn::Port(0)]);
-        assert_eq!(unbuffer_impact_on(&kept, "b", Some(0), Some(1)).reconnect_pins, ["d/ZN"]);
+        let k = unbuffer_impact_on(base(), &kept, "b", Some(0), Some(1));
+        assert_eq!((k.reconnect_pins.as_slice(), k.reconnect_instances.as_slice()), (&["d/ZN".to_string()][..], &["d".to_string()][..]));
+        // A port pin's instance is the top instance (Network::instance), not none: it is in the
+        // effect cone.
+        assert_eq!(k.timing_effect_instances, ["b", "d", "l1", TOP_INSTANCE]);
         // Both nets reach a port: the output net's pins move, its port among them.
         kept.nets[0] = net("n_in", vec![pin(0, "ZN"), pin(1, "A"), Conn::Port(1)]);
-        assert_eq!(unbuffer_impact_on(&kept, "b", Some(0), Some(1)).reconnect_pins, ["l1/A", "out"]);
+        let k = unbuffer_impact_on(base(), &kept, "b", Some(0), Some(1));
+        assert_eq!((k.reconnect_pins.as_slice(), k.reconnect_instances.as_slice()), (&["l1/A".to_string(), "out".to_string()][..], &["l1".to_string(), TOP_INSTANCE.to_string()][..]));
         // An unconnected input: only the output net is written.
-        assert_eq!(unbuffer_impact_on(&nl, "b", None, Some(1)).write_nets, ["n_out"]);
+        assert_eq!(unbuffer_impact_on(base(), &nl, "b", None, Some(1)).write_nets, ["n_out"]);
     }
 
     // estimateTarget: while the WNS tail is active (permissive), a candidate not legal but
@@ -3077,13 +3338,13 @@ mod tests {
         let c = |kind: Move, legal: bool, tail: bool, score: f32| Candidate { kind, estimate: Estimate { legal, score, raw_gain: None, reason: "x", tail_admissible: tail, side_loss: None, sequential_penalty: None, sequential_side_loss: None }, desc: String::new(), impact: MoveImpact::default() };
         let mut cs = vec![c(Move::Unbuffer, false, false, 9.0), c(Move::SizeUp, true, false, 2.0), c(Move::SwapPins, true, false, 2.0), c(Move::VtSwap, false, true, 3.0)];
         let mut strict = cs.clone();
-        assert_eq!(estimate_target(&mut strict, false), Some((Move::SizeUp, 2.0)));
+        assert_eq!(estimate_target(&mut strict, false), Some(1));
         assert_eq!((strict[3].estimate.legal, strict[3].estimate.reason), (false, "x"));
-        assert_eq!(estimate_target(&mut cs, true), Some((Move::VtSwap, 3.0)));
+        assert_eq!(estimate_target(&mut cs, true), Some(3));
         assert_eq!((cs[3].estimate.legal, cs[3].estimate.reason), (true, "wns_tail_permissive"));
         assert_eq!((cs[0].estimate.legal, cs[0].estimate.reason), (false, "x"));
         cs.truncate(3);
-        assert_eq!(estimate_target(&mut cs, true), Some((Move::SizeUp, 2.0)));
+        assert_eq!(estimate_target(&mut cs, true), Some(1));
         assert_eq!(estimate_target(&mut cs[..1], true), None);
     }
 
@@ -3095,15 +3356,17 @@ mod tests {
         let eq = |port: &str, delay: f32| SwapPinsEquivalent { port: port.into(), delay, pin: None, slack: 0.0 };
         let mut t = target_at(0);
         t.inst = "u".into();
-        assert!(swap_pins_mt_generate(&t).is_empty());
+        let (nl, pins) = impact_netlist();
+        let names = ImpactNames::new(&nl, &pins);
+        assert!(swap_pins_mt_generate(&t, &names).is_empty());
         t.swap_pins_input = Some(SwapPinsInput { input_port: "A".into(), input_delay: 0.5, equivalents: vec![eq("B", 0.5), eq("C", 0.25), eq("D", 0.25), eq("E", 0.3)] });
-        let c = swap_pins_mt_generate(&t);
+        let c = swap_pins_mt_generate(&t, &names);
         assert_eq!(c.len(), 1);
         assert_eq!((c[0].kind, c[0].desc.as_str()), (Move::SwapPins, "C"));
-        assert_eq!(c[0].impact, MoveImpact { complete: true, write_instances: vec!["u".into()], write_nets: vec![], reconnect_pins: vec!["u/A".into(), "u/C".into()] });
+        assert_eq!((c[0].impact.complete, &c[0].impact.write_instances, &c[0].impact.write_nets, &c[0].impact.reconnect_pins), (true, &vec!["u".to_string()], &vec![], &vec!["u/A".to_string(), "u/C".to_string()]));
         assert_eq!((c[0].estimate.legal, c[0].estimate.score, c[0].estimate.side_loss), (true, 0.25, None));
         t.swap_pins_input.as_mut().unwrap().equivalents = vec![eq("B", 0.5), eq("C", 0.75)];
-        assert!(swap_pins_mt_generate(&t).is_empty());
+        assert!(swap_pins_mt_generate(&t, &names).is_empty());
     }
 
     // SwapPinsMtCandidate::estimate with the side model: side_loss = weight * (min(slack, 0) -
@@ -3276,13 +3539,176 @@ mod tests {
         assert_eq!((e.legal, e.reason, e.tail_admissible, e.side_loss), (false, "side_slack_floor_violation", false, Some(0.5)));
     }
 
+    /// A small network for the impacts: in -> d (INV) -> u (NAND2, input B unconnected) -> b1
+    /// (BUF) -> l1 (INV) and the port out. NAND2's terminals list B first: pins follow the master.
+    fn impact_netlist() -> (vyges_sta::netlist::Netlist, HashMap<String, Vec<String>>) {
+        use vyges_sta::netlist::{inst, Conn, Net, Netlist, PortDir};
+        let net = |name: &str, pins: Vec<Conn>| std::sync::Arc::new(Net { name: name.into(), pins });
+        let pin = |k: usize, p: &str| Conn::Inst(k, p.into());
+        let nl = Netlist {
+            insts: vec![inst("d", "INV"), inst("u", "NAND2"), inst("b1", "BUF"), inst("l1", "INV")],
+            ports: vec![("in".into(), PortDir::Input), ("out".into(), PortDir::Output)],
+            nets: vec![
+                net("n_in", vec![Conn::Port(0), pin(0, "A")]),
+                net("n_d", vec![pin(0, "ZN"), pin(1, "A")]),
+                net("n_u", vec![pin(1, "ZN"), pin(2, "A")]),
+                net("n_b", vec![pin(2, "Z"), pin(3, "A"), Conn::Port(1)]),
+            ],
+        };
+        let pins = [("INV", vec!["A", "ZN"]), ("NAND2", vec!["B", "A", "ZN"]), ("BUF", vec!["A", "Z"])];
+        (nl, pins.into_iter().map(|(c, ps)| (c.to_string(), ps.into_iter().map(String::from).collect())).collect())
+    }
+
+    fn stage_at(driver_pin: &str) -> crate::delay_estimator::DelayStageState {
+        crate::delay_estimator::DelayStageState {
+            arc: crate::delay_estimator::SelectedArc { scene: 0, cell: String::new(), set: 0, arc: 0 },
+            driver_pin: driver_pin.into(),
+            input_slew: 0.0,
+            load_cap: 0.0,
+            current_model_delay: 0.0,
+            current_delay: 0.0,
+            current_wire_delay: 0.0,
+            current_model_slew: 0.0,
+            current_slew: 0.0,
+            output_slew_merge_arcs: Vec::new(),
+            sta_slew_bias: Default::default(),
+            opposite_rf_arcs: Vec::new(),
+            path_index: 0,
+        }
+    }
+
+    // Network::instance of a top-level port is the top instance (dbNetwork), of an instance pin
+    // its instance; Network::net is none for an unconnected pin; pinIterator lists an instance's
+    // pins in its master's terminal order (supply terminals skipped, as master_pins holds them).
+    #[test]
+    fn impact_names_read_the_network_as_the_reference_does() {
+        let (nl, pins) = impact_netlist();
+        let names = ImpactNames::new(&nl, &pins);
+        assert_eq!((names.instance("in"), names.instance("u/ZN"), names.instance("top/sub/x/Z")), (TOP_INSTANCE.to_string(), "u".to_string(), "top/sub/x".to_string()));
+        assert_eq!((names.net("u/A"), names.net("u/B"), names.net("out")), (Some("n_d".to_string()), None, Some("n_b".to_string())));
+        assert_eq!(names.pins("u"), ["u/B", "u/A", "u/ZN"]);
+        assert!(names.pins("nowhere").is_empty());
+    }
+
+    // MoveCandidate::impact: nothing without an estimator context (not complete); else every
+    // path stage driver's instance and net are timing dependencies, appendUnique (set, once, in
+    // stage order) — a port driver's instance is the top instance.
+    #[test]
+    fn the_base_impact_depends_on_every_path_stage_driver_once() {
+        let (nl, pins) = impact_netlist();
+        let names = ImpactNames::new(&nl, &pins);
+        let mut t = target_at(2);
+        assert_eq!(move_candidate_impact(&t, &names), MoveImpact::default());
+        t = with_context(t);
+        t.estimator_context.as_mut().unwrap().path_stages = ["in", "d/ZN", "u/ZN", "d/ZN"].into_iter().map(stage_at).collect();
+        let i = move_candidate_impact(&t, &names);
+        assert!(!i.complete);
+        assert_eq!(i.timing_dependency_instances, [TOP_INSTANCE, "d", "u"]);
+        assert_eq!(i.timing_dependency_nets, ["n_in", "n_d", "n_u"]);
+    }
+
+    // MoveCandidate::cellSwapImpact: the base impact, complete; the instance written and in the
+    // effect cone; the net of each of its pins in pin order, once, unconnected pins skipped.
+    // SizeDownFanoutMtCandidate::impact: the load's cell swap, and the target driver's instance
+    // in the effect cone after it.
+    #[test]
+    fn a_cell_swap_changes_every_net_on_the_instance() {
+        let (nl, pins) = impact_netlist();
+        let names = ImpactNames::new(&nl, &pins);
+        let mut t = target_at(1);
+        (t.inst, t.driver_pin) = ("u".into(), "u/ZN".into());
+        let i = cell_swap_impact(&t, &names, "u");
+        assert_eq!((i.complete, &i.write_instances, &i.timing_effect_instances, &i.timing_effect_nets), (true, &vec!["u".to_string()], &vec!["u".to_string()], &vec!["n_d".to_string(), "n_u".to_string()]));
+        assert!(i.write_nets.is_empty() && i.reconnect_pins.is_empty() && i.reconnect_instances.is_empty());
+        let i = size_down_fanout_mt_impact(&t, &names, "l1");
+        assert_eq!((&i.write_instances, &i.timing_effect_instances, &i.timing_effect_nets), (&vec!["l1".to_string()], &vec!["l1".to_string(), "u".to_string()], &vec!["n_b".to_string()]));
+    }
+
+    // SwapPinsMtCandidate::impact: the base impact, complete; the driver written and in the
+    // effect cone; for the path input port, the swap's port and the driver port in that order:
+    // the pin reconnects unless it is the driver's, and its net is in the effect cone (once,
+    // unconnected skipped).
+    #[test]
+    fn a_pin_swap_changes_the_two_input_nets_and_the_output_net() {
+        let (nl, pins) = impact_netlist();
+        let names = ImpactNames::new(&nl, &pins);
+        let mut t = target_at(1);
+        (t.inst, t.driver_pin) = ("u".into(), "u/ZN".into());
+        let input = SwapPinsInput { input_port: "A".into(), input_delay: 0.5, equivalents: Vec::new() };
+        let swap = SwapPinsEquivalent { port: "B".into(), delay: 0.25, pin: None, slack: 0.0 };
+        let i = swap_pins_mt_impact(&t, &names, &input, &swap);
+        assert_eq!((i.complete, &i.write_instances, &i.timing_effect_instances), (true, &vec!["u".to_string()], &vec!["u".to_string()]));
+        assert_eq!(i.reconnect_pins, ["u/A", "u/B"]);
+        assert_eq!(i.timing_effect_nets, ["n_d", "n_u"]);
+        assert!(i.write_nets.is_empty() && i.reconnect_instances.is_empty());
+    }
+
+    // RebufferMtCandidate::impact: the base impact, complete; the flat net written and in the
+    // effect cone; the driver's instance written and in the effect cone; per load path, in plan
+    // order, appendReconnectedLoad: the load pin reconnects, its instance reconnects and is in the
+    // effect cone, each once (a port load's instance is the top instance).
+    #[test]
+    fn a_rebuffer_reconnects_each_planned_load_once() {
+        let (nl, pins) = impact_netlist();
+        let names = ImpactNames::new(&nl, &pins);
+        let lp = |pin: &str| crate::rebuffer::LoadPath { load_pin: pin.into(), stages: Vec::new() };
+        let plan = crate::rebuffer::TreePlan { tree: 0, target_load_pin: None, load_paths: vec![lp("l1/A"), lp("out"), lp("l1/A")], tree_input_cap: 0.0, driver_slack_gain: 0.0, anchor_tree: false, buffer_count: 1, load_count: 2 };
+        let i = rebuffer_impact_on(MoveImpact::default(), &names, Some("n_b".into()), "b1/Z", &plan);
+        assert!(i.complete);
+        assert_eq!((&i.write_nets, &i.timing_effect_nets, &i.write_instances), (&vec!["n_b".to_string()], &vec!["n_b".to_string()], &vec!["b1".to_string()]));
+        assert_eq!(i.reconnect_pins, ["l1/A", "out"]);
+        assert_eq!(i.reconnect_instances, ["l1", TOP_INSTANCE]);
+        assert_eq!(i.timing_effect_instances, ["b1", "l1", TOP_INSTANCE]);
+        // No flat net: nothing on the net lists.
+        assert!(rebuffer_impact_on(MoveImpact::default(), &names, None, "b1/Z", &plan).write_nets.is_empty());
+    }
+
+    // makeBatchCandidates: one candidate per evaluation with a best, in pool order, carrying the
+    // evaluation's pool index, the best estimate's score as both scores (unweighted: no stall),
+    // the target's endpoint slack and the best candidate's impact; an evaluation without a best
+    // is skipped. weightsPriority: a WNS stall, at most bottleneck_max_wns_stall_batches long.
+    #[test]
+    fn batch_candidates_are_the_best_of_each_evaluation_in_pool_order() {
+        let pe = ParallelEval::new(for_parallel_eval(Effort::High), '*');
+        let cand = |score: f32, inst: &str| Candidate { kind: Move::SizeUp, estimate: Estimate { legal: true, score, raw_gain: None, reason: "estimate_legal", tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None }, desc: String::new(), impact: MoveImpact { complete: true, write_instances: vec![inst.into()], ..MoveImpact::default() } };
+        let mut targets = vec![target_at(0), target_at(1), target_at(2)];
+        targets[2].slack = -3e-10;
+        let evaluations = vec![TargetEvaluation { candidates: vec![cand(1.0, "a"), cand(2.0, "b")], best: Some(1) }, TargetEvaluation { candidates: vec![cand(5.0, "c")], best: None }, TargetEvaluation { candidates: vec![cand(3.0, "d")], best: Some(0) }];
+        let bcs = pe_make_batch_candidates(&pe, &targets, &evaluations).unwrap();
+        assert_eq!(bcs.iter().map(|b| (b.evaluation_index, b.local_score, b.priority_score, b.endpoint_slack, b.impact.write_instances[0].as_str())).collect::<Vec<_>>(), [(0, 2.0, 2.0, -1e-10, "b"), (2, 3.0, 3.0, -3e-10, "d")]);
+        let mut stalled = pe.clone();
+        stalled.stall.wns_stall_batches = 1;
+        assert!(pe_stall_weights_priority(&stalled));
+        assert!(pe_make_batch_candidates(&stalled, &targets, &evaluations).is_err());
+        stalled.stall.wns_stall_batches = pe.config.parallel_eval.priority.bottleneck_max_wns_stall_batches + 1;
+        assert!(!pe_stall_weights_priority(&stalled));
+        assert!(!pe_stall_weights_priority(&pe));
+    }
+
     // SplitLoadMtCandidate::impact: the driver and its net written, the moved load pins in order.
     #[test]
     fn split_load_mt_writes_the_driver_and_its_net_and_moves_the_loads() {
         let mut t = target_at(0);
         t.inst = "u".into();
         let input = SplitLoadInput { drvr_net: "n".into(), drvr_loc: (0, 0), load_pins: vec!["b/A".into(), "a/A".into()], buffer_cell: "BUF".into(), resized_cell: "BUF".into(), moved_pin_cap: 0.0, target_wire_cap_saved: 0.0, moved_wire_cap: 0.0, target_load_delta: 0.0, moved_loads: vec![] };
-        assert_eq!(split_load_mt_impact(&t, &input), MoveImpact { complete: true, write_instances: vec!["u".into()], write_nets: vec!["n".into()], reconnect_pins: vec!["b/A".into(), "a/A".into()] });
+        t.driver_pin = "u/ZN".into();
+        let (nl, pins) = impact_netlist();
+        let i = split_load_mt_impact(&t, &ImpactNames::new(&nl, &pins), &input);
+        // The driver's instance and net written and in the effect cone; the moved loads'
+        // instances reconnected and in the effect cone after the driver, each once.
+        assert_eq!(
+            i,
+            MoveImpact {
+                complete: true,
+                write_instances: vec!["u".into()],
+                write_nets: vec!["n".into()],
+                reconnect_pins: vec!["b/A".into(), "a/A".into()],
+                reconnect_instances: vec!["b".into(), "a".into()],
+                timing_effect_instances: vec!["u".into(), "b".into(), "a".into()],
+                timing_effect_nets: vec!["n".into()],
+                ..MoveImpact::default()
+            }
+        );
     }
 
 
