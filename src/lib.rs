@@ -53,6 +53,7 @@ pub mod repair_design;
 pub mod repair_hold;
 pub mod repair_setup;
 pub mod repair_timing;
+pub mod sequential_timing;
 pub mod sizing;
 pub mod swap_pins;
 pub mod timing;

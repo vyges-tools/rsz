@@ -16,6 +16,7 @@ use vyges_sta::liberty::MAX;
 use vyges_sta::fuzzy;
 
 use super::{PathView, Repair, Stop};
+use crate::sequential_timing::SequentialResult;
 use crate::delay_estimator::{ContextOptions, EstimatorContext, FaninSideLoadOptions, PathPin, Reader};
 use crate::repair_timing::{Effort, Move};
 
@@ -279,9 +280,9 @@ pub struct Target {
     pub(super) latch_data_path: Option<(Vec<super::ChainKey>, usize)>,
     /// `estimator_context` (`prepareEstimatorContext`).
     pub estimator_context: Option<EstimatorContext>,
-    /// `sequential_timing_estimator` is set (`prepareSequentialEstimator`); its contents are not
-    /// modelled yet.
-    pub sequential_estimator: bool,
+    /// `sequential_timing_estimator` (`prepareSequentialEstimator`): a flip-flop target's setup
+    /// and hold checks, for the cell swaps' side costs.
+    pub sequential_estimator: Option<crate::sequential_timing::SequentialTimingEstimator>,
     /// Why the context build left the target without one (the trace's `why=`).
     pub prepare_why: String,
     /// `unbuffer_gain` (`UnbufferMtGenerator::prepareInputs`): the removal's estimated gain, when
@@ -470,6 +471,11 @@ pub fn evaluation_endpoint_limit(batch_cap: i32, eval_endpoint_factor: i32, min_
 
 /// The VYGP printer's `{:.9e}` as fmt (C++) prints it: the exponent signed, at least two digits.
 fn e9(v: f32) -> String {
+    e9d(f64::from(v))
+}
+
+/// [`e9`] of a double (`fmt::format("{:.9e}", double)`).
+fn e9d(v: f64) -> String {
     let s = format!("{:.9e}", v);
     let (m, e) = s.split_once('e').expect("Rust's {:e} always has an exponent");
     let e: i32 = e.parse().expect("Rust's {:e} exponent is an integer");
@@ -842,7 +848,9 @@ impl Repair<'_, '_> {
             let ends = super::setup_ends(ctx, gs, ss, cs)?;
             let (wns, _) = crate::repair_timing::worst_slack(&ends);
             for target in targets.iter_mut() {
-                pe_prepare_target(target, mask, gs, ss, cs, design, ctx, &PrepareInputs { equiv, dont_use, pin_id: &pin_id, crit, cfg: &cfg, levels, slew_bias, wns });
+                let seq_lines = pe_prepare_target(target, mask, gs, ss, cs, design, ctx, &PrepareInputs { equiv, dont_use, pin_id: &pin_id, crit, cfg: &cfg, levels, slew_bias, wns })?;
+                // The estimator's own lines print inside `prepare`, before the target's.
+                trace.push_str(&seq_lines);
                 trace.push_str(&pe_prepared_lines(target, mask, ctx.libs));
             }
             Ok(())
@@ -1046,7 +1054,7 @@ fn pe_collect_path_driver_targets(pe: &mut ParallelEval, view: &PathView, path_s
                 path_start: seg.start,
                 latch_data_path: latch_data_path.clone(),
                 estimator_context: None,
-                sequential_estimator: false,
+                sequential_estimator: None,
                 prepare_why: String::new(),
                 unbuffer_gain: None,
                 swap_pins_input: None,
@@ -1359,18 +1367,20 @@ fn cell_swap_impact(target: &Target) -> MoveImpact {
 fn size_up_mt_estimate(libs: &crate::preamble::Libs, target: &Target, replacement: &str, score_scale: f32) -> Result<Estimate, Stop> {
     let Some(context) = &target.estimator_context else { return Err(Stop::refused("RSZ-ABSENT", "SizeUpMt estimate without an estimator context".into())) };
     let d = crate::delay_estimator::estimate(libs, context, replacement);
-    size_up_mt_estimate_of(target, &d, score_scale)
+    // `chargeCellSwapSideCosts` asks the sequential estimator only for a legal estimate.
+    let seq = target.sequential_estimator.as_ref().filter(|_| d.legal).map(|s| s.estimate(libs, replacement));
+    size_up_mt_estimate_of(target, &d, seq, score_scale)
 }
 
 /// [`size_up_mt_estimate`] from the window estimate.
-fn size_up_mt_estimate_of(target: &Target, d: &crate::delay_estimator::DelayEstimate, score_scale: f32) -> Result<Estimate, Stop> {
+fn size_up_mt_estimate_of(target: &Target, d: &crate::delay_estimator::DelayEstimate, seq: Option<SequentialResult>, score_scale: f32) -> Result<Estimate, Stop> {
     use crate::delay_estimator::FailReason;
     let score = d.arrival_impr * score_scale;
     if !d.legal {
         return Ok(Estimate { legal: false, score, raw_gain: (d.reason == FailReason::EstimateNonImproving).then_some(d.arrival_impr), reason: d.reason.name(), tail_admissible: d.reason == FailReason::DualRfNonImproving && score > 0.0, side_loss: None, sequential_penalty: None, sequential_side_loss: None });
     }
     let mut e = Estimate { legal: d.legal, score, raw_gain: Some(d.arrival_impr), reason: d.reason.name(), tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None };
-    charge_cell_swap_side_costs(target, d, score_scale, &mut e)?;
+    charge_cell_swap_side_costs(target, d, seq, score_scale, &mut e)?;
     Ok(e)
 }
 
@@ -1380,31 +1390,43 @@ fn size_up_mt_estimate_of(target: &Target, d: &crate::delay_estimator::DelayEsti
 fn vt_swap_mt_estimate(libs: &crate::preamble::Libs, target: &Target, cell: &str) -> Result<Estimate, Stop> {
     let Some(context) = &target.estimator_context else { return Err(Stop::refused("RSZ-ABSENT", "VtSwapMt estimate without an estimator context".into())) };
     let d = crate::delay_estimator::estimate(libs, context, cell);
-    vt_swap_mt_estimate_of(target, &d)
+    let seq = target.sequential_estimator.as_ref().filter(|_| d.legal).map(|s| s.estimate(libs, cell));
+    vt_swap_mt_estimate_of(target, &d, seq)
 }
 
 /// [`vt_swap_mt_estimate`] from the window estimate.
-fn vt_swap_mt_estimate_of(target: &Target, d: &crate::delay_estimator::DelayEstimate) -> Result<Estimate, Stop> {
+fn vt_swap_mt_estimate_of(target: &Target, d: &crate::delay_estimator::DelayEstimate, seq: Option<SequentialResult>) -> Result<Estimate, Stop> {
     use crate::delay_estimator::FailReason;
     if !d.legal {
         let raw = (d.reason == FailReason::EstimateNonImproving).then_some(d.arrival_impr);
         return Ok(Estimate { legal: false, score: raw.unwrap_or(0.0), raw_gain: raw, reason: d.reason.name(), tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None });
     }
     let mut e = Estimate { legal: true, score: d.arrival_impr, raw_gain: Some(d.arrival_impr), reason: "estimate_legal", tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None };
-    charge_cell_swap_side_costs(target, d, 1.0, &mut e)?;
+    charge_cell_swap_side_costs(target, d, seq, 1.0, &mut e)?;
     Ok(e)
 }
 
-/// `MoveCandidate::chargeCellSwapSideCosts`: with a sequential timing estimator on the target its
-/// penalty comes off first — not modelled, so such a target refuses the run; then, when the
-/// estimate charged side paths, their loss: the score is the gain less it times the scale, and a
-/// gain left at or below zero is `side_loss_non_improving`, tail-admissible when the own gain is
-/// positive.
-fn charge_cell_swap_side_costs(target: &Target, d: &crate::delay_estimator::DelayEstimate, score_scale: f32, e: &mut Estimate) -> Result<(), Stop> {
-    if target.sequential_estimator {
-        return Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -phases PARALLEL_EVAL: the SequentialTimingEstimator (chargeCellSwapSideCosts on {}) is not modelled", target.driver_pin)));
-    }
+/// `MoveCandidate::chargeCellSwapSideCosts`: with a sequential timing estimator on the target
+/// (`seq`, its estimate of the replacement) its weighted loss comes off first — the penalty and
+/// the max loss recorded, the score the gain left times the scale; an illegal side, or a gain left
+/// at or below zero, rejects (the side's reason, else `sequential_non_improving`), tail-admissible
+/// for a legal side with a positive own gain. Then, when the estimate charged side paths, their
+/// loss likewise (`side_loss_non_improving`).
+fn charge_cell_swap_side_costs(target: &Target, d: &crate::delay_estimator::DelayEstimate, seq: Option<SequentialResult>, score_scale: f32, e: &mut Estimate) -> Result<(), Stop> {
+    debug_assert_eq!(seq.is_some(), target.sequential_estimator.is_some(), "the caller estimates the side exactly when the target has an estimator");
     let mut adjusted_gain = d.arrival_impr;
+    if let Some(side) = seq {
+        e.sequential_penalty = Some(side.weighted_side_slack_loss);
+        e.sequential_side_loss = Some(side.max_side_slack_loss);
+        adjusted_gain -= side.weighted_side_slack_loss;
+        e.score = adjusted_gain * score_scale;
+        if !side.legal || adjusted_gain <= 0.0 {
+            e.legal = false;
+            e.reason = if side.legal { "sequential_non_improving" } else { side.reason };
+            e.tail_admissible = side.legal && d.arrival_impr > 0.0;
+            return Ok(());
+        }
+    }
     if d.side_paths_evaluated > 0 {
         e.side_loss = Some(d.side_loss);
         adjusted_gain -= d.side_loss;
@@ -2267,14 +2289,16 @@ struct PrepareInputs<'a> {
 }
 
 /// `prepareTarget(target, mask)`: the context, then the sequential estimator, as the mask asks.
+/// Returns the sequential estimator's trace lines (empty unless one was prepared).
 #[allow(clippy::too_many_arguments)]
-fn pe_prepare_target(target: &mut Target, mask: u8, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], cs: &[std::collections::BTreeSet<usize>], design: &dyn super::Design, ctx: &super::Ctx<'_>, inputs: &PrepareInputs<'_>) {
+fn pe_prepare_target(target: &mut Target, mask: u8, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], cs: &[std::collections::BTreeSet<usize>], design: &dyn super::Design, ctx: &super::Ctx<'_>, inputs: &PrepareInputs<'_>) -> Result<String, Stop> {
     if mask & ESTIMATOR_CONTEXT_CACHE != 0 {
         pe_prepare_estimator_context(target, gs, ss, cs, design, ctx, inputs);
     }
     if mask & SEQUENTIAL_ESTIMATOR_CACHE != 0 {
-        pe_prepare_sequential_estimator(target, ctx);
+        return pe_prepare_sequential_estimator(target, gs, ss, cs, design, ctx, inputs);
     }
+    Ok(String::new())
 }
 
 /// `prepareEstimatorContext` → `buildPolicyContext`: `DelayEstimator::buildContext` with the
@@ -2303,7 +2327,7 @@ fn pe_prepare_estimator_context(target: &mut Target, gs: &[vyges_sta::graph::Gra
         let v0 = if scene == 0 { Some(v) } else { gs[0].vertices.iter().position(|x| x.name == vx.name && x.is_driver == vx.is_driver) };
         v0.map_or(super::INF, |v0| super::slack_over_scenes(gs, ss, v0, vyges_sta::liberty::MAX, rf))
     };
-    let reader = Reader { libs: ctx.libs, g, parasitics: design.parasitics(scene), scene, equiv: inputs.equiv, dont_use: inputs.dont_use, slack: &slack, clock_pins: &cs[scene], pin_id: inputs.pin_id, master_pins: ctx.master_pins };
+    let reader = Reader { libs: ctx.libs, g, parasitics: design.parasitics(scene), scene, equiv: inputs.equiv, dont_use: inputs.dont_use, slack: &slack, clock_pins: &cs[scene], pin_id: inputs.pin_id, master_pins: ctx.master_pins, mm: vyges_sta::liberty::MAX };
     let index = target.path_index;
     let cfg = inputs.cfg;
     let options = ContextOptions {
@@ -2329,14 +2353,54 @@ fn pe_prepare_estimator_context(target: &mut Target, gs: &[vyges_sta::graph::Gra
     }
 }
 
-/// `prepareSequentialEstimator`: with a context, on a flip-flop target
-/// (`SequentialTimingEstimator::prepare`: a cell whose sequentials are all registers). What it
-/// prepares — the setup/hold checks per candidate cell — is not modelled yet.
-fn pe_prepare_sequential_estimator(target: &mut Target, ctx: &super::Ctx<'_>) {
-    if target.sequential_estimator || target.estimator_context.is_none() {
-        return;
+/// `prepareSequentialEstimator`: once, with a context — `SequentialTimingEstimator::prepare`
+/// (none unless the target is a flip-flop), its candidates the target's swappable and
+/// VT-equivalent cells. Returns the estimator's trace lines.
+#[allow(clippy::too_many_arguments)]
+fn pe_prepare_sequential_estimator(target: &mut Target, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], cs: &[std::collections::BTreeSet<usize>], design: &dyn super::Design, ctx: &super::Ctx<'_>, inputs: &PrepareInputs<'_>) -> Result<String, Stop> {
+    if target.sequential_estimator.is_some() || target.estimator_context.is_none() {
+        return Ok(String::new());
     }
-    target.sequential_estimator = ctx.libs.link_cell(&target.cell).is_some_and(|c| !c.sequentials.is_empty() && c.sequentials.iter().all(|(_, is_register, _)| *is_register));
+    if !crate::sequential_timing::is_flip_flop(ctx.libs.link_cell(&target.cell)) {
+        return Ok(String::new());
+    }
+    let swappable = ctx.sizing.swappable_cells(&target.cell)?;
+    let vt_equiv = ctx.sizing.vt_equiv_cells(&target.cell, ctx.vt_category_count);
+    let parasitics = |scene: usize| design.parasitics(scene);
+    let timer = crate::sequential_timing::Timer { libs: ctx.libs, gs, ss, parasitics: &parasitics, equiv: inputs.equiv, dont_use: inputs.dont_use, clock_pins: cs, pin_id: inputs.pin_id, master_pins: ctx.master_pins };
+    let output = target.driver_pin.rsplit_once('/').map_or("", |(_, port)| port);
+    target.sequential_estimator = crate::sequential_timing::SequentialTimingEstimator::prepare(&timer, &target.inst, &target.cell, output, &swappable, &vt_equiv);
+    Ok(target.sequential_estimator.as_ref().map(|e| pe_sequential_lines(&target.driver_pin, e, ctx.libs)).unwrap_or_default())
+}
+
+/// The VYGP `seqprep`, `seqchk` and `seqest` lines of a prepared sequential estimator: its
+/// failure, data ports, candidates (by name) and check count; each check's end, slack, margin,
+/// derate, related load, candidate models and inputs; each candidate's estimate.
+fn pe_sequential_lines(drv: &str, e: &crate::sequential_timing::SequentialTimingEstimator, libs: &crate::preamble::Libs) -> String {
+    use crate::sequential_timing::PreparedInputTiming;
+    let mm_name = |mm: usize| if mm == MAX { "max" } else { "min" };
+    let input = |i: &PreparedInputTiming| {
+        let caps: Vec<String> = i.candidate_connected_input_caps.iter().map(|c| e9(*c)).collect();
+        let drv = i.driver.as_ref().map_or("-".to_string(), |d| {
+            let merge: Vec<String> = d.output_slew_merge_arcs.iter().map(|m| format!("{}/{}", e9(m.input_slew), e9(m.current_model_slew))).collect();
+            format!("{}/{}/{}/{}/{}/{}/n{}/{}", d.arc.cell, e9(d.load_cap), e9(d.input_slew), e9(d.current_model_delay), e9(d.current_model_slew), e9(i.delay_derate), i.driver_gate_models.len(), merge.join(";"))
+        });
+        format!("{}:ideal={}:slew={}:cur={}:caps={}:drv={}", mm_name(i.mm), u8::from(i.ideal_clock), e9(i.slew), e9(i.current_connected_input_cap), caps.join(";"), drv)
+    };
+    let mut s = format!("VYGP|seqprep|{drv}|fail={}|ports={}|cands={}|checks={}\n", e.prepare_failure_reason, e.data_ports.join(","), e.candidates.join(","), e.checks.len());
+    for (i, c) in e.checks.iter().enumerate() {
+        let models: String = c.candidate_check_models.iter().map(|m| if m.is_some() { '1' } else { '0' }).collect();
+        s += &format!(
+            "VYGP|seqchk|{drv}|{i}|setup={}|data={}{}|clk={}{}|scene={}|mm={}|rel=-|slack={}|margin={}|cderate={}|rcap={}|models={models}|D={}|C={}|S={}\n",
+            u8::from(c.setup), c.data_pin, rf_short(c.data_rf), c.clock_pin, rf_short(c.clock_rf), libs.scenes.get(c.scene).map_or("default", String::as_str), mm_name(c.mm),
+            e9d(c.baseline_slack), e9(c.baseline_check_margin), e9(c.check_derate), e9(c.related_out_cap), input(&c.data), input(&c.clock), c.clock_check_slew_input.as_ref().map_or("-".to_string(), input),
+        );
+    }
+    for cell in &e.candidates {
+        let r = e.estimate(libs, cell);
+        s += &format!("VYGP|seqest|{drv}|{cell}|legal={}|w={}|m={}|reason={}\n", u8::from(r.legal), e9(r.weighted_side_slack_loss), e9(r.max_side_slack_loss), r.reason);
+    }
+    s
 }
 
 /// The VYGP printer's `{:.9e}` of a value that may be infinite (fmt prints `inf`).
@@ -2356,7 +2420,7 @@ fn rf_short(rf: usize) -> char {
 fn pe_prepared_lines(target: &Target, mask: u8, libs: &crate::preamble::Libs) -> String {
     let drv = &target.driver_pin;
     let why = if mask & ESTIMATOR_CONTEXT_CACHE == 0 { "nomask" } else { target.prepare_why.as_str() };
-    let mut s = format!("VYGP|prep|{drv}|mask={mask}|ctx={}|why={why}|seq={}\n", target.estimator_context.is_some() as i32, target.sequential_estimator as i32);
+    let mut s = format!("VYGP|prep|{drv}|mask={mask}|ctx={}|why={why}|seq={}\n", target.estimator_context.is_some() as i32, target.sequential_estimator.is_some() as i32);
     let Some(c) = &target.estimator_context else { return s };
     s.push_str(&format!(
         "VYGP|pctx|{drv}|stages={}|tsi={}|levels={}|floor={}|margin={}|fslw={}|opp={}|total={}|fsn={}\n",
@@ -2591,7 +2655,7 @@ mod tests {
             path_start: 0,
             latch_data_path: None,
             estimator_context: None,
-            sequential_estimator: false,
+            sequential_estimator: None,
             prepare_why: String::new(),
             unbuffer_gain: None,
             swap_pins_input: None,
@@ -2924,19 +2988,19 @@ mod tests {
     fn size_up_mt_scores_the_scaled_gain_less_the_side_loss() {
         use crate::delay_estimator::FailReason as F;
         let t = with_context(target_at(0));
-        let e = size_up_mt_estimate_of(&t, &delay_estimate(false, -2.0, F::EstimateNonImproving, 0, 0.0), 0.5).unwrap();
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(false, -2.0, F::EstimateNonImproving, 0, 0.0), None, 0.5).unwrap();
         assert_eq!((e.legal, e.score, e.raw_gain, e.reason, e.tail_admissible, e.side_loss), (false, -1.0, Some(-2.0), "estimate_non_improving", false, None));
-        let e = size_up_mt_estimate_of(&t, &delay_estimate(false, 2.0, F::SideSlackFloorViolation, 1, 0.5), 0.5).unwrap();
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(false, 2.0, F::SideSlackFloorViolation, 1, 0.5), None, 0.5).unwrap();
         assert_eq!((e.legal, e.score, e.raw_gain, e.reason, e.tail_admissible, e.side_loss), (false, 1.0, None, "side_slack_floor_violation", false, None));
-        let e = size_up_mt_estimate_of(&t, &delay_estimate(false, 2.0, F::DualRfNonImproving, 1, 0.5), 0.5).unwrap();
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(false, 2.0, F::DualRfNonImproving, 1, 0.5), None, 0.5).unwrap();
         assert_eq!((e.reason, e.tail_admissible), ("dual_rf_non_improving", true));
-        let e = size_up_mt_estimate_of(&t, &delay_estimate(false, -2.0, F::DualRfNonImproving, 1, 0.5), 0.5).unwrap();
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(false, -2.0, F::DualRfNonImproving, 1, 0.5), None, 0.5).unwrap();
         assert!(!e.tail_admissible);
-        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 0, 0.0), 0.5).unwrap();
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 0, 0.0), None, 0.5).unwrap();
         assert_eq!((e.legal, e.score, e.raw_gain, e.reason, e.side_loss), (true, 1.0, Some(2.0), "estimate_legal", None));
-        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 2, 0.5), 0.5).unwrap();
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 2, 0.5), None, 0.5).unwrap();
         assert_eq!((e.legal, e.score, e.side_loss), (true, 0.75, Some(0.5)));
-        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 2, 3.0), 0.5).unwrap();
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 2, 3.0), None, 0.5).unwrap();
         assert_eq!((e.legal, e.score, e.reason, e.tail_admissible, e.side_loss), (false, -0.5, "side_loss_non_improving", true, Some(3.0)));
     }
 
@@ -2947,24 +3011,33 @@ mod tests {
     fn vt_swap_mt_keeps_the_gain_only_of_a_non_improving_reject() {
         use crate::delay_estimator::FailReason as F;
         let t = with_context(target_at(0));
-        let e = vt_swap_mt_estimate_of(&t, &delay_estimate(false, -2.0, F::EstimateNonImproving, 0, 0.0)).unwrap();
+        let e = vt_swap_mt_estimate_of(&t, &delay_estimate(false, -2.0, F::EstimateNonImproving, 0, 0.0), None).unwrap();
         assert_eq!((e.legal, e.score, e.raw_gain, e.reason), (false, -2.0, Some(-2.0), "estimate_non_improving"));
-        let e = vt_swap_mt_estimate_of(&t, &delay_estimate(false, 2.0, F::DualRfNonImproving, 1, 0.5)).unwrap();
+        let e = vt_swap_mt_estimate_of(&t, &delay_estimate(false, 2.0, F::DualRfNonImproving, 1, 0.5), None).unwrap();
         assert_eq!((e.legal, e.score, e.raw_gain, e.reason, e.tail_admissible), (false, 0.0, None, "dual_rf_non_improving", false));
-        let e = vt_swap_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 1, 0.5)).unwrap();
+        let e = vt_swap_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 1, 0.5), None).unwrap();
         assert_eq!((e.legal, e.score, e.raw_gain, e.side_loss), (true, 1.5, Some(2.0), Some(0.5)));
     }
 
-    // chargeCellSwapSideCosts: a target with a sequential timing estimator refuses (not modelled),
-    // never guessed.
+    // Rules (MoveCandidate::chargeCellSwapSideCosts with a sequential timing estimator): its
+    // weighted loss comes off the gain first and is recorded with the max loss; the score is the
+    // gain left times the scale. An illegal side rejects with the side's reason; a legal side
+    // leaving no gain is sequential_non_improving; either is tail-admissible only for a legal side
+    // with a positive own gain. A legal side with gain left goes on to the side-path loss.
     #[test]
-    fn a_sequential_target_refuses_the_cell_swap_side_costs() {
+    fn a_sequential_target_pays_its_side_checks_first() {
         use crate::delay_estimator::FailReason as F;
         let mut t = with_context(target_at(0));
-        t.sequential_estimator = true;
-        assert!(size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 0, 0.0), 0.5).is_err());
-        // Not reached for a rejected estimate.
-        assert!(size_up_mt_estimate_of(&t, &delay_estimate(false, 2.0, F::EstimateNonImproving, 0, 0.0), 0.5).is_ok());
+        t.sequential_estimator = Some(crate::sequential_timing::SequentialTimingEstimator { candidates: Vec::new(), checks: Vec::new(), prepare_failure_reason: "", data_ports: Vec::new() });
+        let side = |legal: bool, w: f32, m: f32, reason: &'static str| Some(SequentialResult { legal, weighted_side_slack_loss: w, max_side_slack_loss: m, reason });
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 0, 0.0), side(false, 0.5, 1.0, "sequential_setup_violation"), 0.5).unwrap();
+        assert_eq!((e.legal, e.score, e.reason, e.tail_admissible, e.sequential_penalty, e.sequential_side_loss), (false, 0.75, "sequential_setup_violation", false, Some(0.5), Some(1.0)));
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 0, 0.0), side(true, 2.0, 2.0, "sequential_estimate_legal"), 0.5).unwrap();
+        assert_eq!((e.legal, e.score, e.reason, e.tail_admissible), (false, 0.0, "sequential_non_improving", true));
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 1, 2.5), side(true, 0.0, 0.0, "sequential_estimate_legal"), 0.5).unwrap();
+        assert_eq!((e.legal, e.score, e.reason, e.tail_admissible, e.side_loss, e.sequential_penalty), (false, -0.25, "side_loss_non_improving", true, Some(2.5), Some(0.0)));
+        let e = vt_swap_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 0, 0.0), side(true, 0.5, 0.5, "sequential_estimate_legal")).unwrap();
+        assert_eq!((e.legal, e.score, e.reason, e.sequential_penalty), (true, 1.5, "estimate_legal", Some(0.5)));
     }
 
     // replacementFitsInputCapBudgets: per budget, the replacement port's largest max cap (0 without
