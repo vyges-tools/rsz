@@ -14,6 +14,8 @@ use vyges_sta::liberty::{ArcSet, Cell, Model, Role, MAX};
 
 use crate::preamble::Libs;
 
+pub mod buffer_tree;
+
 /// `SelectedArc`: the stage's timing arc on its CURRENT scene cell — the arc set and the arc
 /// within it — and the scene (the min/max is always max here: setup).
 #[derive(Debug, Clone, PartialEq)]
@@ -162,6 +164,7 @@ pub enum FailReason {
     EstimateNonImproving,
     MissingCandidatePort,
     MissingCandidateTimingArc,
+    InvalidBufferInsertion,
     SideSlackFloorViolation,
     DualRfNonImproving,
     MissingBufferTimingArc,
@@ -183,6 +186,7 @@ impl FailReason {
             FailReason::EstimateNonImproving => "estimate_non_improving",
             FailReason::MissingCandidatePort => "missing_candidate_port",
             FailReason::MissingCandidateTimingArc => "missing_candidate_timing_arc",
+            FailReason::InvalidBufferInsertion => "invalid_buffer_insertion",
             FailReason::SideSlackFloorViolation => "side_slack_floor_violation",
             FailReason::DualRfNonImproving => "dual_rf_non_improving",
             FailReason::MissingBufferTimingArc => "missing_buffer_timing_arc",

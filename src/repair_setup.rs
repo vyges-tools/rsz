@@ -938,15 +938,16 @@ fn view_of_chain(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[B
 /// driver arc is timed in its arrival path's scene.
 fn probe_rebuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], _cs: &[BTreeSet<usize>], design: &dyn Design, drvr_name: &str) -> RebufProbe {
     let g = &gs[0];
-    let ideal: BTreeSet<usize> = gs[0].ideal_clock.iter().copied().collect();
     let Some(drvr) = g.vertices.iter().position(|x| x.name == drvr_name && x.is_driver) else { return RebufProbe::Skip };
     let vx = &g.vertices[drvr];
     if vx.lib.is_none() {
         return RebufProbe::Warn(format!("[WARNING RSZ-2020] rebuffering does not support top port as the driver pin: {}", vx.name));
     }
     let Some(net) = g.vertex_net[drvr] else { return RebufProbe::Skip };
-    let (Some(cell_name), Some(port)) = (vx.cell.as_deref(), vx.port.as_deref()) else { return RebufProbe::Skip };
-    let Some(cell) = g.libs[vx.lib.expect("an instance pin")].cells.get(cell_name) else { return RebufProbe::Skip };
+    let (Some(cell_name), Some(_)) = (vx.cell.as_deref(), vx.port.as_deref()) else { return RebufProbe::Skip };
+    if !g.libs[vx.lib.expect("an instance pin")].cells.contains_key(cell_name) {
+        return RebufProbe::Skip;
+    }
     // hasTopLevelOutputPort.
     let top_out = g.netlist.nets[net].pins.iter().any(|c| matches!(c, vyges_sta::netlist::Conn::Port(k) if g.netlist.ports[*k].1 == vyges_sta::netlist::PortDir::Output));
     if top_out {
@@ -957,6 +958,21 @@ fn probe_rebuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], _cs: &
     let Some((bn, root)) = design.net_shape(net_name, &vx.name).and_then(|shape| crate::buffered_net::make_buffered_net(&bctx, &shape).ok().flatten()) else {
         return RebufProbe::Warn(format!("[WARNING RSZ-0075] makeBufferedNet failed for driver {}", vx.name));
     };
+    match rebuffer_probe_of_net(ctx, gs, ss, design, drvr, &bn, root) {
+        Some(p) => RebufProbe::Ready(Box::new(p)),
+        None => RebufProbe::Skip,
+    }
+}
+
+/// `annotateLoadSlacks` over a buffered net (each load's worst max path walked back to the
+/// driver), `drvrPinTiming`'s arcs and `setPin`'s limits: the planner's input for one driver.
+/// None for a driver without a liberty cell and port.
+fn rebuffer_probe_of_net(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], design: &dyn Design, drvr: usize, bn: &crate::buffered_net::BufferedNet, root: usize) -> Option<rebuffer::Probe> {
+    let g = &gs[0];
+    let ideal: BTreeSet<usize> = gs[0].ideal_clock.iter().copied().collect();
+    let vx = &g.vertices[drvr];
+    let (cell_name, port) = (vx.cell.as_deref()?, vx.port.as_deref()?);
+    let cell = g.libs[vx.lib?].cells.get(cell_name)?;
     // The buffered net as rebuffer nodes, its loads annotated in visit order.
     let mut nodes: Vec<rebuffer::Node> = Vec::with_capacity(bn.nodes.len());
     for n in &bn.nodes {
@@ -970,7 +986,7 @@ fn probe_rebuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], _cs: &
     }
     let mut arrival_paths: [Option<(usize, vyges_sta::search::Path)>; 2] = [None, None];
     let mut warnings = Vec::new();
-    annotate_load_slacks(gs, ss, &bn, root, &vx.name, &mut nodes, &mut arrival_paths, &mut warnings);
+    annotate_load_slacks(gs, ss, bn, root, &vx.name, &mut nodes, &mut arrival_paths, &mut warnings);
     let mut arcs: [Option<Option<rebuffer::DriverArc>>; 2] = [None, None];
     let mut arc_scenes = [0usize; 2];
     for rf in 0..2 {
@@ -1002,7 +1018,7 @@ fn probe_rebuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], _cs: &
     let p = ctx.libs.scene_cell(0, cell_name).unwrap_or(link).port(port);
     let (max_slew, exists) = crate::timing::find_slew_limit(lib, p.map_or(vyges_sta::liberty::Direction::Output, |p| p.direction), p.and_then(|p| p.max_transition), ctx.limits);
     let drvr_pin_max_slew = if exists { (f64::from(max_slew) * (1.0 - 20.0 / 100.0)) as f32 } else { INF };
-    RebufProbe::Ready(Box::new(rebuffer::Probe {
+    Some(rebuffer::Probe {
         nodes,
         root,
         arcs,
@@ -1013,7 +1029,7 @@ fn probe_rebuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], _cs: &
         drvr_pin_max_slew,
         pin: vx.name.clone(),
         warnings,
-    }))
+    })
 }
 
 /// One driver's imported tree for `fullyRebuffer`, or why there is none.

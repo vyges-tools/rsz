@@ -191,6 +191,12 @@ pub fn slack_loss_floor(best_slack: FixedDelay) -> FixedDelay {
 
 /// The VYGP printer's `{:.9e}` (fmt, or printf's `%.9e`): the exponent signed, at least two
 /// digits.
+/// The printer's planner lines name pins as the reference's SDC network prints them
+/// (`sdc_network_->pathName`: [`crate::repair_timing::sta_to_sdc`]); its generator lines do not.
+fn sdc(pin: &str) -> String {
+    crate::repair_timing::sta_to_sdc(pin)
+}
+
 pub fn e9<T: Into<f64>>(v: T) -> String {
     let s = format!("{:.9e}", v.into());
     let (m, e) = s.split_once('e').expect("Rust's {:e} always has an exponent");
@@ -1601,7 +1607,7 @@ impl Rebuf<'_> {
             Some(a) => self.area_recovery_target(a),
             None => target,
         };
-        trace.push(format!("VYGP|rbatgt|{}|target={}|anchor_target={}|anchor={}", self.pin, e9(target.to_secs()), e9(anchor_target.to_secs()), u8::from(anchor.option.is_some())));
+        trace.push(format!("VYGP|rbatgt|{}|target={}|anchor_target={}|anchor={}", sdc(&self.pin), e9(target.to_secs()), e9(anchor_target.to_secs()), u8::from(anchor.option.is_some())));
         let mut i = 0;
         while i < 5 && !beam.is_empty() {
             let alpha = (1 + i) as f32 / 5.0;
@@ -1643,7 +1649,7 @@ impl Rebuf<'_> {
             }
             _ => "-".into(),
         };
-        format!("VYGP|{tag}|{}|r{round}|n={}|anchor={an}|{}", self.pin, options.len(), list.join(","))
+        format!("VYGP|{tag}|{}|r{round}|n={}|anchor={an}|{}", sdc(&self.pin), options.len(), list.join(","))
     }
 
     /// The printer's tree: `L<pin>`, `W(x,y,layer)`, `V(x,y,layer,ref)`, `B(cell,x,y)`, `J(x,y)`,
@@ -1651,7 +1657,7 @@ impl Rebuf<'_> {
     pub fn vyg_tree(&self, n: usize) -> String {
         let nd = &self.nodes[n];
         match &nd.kind {
-            Kind::Load { pin } => format!("L{pin}"),
+            Kind::Load { pin } => format!("L{}", sdc(pin)),
             Kind::Wire { r } => format!("W({},{},{})[{}]", nd.x, nd.y, nd.layer, self.vyg_tree(*r)),
             Kind::Via { r, ref_layer } => format!("V({},{},{},{ref_layer})[{}]", nd.x, nd.y, nd.layer, self.vyg_tree(*r)),
             Kind::Buffer { cell, r } => format!("B({cell},{},{})[{}]", nd.x, nd.y, self.vyg_tree(*r)),
@@ -1754,11 +1760,11 @@ impl Rebuf<'_> {
                     format!("{t}:{}:{}:{}:{}:{}:{}", s.buffer_cell.as_deref().unwrap_or("-"), e9(s.wire_rc.length), e9(s.wire_rc.res), e9(s.wire_rc.cap), e9(s.downstream_cap), u8::from(s.drives_distributed_load))
                 })
                 .collect();
-            paths.push(format!("{}{{{}}}", lp.load_pin, st.join(";")));
+            paths.push(format!("{}{{{}}}", sdc(&lp.load_pin), st.join(";")));
         }
         format!(
             "VYGP|rbplan|{}|anchor={}|bufs={}|loads={}|dsg={}|cap={}|target={}|tree={}|paths={}",
-            self.pin,
+            sdc(&self.pin),
             u8::from(plan.anchor_tree),
             plan.buffer_count,
             plan.load_count,
@@ -1777,7 +1783,7 @@ impl Rebuf<'_> {
         let plan_limit = max_plans.max(1);
         let root = self.probe.root;
         let request = PlanRequest { target_load_pin: target_load_pin.map(str::to_string), original_slack: self.slack_at_driver_pin(root) };
-        trace.push(format!("VYGP|rbreq|{}|tgt={}|limit={plan_limit}|orig={}|tree={}", self.pin, target_load_pin.unwrap_or("-"), e9(request.original_slack.to_secs()), self.vyg_tree(root)));
+        trace.push(format!("VYGP|rbreq|{}|tgt={}|limit={plan_limit}|orig={}|tree={}", sdc(&self.pin), target_load_pin.map_or_else(|| "-".to_string(), sdc), e9(request.original_slack.to_secs()), self.vyg_tree(root)));
         // `allow_topology_rewrite`: placement parasitics only.
         let allow_topology_rewrite = self.ctx.layers.is_none();
         let Some((mut beam, mut anchor)) = self.run_timing_beam(root, allow_topology_rewrite, plan_limit, trace) else { return Vec::new() };

@@ -879,7 +879,10 @@ impl Repair<'_, '_> {
             for (target, facts) in targets.iter_mut().zip(&facts) {
                 pe_plan_generation(pe, target, facts, &plan, &mut trace).map_err(|e| Stop::refused("RSZ-ABSENT", e))?;
             }
-            Ok(targets.iter().map(|target| pe_run_generators(target, &plan, &cfg)).collect::<Result<Vec<_>, Stop>>())
+            let mut rb = String::new();
+            let generated = targets.iter().map(|target| pe_run_generators(target, &plan, &cfg, &mut rb)).collect::<Result<Vec<_>, Stop>>();
+            trace.push_str(&rb);
+            Ok(generated)
         })?;
         // A generator that reaches an unported part refuses the run after the plan lines print.
         let generated = match generated {
@@ -1137,13 +1140,14 @@ fn pe_plan_generation(pe: &mut ParallelEval, target: &mut Target, facts: &PlanFa
 
 /// The generators whose `generate` and candidate `estimate` are modelled.
 fn generate_modelled(m: Move) -> bool {
-    matches!(m, Move::Unbuffer | Move::SwapPins | Move::SizeUp | Move::VtSwap | Move::SizeDownFanout | Move::SplitLoad)
+    matches!(m, Move::Unbuffer | Move::SwapPins | Move::SizeUp | Move::VtSwap | Move::SizeDownFanout | Move::SplitLoad | Move::Buffer)
 }
 
 /// A task's generators in plan order (`MoveGenerator::generate`): per generator its candidates,
 /// none for one not modelled yet.
-fn pe_run_generators(target: &Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtConfig) -> Result<Vec<Vec<Candidate>>, Stop> {
-    target.plan.iter().map(|&m| if generate_modelled(m) { pe_generate(m, target, plan, cfg) } else { Ok(Vec::new()) }).collect()
+/// `rb` collects the printer's RebufferMt lines (the planner's, the plan gates, the estimates).
+fn pe_run_generators(target: &Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtConfig, rb: &mut String) -> Result<Vec<Vec<Candidate>>, Stop> {
+    target.plan.iter().map(|&m| if generate_modelled(m) { pe_generate(m, target, plan, cfg, rb) } else { Ok(Vec::new()) }).collect()
 }
 
 /// `collectGenerated`: per target, per generator in plan order, the trace's candidate count.
@@ -1158,7 +1162,7 @@ fn pe_collect_generated(pe: &ParallelEval, targets: &[Target], generated: &[Vec<
 }
 
 /// `MoveGenerator::generate` with each candidate's `estimate()`, `vygDescribe()` and `impact()`.
-fn pe_generate(m: Move, target: &Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtConfig) -> Result<Vec<Candidate>, Stop> {
+fn pe_generate(m: Move, target: &Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtConfig, rb: &mut String) -> Result<Vec<Candidate>, Stop> {
     match m {
         // UnbufferMtGenerator: one removal when the prepared gain is positive.
         Move::Unbuffer => Ok(unbuffer_mt_generate(target, || unbuffer_mt_impact(target, plan))),
@@ -1167,8 +1171,168 @@ fn pe_generate(m: Move, target: &Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtC
         Move::VtSwap => vt_swap_mt_generate(target, plan.ctx, cfg),
         Move::SizeDownFanout => Ok(size_down_fanout_mt_generate(target, plan.ctx.libs, cfg)),
         Move::SplitLoad => Ok(split_load_mt_generate(target, plan.ctx.libs, cfg)),
+        Move::Buffer => rebuffer_mt_generate(target, plan, cfg, rb),
         _ => Ok(Vec::new()),
     }
+}
+
+/// `RebufferMtGenerator::generate`: nothing for a driver whose instance already has a buffer move
+/// or a target without a load pin; else the prepared net planned (`makeTreePlans`), the plans
+/// gated, one candidate per plan in plan order.
+fn rebuffer_mt_generate(target: &Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtConfig, rb: &mut String) -> Result<Vec<Candidate>, Stop> {
+    if plan.committer.has_moves(Move::Buffer, (plan.inst_id)(&target.inst)) {
+        return Ok(Vec::new());
+    }
+    let Some(load_pin) = target.load_pin.as_deref() else { return Ok(Vec::new()) };
+    let plans = rebuffer_mt_make_tree_plans(target, plan, cfg, load_pin, rb)?;
+    Ok(rebuffer_mt_add_tree_plan_candidates(target, plan, cfg, &plans, rb))
+}
+
+/// `RebufferMtGenerator::makeTreePlans`: `makeRebufferTreePlans` on the prepared net (none without
+/// one), then the plan gates: no tree without buffers or with a dont-touch load behind a buffer;
+/// a one-buffer tree only with `allow_rebuffer_mt_single_buffer`; no tree past the score cap —
+/// the anchor tree exempt from the last two.
+fn rebuffer_mt_make_tree_plans(target: &Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtConfig, load_pin: &str, rb: &mut String) -> Result<Vec<crate::rebuffer::TreePlan>, Stop> {
+    let Some((bn, root)) = target.rebuffer_net.as_ref() else { return Ok(Vec::new()) };
+    let rctx = plan.ctx.rebuffer.ok_or_else(|| Stop::refused("RSZ-ABSENT", "RebufferMt without characterized buffers".into()))?;
+    let g = &plan.gs[0];
+    let Some(drvr) = g.vertices.iter().position(|x| x.name == target.driver_pin && x.is_driver) else { return Ok(Vec::new()) };
+    let Some(probe) = super::rebuffer_probe_of_net(plan.ctx, plan.gs, plan.ss, plan.design, drvr, bn, *root) else { return Ok(Vec::new()) };
+    if let Some(w) = probe.warnings.first() {
+        return Err(Stop::refused("RSZ-ABSENT", format!("RebufferMt planning warnings are not modelled: {w}")));
+    }
+    let mut rbuf = crate::rebuffer::Rebuf::new(rctx, &probe);
+    let mut lines = Vec::new();
+    let mut plans = rbuf.make_rebuffer_tree_plans(Some(load_pin), cfg.rebuffer_mt_max_candidates.max(1) as usize, &mut lines);
+    for l in lines {
+        rb.push_str(&l);
+        rb.push('\n');
+    }
+    if let Some(e) = rbuf.failed.as_ref().or(rbuf.refused.as_ref()) {
+        return Err(Stop::refused("RSZ-ABSENT", format!("RebufferMt planning of {}: {e}", target.driver_pin)));
+    }
+    if let Some((_, w)) = rbuf.trace.iter().find(|(level, _)| level.is_none()) {
+        return Err(Stop::refused("RSZ-ABSENT", format!("RebufferMt planning warnings are not modelled: {w}")));
+    }
+    for (k, p) in plans.iter().enumerate() {
+        rb.push_str(&format!("VYGP|rbgate|{}|{k}|bufs={}|anchor={}|dsg={}|dt={}\n", target.driver_pin, p.buffer_count, u8::from(p.anchor_tree), e9(p.driver_slack_gain), u8::from(rebuffer_has_dont_touch_load_behind_buffer(plan, p))));
+    }
+    plans.retain(|p| {
+        if p.buffer_count == 0 || rebuffer_has_dont_touch_load_behind_buffer(plan, p) {
+            return false;
+        }
+        if p.buffer_count == 1 && !p.anchor_tree && !cfg.allow_rebuffer_mt_single_buffer {
+            return false;
+        }
+        !(!p.anchor_tree && cfg.rebuffer_mt_max_score > 0.0 && p.driver_slack_gain.abs() > cfg.rebuffer_mt_max_score)
+    });
+    Ok(plans)
+}
+
+/// `hasDontTouchLoadBehindBuffer`: a load behind a buffer that is dont-touch (`Resizer::dontTouch`:
+/// its instance or its net).
+fn rebuffer_has_dont_touch_load_behind_buffer(plan: &PlanTimer<'_, '_, '_>, p: &crate::rebuffer::TreePlan) -> bool {
+    let info = plan.design.net_info();
+    p.load_paths.iter().any(|lp| {
+        let behind = lp.stages.iter().any(|s| s.kind == crate::rebuffer::StageKind::Buffer);
+        let inst_dt = lp.load_pin.rsplit_once('/').is_some_and(|(inst, _)| info.dont_touch_insts.contains(inst));
+        let net_dt = plan.design.pin_net(&lp.load_pin).is_some_and(|(net, _)| info.dont_touch.contains(&net));
+        behind && (inst_dt || net_dt)
+    })
+}
+
+/// `addTreePlanCandidates` with `makeSideContexts`: one candidate per plan; its side contexts the
+/// plan's other loads that have load timing, in load-path order.
+fn rebuffer_mt_add_tree_plan_candidates(target: &Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtConfig, plans: &[crate::rebuffer::TreePlan], rb: &mut String) -> Vec<Candidate> {
+    let mut out = Vec::with_capacity(plans.len());
+    for p in plans {
+        let sides = rebuffer_make_side_contexts(p, &target.rebuffer_load_timing);
+        let Some(context) = target.estimator_context.as_ref() else { continue };
+        out.push(Candidate {
+            kind: Move::Buffer,
+            estimate: rebuffer_mt_estimate(plan.ctx.libs, context, target, p, &sides, cfg, rb),
+            desc: format!("bufs={}/loads={}/anchor={}/dsg={:.6}/cap={:.6}", p.buffer_count, p.load_count, u8::from(p.anchor_tree), p.driver_slack_gain, p.tree_input_cap),
+            impact: rebuffer_mt_impact(target, plan, p),
+        });
+    }
+    out
+}
+
+/// `makeSideContexts`: the plan's loads other than the target load that have load timing (none
+/// without the side-load model), in load-path order.
+fn rebuffer_make_side_contexts(p: &crate::rebuffer::TreePlan, load_timing: &[RebufferLoadTiming]) -> Vec<crate::delay_estimator::buffer_tree::SidePathContext> {
+    if load_timing.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for lp in &p.load_paths {
+        if p.target_load_pin.as_deref() == Some(lp.load_pin.as_str()) {
+            continue;
+        }
+        let Some(t) = load_timing.iter().find(|t| t.pin == lp.load_pin) else { continue };
+        out.push(crate::delay_estimator::buffer_tree::SidePathContext { load_pin: lp.load_pin.clone(), current_driver_to_load_delay: t.wire_delay, current_slack: t.slack, weight: t.weight });
+    }
+    out
+}
+
+/// `RebufferMtCandidate::estimate`: the buffer-tree estimate; the score is the gain less the side
+/// loss, scaled; an estimator reject keeps its gain only when non-improving or below the side
+/// floor; a legal estimate is still rejected at a score at or below zero
+/// (`side_loss_non_improving`, tail-admissible for a positive own gain) or under the minimum
+/// (`min_score`).
+fn rebuffer_mt_estimate(libs: &crate::preamble::Libs, context: &EstimatorContext, target: &Target, p: &crate::rebuffer::TreePlan, sides: &[crate::delay_estimator::buffer_tree::SidePathContext], cfg: &MtConfig, rb: &mut String) -> Estimate {
+    use crate::delay_estimator::buffer_tree as bt;
+    let mut trace = Vec::new();
+    let mut side_evals = Vec::new();
+    let d = bt::estimate_buffer_tree_with_side_paths(libs, context, p, sides, Some(&mut trace), Some(&mut side_evals));
+    rb.push_str(&rebuffer_est_line(&target.driver_pin, &d, &trace, &side_evals));
+    rebuffer_mt_estimate_of(&d, cfg.rebuffer_mt_score_scale, cfg.rebuffer_mt_min_score)
+}
+
+/// The score rules of [`rebuffer_mt_estimate`] on a delay estimate.
+fn rebuffer_mt_estimate_of(d: &crate::delay_estimator::DelayEstimate, score_scale: f32, min_score: f32) -> Estimate {
+    use crate::delay_estimator::FailReason;
+    let raw_score = d.arrival_impr - d.side_loss;
+    let mut e = Estimate { legal: false, score: raw_score * score_scale, raw_gain: None, reason: d.reason.name(), tail_admissible: false, side_loss: (d.side_paths_evaluated > 0).then_some(d.side_loss), sequential_penalty: None, sequential_side_loss: None };
+    if !d.legal {
+        if matches!(d.reason, FailReason::EstimateNonImproving | FailReason::SideSlackFloorViolation) {
+            e.raw_gain = Some(d.arrival_impr);
+        }
+        return e;
+    }
+    e.raw_gain = Some(d.arrival_impr);
+    if raw_score <= 0.0 || raw_score < min_score {
+        e.reason = if raw_score <= 0.0 { "side_loss_non_improving" } else { "min_score" };
+        e.tail_admissible = d.arrival_impr > 0.0;
+        return e;
+    }
+    e.legal = true;
+    e
+}
+
+/// The printer's `rbest` line: the estimate, its stage trace and its side paths.
+fn rebuffer_est_line(drvr: &str, d: &crate::delay_estimator::DelayEstimate, trace: &[crate::delay_estimator::buffer_tree::StageEvaluation], sides: &[crate::delay_estimator::buffer_tree::SidePathEvaluation]) -> String {
+    let stages = |t: &[crate::delay_estimator::buffer_tree::StageEvaluation]| {
+        t.iter()
+            .map(|e| format!("{}:{}:{}:{}:{}:{}:{}", e.path_index, e.cell.as_deref().unwrap_or("-"), e9(e.input_slew), e9(e.load_cap), e9(e.stage_delay), e9(e.output_slew), e9(e.wire_delay)))
+            .collect::<Vec<_>>()
+            .join(";")
+    };
+    let sides: Vec<String> = sides.iter().map(|s| format!("{}:{}:{}:{}:{{{}}}", s.load_pin, u8::from(s.legal), e9(s.arrival_impr), e9(s.slack_after), stages(&s.trace))).collect();
+    format!("VYGP|rbest|{drvr}|legal={}|reason={}|impr={}|side={}|nside={}|stages={}|sides={}\n", u8::from(d.legal), d.reason.name(), e9(d.arrival_impr), e9(d.side_loss), d.side_paths_evaluated, stages(trace), sides.join(","))
+}
+
+/// `RebufferMtCandidate::impact`: complete; the driver's net and instance written; every plan
+/// load reconnects, in load-path order.
+fn rebuffer_mt_impact(target: &Target, plan: &PlanTimer<'_, '_, '_>, p: &crate::rebuffer::TreePlan) -> MoveImpact {
+    let net = plan.design.pin_net(&target.driver_pin).map(|(n, _)| n);
+    let mut reconnect: Vec<String> = Vec::new();
+    for lp in &p.load_paths {
+        if !reconnect.contains(&lp.load_pin) {
+            reconnect.push(lp.load_pin.clone());
+        }
+    }
+    MoveImpact { complete: true, write_instances: vec![target.inst.clone()], write_nets: net.into_iter().collect(), reconnect_pins: reconnect }
 }
 
 /// `UnbufferMtGenerator::generate`: one removal when `prepareInputs` left a gain above zero (none
@@ -3121,4 +3285,36 @@ mod tests {
         assert_eq!(split_load_mt_impact(&t, &input), MoveImpact { complete: true, write_instances: vec!["u".into()], write_nets: vec!["n".into()], reconnect_pins: vec!["b/A".into(), "a/A".into()] });
     }
 
+
+    // RebufferMtCandidate::estimate: raw score = gain - side loss, score = raw * scale. A reject
+    // keeps its gain only for estimate_non_improving / side_slack_floor_violation; a legal
+    // estimate at raw <= 0 is side_loss_non_improving, under min_score is min_score — both
+    // tail-admissible for a positive own gain. side_loss only when side paths were evaluated.
+    #[test]
+    fn rebuffer_mt_scores_the_gain_less_the_side_loss() {
+        use crate::delay_estimator::FailReason as F;
+        let e = rebuffer_mt_estimate_of(&delay_estimate(true, 20e-12, F::EstimateLegal, 1, 4e-12), 0.5, 5e-12);
+        assert_eq!((e.legal, e.score, e.raw_gain, e.side_loss, e.reason), (true, (20e-12f32 - 4e-12) * 0.5, Some(20e-12), Some(4e-12), "estimate_legal"));
+        let e = rebuffer_mt_estimate_of(&delay_estimate(true, 6e-12, F::EstimateLegal, 0, 0.0), 0.5, 7e-12);
+        assert_eq!((e.legal, e.reason, e.tail_admissible, e.side_loss), (false, "min_score", true, None));
+        let e = rebuffer_mt_estimate_of(&delay_estimate(true, 2e-12, F::EstimateLegal, 1, 3e-12), 0.5, 0.0);
+        assert_eq!((e.legal, e.reason, e.tail_admissible), (false, "side_loss_non_improving", true));
+        let e = rebuffer_mt_estimate_of(&delay_estimate(false, 2e-12, F::SideSlackFloorViolation, 1, 1e-12), 0.5, 0.0);
+        assert_eq!((e.legal, e.raw_gain, e.reason, e.tail_admissible), (false, Some(2e-12), "side_slack_floor_violation", false));
+        let e = rebuffer_mt_estimate_of(&delay_estimate(false, 0.0, F::InvalidBufferInsertion, 0, 0.0), 0.5, 0.0);
+        assert_eq!((e.legal, e.raw_gain, e.reason), (false, None, "invalid_buffer_insertion"));
+    }
+
+    // makeSideContexts: every plan load but the target that has load timing, in load-path order;
+    // none at all without load timing (side loads off).
+    #[test]
+    fn rebuffer_side_contexts_are_the_other_timed_loads_in_path_order() {
+        let lp = |pin: &str| crate::rebuffer::LoadPath { load_pin: pin.into(), stages: vec![] };
+        let p = crate::rebuffer::TreePlan { tree: 0, target_load_pin: Some("t/A".into()), load_paths: vec![lp("b/A"), lp("t/A"), lp("a/A"), lp("u/A")], tree_input_cap: 0.0, driver_slack_gain: 0.0, anchor_tree: false, buffer_count: 1, load_count: 4 };
+        let lt = |pin: &str| RebufferLoadTiming { pin: pin.into(), slack: -1.0, wire_delay: 2.0, weight: 0.5 };
+        let s = rebuffer_make_side_contexts(&p, &[lt("a/A"), lt("t/A"), lt("b/A")]);
+        assert_eq!(s.iter().map(|c| c.load_pin.as_str()).collect::<Vec<_>>(), ["b/A", "a/A"]);
+        assert_eq!((s[0].current_driver_to_load_delay, s[0].current_slack, s[0].weight), (2.0, -1.0, 0.5));
+        assert!(rebuffer_make_side_contexts(&p, &[]).is_empty());
+    }
 }
