@@ -7,8 +7,8 @@
 //! diverges from the reference's points at one stage. Modelled so far: `start` (S1), the
 //! target collection of a batch (S2: `collectTargetEndpoints`, `collectTargets`), the targets'
 //! preparation (S3a: `prewarmTargets`, `prepareTargets`), candidate generation and estimation
-//! (S3b/S3c: `generateCandidates`, `estimateTargets`) and the batch candidates
-//! (`makeBatchCandidates`). The selection (`BatchSelector`) onward is refused.
+//! (S3b/S3c: `generateCandidates`, `estimateTargets`) and the batch (`selectBatch`:
+//! `makeBatchCandidates`, `BatchSelector`). The commit (`commitBatch`) onward is refused.
 
 use std::collections::{HashMap, HashSet};
 
@@ -16,7 +16,7 @@ use vyges_sta::liberty::MAX;
 
 use vyges_sta::fuzzy;
 
-use super::batch_selector::BatchCandidate;
+use super::batch_selector::{BatchCandidate, BatchConflictReason, BatchSelection, BatchSelector};
 use super::{PathView, Repair, Stop};
 use crate::sequential_timing::SequentialResult;
 use crate::delay_estimator::{ContextOptions, EstimatorContext, FaninSideLoadOptions, PathPin, Reader};
@@ -545,12 +545,13 @@ fn accumulate_prepare_requirements(generators: &[Move]) -> u8 {
 }
 
 /// `BatchPool`: the targets of one batch (a deque upstream, so they never move), their
-/// evaluations index-aligned with them, and the batch candidates made from those.
+/// evaluations index-aligned with them, the batch candidates made from those and the selection.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BatchPool {
     pub targets: Vec<Target>,
     pub evaluations: Vec<TargetEvaluation>,
     pub candidates: Vec<BatchCandidate>,
+    pub selection: BatchSelection,
 }
 
 impl BatchPool {
@@ -614,7 +615,7 @@ pub struct ParallelEval {
     pub unbuffer_in_sequence: bool,
     /// `move_generators_`: the moves `makeParallelEvalGenerator` makes a generator for.
     pub generators: Vec<Move>,
-    /// The selector's config, copied after the margin went in.
+    /// The selector's config, copied after the margin went in (`batch_selector_`).
     pub selector: BatchSelectorConfig,
     pub committed_moves: i32,
     pub batch_index: i32,
@@ -836,7 +837,10 @@ impl Repair<'_, '_> {
         if pe.stall.wns_stall_batches > 0 {
             return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: analyzeBottlenecks is not modelled".into()));
         }
-        let _pool = self.pe_evaluate_targets(pe, scope)?;
+        let pool = self.pe_evaluate_targets(pe, scope)?;
+        if pool.targets.is_empty() {
+            return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: a batch without targets (finishWithoutTargets) is not modelled".into()));
+        }
         Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: the batch commit (commitBatch onward) is not modelled".into()))
     }
 
@@ -945,7 +949,18 @@ impl Repair<'_, '_> {
                 pool.adopt(chunk);
                 pool.append(evaluations);
             }
+            // The selection so far decides whether another chunk is needed; a batch cut short by
+            // the score floor still takes another chunk.
             pe_select_batch(pe, &mut pool, scope.batch_cap)?;
+            if next_endpoint >= scope.target_endpoints || pool.selection.evaluation_indices.len() as i32 >= scope.batch_cap {
+                break;
+            }
+            pe_event("batch_eval_chunks_extended", "", "", 1);
+        }
+        // `work_.addEndpoints`: the work meter feeds the stall and tail budgets (not modelled).
+        pe_event("batch_endpoints_evaluated", "", "", next_endpoint);
+        if !pool.targets.is_empty() {
+            pe_record_selection(&pool);
         }
         Ok(pool)
     }
@@ -1933,11 +1948,42 @@ fn pe_estimate_targets(pe: &ParallelEval, targets: &[Target], generated: Vec<Vec
 }
 
 /// `selectBatch`: the pool's batch candidates (`makeBatchCandidates`), then the selection
-/// (`BatchSelector::select`, not modelled yet: refused after the candidates print).
-fn pe_select_batch(pe: &ParallelEval, pool: &mut BatchPool, _batch_cap: i32) -> Result<(), Stop> {
+/// (`BatchSelector::select`), with the worst-endpoint reserve while WNS is stalled.
+fn pe_select_batch(pe: &ParallelEval, pool: &mut BatchPool, batch_cap: i32) -> Result<(), Stop> {
     pool.candidates = pe_make_batch_candidates(pe, &pool.targets, &pool.evaluations)?;
-    pe_trace(&(pe_batch_candidate_lines(pe, pool) + &pe_bc_lines(pe, pool)));
-    Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: the batch selection (BatchSelector) is not modelled".into()))
+    let mut t = pe_batch_candidate_lines(pe, pool);
+    pool.selection = BatchSelector::new(pe.selector).select(&pool.candidates, batch_cap, pe_stall_wns_stalled(pe), &mut t);
+    t.push_str(&pe_bc_lines(pe, pool));
+    let indices: Vec<String> = pool.selection.evaluation_indices.iter().map(usize::to_string).collect();
+    t.push_str(&format!("VYGP|sel|{}|cap={batch_cap}|{}\n", pe.batch_index, indices.join(",")));
+    pe_trace(&t);
+    Ok(())
+}
+
+/// `StallMonitor::wnsStalled`: the last saved batch did not move WNS past the best checkpoint.
+fn pe_stall_wns_stalled(pe: &ParallelEval) -> bool {
+    pe.stall.wns_stall_batches > 0
+}
+
+/// `recordSelection` (the profiler on): each selected best candidate (`moveSelected`), then the
+/// selection's stats and its deferrals per conflict reason.
+fn pe_record_selection(pool: &BatchPool) {
+    for &index in &pool.selection.evaluation_indices {
+        let kind = pool.evaluations[index].best_candidate().map_or("", |c| c.kind.name());
+        pe_event("candidate_selected", "selected", kind, 1);
+    }
+    let stats = &pool.selection.stats;
+    pe_event("batch_considered", "", "", stats.considered as usize);
+    pe_event("batch_limited", "", "", stats.batch_limited as usize);
+    pe_event("score_limited", "", "", stats.score_limited as usize);
+    for reason in BatchConflictReason::ALL {
+        pe_event(&format!("conflict_{}", reason.name()), "", "", stats.deferred[reason as usize] as usize);
+    }
+}
+
+/// A profiler event as the printer writes it (`VYGP|ev|name|metric=|move=|count=`).
+fn pe_event(name: &str, metric: &str, kind: &str, count: usize) {
+    pe_trace(&format!("VYGP|ev|{name}|metric={metric}|move={kind}|count={count}\n"));
 }
 
 /// `makeBatchCandidates`: one batch candidate per evaluation with a best candidate, in pool order:
@@ -2817,7 +2863,7 @@ fn pe_sequential_lines(drv: &str, e: &crate::sequential_timing::SequentialTiming
 }
 
 /// The VYGP printer's `{:.9e}` of a value that may be infinite (fmt prints `inf`).
-fn e9i(v: f32) -> String {
+pub(super) fn e9i(v: f32) -> String {
     if v.is_infinite() {
         return if v > 0.0 { "inf".into() } else { "-inf".into() };
     }
