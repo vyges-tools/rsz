@@ -156,6 +156,117 @@ pub struct Node {
     pub arrival: FixedDelay,
 }
 
+/// `Rebuffer::RankedOption`: a beam option with the measures the rankings compare. `option` is
+/// the tree's root (none for an empty anchor); `slack` the driver slack `evaluateOption` found
+/// when the option was selected; `index` its position among the generated options (the last
+/// tie-break); `signature` its structure ([`Rebuf::tree_signature`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RankedOption {
+    pub option: Option<usize>,
+    pub slack: FixedDelay,
+    pub unconstrained: bool,
+    pub meets_target: bool,
+    pub preserves_best_slack: bool,
+    pub signature: String,
+    pub index: i64,
+}
+
+impl RankedOption {
+    /// The option's root; every ranked option has one (only an anchor may be empty).
+    fn node(&self) -> usize {
+        self.option.expect("a ranked option has a tree")
+    }
+}
+
+/// `kNegativeSlackLossBudget`, `kPositiveSlackLossBudget`: the slack a tree may give back for
+/// area in RebufferMt planning — 1 ps while the best tree still violates, 20 ps once it has margin.
+const NEGATIVE_SLACK_LOSS_BUDGET: f32 = 1.0e-12;
+const POSITIVE_SLACK_LOSS_BUDGET: f32 = 20.0e-12;
+
+/// `slackLossFloor`: the slack an option may fall to below `best_slack` and still preserve it.
+pub fn slack_loss_floor(best_slack: FixedDelay) -> FixedDelay {
+    let budget = if best_slack.to_secs() < 0.0 { NEGATIVE_SLACK_LOSS_BUDGET } else { POSITIVE_SLACK_LOSS_BUDGET };
+    best_slack - FixedDelay::from_secs(budget)
+}
+
+/// The VYGP printer's `{:.9e}` (fmt, or printf's `%.9e`): the exponent signed, at least two
+/// digits.
+pub fn e9<T: Into<f64>>(v: T) -> String {
+    let s = format!("{:.9e}", v.into());
+    let (m, e) = s.split_once('e').expect("Rust's {:e} always has an exponent");
+    let e: i32 = e.parse().expect("Rust's {:e} exponent is an integer");
+    format!("{m}e{}{:02}", if e < 0 { '-' } else { '+' }, e.abs())
+}
+
+/// `BufferTreeStageType` (a via is never planned: see [`Rebuf::build_load_paths`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageKind {
+    Wire,
+    Buffer,
+}
+
+/// `WireRC`: a wire stage's length (meters) and its total resistance and capacitance.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct WireRcStage {
+    pub length: f32,
+    pub res: f32,
+    pub cap: f32,
+}
+
+/// `BufferTreePathStage`: one wire or buffer on a planned root-to-load path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathStage {
+    pub kind: StageKind,
+    pub buffer_cell: Option<String>,
+    pub wire_rc: WireRcStage,
+    /// The capacitance below this stage in the planned tree.
+    pub downstream_cap: f32,
+    /// The stage drives more than one load branch (a wire or a branch before the next buffer).
+    pub drives_distributed_load: bool,
+}
+
+/// `BufferTreeLoadPath`: the stages from the planned tree's root to one load pin.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoadPath {
+    pub load_pin: String,
+    pub stages: Vec<PathStage>,
+}
+
+/// `Rebuffer::PlanRequest`: what one planning call plans for.
+#[derive(Debug, Clone)]
+pub struct PlanRequest {
+    pub target_load_pin: Option<String>,
+    pub original_slack: FixedDelay,
+}
+
+/// `RebufferTreePlan`: a buffer-tree proposal with the paths and loading the MT estimate reads.
+#[derive(Debug, Clone)]
+pub struct TreePlan {
+    /// The tree's root in the planner's arena.
+    pub tree: usize,
+    pub target_load_pin: Option<String>,
+    pub load_paths: Vec<LoadPath>,
+    pub tree_input_cap: f32,
+    /// The tree's driver pin slack less the current net's.
+    pub driver_slack_gain: f32,
+    /// The lineage of top-ranked options through the beam rounds, exempt from the score gates.
+    pub anchor_tree: bool,
+    pub buffer_count: i64,
+    pub load_count: i64,
+}
+
+impl TreePlan {
+    /// `loadPath`: the load path of `pin`, if the tree reaches it.
+    pub fn load_path(&self, pin: &str) -> Option<&LoadPath> {
+        self.load_paths.iter().find(|p| p.load_pin == pin)
+    }
+
+    /// `targetPath`.
+    pub fn target_path(&self) -> Option<&LoadPath> {
+        self.target_load_pin.as_deref().and_then(|p| self.load_path(p))
+    }
+}
+
 /// One buffer size (`BufferSize`) with what the passes read of its cell.
 #[derive(Debug, Clone)]
 pub struct BufferSize {
@@ -868,33 +979,128 @@ impl Rebuf<'_> {
         None
     }
 
-    /// `bufferForTiming`: the options at the root, best by driver slack.
-    pub fn buffer_for_timing(&mut self, tree: usize, allow_topology_rewrite: bool) -> Option<usize> {
+    /// `timingOrder`: unconstrained first, then the larger slack (compared in seconds), the
+    /// smaller cap, the smaller area, the fewer buffers.
+    pub fn timing_order(&self, lhs: &RankedOption, rhs: &RankedOption) -> bool {
+        if lhs.unconstrained != rhs.unconstrained {
+            return lhs.unconstrained;
+        }
+        if lhs.slack.to_secs() != rhs.slack.to_secs() {
+            return lhs.slack > rhs.slack;
+        }
+        let (l, r) = (&self.nodes[lhs.node()], &self.nodes[rhs.node()]);
+        if l.cap != r.cap {
+            return l.cap < r.cap;
+        }
+        if l.area != r.area {
+            return l.area < r.area;
+        }
+        self.buffer_count(lhs.node()) < self.buffer_count(rhs.node())
+    }
+
+    /// `areaOrder`: meets the target, preserves the best slack, the larger slack among those that
+    /// do not, the smaller area among those that meet and preserve, then cap, buffer count, slack
+    /// and generation index.
+    pub fn area_order(&self, lhs: &RankedOption, rhs: &RankedOption) -> bool {
+        if lhs.meets_target != rhs.meets_target {
+            return lhs.meets_target;
+        }
+        if lhs.preserves_best_slack != rhs.preserves_best_slack {
+            return lhs.preserves_best_slack;
+        }
+        if !lhs.preserves_best_slack && lhs.slack.to_secs() != rhs.slack.to_secs() {
+            return lhs.slack > rhs.slack;
+        }
+        let (l, r) = (&self.nodes[lhs.node()], &self.nodes[rhs.node()]);
+        if lhs.meets_target && lhs.preserves_best_slack && l.area != r.area {
+            return l.area < r.area;
+        }
+        if l.cap != r.cap {
+            return l.cap < r.cap;
+        }
+        let (lb, rb) = (self.buffer_count(lhs.node()), self.buffer_count(rhs.node()));
+        if lb != rb {
+            return lb < rb;
+        }
+        if lhs.slack.to_secs() != rhs.slack.to_secs() {
+            return lhs.slack > rhs.slack;
+        }
+        lhs.index < rhs.index
+    }
+
+    /// `std::ranges::sort(options, order)`: libc++'s unstable sort, so fully tied options keep the
+    /// order it leaves them in. A range that reaches its heap fallback is refused.
+    fn sort_ranked(&mut self, options: &mut [RankedOption], area: bool) {
+        let sorted = {
+            let me = &*self;
+            crate::order::libcxx_sort_by(options, |a, b| if area { me.area_order(a, b) } else { me.timing_order(a, b) })
+        };
+        if let Err(h) = sorted {
+            self.refused.get_or_insert(format!("rebuffer option ranking: {} options reach the sort's heap fallback, which is not modelled", h.len));
+        }
+    }
+
+    /// `selectTimingOptions`: each option the driver can drive, with its driver slack; for one plan
+    /// the best (the serial rule: the first, an unconstrained one, or a strictly larger slack),
+    /// else the `max_plans` first in timing order.
+    pub fn select_timing_options(&mut self, top: &[usize], max_plans: usize) -> Vec<RankedOption> {
+        if max_plans == 1 {
+            let mut best_slack = -FixedDelay::inf();
+            let mut best: Option<usize> = None;
+            let mut best_index = 0;
+            let mut i = 1;
+            self.debug(2, "timing-optimized options".into());
+            for &p in top {
+                let Some(slack) = self.evaluate_option(p, i) else { continue };
+                if best.is_none() || self.nodes[p].slack_rf.is_none() || slack > best_slack {
+                    best_slack = slack;
+                    best = Some(p);
+                    best_index = i;
+                }
+                i += 1;
+            }
+            let Some(b) = best else {
+                self.debug(2, "no available option".into());
+                return Vec::new();
+            };
+            self.debug(2, format!("best option {best_index}"));
+            return vec![RankedOption { option: Some(b), slack: best_slack, unconstrained: self.nodes[b].slack_rf.is_none(), index: best_index, ..RankedOption::default() }];
+        }
+        let mut ranked: Vec<RankedOption> = Vec::with_capacity(top.len());
+        let mut i = 1;
+        self.debug(2, "timing-optimized options".into());
+        for &p in top {
+            let Some(slack) = self.evaluate_option(p, i) else { continue };
+            ranked.push(RankedOption { option: Some(p), slack, unconstrained: self.nodes[p].slack_rf.is_none(), index: i, ..RankedOption::default() });
+            i += 1;
+        }
+        self.sort_ranked(&mut ranked, false);
+        match ranked.first() {
+            Some(f) => {
+                let line = format!("best option {}", f.index);
+                self.debug(2, line);
+            }
+            None => self.debug(2, "no available option".into()),
+        }
+        ranked.truncate(max_plans);
+        ranked
+    }
+
+    /// `bufferForTimingTopK`: the timing options at the root (the visitor below), then
+    /// `selectTimingOptions`; none, with RSZ-2009, when the root has no option.
+    pub fn buffer_for_timing_top_k(&mut self, tree: usize, allow_topology_rewrite: bool, max_plans: usize) -> Vec<RankedOption> {
         let top = self.timing_options(tree, 1, allow_topology_rewrite);
         if top.is_empty() {
             let line = format!("[WARNING RSZ-2009] Skipping buffering because no valid buffering solution satisfying the design rules can be found for net connected to pin {}.", self.pin);
             self.warn(line);
-            return None;
+            return Vec::new();
         }
-        let mut best_slack = -FixedDelay::inf();
-        let mut best: Option<usize> = None;
-        let mut best_index = 0;
-        let mut i = 1;
-        self.debug(2, "timing-optimized options".into());
-        for p in top {
-            let Some(slack) = self.evaluate_option(p, i) else { continue };
-            if best.is_none() || self.nodes[p].slack_rf.is_none() || slack > best_slack {
-                best_slack = slack;
-                best = Some(p);
-                best_index = i;
-            }
-            i += 1;
-        }
-        match best {
-            Some(_) => self.debug(2, format!("best option {best_index}")),
-            None => self.debug(2, "no available option".into()),
-        }
-        best
+        self.select_timing_options(&top, max_plans)
+    }
+
+    /// `bufferForTiming`: the single best of `bufferForTimingTopK`.
+    pub fn buffer_for_timing(&mut self, tree: usize, allow_topology_rewrite: bool) -> Option<usize> {
+        self.buffer_for_timing_top_k(tree, allow_topology_rewrite, 1).first().and_then(|o| o.option)
     }
 
     /// `bufferForTiming`'s visitor at `node` (`level` from 1 at the root).
@@ -976,7 +1182,7 @@ impl Rebuf<'_> {
                         }
                     }
                 }
-                self.insert_buffer_options(&mut wired, level, 0, false, FixedDelay::ZERO, None);
+                self.insert_buffer_options(&mut wired, level, 0, false, FixedDelay::ZERO, None, true);
                 wired
             }
             Kind::Junction { r, r2 } => {
@@ -1057,9 +1263,12 @@ impl Rebuf<'_> {
     /// `insertBufferOptions`: the options passed through when they improve on the last kept
     /// (slack, or area above the threshold), each buffer size placed on the best option it can
     /// drive; in area mode an option fitting the exemplar's envelope is assured.
-    fn insert_buffer_options(&mut self, opts: &mut Vec<usize>, level: usize, next_segment_wl: i32, area_oriented: bool, slack_threshold: FixedDelay, exemplar: Option<usize>) {
+    /// `strict_assured`: without an assured option the reference errors (RSZ-0501); otherwise the
+    /// options are cleared and `false` returned.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_buffer_options(&mut self, opts: &mut Vec<usize>, level: usize, next_segment_wl: i32, area_oriented: bool, slack_threshold: FixedDelay, exemplar: Option<usize>, strict_assured: bool) -> bool {
         if opts.is_empty() {
-            return;
+            return true;
         }
         let strong = self.ctx.sizes.len() - 1;
         let envelope = if area_oriented { Some(self.metrics(exemplar.expect("an exemplar"), slack_threshold)) } else { None };
@@ -1167,23 +1376,30 @@ impl Rebuf<'_> {
                     }
                 }
             }
-            if !assured_satisfied && self.failed.is_none() {
-                self.failed = Some(format!("RSZ-0501: buffering pin {} failed: area recovery cannot reproduce solution", self.pin));
+            if !assured_satisfied {
+                if !strict_assured {
+                    opts.clear();
+                    return false;
+                }
+                self.error_area_recovery_unreproducible();
             }
         }
         *opts = new_opts;
+        true
+    }
+
+    /// `errorAreaRecoveryUnreproducible` (RSZ-0501): where the reference stops.
+    fn error_area_recovery_unreproducible(&mut self) {
+        if self.failed.is_none() {
+            self.failed = Some(format!("RSZ-0501: buffering pin {} failed: area recovery cannot reproduce solution", self.pin));
+        }
     }
 
     /// `recoverArea`: the arrival spread down from the root, then per node the cheapest options
     /// meeting a slack threshold that moves from the node's slack toward the target by `alpha`.
-    pub fn recover_area(&mut self, root: usize, mut slack_target: FixedDelay, alpha: f32) -> Option<usize> {
-        let (_, mut correction, _) = self.drvr_pin_timing(root);
-        if self.nodes[root].slack_rf.is_none() {
-            correction = 0.0;
-            slack_target = -FixedDelay::inf();
-        }
-        self.spread_arrival(root, -FixedDelay::from_secs(correction));
-        let top = self.area_options(root, 1, 0, slack_target, alpha);
+    pub fn recover_area(&mut self, root: usize, slack_target: FixedDelay, alpha: f32) -> Option<usize> {
+        let slack_target = self.annotate_arrival_delays(root, slack_target);
+        let top = self.area_recovery_options(root, slack_target, alpha, true);
         let mut best_slack = -FixedDelay::inf();
         let mut best_area = f32::MAX;
         let (mut best_slack_option, mut best_area_option) = (None, None);
@@ -1217,6 +1433,381 @@ impl Rebuf<'_> {
         None
     }
 
+    /// `recoverAreaTopK`: the area options of `root` with their driver slacks; the `max_plans`
+    /// first in area order when the first meets the target, else the one with the best slack
+    /// (the serial rule).
+    pub fn recover_area_top_k(&mut self, root: usize, slack_target: FixedDelay, alpha: f32, max_plans: usize, strict_assured: bool) -> Vec<RankedOption> {
+        let slack_target = self.annotate_arrival_delays(root, slack_target);
+        let top = self.area_recovery_options(root, slack_target, alpha, strict_assured);
+        let mut ranked: Vec<RankedOption> = Vec::with_capacity(top.len());
+        let mut best_slack = -FixedDelay::inf();
+        let mut best_slack_option: Option<usize> = None;
+        let mut best_slack_index = 0;
+        let mut i = 1;
+        self.debug(2, "area-optimized options".into());
+        for p in top {
+            let Some(slack) = self.evaluate_option(p, i) else { continue };
+            let unconstrained = self.nodes[p].slack_rf.is_none();
+            if best_slack_option.is_none() || unconstrained || slack > best_slack {
+                best_slack = slack;
+                best_slack_option = Some(p);
+                best_slack_index = i;
+            }
+            ranked.push(RankedOption { option: Some(p), slack, unconstrained, meets_target: slack >= slack_target || unconstrained, preserves_best_slack: false, index: i, ..RankedOption::default() });
+            i += 1;
+        }
+        let slack_floor = slack_loss_floor(best_slack);
+        for o in &mut ranked {
+            o.preserves_best_slack = o.slack >= slack_floor || o.unconstrained;
+        }
+        self.sort_ranked(&mut ranked, true);
+        if ranked.first().is_some_and(|o| o.meets_target) {
+            let line = format!("best option {} (area optimized)", ranked[0].index);
+            self.debug(2, line);
+            ranked.truncate(max_plans);
+            return ranked;
+        }
+        if let Some(b) = best_slack_option {
+            self.debug(2, format!("best option {best_slack_index} (closest to meeting timing target)"));
+            return vec![RankedOption { option: Some(b), slack: best_slack, unconstrained: self.nodes[b].slack_rf.is_none(), index: best_slack_index, ..RankedOption::default() }];
+        }
+        self.debug(2, "no available option".into());
+        Vec::new()
+    }
+
+    /// `treeSignature`: a type-tagged pre-order encoding of the tree's structure — locations,
+    /// layers, buffer cells and load pins (the reference encodes the pin and cell pointers,
+    /// which within one planning call identify them as their names do).
+    pub fn tree_signature(&self, n: usize) -> String {
+        let nd = &self.nodes[n];
+        match &nd.kind {
+            Kind::Load { pin } => format!("L{pin}"),
+            Kind::Wire { r } => format!("W{},{},{}[{}]", nd.x, nd.y, nd.layer, self.tree_signature(*r)),
+            Kind::Via { r, ref_layer } => format!("V{},{},{},{ref_layer}[{}]", nd.x, nd.y, nd.layer, self.tree_signature(*r)),
+            Kind::Buffer { cell, r } => format!("B{cell},{},{}[{}]", nd.x, nd.y, self.tree_signature(*r)),
+            Kind::Junction { r, r2 } => format!("J{},{}[{}][{}]", nd.x, nd.y, self.tree_signature(*r), self.tree_signature(*r2)),
+        }
+    }
+
+    /// `keepAnchorTree`: the anchor replaces the selected option that is its structural twin's
+    /// tree; else it takes a free slot, else the last.
+    pub fn keep_anchor_tree(ranked: &[RankedOption], anchor: &RankedOption, anchor_signature: &str, plan_limit: usize, selected: &mut Vec<RankedOption>) {
+        let Some(twin) = ranked.iter().find(|o| o.signature == anchor_signature).map(|o| o.option) else { return };
+        if let Some(s) = selected.iter_mut().find(|s| s.option == twin) {
+            *s = anchor.clone();
+            return;
+        }
+        if selected.len() < plan_limit {
+            selected.push(anchor.clone());
+        } else if let Some(last) = selected.last_mut() {
+            *last = anchor.clone();
+        }
+    }
+
+    /// `uniqueTreeOptions`: each option's signature recorded; an option whose structure an earlier
+    /// one has is dropped.
+    pub fn unique_tree_options(&self, options: Vec<RankedOption>) -> Vec<RankedOption> {
+        let mut seen = std::collections::HashSet::new();
+        let mut unique = Vec::with_capacity(options.len());
+        for mut o in options {
+            o.signature = self.tree_signature(o.node());
+            if seen.insert(o.signature.clone()) {
+                unique.push(o);
+            }
+        }
+        unique
+    }
+
+    /// `limitTimingOptions`: the unique options in timing order, the `plan_limit` first, the
+    /// anchor kept.
+    pub fn limit_timing_options(&mut self, options: Vec<RankedOption>, anchor: &RankedOption, plan_limit: usize) -> Vec<RankedOption> {
+        let mut ranked = self.unique_tree_options(options);
+        self.sort_ranked(&mut ranked, false);
+        let mut selected: Vec<RankedOption> = ranked.iter().take(plan_limit).cloned().collect();
+        if let Some(a) = anchor.option {
+            let sig = self.tree_signature(a);
+            Self::keep_anchor_tree(&ranked, anchor, &sig, plan_limit, &mut selected);
+        }
+        selected
+    }
+
+    /// `limitAreaOptions`: the unique options with this round's target (meets) and order position,
+    /// the best slack's loss floor (preserves), in area order, the `plan_limit` first, the anchor
+    /// kept.
+    pub fn limit_area_options(&mut self, options: Vec<RankedOption>, slack_target: FixedDelay, anchor: &RankedOption, plan_limit: usize) -> Vec<RankedOption> {
+        let mut ranked = self.unique_tree_options(options);
+        let mut best_slack = -FixedDelay::inf();
+        for (index, o) in ranked.iter_mut().enumerate() {
+            best_slack = best_slack.max(o.slack);
+            o.meets_target = o.slack >= slack_target || o.unconstrained;
+            o.index = index as i64;
+        }
+        let slack_floor = slack_loss_floor(best_slack);
+        for o in &mut ranked {
+            o.preserves_best_slack = o.slack >= slack_floor || o.unconstrained;
+        }
+        self.sort_ranked(&mut ranked, true);
+        let mut selected: Vec<RankedOption> = ranked.iter().take(plan_limit).cloned().collect();
+        if let Some(a) = anchor.option {
+            let sig = self.tree_signature(a);
+            Self::keep_anchor_tree(&ranked, anchor, &sig, plan_limit, &mut selected);
+        }
+        selected
+    }
+
+    /// `areaRecoveryTarget`: the tree's driver slack less 1% of its driver gate delay (floored at
+    /// 0) plus its critical path delay.
+    pub fn area_recovery_target(&self, tree: usize) -> FixedDelay {
+        let (gd, _, _) = self.drvr_pin_timing(tree);
+        let relaxation = (gd.max(0.0) + self.critical_path_delay(tree).to_secs()) * RELAXATION_FACTOR;
+        self.slack_at_driver_pin(tree) - FixedDelay::from_secs(relaxation)
+    }
+
+    /// `runTimingBeam`: three rounds of `bufferForTimingTopK` over the beam; the anchor follows the
+    /// top option of the previous anchor's expansion. `None`, with RSZ-2021, when a round leaves
+    /// no option.
+    pub fn run_timing_beam(&mut self, bnet: usize, allow_topology_rewrite: bool, plan_limit: usize, trace: &mut Vec<String>) -> Option<(Vec<RankedOption>, RankedOption)> {
+        let mut beam = vec![RankedOption { option: Some(bnet), ..RankedOption::default() }];
+        let mut anchor = RankedOption { option: Some(bnet), ..RankedOption::default() };
+        for i in 0..3 {
+            let mut next_options = Vec::new();
+            let mut next_anchor = RankedOption::default();
+            for beam_option in beam.clone() {
+                let timing_options = self.buffer_for_timing_top_k(beam_option.node(), allow_topology_rewrite, plan_limit);
+                trace.push(self.vyg_ranked("rbtk", i, &timing_options, None));
+                if anchor.option.is_some() && beam_option.option == anchor.option && !timing_options.is_empty() {
+                    next_anchor = timing_options[0].clone();
+                }
+                next_options.extend(timing_options);
+            }
+            beam = self.limit_timing_options(next_options, &next_anchor, plan_limit);
+            trace.push(self.vyg_ranked("rbtbeam", i, &beam, Some(&next_anchor)));
+            anchor = next_anchor;
+            if beam.is_empty() {
+                let line = format!("[WARNING RSZ-2021] cannot find a viable buffering solution on pin {} after {} rounds of buffering (no solution meets design rules)", self.pin, i + 1);
+                self.warn(line);
+                return None;
+            }
+        }
+        Some((beam, anchor))
+    }
+
+    /// `runAreaRecoveryBeam`: five rounds of `recoverAreaTopK` (alpha (1 + i) / 5) over the beam
+    /// against the first option's target; the anchor recovered against its own target, strictly
+    /// and alone; with more than one plan the beam's options stay candidates.
+    pub fn run_area_recovery_beam(&mut self, plan_limit: usize, beam: &mut Vec<RankedOption>, anchor: &mut RankedOption, trace: &mut Vec<String>) {
+        let target = self.area_recovery_target(beam[0].node());
+        let anchor_target = match anchor.option {
+            Some(a) => self.area_recovery_target(a),
+            None => target,
+        };
+        trace.push(format!("VYGP|rbatgt|{}|target={}|anchor_target={}|anchor={}", self.pin, e9(target.to_secs()), e9(anchor_target.to_secs()), u8::from(anchor.option.is_some())));
+        let mut i = 0;
+        while i < 5 && !beam.is_empty() {
+            let alpha = (1 + i) as f32 / 5.0;
+            let mut next_options = if plan_limit > 1 { beam.clone() } else { Vec::new() };
+            let mut next_anchor = RankedOption::default();
+            for beam_option in beam.clone() {
+                if anchor.option.is_some() && beam_option.option == anchor.option {
+                    let anchor_area_options = self.recover_area_top_k(beam_option.node(), anchor_target, alpha, 1, true);
+                    trace.push(self.vyg_ranked("rbaa", i, &anchor_area_options, None));
+                    if let Some(f) = anchor_area_options.first() {
+                        next_anchor = f.clone();
+                    }
+                    next_options.extend(anchor_area_options);
+                }
+                let area_options = self.recover_area_top_k(beam_option.node(), target, alpha, plan_limit, false);
+                trace.push(self.vyg_ranked("rbak", i, &area_options, None));
+                next_options.extend(area_options);
+            }
+            *beam = self.limit_area_options(next_options, target, &next_anchor, plan_limit);
+            trace.push(self.vyg_ranked("rbabeam", i, beam, Some(&next_anchor)));
+            *anchor = next_anchor;
+            i += 1;
+        }
+    }
+
+    /// The printer's ranked-option line (`VYGP|<tag>|drv|r<round>|n=|anchor=|options`), as the
+    /// instrumented reference writes it.
+    fn vyg_ranked(&self, tag: &str, round: usize, options: &[RankedOption], anchor: Option<&RankedOption>) -> String {
+        let one = |o: &RankedOption| {
+            let n = o.node();
+            let nd = &self.nodes[n];
+            format!("{}:u{}:i{}:m{}:p{}:c{}:a{}:b{}:{}", e9(o.slack.to_secs()), u8::from(o.unconstrained), o.index, u8::from(o.meets_target), u8::from(o.preserves_best_slack), e9(nd.cap), e9(nd.area), self.buffer_count(n), self.vyg_tree(n))
+        };
+        let list: Vec<String> = options.iter().map(one).collect();
+        let an = match anchor {
+            Some(a) if a.option.is_some() => {
+                let at = options.iter().rposition(|o| o.option == a.option).map_or(-1, |k| k as i64);
+                format!("{}@{at}", one(a))
+            }
+            _ => "-".into(),
+        };
+        format!("VYGP|{tag}|{}|r{round}|n={}|anchor={an}|{}", self.pin, options.len(), list.join(","))
+    }
+
+    /// The printer's tree: `L<pin>`, `W(x,y,layer)`, `V(x,y,layer,ref)`, `B(cell,x,y)`, `J(x,y)`,
+    /// each followed by its children in brackets.
+    pub fn vyg_tree(&self, n: usize) -> String {
+        let nd = &self.nodes[n];
+        match &nd.kind {
+            Kind::Load { pin } => format!("L{pin}"),
+            Kind::Wire { r } => format!("W({},{},{})[{}]", nd.x, nd.y, nd.layer, self.vyg_tree(*r)),
+            Kind::Via { r, ref_layer } => format!("V({},{},{},{ref_layer})[{}]", nd.x, nd.y, nd.layer, self.vyg_tree(*r)),
+            Kind::Buffer { cell, r } => format!("B({cell},{},{})[{}]", nd.x, nd.y, self.vyg_tree(*r)),
+            Kind::Junction { r, r2 } => format!("J({},{})[{}][{}]", nd.x, nd.y, self.vyg_tree(*r), self.vyg_tree(*r2)),
+        }
+    }
+
+    /// `buildLoadPaths`: per load, in tree order, the stages from the root — a wire its length and
+    /// RC with the cap below it; a buffer its cell, the cap below plus its output pin's, and
+    /// whether that is a distributed load (`drivesDistributedLoadBeforeNextBuffer`). A via is
+    /// refused (`bufferForTiming`'s trees carry none).
+    pub fn build_load_paths(&mut self, n: usize, prefix: &mut Vec<PathStage>, out: &mut Vec<LoadPath>) {
+        match self.nodes[n].kind.clone() {
+            Kind::Load { pin } => out.push(LoadPath { load_pin: pin, stages: prefix.clone() }),
+            Kind::Wire { r } => {
+                let (layer_res, layer_cap, _) = self.wire_rc_of(self.loc(n), r, self.nodes[n].layer);
+                let len = {
+                    let (a, b) = (self.loc(n), self.loc(r));
+                    (a.0 - b.0).abs() + (a.1 - b.1).abs()
+                };
+                let length = self.ctx.dbu_to_meters(len) as f32;
+                let rc = WireRcStage { length, res: (f64::from(length) * layer_res) as f32, cap: (f64::from(length) * layer_cap) as f32 };
+                prefix.push(PathStage { kind: StageKind::Wire, buffer_cell: None, wire_rc: rc, downstream_cap: self.nodes[r].cap, drives_distributed_load: false });
+                self.build_load_paths(r, prefix, out);
+                prefix.pop();
+            }
+            Kind::Via { r, .. } => {
+                self.refused.get_or_insert_with(|| "buildLoadPaths: a via in a planned tree (viaResistance is not modelled)".into());
+                self.build_load_paths(r, prefix, out);
+            }
+            Kind::Buffer { cell, r } => {
+                let c = self.ctx.cell(&cell);
+                let output_cap = c.buffer_ports().map_or(0.0, |(_, out)| port_cap(c, &out.name));
+                let distributed = !matches!(self.nodes[r].kind, Kind::Load { .. } | Kind::Buffer { .. });
+                prefix.push(PathStage { kind: StageKind::Buffer, buffer_cell: Some(cell), wire_rc: WireRcStage::default(), downstream_cap: self.nodes[r].cap + output_cap, drives_distributed_load: distributed });
+                self.build_load_paths(r, prefix, out);
+                prefix.pop();
+            }
+            Kind::Junction { r, r2 } => {
+                self.build_load_paths(r, prefix, out);
+                self.build_load_paths(r2, prefix, out);
+            }
+        }
+    }
+
+    /// `makePlanFromTree`: the tree's load paths, its input cap, buffers and loads, and its driver
+    /// slack less the original net's. The reference clones the tree (ownership only).
+    pub fn make_plan_from_tree(&mut self, tree: usize, request: &PlanRequest) -> TreePlan {
+        let mut load_paths = Vec::new();
+        self.build_load_paths(tree, &mut Vec::new(), &mut load_paths);
+        let final_slack = self.slack_at_driver_pin(tree);
+        TreePlan {
+            tree,
+            target_load_pin: request.target_load_pin.clone(),
+            load_paths,
+            tree_input_cap: self.nodes[tree].cap,
+            driver_slack_gain: (final_slack - request.original_slack).to_secs(),
+            anchor_tree: false,
+            buffer_count: self.buffer_count(tree),
+            load_count: self.load_count(tree),
+        }
+    }
+
+    /// `BufferedNet::loadCount`.
+    pub fn load_count(&self, n: usize) -> i64 {
+        match &self.nodes[n].kind {
+            Kind::Load { .. } => 1,
+            Kind::Wire { r } | Kind::Buffer { r, .. } | Kind::Via { r, .. } => self.load_count(*r),
+            Kind::Junction { r, r2 } => self.load_count(*r) + self.load_count(*r2),
+        }
+    }
+
+    /// `plansFromBeam`: one plan per beam option that reaches the target load, the anchor's
+    /// marked.
+    pub fn plans_from_beam(&mut self, beam: &[RankedOption], anchor: &RankedOption, request: &PlanRequest, trace: &mut Vec<String>) -> Vec<TreePlan> {
+        let mut plans = Vec::with_capacity(beam.len());
+        for o in beam {
+            let mut plan = self.make_plan_from_tree(o.node(), request);
+            plan.anchor_tree = anchor.option.is_some() && o.option == anchor.option;
+            trace.push(self.vyg_plan(&plan));
+            if plan.target_path().is_some() {
+                plans.push(plan);
+            }
+        }
+        plans
+    }
+
+    /// The printer's plan line (`VYGP|rbplan`).
+    fn vyg_plan(&self, plan: &TreePlan) -> String {
+        let mut paths = Vec::new();
+        for lp in &plan.load_paths {
+            let st: Vec<String> = lp
+                .stages
+                .iter()
+                .map(|s| {
+                    let t = match s.kind {
+                        StageKind::Wire => "w",
+                        StageKind::Buffer => "b",
+                    };
+                    format!("{t}:{}:{}:{}:{}:{}:{}", s.buffer_cell.as_deref().unwrap_or("-"), e9(s.wire_rc.length), e9(s.wire_rc.res), e9(s.wire_rc.cap), e9(s.downstream_cap), u8::from(s.drives_distributed_load))
+                })
+                .collect();
+            paths.push(format!("{}{{{}}}", lp.load_pin, st.join(";")));
+        }
+        format!(
+            "VYGP|rbplan|{}|anchor={}|bufs={}|loads={}|dsg={}|cap={}|target={}|tree={}|paths={}",
+            self.pin,
+            u8::from(plan.anchor_tree),
+            plan.buffer_count,
+            plan.load_count,
+            e9(plan.driver_slack_gain),
+            e9(plan.tree_input_cap),
+            u8::from(plan.target_path().is_some()),
+            self.vyg_tree(plan.tree),
+            paths.join(",")
+        )
+    }
+
+    /// `makeRebufferTreePlans` after `setPin` and `annotateLoadSlacks` (the probe): the timing
+    /// beam, the area-recovery beam, the plans. Empty when the timing beam finds nothing; an empty
+    /// area beam is RSZ-2022.
+    pub fn make_rebuffer_tree_plans(&mut self, target_load_pin: Option<&str>, max_plans: usize, trace: &mut Vec<String>) -> Vec<TreePlan> {
+        let plan_limit = max_plans.max(1);
+        let root = self.probe.root;
+        let request = PlanRequest { target_load_pin: target_load_pin.map(str::to_string), original_slack: self.slack_at_driver_pin(root) };
+        trace.push(format!("VYGP|rbreq|{}|tgt={}|limit={plan_limit}|orig={}|tree={}", self.pin, target_load_pin.unwrap_or("-"), e9(request.original_slack.to_secs()), self.vyg_tree(root)));
+        // `allow_topology_rewrite`: placement parasitics only.
+        let allow_topology_rewrite = self.ctx.layers.is_none();
+        let Some((mut beam, mut anchor)) = self.run_timing_beam(root, allow_topology_rewrite, plan_limit, trace) else { return Vec::new() };
+        self.run_area_recovery_beam(plan_limit, &mut beam, &mut anchor, trace);
+        if beam.is_empty() {
+            self.failed.get_or_insert_with(|| "RSZ-2022: failed area recovery".into());
+            return Vec::new();
+        }
+        self.plans_from_beam(&beam, &anchor, &request, trace)
+    }
+
+    /// `annotateArrivalDelays`: the driver's arrival correction spread down the tree as each
+    /// node's arrival delay; the target area recovery works against (-INF, and no correction,
+    /// for an unconstrained tree).
+    fn annotate_arrival_delays(&mut self, root: usize, mut slack_target: FixedDelay) -> FixedDelay {
+        let (_, mut correction, _) = self.drvr_pin_timing(root);
+        if self.nodes[root].slack_rf.is_none() {
+            correction = 0.0;
+            slack_target = -FixedDelay::inf();
+        }
+        self.spread_arrival(root, -FixedDelay::from_secs(correction));
+        slack_target
+    }
+
+    /// `areaRecoveryOptions`: the area options at the root (the visitor below); empty when a
+    /// non-strict node has no assured option.
+    fn area_recovery_options(&mut self, root: usize, slack_target: FixedDelay, alpha: f32, strict_assured: bool) -> Vec<usize> {
+        self.area_options(root, 1, 0, slack_target, alpha, strict_assured)
+    }
+
     fn spread_arrival(&mut self, n: usize, arrival: FixedDelay) {
         self.nodes[n].arrival = arrival;
         match self.nodes[n].kind.clone() {
@@ -1232,7 +1823,7 @@ impl Rebuf<'_> {
         }
     }
 
-    fn area_options(&mut self, node: usize, level: usize, upstream_wl: i32, slack_target: FixedDelay, alpha: f32) -> Vec<usize> {
+    fn area_options(&mut self, node: usize, level: usize, upstream_wl: i32, slack_target: FixedDelay, alpha: f32, strict_assured: bool) -> Vec<usize> {
         match self.nodes[node].kind.clone() {
             // `recoverArea` runs on `bufferForTiming`'s trees, which carry no via (the reference
             // aborts on one).
@@ -1248,19 +1839,21 @@ impl Rebuf<'_> {
                             let (a, b) = (self.loc(inner), self.loc(r));
                             (a.0 - b.0).abs() + (a.1 - b.1).abs()
                         };
-                        let o = self.area_options(r, level + 1, len, slack_target, alpha);
+                        let o = self.area_options(r, level + 1, len, slack_target, alpha, strict_assured);
                         let (at, layer) = (self.loc(inner), self.nodes[inner].layer);
                         o.into_iter().map(|opt| self.add_wire(opt, at, layer, Some(level))).collect()
                     }
-                    _ => self.area_options(inner, level + 1, 0, slack_target, alpha),
+                    _ => self.area_options(inner, level + 1, 0, slack_target, alpha, strict_assured),
                 };
                 let threshold = FixedDelay::lerp(self.nodes[node].slack, slack_target + self.nodes[node].arrival, alpha);
-                self.insert_buffer_options(&mut opts, level, upstream_wl, true, threshold, Some(node));
+                if !self.insert_buffer_options(&mut opts, level, upstream_wl, true, threshold, Some(node), strict_assured) {
+                    return Vec::new();
+                }
                 opts
             }
             Kind::Junction { r, r2 } => {
-                let left = self.area_options(r, level + 1, upstream_wl, slack_target, alpha);
-                let right = self.area_options(r2, level + 1, upstream_wl, slack_target, alpha);
+                let left = self.area_options(r, level + 1, upstream_wl, slack_target, alpha, strict_assured);
+                let right = self.area_options(r2, level + 1, upstream_wl, slack_target, alpha, strict_assured);
                 let threshold = FixedDelay::lerp(self.nodes[node].slack, slack_target + self.nodes[node].arrival, alpha);
                 let envelope = self.metrics(node, threshold);
                 let mut assured_fallback = None;
@@ -1284,7 +1877,14 @@ impl Rebuf<'_> {
                     let line = format!("{:level$} - {}", "", self.to_string(o));
                     self.debug(3, line);
                 }
-                if !opts.iter().any(|&o| self.fits_envelope(o, &envelope)) {
+                let assured_found = opts.iter().any(|&o| self.fits_envelope(o, &envelope));
+                if !assured_found && assured_fallback.is_none() {
+                    if !strict_assured {
+                        return Vec::new();
+                    }
+                    self.error_area_recovery_unreproducible();
+                }
+                if !assured_found {
                     if let Some(f) = assured_fallback {
                         self.insert_assured(&mut opts, f, level);
                     }
