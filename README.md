@@ -1,7 +1,5 @@
 # vyges-rsz
 
-**[Download Loom](https://vyges.com/products/vyges-cli/#install)** · install the free [Vyges CLI](https://vyges.com/products/vyges-cli/), then `vyges install physical`
-
 Electrical repair of a placed design: repeaters inserted along each net's Steiner tree where a
 wire is too long, a driver sees too much capacitance or fans out too far, or a load's transition
 is too slow — and a driver resized where its own transition is.
