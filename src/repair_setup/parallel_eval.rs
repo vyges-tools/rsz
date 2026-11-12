@@ -768,6 +768,341 @@ fn e9d(v: f64) -> String {
     format!("{m}e{}{:02}", if e < 0 { '-' } else { '+' }, e.abs())
 }
 
+/// `fmt::format("{:.3e}", v)`: the exponent signed, at least two digits.
+fn e3(v: f32) -> String {
+    let s = format!("{:.3e}", v);
+    let (m, e) = s.split_once('e').expect("Rust's {:e} always has an exponent");
+    let e: i32 = e.parse().expect("Rust's {:e} exponent is an integer");
+    format!("{m}e{}{:02}", if e < 0 { '-' } else { '+' }, e.abs())
+}
+
+/// The bottleneck analysis the policy keeps between batches: its age (`INT_MAX` when none
+/// applies), whether it was made in the tail, and each analyzed cone vertex's severity keyed by
+/// the vertex's pin name and driver flag (the graph is rebuilt between batches; a new vertex is
+/// outside the cone, as a new vertex id is upstream).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bottlenecks {
+    pub age: i32,
+    pub in_tail: bool,
+    pub severity: HashMap<(String, bool), f32>,
+    pub max_severity: f32,
+}
+
+impl Default for Bottlenecks {
+    fn default() -> Self {
+        Bottlenecks { age: i32::MAX, in_tail: false, severity: HashMap::new(), max_severity: 0.0 }
+    }
+}
+
+impl Bottlenecks {
+    /// `bottleneckPriorityScore(local_score, vertex, priority)`: `local_score * (1 + scale *
+    /// ratio^exponent)`, the ratio the vertex's severity over the largest (0 outside the cone).
+    pub fn priority_score(&self, local_score: f32, vertex: Option<&(String, bool)>, priority: &BatchPriorityConfig) -> f32 {
+        let severity = vertex.and_then(|k| self.severity.get(k));
+        let ratio = match severity {
+            Some(&sv) if self.max_severity > 0.0 => sv / self.max_severity,
+            _ => 0.0,
+        };
+        local_score * (1.0 + priority.bottleneck_scale * ratio.powf(priority.bottleneck_exponent))
+    }
+}
+
+/// What an analysis leaves: each cone vertex's severity by key, the largest, the cone size.
+type ConeSeverity = (HashMap<(String, bool), f32>, f32, usize);
+
+/// One violating-cone vertex (`BottleneckAnalysis::Node`).
+#[derive(Debug, Clone, Default)]
+struct ConeNode {
+    vertex: usize,
+    slack_deficit: f32,
+    has_cone_fanin: bool,
+    startpoint_deficit_sum: f32,
+    endpoint_deficit_sum: f32,
+}
+
+/// `forEachDataFanin`: the fanin edges carrying data arrivals, in the reference's in-edge
+/// iterator order (newest first): no timing checks, clock-to-Q or latch D-to-Q, no set/clear arcs
+/// (`preset_clr_arcs_enabled` is false), no disabled bidirect instance paths. Disabled loop
+/// edges cannot occur: a timing loop is refused when the graph is built.
+fn data_fanins(g: &vyges_sta::graph::Graph<'_>, v: usize) -> Vec<usize> {
+    use vyges_sta::liberty::Role;
+    let mut out = Vec::new();
+    for &e in g.in_edges[v].iter().rev() {
+        if let vyges_sta::graph::EdgeKind::Gate { set } = g.edges[e].kind {
+            let role = &g.arc_set(e, set).role;
+            if role.is_timing_check() || matches!(role, Role::RegClkToQ | Role::LatchDtoQ | Role::RegSetClr) || g.bidirect_inst_paths.contains(&e) {
+                continue;
+            }
+        }
+        out.push(g.edges[e].from);
+    }
+    out
+}
+
+/// `BottleneckAnalysis::analyze(violating_endpoints, slack_margin, max_endpoints,
+/// max_startpoints)` on scene 0's graph (slacks over every scene): the cone of the first
+/// `max_endpoints` endpoints (a backward search, LIFO, through the vertices that still violate),
+/// each vertex's distinct downstream endpoint deficits and distinct upstream startpoint deficits
+/// (the startpoints: cone vertices without a cone fanin, worst deficit first, at most
+/// `max_startpoints`), and its severity, their geometric mean. Returns the severities by vertex
+/// key, the largest, and the cone size.
+fn bottleneck_analyze(gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], endpoints: &[(String, f32)], slack_margin: f32, max_startpoints: usize) -> Result<ConeSeverity, String> {
+    let g = &gs[0];
+    let mut nodes: Vec<ConeNode> = Vec::new();
+    let mut node_of: Vec<i32> = vec![-1; g.vertices.len()];
+    let admit = |nodes: &mut Vec<ConeNode>, node_of: &mut Vec<i32>, v: usize, deficit: f32| -> usize {
+        nodes.push(ConeNode { vertex: v, slack_deficit: deficit, ..ConeNode::default() });
+        node_of[v] = (nodes.len() - 1) as i32;
+        nodes.len() - 1
+    };
+    // collectCone.
+    let mut endpoint_nodes = Vec::new();
+    let mut queue = Vec::new();
+    for (pin, slack) in endpoints {
+        let v = g.vertices.iter().position(|x| x.name == *pin && !x.is_driver).or_else(|| g.vertices.iter().position(|x| x.name == *pin));
+        let deficit = slack_margin - slack;
+        let Some(v) = v else { continue };
+        if deficit <= 0.0 || node_of[v] >= 0 {
+            continue;
+        }
+        let k = admit(&mut nodes, &mut node_of, v, deficit);
+        endpoint_nodes.push(k);
+        queue.push(k);
+    }
+    while let Some(k) = queue.pop() {
+        for fanin in data_fanins(g, nodes[k].vertex) {
+            if node_of[fanin] >= 0 {
+                nodes[k].has_cone_fanin = true;
+                continue;
+            }
+            let deficit = slack_margin - super::slack_over_scenes(gs, ss, fanin, MAX, None);
+            if deficit <= 0.0 {
+                continue;
+            }
+            let f = admit(&mut nodes, &mut node_of, fanin, deficit);
+            queue.push(f);
+            nodes[k].has_cone_fanin = true;
+        }
+    }
+    if nodes.is_empty() {
+        return Ok((HashMap::new(), 0.0, 0));
+    }
+    // Level order (a stable sort: ties stay in admission order); a fanin has the lower level.
+    let levels = g.levels()?;
+    let mut order: Vec<usize> = (0..nodes.len()).collect();
+    order.sort_by_key(|&k| levels[nodes[k].vertex]);
+    // sumEndpointDeficits: reach sets handed to the fanins in descending level.
+    let words = endpoint_nodes.len().div_ceil(64);
+    let mut reach = vec![0u64; nodes.len() * words];
+    for (bit, &k) in endpoint_nodes.iter().enumerate() {
+        reach[k * words + bit / 64] |= 1u64 << (bit % 64);
+    }
+    for &k in order.iter().rev() {
+        for fanin in data_fanins(g, nodes[k].vertex) {
+            let f = node_of[fanin];
+            if f < 0 {
+                continue;
+            }
+            for w in 0..words {
+                let bits = reach[k * words + w];
+                reach[f as usize * words + w] |= bits;
+            }
+        }
+    }
+    for k in 0..nodes.len() {
+        for w in 0..words {
+            let mut bits = reach[k * words + w];
+            while bits != 0 {
+                let bit = w * 64 + bits.trailing_zeros() as usize;
+                nodes[k].endpoint_deficit_sum += nodes[endpoint_nodes[bit]].slack_deficit;
+                bits &= bits - 1;
+            }
+        }
+    }
+    // sumStartpointDeficits: the worst startpoints, reach sets collected in ascending level.
+    let mut starts: Vec<usize> = (0..nodes.len()).filter(|&k| !nodes[k].has_cone_fanin).collect();
+    starts.sort_by(|&a, &b| nodes[b].slack_deficit.partial_cmp(&nodes[a].slack_deficit).unwrap_or(std::cmp::Ordering::Equal));
+    starts.truncate(max_startpoints);
+    let words = starts.len().div_ceil(64);
+    let mut reach = vec![0u64; nodes.len() * words];
+    for (bit, &k) in starts.iter().enumerate() {
+        reach[k * words + bit / 64] |= 1u64 << (bit % 64);
+    }
+    for &k in &order {
+        for fanin in data_fanins(g, nodes[k].vertex) {
+            let f = node_of[fanin];
+            if f < 0 {
+                continue;
+            }
+            for w in 0..words {
+                let bits = reach[f as usize * words + w];
+                reach[k * words + w] |= bits;
+            }
+        }
+    }
+    for k in 0..nodes.len() {
+        for w in 0..words {
+            let mut bits = reach[k * words + w];
+            while bits != 0 {
+                let bit = w * 64 + bits.trailing_zeros() as usize;
+                nodes[k].startpoint_deficit_sum += nodes[starts[bit]].slack_deficit;
+                bits &= bits - 1;
+            }
+        }
+    }
+    // bottleneckSeverity: the geometric mean keeps seconds and balances both sides.
+    let mut severity = HashMap::with_capacity(nodes.len());
+    let mut max_severity = 0.0f32;
+    for n in &nodes {
+        let sv = (n.startpoint_deficit_sum * n.endpoint_deficit_sum).sqrt();
+        max_severity = max_severity.max(sv);
+        let x = &g.vertices[n.vertex];
+        severity.insert((x.name.clone(), x.is_driver), sv);
+    }
+    Ok((severity, max_severity, nodes.len()))
+}
+
+/// `WnsTail::Step`: the tail's decision after a batch (printed as its index).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailStep {
+    Continue = 0,
+    Speculate = 1,
+    Widen = 2,
+    Stop = 3,
+}
+
+/// `WnsTail`: after the batches stall, the run works on the worst `wns_tail_endpoints` endpoints
+/// with small batches (one move after a miss, doubling after a save up to the stage's cap); a
+/// stalled stage first speculates (keeps missed batches in the open journal), then widens.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WnsTail {
+    pub active: bool,
+    pub started: bool,
+    /// Batches so far, and batches without a better WNS.
+    pub batches: i32,
+    pub batches_without_gain: i32,
+    pub endpoints: i32,
+    pub max_batch: i32,
+    pub batch_cap: i32,
+    /// Work when the tail started and the work it may spend.
+    pub work_start: f64,
+    pub budget_work: f64,
+    /// The smallest best-WNS gain that counts as tail progress.
+    pub min_gain: f32,
+    /// Missed tail batches kept in the open journal, and the instances they committed.
+    pub speculative_batches: i32,
+    pub speculative_instances: Vec<InstanceRecord>,
+    pub greedy_stalled: bool,
+}
+
+impl WnsTail {
+    /// `reset`.
+    pub fn reset(&mut self) {
+        *self = WnsTail::default();
+    }
+
+    /// `start(work, reference_period)`: once, and only with tail endpoints configured; the
+    /// budget is `wns_tail_work_pct` of the work so far, at least `wns_tail_min_work`.
+    pub fn start(&mut self, cfg: &ParallelEvalConfig, work: f64, reference_period: f32) -> bool {
+        if cfg.wns_tail_endpoints <= 0 || self.started {
+            return false;
+        }
+        self.reset();
+        self.active = true;
+        self.started = true;
+        self.endpoints = cfg.wns_tail_endpoints;
+        self.max_batch = cfg.wns_tail_batch;
+        self.batch_cap = 1;
+        self.work_start = work;
+        self.budget_work = (self.work_start * f64::from(cfg.wns_tail_work_pct) / 100.0).max(f64::from(cfg.wns_tail_min_work));
+        self.min_gain = reference_period * cfg.wns_tail_min_gain_period_pct / 100.0;
+        true
+    }
+
+    /// `unbufferAllowed`: buffer removal only in the single-move batches of a stalled greedy stage.
+    pub fn unbuffer_allowed(&self) -> bool {
+        self.active && self.batch_cap == 1 && self.greedy_stalled
+    }
+
+    /// `afterBatch(best_wns_before, best_wns_after, batch_saved)`: only a best-WNS gain over
+    /// `min_gain` is progress (a speculative run is judged when it ends); a save doubles the cap
+    /// up to the stage's, a miss drops it to one move.
+    pub fn after_batch(&mut self, best_wns_before: f32, best_wns_after: f32, batch_saved: bool) {
+        self.batches += 1;
+        let progressed = best_wns_after - best_wns_before > self.min_gain;
+        if self.speculative_batches == 0 {
+            self.batches_without_gain = if progressed { 0 } else { self.batches_without_gain + 1 };
+        }
+        self.batch_cap = if batch_saved { self.max_batch.min(self.batch_cap * 2) } else { 1 };
+    }
+
+    /// `nextStep(committed_moves, work, reason)`: the first rule that fires is the reason; the
+    /// work budget and the batch limit stop the tail; a stall speculates once per greedy stage;
+    /// otherwise the tail widens while it can.
+    pub fn next_step(&self, cfg: &ParallelEvalConfig, committed_moves: i32, work: f64) -> (TailStep, Option<&'static str>) {
+        let reason = if committed_moves == 0 {
+            "wns_tail_no_committed_moves"
+        } else if self.batches_without_gain >= cfg.wns_tail_stall {
+            "wns_tail_stalled"
+        } else if self.batches >= cfg.wns_tail_max_batches {
+            "wns_tail_max_batches"
+        } else if work - self.work_start > self.budget_work {
+            "wns_tail_work_budget"
+        } else {
+            return (TailStep::Continue, None);
+        };
+        if reason == "wns_tail_work_budget" || self.batches >= cfg.wns_tail_max_batches {
+            return (TailStep::Stop, Some(reason));
+        }
+        if !self.greedy_stalled && reason == "wns_tail_stalled" {
+            return (TailStep::Speculate, Some(reason));
+        }
+        if self.endpoints < cfg.wns_tail_max_endpoints {
+            return (TailStep::Widen, Some(reason));
+        }
+        (TailStep::Stop, Some(reason))
+    }
+
+    /// `beginSpeculativeStage`.
+    pub fn begin_speculative_stage(&mut self) {
+        self.batches_without_gain = 0;
+        self.greedy_stalled = true;
+    }
+
+    /// `widen`: an open speculative run dropped (the caller's restore undid it); endpoints and
+    /// the stage cap grown by `wns_tail_grow`.
+    pub fn widen(&mut self, cfg: &ParallelEvalConfig) {
+        self.speculative_batches = 0;
+        self.speculative_instances.clear();
+        self.endpoints = cfg.wns_tail_max_endpoints.min(self.endpoints * cfg.wns_tail_grow);
+        self.max_batch *= cfg.wns_tail_grow;
+        self.batches_without_gain = 0;
+        self.greedy_stalled = true;
+    }
+
+    /// `maySpeculate`: only once a greedy stage stalled, up to `wns_tail_speculate` batches.
+    pub fn may_speculate(&self, cfg: &ParallelEvalConfig) -> bool {
+        self.speculative_batches < cfg.wns_tail_speculate && self.greedy_stalled
+    }
+
+    /// `keepSpeculative(instances)`.
+    pub fn keep_speculative(&mut self, instances: &[InstanceRecord]) {
+        self.speculative_batches += 1;
+        self.speculative_instances.extend_from_slice(instances);
+    }
+
+    /// `speculating`.
+    pub fn speculating(&self) -> bool {
+        self.speculative_batches > 0
+    }
+
+    /// `endSpeculation`: the run ended; its instances returned.
+    pub fn end_speculation(&mut self) -> Vec<InstanceRecord> {
+        self.speculative_batches = 0;
+        std::mem::take(&mut self.speculative_instances)
+    }
+}
+
 /// The policy's run state (`SetupParallelEvalPolicy`'s members), as `start` leaves it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParallelEval {
@@ -809,6 +1144,10 @@ pub struct ParallelEval {
     pub batch_swaps: Vec<SwapRecord>,
     /// `tabu_`.
     pub tabu: MissTabu,
+    /// `tail_`: the WNS tail, after the batches stall.
+    pub tail: WnsTail,
+    /// `bottleneck_`, `bottleneck_age_`, `bottleneck_in_tail_`.
+    pub bottleneck: Bottlenecks,
     /// `critPathLoadPins`: every load pin on a collected worst path.
     pub crit_path_load_pins: HashSet<String>,
     /// The phase's progress-row marker (`phaseMarkerForIndex`).
@@ -847,6 +1186,8 @@ impl ParallelEval {
             batch_candidates: Vec::new(),
             batch_swaps: Vec::new(),
             tabu: MissTabu::default(),
+            tail: WnsTail::default(),
+            bottleneck: Bottlenecks::default(),
             crit_path_load_pins: HashSet::new(),
             marker,
         }
@@ -1085,7 +1426,7 @@ impl Repair<'_, '_> {
         pe.stall.reset(pe.checkpoint_tns, pe.reference_period);
         pe.graph_vertices = self.pe_graph_vertices()?;
         pe.work.reset(pe.graph_vertices);
-        self.debug("repair_setup", 1, format!("PARALLEL_EVAL reference clock period {:.3e}", pe.reference_period));
+        self.debug("repair_setup", 1, format!("PARALLEL_EVAL reference clock period {}", e3(pe.reference_period)));
         Ok(())
     }
 
@@ -1107,7 +1448,7 @@ impl Repair<'_, '_> {
             return Ok(());
         }
         let scope = self.pe_collect_target_endpoints(pe)?;
-        pe_analyze_bottlenecks(pe)?;
+        self.pe_analyze_bottlenecks(pe, &scope)?;
         let pre_batch_wns = self.timing.worst().0;
         pe_trace(&format!("VYGP|prewns|{}|{}\n", pe.batch_index, e9(pre_batch_wns)));
         let pool = self.pe_evaluate_targets(pe, scope)?;
@@ -1122,7 +1463,11 @@ impl Repair<'_, '_> {
             self.pe_update_timing(pe)?;
         }
         pe.batch_index += 1;
-        self.pe_judge_batch(pe, &pool, pre_batch_wns, &mut batch_moves)?;
+        let best_wns_before = pe.best_checkpoint_wns;
+        let batch_saved = self.pe_judge_batch(pe, &pool, pre_batch_wns, &mut batch_moves)?;
+        if pe.tail.active {
+            pe.tail.after_batch(best_wns_before, pe.best_checkpoint_wns, batch_saved);
+        }
         self.pe_apply_stop_rules(pe, batch_moves)?;
         self.pe_print_tracker_batch_summary(pe)?;
         pe.batch_candidates.clear();
@@ -1162,29 +1507,86 @@ impl Repair<'_, '_> {
             return Ok(true);
         }
         pe_trace(&format!("VYGP|verdict|{}|missed\n", pe.batch_index));
-        self.pe_settle_missed_batch(pe)?;
+        self.pe_settle_missed_batch(pe, *batch_moves)?;
         Ok(false)
     }
 
-    /// `settleMissedBatch`: the tail's speculation keeps a missed batch only while the tail runs
-    /// (it never does here), so the batch is undone (`undoMissedBatch`).
-    fn pe_settle_missed_batch(&mut self, pe: &mut ParallelEval) -> Result<(), Stop> {
-        pe_trace(&format!("VYGP|settle|{}|undo\n", pe.batch_index));
-        self.pe_undo_batch(pe)
+    /// `analyzeBottlenecks(scope)`: only while saved batches stall WNS (`weightsPriority`; a
+    /// pause makes the next analysis start fresh); one analysis serves
+    /// `bottleneck_refresh_batches` batches, and entering the tail makes a fresh one. The cone is
+    /// cut at `bottleneck_max_endpoints` of the batch's target endpoints.
+    fn pe_analyze_bottlenecks(&mut self, pe: &mut ParallelEval, scope: &BatchScope) -> Result<(), Stop> {
+        let priority = pe.config.parallel_eval.priority;
+        if !pe.stall.weights_priority(&pe.config.parallel_eval) {
+            pe.bottleneck.age = i32::MAX;
+            return Ok(());
+        }
+        let tail_changed = pe.tail.active != pe.bottleneck.in_tail;
+        pe.bottleneck.age = pe.bottleneck.age.saturating_add(1);
+        if !tail_changed && pe.bottleneck.age < priority.bottleneck_refresh_batches {
+            return Ok(());
+        }
+        pe.bottleneck.age = 0;
+        pe.bottleneck.in_tail = pe.tail.active;
+        let limit = (priority.bottleneck_max_endpoints.max(0) as usize).min(scope.target_endpoints);
+        let ends: Vec<(String, f32)> = self.collector_ends.iter().take(limit).cloned().collect();
+        let margin = self.ctx.margin;
+        let max_startpoints = priority.bottleneck_max_startpoints.max(0) as usize;
+        let edits = self.design.take_timer_edits();
+        let ctx = self.ctx;
+        let (severity, max_severity, cone) = super::timed_all(ctx, self.design.as_design(), &mut self.timer, edits, |gs, ss, _| {
+            bottleneck_analyze(gs, ss, &ends, margin, max_startpoints).map_err(|e| Stop::refused("RSZ-ABSENT", format!("repair_timing -phases PARALLEL_EVAL: the bottleneck analysis: {e}")))
+        })?;
+        pe.bottleneck.severity = severity;
+        pe.bottleneck.max_severity = max_severity;
+        pe_event("bottleneck_analyses", "", "", 1);
+        pe_event("bottleneck_cone_vertices", "", "", cone);
+        Ok(())
     }
 
-    /// `undoBatch` (no speculative batches): the open journal rolled back after the work meter's
-    /// update; the batch's instances the rollback kept go on the tabu list with their undo count.
-    fn pe_undo_batch(&mut self, pe: &mut ParallelEval) -> Result<(), Stop> {
+    /// `settleMissedBatch(batch_moves)`: while the tail runs, a stalled greedy stage keeps a
+    /// missed batch that committed moves (within the area limit and the speculation budget) in
+    /// the open journal; otherwise the batch is undone (`undoMissedBatch`).
+    fn pe_settle_missed_batch(&mut self, pe: &mut ParallelEval, batch_moves: i32) -> Result<(), Stop> {
+        let cfg = pe.config.parallel_eval;
+        if pe.tail.active && batch_moves > 0 && pe_within_max_utilization() && pe.tail.may_speculate(&cfg) {
+            pe_trace(&format!("VYGP|settle|{}|speculate\n", pe.batch_index));
+            pe.tail.keep_speculative(&pe.batch_instances);
+            pe_event("wns_tail_speculate", "wns_tail_speculative_batches", "", 1);
+            return Ok(());
+        }
+        pe_trace(&format!("VYGP|settle|{}|undo\n", pe.batch_index));
+        self.pe_undo_missed_batch(pe)
+    }
+
+    /// `undoMissedBatch`: a failed speculative run ends, and every batch of it is undone with
+    /// the last.
+    fn pe_undo_missed_batch(&mut self, pe: &mut ParallelEval) -> Result<(), Stop> {
+        let mut speculative = Vec::new();
+        if pe.tail.speculating() {
+            pe_event("wns_tail_speculation_failed", "", "", 1);
+            speculative = pe.tail.end_speculation();
+        }
+        self.pe_undo_batch(pe, &speculative)
+    }
+
+    /// `undoBatch(speculative)`: the open journal rolled back after the work meter's update; the
+    /// speculative run's kept instances go on the tabu list, and the batch's kept instances on it
+    /// with their undo count (only the last batch counts toward the undo limit).
+    fn pe_undo_batch(&mut self, pe: &mut ParallelEval, speculative: &[InstanceRecord]) -> Result<(), Stop> {
         if !pe.batch_journal_open {
             return Ok(());
         }
-        pe_trace(&format!("VYGP|undo|{}|tentative={}|speculative=0|instances={}\n", pe.batch_index, pe.tentative_moves, pe.batch_instances.len()));
+        pe_trace(&format!("VYGP|undo|{}|tentative={}|speculative={}|instances={}\n", pe.batch_index, pe.tentative_moves, speculative.len(), pe.batch_instances.len()));
         pe_event("batches_undone", "", "", 1);
         pe_event("moves_undone", "", "", pe.tentative_moves.max(0) as usize);
         self.pe_note_timing_update(pe);
         self.pe_roll_back_journal(pe)?;
         let cfg = pe.config.parallel_eval;
+        for record in self.pe_kept_instances(speculative) {
+            pe_trace(&format!("VYGP|undo|{}|tabu|spec|{}\n", pe.batch_index, record.name));
+            pe.tabu.add_tabu(&cfg, record.id, &record.name, pe.batch_index);
+        }
         for record in self.pe_kept_instances(&pe.batch_instances) {
             let blocked = pe.tabu.record_undo(&cfg, record.id, &record.name, pe.batch_index);
             pe_trace(&format!("VYGP|undo|{}|tabu|undo|{}|blocked={}\n", pe.batch_index, record.name, u8::from(blocked)));
@@ -1243,6 +1645,12 @@ impl Repair<'_, '_> {
             if in_place && self.pe_revert_in_place(pe, pool, &blocked, batch_moves)? {
                 pe_event("batch_salvage_in_place", "", "", 1);
             } else {
+                // The roll-back would also drop the speculative batches in the same journal.
+                if pe.tail.speculating() {
+                    pe_event("batch_salvage_skipped_speculating", "", "", 1);
+                    pe_trace(&format!("VYGP|salv|{b}|skip=speculating\n"));
+                    return Ok(false);
+                }
                 in_place = false;
                 self.pe_note_timing_update(pe);
                 self.pe_roll_back_journal(pe)?;
@@ -1421,12 +1829,16 @@ impl Repair<'_, '_> {
         Ok(true)
     }
 
-    /// `stopAtCheckpoint(reason)`: the open batch undone (no tail runs), the run complete with
-    /// result false.
+    /// `stopAtCheckpoint(reason)`: the open batch (or speculative run) undone, a running tail
+    /// stopped, the run complete with result false.
     fn pe_stop_at_checkpoint(&mut self, pe: &mut ParallelEval, reason: &str) -> Result<(), Stop> {
         pe_trace(&format!("VYGP|end|{}|{reason}|at_checkpoint\n", pe.batch_index));
         pe_stop(reason);
         self.pe_restore_batch_checkpoint(pe)?;
+        if pe.tail.active {
+            pe_event("wns_tail_batches", "", "", pe.tail.batches.max(0) as usize);
+            pe.tail.active = false;
+        }
         pe_mark_run_complete(pe, false);
         Ok(())
     }
@@ -1680,6 +2092,11 @@ impl Repair<'_, '_> {
     fn pe_save_batch_checkpoint(&mut self, pe: &mut ParallelEval, wns: f32, tns: f32) -> Result<(), Stop> {
         pe_trace(&format!("VYGP|ckpt|{}|wns={}|tns={}|journal={}\n", pe.batch_index, e9(wns), e9(tns), u8::from(pe.batch_journal_open)));
         pe_event("checkpoints_saved", "", "", 1);
+        if pe.tail.speculating() {
+            pe_event("wns_tail_speculation_paid", "", "", 1);
+            pe_event("wns_tail_speculation_paid_batches", "", "", pe.tail.speculative_batches.max(0) as usize);
+            pe.tail.end_speculation();
+        }
         if pe.batch_journal_open {
             self.commit_journal()?;
             pe.batch_journal_open = false;
@@ -1723,12 +2140,15 @@ impl Repair<'_, '_> {
     fn pe_apply_stop_rules(&mut self, pe: &mut ParallelEval, batch_moves: i32) -> Result<(), Stop> {
         let cfg = pe.config.parallel_eval;
         let stall = pe.stall.stall(&cfg);
-        pe_trace(&format!("VYGP|rule|{}|moves={batch_moves}|misses={}|stall={}|window={}|tail=0|committed={}\n", pe.batch_index, pe.checkpoint_misses, stall as i32, u8::from(pe.stall.window_stalled), pe.committed_moves));
+        pe_trace(&format!("VYGP|rule|{}|moves={batch_moves}|misses={}|stall={}|window={}|tail={}|committed={}\n", pe.batch_index, pe.checkpoint_misses, stall as i32, u8::from(pe.stall.window_stalled), u8::from(pe.tail.active), pe.committed_moves));
         if self.pe_finish_if_no_setup_violations(pe)? {
             return Ok(());
         }
         if self.args.max_iterations > 0 && i64::from(pe.batch_index) >= self.args.max_iterations {
             return self.pe_stop_at_checkpoint(pe, "max_iterations");
+        }
+        if pe.tail.active {
+            return self.pe_apply_tail_stop_rules(pe, batch_moves);
         }
         if batch_moves == 0 {
             return self.pe_start_tail_or_finish(pe, "no_committed_moves");
@@ -1757,12 +2177,74 @@ impl Repair<'_, '_> {
             pe_start_small_batch_retry(pe);
             return Ok(());
         }
-        // `WnsTail::start`: refused with no tail endpoints configured (it starts once per run).
-        if pe.config.parallel_eval.wns_tail_endpoints > 0 {
-            return Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -phases PARALLEL_EVAL: the WNS tail (startWnsTail, after {reason}) is not modelled")));
+        if self.pe_start_wns_tail(pe, reason) {
+            pe_trace(&format!("VYGP|tail|{}|start\n", pe.batch_index));
+            return Ok(());
         }
         pe_trace(&format!("VYGP|end|{}|{reason}|finish\n", pe.batch_index));
         pe_stop(reason);
+        pe_mark_run_complete(pe, false);
+        Ok(())
+    }
+
+    /// `startWnsTail(reason)`: the tail started (once, with tail endpoints configured) at the
+    /// work so far; misses cleared, the temporary tabu dropped (the tail works on exactly the
+    /// instances the stalled loop left there), the tail's generators added.
+    fn pe_start_wns_tail(&mut self, pe: &mut ParallelEval, reason: &str) -> bool {
+        let cfg = pe.config.parallel_eval;
+        let work = pe.work.seconds(&cfg);
+        if !pe.tail.start(&cfg, work, pe.reference_period) {
+            return false;
+        }
+        pe.checkpoint_misses = 0;
+        pe.tabu.clear_temporary();
+        self.pe_add_tail_generators(pe);
+        pe_event("wns_tail_begin", "wns_tail_starts", "", 1);
+        self.debug("repair_setup", 1, format!("PARALLEL_EVAL WNS tail after {reason} at batch {} (WNS {})", pe.batch_index, e3(pe.checkpoint_wns)));
+        true
+    }
+
+    /// `addTailGenerators`: pin swaps, buffer removal and size down join the tail when the
+    /// default sequence left them out (`tailMayAddMove`: no explicit -sequence, the move's
+    /// -skip_* option not given, no generator for it yet).
+    fn pe_add_tail_generators(&mut self, pe: &mut ParallelEval) {
+        for m in [Move::SwapPins, Move::Unbuffer, Move::SizeDownFanout] {
+            if self.args.sequence.is_empty() && self.pe_move_enabled(m) && !pe.generators.contains(&m) {
+                pe.generators.push(m);
+                pe_event("wns_tail_generator", "", m.name(), 1);
+            }
+        }
+    }
+
+    /// `applyTailStopRules(batch_moves)`: the tail's next step — continue; speculate on the
+    /// stalled stage; widen it (the checkpoint restored first: that also drops an open
+    /// speculative run); or stop at the checkpoint.
+    fn pe_apply_tail_stop_rules(&mut self, pe: &mut ParallelEval, batch_moves: i32) -> Result<(), Stop> {
+        let cfg = pe.config.parallel_eval;
+        let (step, reason) = pe.tail.next_step(&cfg, batch_moves, pe.work.seconds(&cfg));
+        pe_trace(&format!("VYGP|tail|{}|step={}|reason={}\n", pe.batch_index, step as i32, reason.unwrap_or("-")));
+        match step {
+            TailStep::Continue => return Ok(()),
+            TailStep::Speculate => {
+                pe.tail.begin_speculative_stage();
+                pe.tabu.clear_temporary();
+                pe_event("wns_tail_speculative_stage", "wns_tail_speculative_stages", "", 1);
+                return Ok(());
+            }
+            TailStep::Widen => {
+                self.pe_restore_batch_checkpoint(pe)?;
+                pe.tail.widen(&cfg);
+                pe.tabu.clear_temporary();
+                pe_event("wns_tail_grow", "", "", 1);
+                return Ok(());
+            }
+            TailStep::Stop => {}
+        }
+        let reason = reason.expect("a stop step always names its rule");
+        pe_event("wns_tail_batches", "", "", pe.tail.batches.max(0) as usize);
+        pe_stop(reason);
+        self.pe_restore_batch_checkpoint(pe)?;
+        pe.tail.active = false;
         pe_mark_run_complete(pe, false);
         Ok(())
     }
@@ -1788,7 +2270,11 @@ impl Repair<'_, '_> {
             self.pe_print_row(&format!("{}{}", pe.batch_index, pe.marker));
         }
         let failing_endpoint_count = self.collector_violating;
-        let target_endpoints = failing_endpoint_count.min(pe.max_end_repairs);
+        // -repair_tns and the WNS tail visit only the worst endpoints.
+        let mut target_endpoints = failing_endpoint_count.min(pe.max_end_repairs);
+        if pe.tail.active {
+            target_endpoints = target_endpoints.min(pe.tail.endpoints.max(0) as usize);
+        }
         let batch_cap = pe_effective_batch_cap(pe, target_endpoints);
         pe.stall.begin_batch(batch_cap, failing_endpoint_count);
         let mut t = format!("VYGP|scope|{}|fep={failing_endpoint_count}|target_endpoints={target_endpoints}|cap={batch_cap}\n", pe.batch_index);
@@ -2068,6 +2554,9 @@ impl Repair<'_, '_> {
 /// `effectiveBatchCap` before the tail and the small-batch retry (S5): `adaptiveBatchSize`.
 fn pe_effective_batch_cap(pe: &ParallelEval, target_endpoints: usize) -> i32 {
     let cfg = pe.config.parallel_eval;
+    if pe.tail.active {
+        return pe.tail.batch_cap;
+    }
     if pe.small_batch_retry_started {
         return cfg.retry_batch_cap;
     }
@@ -2086,18 +2575,13 @@ fn pe_within_max_utilization() -> bool {
     true
 }
 
-/// `analyzeBottlenecks`: the weights apply only while saved batches stall WNS
-/// (`weightsPriority`); their analysis is not modelled.
-fn pe_analyze_bottlenecks(pe: &ParallelEval) -> Result<(), Stop> {
-    if !pe.stall.weights_priority(&pe.config.parallel_eval) {
-        return Ok(());
-    }
-    Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: analyzeBottlenecks is not modelled".into()))
-}
 
-/// `checkpointWnsTolerance`: `checkpoint_wns_tolerance_period_pct` of the reference period (0
-/// while the WNS tail runs; it never does here).
+/// `checkpointWnsTolerance`: `checkpoint_wns_tolerance_period_pct` of the reference period; 0
+/// while the WNS tail runs (it works on the worst path and allows no drift).
 fn pe_checkpoint_wns_tolerance(pe: &ParallelEval) -> f32 {
+    if pe.tail.active {
+        return 0.0;
+    }
     pe.reference_period * pe.config.parallel_eval.checkpoint_wns_tolerance_period_pct / 100.0
 }
 
@@ -2112,9 +2596,20 @@ pub fn batch_improves_checkpoint(checkpoint_wns: f32, checkpoint_tns: f32, curre
     wns_within_band && fuzzy::less(checkpoint_tns, current_tns)
 }
 
-/// `acceptsBatch` (the tail's TNS bound applies only while it runs, which it never does here).
+/// `acceptsBatch`: the batch improves the checkpoint; while the tail runs (it also takes
+/// estimator-rejected moves) a WNS gain may cost TNS only up to `wns_tail_tns_ratio` times itself.
 fn pe_accepts_batch(pe: &ParallelEval, wns_after: f32, tns_after: f32) -> bool {
-    batch_improves_checkpoint(pe.checkpoint_wns, pe.checkpoint_tns, wns_after, tns_after, pe.best_checkpoint_wns, pe_checkpoint_wns_tolerance(pe))
+    if !batch_improves_checkpoint(pe.checkpoint_wns, pe.checkpoint_tns, wns_after, tns_after, pe.best_checkpoint_wns, pe_checkpoint_wns_tolerance(pe)) {
+        return false;
+    }
+    if pe.tail.active {
+        let wns_gain = (wns_after - pe.checkpoint_wns).max(0.0);
+        if fuzzy::less(tns_after, pe.checkpoint_tns - wns_gain * pe.config.parallel_eval.wns_tail_tns_ratio) {
+            pe_event("wns_tail_reject_tns", "", "", 1);
+            return false;
+        }
+    }
+    true
 }
 
 /// `recordSwap`: a size or VT swap remembers the cell it replaces. (`replaceCell` finds masters
@@ -3087,18 +3582,25 @@ fn pe_event(name: &str, metric: &str, kind: &str, count: usize) {
 
 /// `makeBatchCandidates`: one batch candidate per evaluation with a best candidate, in pool order:
 /// its index, the best estimate's score as the local score, the priority score (the local score;
-/// a stalled batch weighs it by the target's share of the violating cone, `analyzeBottlenecks`,
-/// which is refused before any batch gets here), the target's endpoint slack, and the best
-/// candidate's impact.
+/// while saved batches stall WNS, weighted by the target's share of the violating cone,
+/// `bottleneckPriorityScore`), the target's endpoint slack, and the best candidate's impact.
 fn pe_make_batch_candidates(pe: &ParallelEval, targets: &[Target], evaluations: &[TargetEvaluation]) -> Result<Vec<BatchCandidate>, Stop> {
-    if pe_stall_weights_priority(pe) {
-        return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: bottleneckPriorityScore is not modelled".into()));
-    }
+    // A stalled batch ranks the targets by their share of the violating cone.
+    let weighted = pe_stall_weights_priority(pe);
+    let priority = pe.config.parallel_eval.priority;
     let mut candidates = Vec::with_capacity(evaluations.len());
     for (index, evaluation) in evaluations.iter().enumerate() {
         let Some(best) = evaluation.best_candidate() else { continue };
         let local_score = best.estimate.score;
-        candidates.push(BatchCandidate { evaluation_index: index, local_score, priority_score: local_score, endpoint_slack: targets[index].slack, impact: best.impact.clone() });
+        let priority_score = if weighted {
+            // `target().vertex()`: the target pin's driver vertex.
+            let pin = &targets[index].driver_pin;
+            let key = [(pin.clone(), true), (pin.clone(), false)].into_iter().find(|k| pe.bottleneck.severity.contains_key(k));
+            pe.bottleneck.priority_score(local_score, key.as_ref(), &priority)
+        } else {
+            local_score
+        };
+        candidates.push(BatchCandidate { evaluation_index: index, local_score, priority_score, endpoint_slack: targets[index].slack, impact: best.impact.clone() });
     }
     Ok(candidates)
 }
@@ -3145,10 +3647,9 @@ fn pe_bc_lines(pe: &ParallelEval, pool: &BatchPool) -> String {
     t
 }
 
-/// `WnsTail::active()`: false until the tail starts. The tail starts after a stalled batch, never
-/// before batch 1, and the run is refused before batch 1 (the batch is not modelled yet).
-fn pe_wns_tail_active(_pe: &ParallelEval) -> bool {
-    false
+/// `WnsTail::active()`: the tail runs (it starts once the batches stall).
+fn pe_wns_tail_active(pe: &ParallelEval) -> bool {
+    pe.tail.active
 }
 
 /// `estimateTarget`: while the WNS tail is active (`permissive`), a candidate not legal but
@@ -3205,10 +3706,9 @@ fn pe_generator_allowed(pe: &ParallelEval, m: Move) -> bool {
     }
 }
 
-/// `ParallelEvalState::unbufferAllowed`: `active && batch_cap == 1 && greedy_stalled`. The tail
-/// is not modelled: it is inactive from `resetRunState` until a later batch stalls.
-fn pe_tail_unbuffer_allowed(_pe: &ParallelEval) -> bool {
-    false
+/// `WnsTail::unbufferAllowed`: `active && batch_cap == 1 && greedy_stalled`.
+fn pe_tail_unbuffer_allowed(pe: &ParallelEval) -> bool {
+    pe.tail.unbuffer_allowed()
 }
 
 /// `kRebufferMaxFanout`: RebufferMt plans trees for fewer loads than this.
@@ -4047,6 +4547,7 @@ fn pe_build_move_generators(pe: &mut ParallelEval) {
 
 /// `resetRunState`.
 fn pe_reset_run_state(pe: &mut ParallelEval) {
+    pe.tail.reset();
     pe.tabu.reset();
     pe.committed_moves = 0;
     pe.batch_index = 0;
@@ -4810,7 +5311,8 @@ mod tests {
     }
 
     // makeBatchCandidates: one candidate per evaluation with a best, in pool order, carrying the
-    // evaluation's pool index, the best estimate's score as both scores (unweighted: no stall),
+    // evaluation's pool index, the best estimate's score as both scores (unweighted: no stall;
+    // weighted by bottleneckPriorityScore while saved batches stall WNS),
     // the target's endpoint slack and the best candidate's impact; an evaluation without a best
     // is skipped. weightsPriority: a WNS stall, at most bottleneck_max_wns_stall_batches long.
     #[test]
@@ -4825,7 +5327,14 @@ mod tests {
         let mut stalled = pe.clone();
         stalled.stall.wns_stall_batches = 1;
         assert!(pe_stall_weights_priority(&stalled));
-        assert!(pe_make_batch_candidates(&stalled, &targets, &evaluations).is_err());
+        // Weighted: a target outside the analyzed cone keeps its local score; one in it is scaled.
+        let bcs = pe_make_batch_candidates(&stalled, &targets, &evaluations).unwrap();
+        assert_eq!(bcs.iter().map(|b| b.priority_score).collect::<Vec<_>>(), [2.0, 3.0]);
+        stalled.bottleneck.severity.insert(("b1/Z".to_string(), true), 1.0);
+        stalled.bottleneck.max_severity = 1.0;
+        let factor = 1.0 + stalled.config.parallel_eval.priority.bottleneck_scale;
+        let bcs = pe_make_batch_candidates(&stalled, &targets, &evaluations).unwrap();
+        assert_eq!(bcs.iter().map(|b| (b.local_score, b.priority_score)).collect::<Vec<_>>(), [(2.0, 2.0 * factor), (3.0, 3.0 * factor)]);
         stalled.stall.wns_stall_batches = pe.config.parallel_eval.priority.bottleneck_max_wns_stall_batches + 1;
         assert!(!pe_stall_weights_priority(&stalled));
         assert!(!pe_stall_weights_priority(&pe));
@@ -4911,6 +5420,134 @@ mod tests {
     /// gain over the previous checkpoint past `progress_tns_pct` of |initial TNS|; without it the
     /// batch and its moves count as stalled; the move budget is `stall_batches` times the larger
     /// of `min_batch_cap` and the last cap.
+    /// `BottleneckAnalysis::bottleneckPriorityScore` (upstream policy/BottleneckAnalysis): the
+    /// rank is `local_score * (1 + bottleneck_scale * ratio^bottleneck_exponent)`, the ratio the
+    /// target vertex's severity over the largest; 0 outside the cone or with no severity; the
+    /// factor multiplies a negative score too (a cone-central loss ranks lower).
+    #[test]
+    fn the_bottleneck_priority_scales_the_local_score_by_the_cone_share() {
+        let p = BatchPriorityConfig::default();
+        let mut b = Bottlenecks::default();
+        let key = ("u1/Z".to_string(), true);
+        assert_eq!(b.priority_score(2.0, Some(&key), &p), 2.0, "no analysis");
+        b.severity.insert(key.clone(), 0.5);
+        b.severity.insert(("u2/Z".to_string(), true), 1.0);
+        b.max_severity = 1.0;
+        let factor = 1.0 + p.bottleneck_scale * 0.5f32.powf(p.bottleneck_exponent);
+        assert_eq!(b.priority_score(2.0, Some(&key), &p), 2.0 * factor);
+        assert_eq!(b.priority_score(-2.0, Some(&key), &p), -2.0 * factor);
+        assert_eq!(b.priority_score(2.0, None, &p), 2.0, "outside the cone");
+        b.max_severity = 0.0;
+        assert_eq!(b.priority_score(2.0, Some(&key), &p), 2.0, "no severity anywhere");
+    }
+
+    /// Upstream gtest `ParallelEvalTailGainFollowsThePeriod`: a tail batch is WNS progress only
+    /// when the best WNS gains more than `wns_tail_min_gain_period_pct` of the reference period,
+    /// whatever the WNS.
+    #[test]
+    fn the_tail_gain_follows_the_period() {
+        let cfg = ParallelEvalConfig::default();
+        let period = 500e-12f32;
+        let min_gain = period * cfg.wns_tail_min_gain_period_pct / 100.0;
+        let mut tail = WnsTail::default();
+        assert!(tail.start(&cfg, 0.0, period));
+        for wns in [-100e-12f32, -0.01e-12] {
+            tail.after_batch(wns, wns + 0.5 * min_gain, true);
+            assert_eq!(tail.batches_without_gain, 1, "{wns}");
+            tail.after_batch(wns, wns + 2.0 * min_gain, true);
+            assert_eq!(tail.batches_without_gain, 0, "{wns}");
+        }
+    }
+
+    /// `WnsTail::start` / `afterBatch` (upstream ParallelEvalState): the tail starts once and only
+    /// with tail endpoints; its budget is `wns_tail_work_pct` of the work so far, at least
+    /// `wns_tail_min_work`; the cap starts at one move, doubles after a save up to the stage's
+    /// `wns_tail_batch`, and drops to one after a miss; a speculative run is not judged per batch.
+    #[test]
+    fn the_tail_starts_once_and_sizes_its_batches() {
+        let cfg = ParallelEvalConfig::default();
+        let mut tail = WnsTail::default();
+        assert!(!tail.start(&ParallelEvalConfig { wns_tail_endpoints: 0, ..cfg }, 10.0, 1e-9));
+        assert!(tail.start(&cfg, 10.0, 1e-9));
+        assert!(!tail.start(&cfg, 10.0, 1e-9), "once per run");
+        assert_eq!((tail.endpoints, tail.batch_cap, tail.max_batch), (cfg.wns_tail_endpoints, 1, cfg.wns_tail_batch));
+        assert_eq!(tail.budget_work, f64::from(cfg.wns_tail_min_work), "4x of 10 is below the floor");
+        let mut big = WnsTail::default();
+        assert!(big.start(&cfg, 100.0, 1e-9));
+        assert_eq!(big.budget_work, 100.0 * f64::from(cfg.wns_tail_work_pct) / 100.0);
+        for want in [2, 4, 8, 8] {
+            tail.after_batch(0.0, 0.0, true);
+            assert_eq!(tail.batch_cap, want.min(cfg.wns_tail_batch));
+        }
+        tail.after_batch(0.0, 0.0, false);
+        assert_eq!(tail.batch_cap, 1);
+        let before = tail.batches_without_gain;
+        tail.keep_speculative(&[InstanceRecord { name: "u1".into(), id: 3 }]);
+        tail.after_batch(0.0, 0.0, false);
+        assert_eq!(tail.batches_without_gain, before, "a speculative run is judged when it ends");
+        assert_eq!(tail.end_speculation(), vec![InstanceRecord { name: "u1".into(), id: 3 }]);
+        assert!(!tail.speculating());
+    }
+
+    /// `WnsTail::nextStep` / `widen` (upstream ParallelEvalState): the first rule that fires is
+    /// the reason (no moves, stalled, max batches, work budget); the budget and the batch limit
+    /// stop the tail; a stall in a greedy stage speculates first; else the tail widens (endpoints
+    /// and stage cap times `wns_tail_grow`, endpoints capped) while below `wns_tail_max_endpoints`,
+    /// then stops. Speculation needs a stalled greedy stage and stays within `wns_tail_speculate`.
+    #[test]
+    fn the_tail_steps_speculate_widen_then_stop() {
+        let cfg = ParallelEvalConfig::default();
+        let mut tail = WnsTail::default();
+        assert!(tail.start(&cfg, 0.0, 1e-9));
+        assert_eq!(tail.next_step(&cfg, 1, 0.0), (TailStep::Continue, None));
+        assert_eq!(tail.next_step(&cfg, 0, 0.0), (TailStep::Widen, Some("wns_tail_no_committed_moves")));
+        assert_eq!(tail.next_step(&cfg, 1, tail.budget_work + 1.0), (TailStep::Stop, Some("wns_tail_work_budget")));
+        tail.batches_without_gain = cfg.wns_tail_stall;
+        assert!(!tail.may_speculate(&cfg), "only after a stalled greedy stage");
+        assert_eq!(tail.next_step(&cfg, 1, 0.0), (TailStep::Speculate, Some("wns_tail_stalled")));
+        tail.begin_speculative_stage();
+        assert_eq!((tail.batches_without_gain, tail.greedy_stalled), (0, true));
+        assert!(tail.may_speculate(&cfg));
+        tail.speculative_batches = cfg.wns_tail_speculate;
+        assert!(!tail.may_speculate(&cfg));
+        tail.batches_without_gain = cfg.wns_tail_stall;
+        assert_eq!(tail.next_step(&cfg, 1, 0.0), (TailStep::Widen, Some("wns_tail_stalled")));
+        let (e, m) = (tail.endpoints, tail.max_batch);
+        tail.widen(&cfg);
+        assert_eq!((tail.endpoints, tail.max_batch, tail.speculative_batches), (e * cfg.wns_tail_grow, m * cfg.wns_tail_grow, 0));
+        while tail.endpoints < cfg.wns_tail_max_endpoints {
+            tail.widen(&cfg);
+        }
+        assert_eq!(tail.endpoints, cfg.wns_tail_max_endpoints);
+        assert_eq!(tail.next_step(&cfg, 0, 0.0), (TailStep::Stop, Some("wns_tail_no_committed_moves")));
+        tail.batches = cfg.wns_tail_max_batches;
+        assert_eq!(tail.next_step(&cfg, 0, 0.0), (TailStep::Stop, Some("wns_tail_no_committed_moves")), "the first rule names the reason");
+        // Buffer removal runs only in the single-move batches of a stalled greedy stage.
+        tail.batch_cap = 1;
+        assert!(tail.unbuffer_allowed());
+        tail.batch_cap = 2;
+        assert!(!tail.unbuffer_allowed());
+    }
+
+    /// `acceptsBatch` under the tail (upstream SetupParallelEvalPolicy): no WNS tolerance, and a
+    /// WNS gain may cost TNS only up to `wns_tail_tns_ratio` times itself.
+    #[test]
+    fn the_tail_bounds_the_tns_a_wns_gain_may_cost() {
+        let mut pe = ParallelEval::new(for_parallel_eval(Effort::High), 'P');
+        pe.reference_period = 1e-9;
+        pe.checkpoint_wns = -1e-10;
+        pe.best_checkpoint_wns = -1e-10;
+        pe.checkpoint_tns = -1e-9;
+        let ratio = pe.config.parallel_eval.wns_tail_tns_ratio;
+        // WNS +1e-12: TNS may fall by up to ratio * 1e-12.
+        assert!(pe_accepts_batch(&pe, -0.99e-10, -1e-9 - 0.5 * ratio * 1e-12));
+        assert!(pe_accepts_batch(&pe, -0.99e-10, -1e-9 - 2.0 * ratio * 1e-12), "no bound before the tail");
+        pe.tail.active = true;
+        assert_eq!(pe_checkpoint_wns_tolerance(&pe), 0.0);
+        assert!(pe_accepts_batch(&pe, -0.99e-10, -1e-9 - 0.5 * ratio * 1e-12));
+        assert!(!pe_accepts_batch(&pe, -0.99e-10, -1e-9 - 2.0 * ratio * 1e-12));
+    }
+
     /// `MissTabu` (upstream ParallelEvalState): `addTabu` skips an instance until batch
     /// `now + miss_tabu_batches`, and `expire(now)` drops entries ending at or before `now`;
     /// `recordUndo` also counts undos and excludes the instance once the count reaches
