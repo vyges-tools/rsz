@@ -398,13 +398,39 @@ pub fn run(job: &Value) -> Result<Value, String> {
     run_owned(job, Db::new()).map(|(report, _)| report)
 }
 
+/// `dbNetwork::readLibertyAfter` -> `Resizer::postReadLiberty` -> `copyDontUseFromLiberty`, after
+/// every read_liberty: the liberty dont_use cells of EVERY library read so far are put back into
+/// dont_use_, so one cleared by unset_dont_use comes back.
+fn post_read_liberty_dont_use(dont_use: &mut BTreeSet<String>, libs: &[Library]) {
+    for l in libs {
+        dont_use.extend(l.cells.values().filter(|c| c.dont_use).map(|c| c.name.clone()));
+    }
+}
+
+/// `set_dont_use_cmd` -> `Resizer::setDontUse(cell, dont_use)` for each cell a `get_lib_cells`
+/// pattern matches in any library: inserted into dont_use_, or (unset_dont_use) erased from it.
+fn set_dont_use_cells(dont_use: &mut BTreeSet<String>, libs: &[Library], pat: &str, on: bool) {
+    for lib in libs {
+        for c in lib.cells.keys().filter(|c| glob_match(pat, c)) {
+            if on {
+                dont_use.insert(c.clone());
+            } else {
+                dont_use.remove(c);
+            }
+        }
+    }
+}
+
 /// [`run`] on a database already open (the steps may still read one over it), handing the
 /// database back as the steps left it — for an engine that runs the resizer on its own design
 /// mid-command (global placement's timing-driven iterations).
 pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
     let mut db = db;
     let mut libs = Libs::default();
-    let mut set_dont_use: BTreeSet<String> = BTreeSet::new();
+    // `Resizer::dont_use_`: one set. Every read_liberty re-adds the liberty dont_use cells of
+    // every library read so far (`postReadLiberty` -> `copyDontUseFromLiberty`), set_dont_use adds,
+    // unset_dont_use removes (liberty-marked cells too, until the next read_liberty).
+    let mut dont_use_state: BTreeSet<String> = BTreeSet::new();
     let mut liberty = vyges_est::liberty::LibertyClocks::default();
     let mut rc = vyges_est::rc::Rc::new();
     let mut sdc: Option<vyges_loom::sdc::Sdc> = None;
@@ -541,27 +567,28 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     return Err("read_liberty -corner without define_corners (not modelled)".into());
                 }
                 libs.libs.push(lib);
+                post_read_liberty_dont_use(&mut dont_use_state, &libs.libs);
             }
             // `set_dont_use_cmd`: each element of the list through `get_lib_cells` — a cell-name
             // glob (`*`, `?`) over every library read so far; no match only warns.
-            "set_dont_use" => {
+            // `unset_dont_use` is the same command with dont_use 0 (`Resizer::setDontUse(cell, false)`:
+            // erased from dont_use_).
+            "set_dont_use" | "unset_dont_use" => {
                 // The buffer list is found once and kept (findBuffers returns early when it has one).
                 if !buffered.is_empty() {
-                    return Err("set_dont_use after buffer_ports: the kept buffer list is not modelled".into());
+                    return Err(format!("{cmd} after buffer_ports: the kept buffer list is not modelled"));
                 }
                 for a in &args {
                     for pat in a.split_whitespace() {
                         // A SWIG object handle (`_<hex>_p_LibertyCell`) is a cell object logged
                         // without its name: as a pattern it would silently match nothing.
                         if pat.starts_with('_') && pat.contains("_p_") {
-                            return Err(format!("set_dont_use {pat}: an object handle, not a cell name (not modelled)"));
+                            return Err(format!("{cmd} {pat}: an object handle, not a cell name (not modelled)"));
                         }
                         if pat.contains(['/', '[', ']', '\\']) {
-                            return Err(format!("set_dont_use {pat}: library-qualified or bracketed patterns are not modelled"));
+                            return Err(format!("{cmd} {pat}: library-qualified or bracketed patterns are not modelled"));
                         }
-                        for lib in &libs.libs {
-                            set_dont_use.extend(lib.cells.keys().filter(|c| glob_match(pat, c)).cloned());
-                        }
+                        set_dont_use_cells(&mut dont_use_state, &libs.libs, pat, cmd == "set_dont_use");
                     }
                 }
             }
@@ -766,10 +793,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 }
                 link_corner_is_first(&libs)?;
                 let o = buffer_ports::Options::parse(&args)?;
-                let mut dont_use = set_dont_use.clone();
-                for lib in &libs.libs {
-                    dont_use.extend(lib.cells.values().filter(|c| c.dont_use).map(|c| c.name.clone()));
-                }
+                let dont_use = dont_use_state.clone();
                 let m = masters(&db)?;
                 if !db.block_get_mod_insts().is_empty() {
                     return Err("buffer_ports on a hierarchical design: not modelled".into());
@@ -834,11 +858,8 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     return Err("set_max_delay / set_min_delay: not modelled for repair_design".into());
                 }
                 let mut a = parse_args(&args)?;
-                // dont_use_: every liberty dont_use cell (copyDontUseFromLiberty), then set_dont_use.
-                let mut dont_use = set_dont_use.clone();
-                for lib in &libs.libs {
-                    dont_use.extend(lib.cells.values().filter(|c| c.dont_use).map(|c| c.name.clone()));
-                }
+                // dont_use_ (`dont_use_state`): liberty dont_use cells as read_liberty left them, then set/unset_dont_use.
+                let dont_use = dont_use_state.clone();
                 let m = masters(&db)?;
                 let lib0 = libs.default_library().ok_or("repair_design before any liberty library")?;
                 // The SDC's times are in the first library's unit (`user_time_to_sta`, here and in
@@ -1019,10 +1040,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 if clk_buffers.is_empty() {
                     return Err("repair_clock_nets with no clock buffer list in the session (inferClockBufferList): not modelled".into());
                 }
-                let mut dont_use = set_dont_use.clone();
-                for lib in &libs.libs {
-                    dont_use.extend(lib.cells.values().filter(|c| c.dont_use).map(|c| c.name.clone()));
-                }
+                let dont_use = dont_use_state.clone();
                 let m = masters(&db)?;
                 let lib0 = libs.default_library().ok_or("repair_clock_nets before any liberty library")?;
                 if lib0.time_scale != 1e-9f32 {
@@ -1318,7 +1336,9 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 } else {
                     g.find_delays(&parasitics[0], None)?;
                 }
-                let mut ssdc = search_sdc_on(s, &netlist, time_scale, clock_propagated, a.hold)?;
+                // A hold-only repair applies the clock uncertainties (the search reads them into the
+                // hold and the setup checks); a setup part with setup uncertainty is refused there.
+                let mut ssdc = search_sdc_on(s, &netlist, time_scale, clock_propagated, a.hold && !a.setup)?;
                 crate::env::add_virtual_latencies(&mut ssdc, &virtual_latencies)?;
                 // The groups earlier commands made stay in the constraints (`makeGroupPath` on the
                 // command SDC), after the file's own.
@@ -1396,10 +1416,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 // `hasVtSwapCells`: more than one VT category among the buffers (`getBufferList` in
                 // the preamble, clock buffers excluded for -setup).
                 let vt_category_count = {
-                    let mut du = set_dont_use.clone();
-                    for lib in &libs.libs {
-                        du.extend(lib.cells.values().filter(|c| c.dont_use).map(|c| c.name.clone()));
-                    }
+                    let du = dont_use_state.clone();
                     crate::preamble::get_buffer_list(&libs, &m, &du, !hold_only).map_err(|e| format!("{}: {}", e.code(), e.message()))?.sorted_vt.len()
                 };
                 let seq = if recover { Vec::new() } else { rt::move_sequence(&a, vt_category_count > 1) };
@@ -1446,10 +1463,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     break;
                 } else {
                     // Resizer::resizePreamble: the equivalent cells, the buffers, the target slews.
-                    let mut dont_use = set_dont_use.clone();
-                    for lib in &libs.libs {
-                        dont_use.extend(lib.cells.values().filter(|c| c.dont_use).map(|c| c.name.clone()));
-                    }
+                    let dont_use = dont_use_state.clone();
                     let equiv = crate::sizing::make_equiv_cells(&libs);
                     let db_hierarchy = db.has_hierarchy();
                     let site_heights: BTreeMap<String, i32> = m.values().map(|mm| mm.site.clone()).filter(|s| !s.is_empty()).map(|s| (s.clone(), db.site_get_height(&s))).collect();
@@ -2026,6 +2040,26 @@ mod tests {
     /// made (`rsz::resolve_path_group reg2reg` then `in2reg`) go back to that order in their own
     /// slots, other exceptions untouched. Witness: repair_setup_parallel_eval_path_group's seqchk
     /// tag order at flop D pins (pe-s3a prep line 1).
+    /// Upstream rule (`Resizer::setDontUse` / `postReadLiberty` at 4155ac3): dont_use_ is one set.
+    /// unset_dont_use erases a cell even when liberty marks it dont_use; the next read_liberty
+    /// puts every liberty-marked cell of every library back. Witness: repair_hold14 call 2
+    /// (`unset_dont_use sky130_fd_sc_hd__dly*` before it; the reference then inserts dlygate4sd3_1).
+    #[test]
+    fn unset_dont_use_clears_a_cell_until_the_next_read_liberty() {
+        let cell = |name: &str, dont_use: bool| (name.to_string(), vyges_sta::liberty::Cell { name: name.into(), dont_use, ..Default::default() });
+        let lib = Library { cells: [cell("dly1", true), cell("dly2", false), cell("buf", false)].into_iter().collect(), ..Default::default() };
+        let libs = vec![lib];
+        let mut du = BTreeSet::new();
+        post_read_liberty_dont_use(&mut du, &libs);
+        assert_eq!(du.iter().map(String::as_str).collect::<Vec<_>>(), ["dly1"]);
+        set_dont_use_cells(&mut du, &libs, "dly*", true);
+        assert_eq!(du.iter().map(String::as_str).collect::<Vec<_>>(), ["dly1", "dly2"]);
+        set_dont_use_cells(&mut du, &libs, "dly*", false);
+        assert!(du.is_empty(), "unset clears the liberty-marked cell too: {du:?}");
+        post_read_liberty_dont_use(&mut du, &libs);
+        assert_eq!(du.iter().map(String::as_str).collect::<Vec<_>>(), ["dly1"], "read_liberty brings back only the liberty-marked one");
+    }
+
     #[test]
     fn script_made_groups_regain_their_creation_order() {
         let pd = |group: Option<&str>| vyges_sta::sdc::PathDelay { from_pins: Vec::new(), from_clock: false, to_pins: Vec::new(), to_clock: false, min_max: vyges_sta::liberty::MAX, ignore_clk_latency: false, break_path: false, delay: 0.0, false_path: group.is_none(), multicycle: None, thrus: Vec::new(), group: group.map(String::from) };
