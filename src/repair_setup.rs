@@ -2218,6 +2218,8 @@ pub struct Outcome {
     pub inserted: i64,
     /// The timer's levels when the call ended (see [`crate::repair_timing::Args::sta_levels`]).
     pub levels: BTreeMap<String, i32>,
+    /// The reference's error that ended the call (`RSZ-0217`: an unknown phase reached), when one did.
+    pub error: Option<String>,
 }
 
 struct Repair<'c, 'd> {
@@ -3100,6 +3102,13 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
         if ctx.path_group.is_some() && !matches!(name.as_str(), "LEGACY" | "LAST_GASP" | "CRIT_VT_SWAP" | "PARALLEL_EVAL") {
             return Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -path_group with the {name} phase: not modelled")));
         }
+        // `makePolicyForPhase`: a name it does not know errors as the loop reaches it — after the
+        // phases before it ran — and the call ends there, without the final report.
+        if !crate::repair_timing::is_phase_name(name) {
+            r.report(crate::repair_timing::unknown_phase_line(name));
+            r.out.error = Some(format!("RSZ-0217: unknown phase {name}"));
+            break;
+        }
         match name.as_str() {
             "LEGACY" => {
                 r.phase = format!("LEGACY{marker}");
@@ -3131,7 +3140,9 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
             other => return Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -phases: {other} is not modelled"))),
         }
     }
-    r.finalize_and_report()?;
+    if r.out.error.is_none() {
+        r.finalize_and_report()?;
+    }
     // A diagnostic: the timer as the call left it — incremental — every pin's max slack per
     // transition in fs (the least over the scenes), as the capture's `post-1.slacks` holds the
     // reference's (`VYGES_RSZ_POST_SLACKS=<file>`).

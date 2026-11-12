@@ -1778,7 +1778,11 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         lines.splice(k + 1..k + 1, o.preamble);
                     }
                     lines.extend(o.lines);
-                    timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len(), "resized": o.resized, "removed": o.removed, "inserted": o.inserted }));
+                    timing_runs.push(json!({ "lines": lines, "endpoints": ends.len(), "violating_endpoints": violating.len(), "resized": o.resized, "removed": o.removed, "inserted": o.inserted, "error": o.error }));
+                    // The reference's error ended the command (the script catches it).
+                    if o.error.is_some() {
+                        break;
+                    }
                 }
                 if a.hold {
                     timing_stop = Some("repair_timing -hold: not modelled".into());

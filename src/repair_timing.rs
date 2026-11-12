@@ -468,9 +468,28 @@ pub fn phase_names(phases: Option<&str>) -> Vec<String> {
     names
 }
 
-/// Whether every phase of the list is modelled.
+/// Whether the list is modelled up to where the call ends: each phase in order is modelled, or an
+/// unknown name is reached first (`makePolicyForPhase` errors there, RSZ-0217, so the names after
+/// it never run).
 pub fn phases_modelled(phases: &str) -> bool {
-    phase_names(Some(phases)).iter().all(|n| matches!(n.as_str(), "LEGACY" | "WNS" | "WNS_PATH" | "TNS" | "ENDPOINT_FANIN" | "STARTPOINT_FANOUT" | "LAST_GASP" | "CRIT_VT_SWAP" | "REROUTE"))
+    for n in phase_names(Some(phases)) {
+        match n.as_str() {
+            "LEGACY" | "WNS" | "WNS_PATH" | "TNS" | "ENDPOINT_FANIN" | "STARTPOINT_FANOUT" | "LAST_GASP" | "CRIT_VT_SWAP" | "REROUTE" => {}
+            known if is_phase_name(known) => return false,
+            _ => return true,
+        }
+    }
+    true
+}
+
+/// A name `makePolicyForPhase` knows.
+pub fn is_phase_name(name: &str) -> bool {
+    matches!(name, "LEGACY" | "WNS" | "WNS_PATH" | "WNS_CONE" | "TNS" | "ENDPOINT_FANIN" | "STARTPOINT_FANOUT" | "LAST_GASP" | "CRIT_VT_SWAP" | "REROUTE" | "GLOBAL_SIZING" | "PARALLEL_EVAL")
+}
+
+/// `makePolicyForPhase`'s error for a name it does not know (RSZ-0217).
+pub fn unknown_phase_line(name: &str) -> String {
+    format!("[ERROR RSZ-0217] Unknown phase name '{name}'. Valid phase names are: {VALID_PHASES}")
 }
 
 /// `sta::parseTokens(phases)` (space and tab delimited), then the first phase's policy.
@@ -491,7 +510,7 @@ pub fn phase_plan(phases: &str) -> PhasePlan {
     match first {
         "LEGACY" | "WNS" | "WNS_PATH" | "WNS_CONE" | "TNS" | "ENDPOINT_FANIN" | "STARTPOINT_FANOUT" | "LAST_GASP" | "CRIT_VT_SWAP" | "REROUTE" => PhasePlan::LegacyPreamble { startpoints: first == "STARTPOINT_FANOUT" },
         "GLOBAL_SIZING" | "PARALLEL_EVAL" => PhasePlan::Other,
-        _ => PhasePlan::Error { code: "RSZ-0217", line: format!("[ERROR RSZ-0217] Unknown phase name '{first}'. Valid phase names are: {VALID_PHASES}") },
+        _ => PhasePlan::Error { code: "RSZ-0217", line: unknown_phase_line(first) },
     }
 }
 
@@ -996,6 +1015,12 @@ mod tests {
         assert!(phases_modelled("TNS"));
         assert!(phases_modelled("ENDPOINT_FANIN STARTPOINT_FANOUT"));
         assert!(!phases_modelled("WNS_CONE"));
+        // Upstream rule (`Optimizer::run` makes each phase's policy as the loop reaches it): an
+        // unknown name ends the call there (RSZ-0217) after the phases before it ran, so what
+        // follows it is never read. Witness: repair_setup_invalid_phase call 2.
+        assert!(phases_modelled("WNS_PATH BAD_PHASE LAST_GASP"));
+        assert!(phases_modelled("WNS_PATH BAD_PHASE WNS_CONE"));
+        assert!(!phases_modelled("WNS_CONE BAD_PHASE"), "a known unmodelled phase before it still runs");
     }
 
     /// Rule (`dbNetwork::name(Net*)`): the module prefix of the net's first output driver is
