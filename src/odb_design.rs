@@ -1223,6 +1223,10 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
 }
 
 impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
+    fn pending_nets(&self) -> BTreeSet<String> {
+        self.invalid.clone()
+    }
+
     fn steiner_points(&self, root: (i32, i32), sinks: &[(i32, i32)]) -> Option<vyges_rsz::buffered_net::Tree> {
         vyges_rsz::env::steiner_over_points(root, sinks, self.alpha)
     }

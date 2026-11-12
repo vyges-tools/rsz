@@ -7,8 +7,12 @@
 //! diverges from the reference's points at one stage. Modelled so far: `start` (S1), the
 //! target collection of a batch (S2: `collectTargetEndpoints`, `collectTargets`), the targets'
 //! preparation (S3a: `prewarmTargets`, `prepareTargets`), candidate generation and estimation
-//! (S3b/S3c: `generateCandidates`, `estimateTargets`) and the batch (`selectBatch`:
-//! `makeBatchCandidates`, `BatchSelector`). The commit (`commitBatch`) onward is refused.
+//! (S3b/S3c: `generateCandidates`, `estimateTargets`), the batch (`selectBatch`:
+//! `makeBatchCandidates`, `BatchSelector`), and (S4a) its commit (`commitBatch`, each candidate's
+//! `apply`), the timing update, the verdict when the checkpoint accepts the batch
+//! (`saveBatchCheckpoint`), the stop rules and the run's ends, with the work meter and the stall
+//! monitor. A missed batch (salvage, undo, tabu), the small-batch retry, the WNS tail and the
+//! bottleneck weights are refused.
 
 use std::collections::{HashMap, HashSet};
 
@@ -215,8 +219,8 @@ pub fn for_parallel_eval(effort: Effort) -> MtConfig {
     c
 }
 
-/// `StallMonitor`: the batch stage's progress against its stall rules (the rules: S5). Here, what
-/// `reset` and `beginBatch` keep.
+/// `StallMonitor`: the batch stage's progress against its stall rules. The config is the run's
+/// (`ParallelEvalPolicyConfig`), passed to the rules that read it.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct StallMonitor {
     pub initial_tns: f32,
@@ -225,13 +229,31 @@ pub struct StallMonitor {
     pub stalled_moves: i32,
     pub last_batch_moves: i32,
     pub wns_stall_batches: i32,
+    pub window: std::collections::VecDeque<SavedCheckpoint>,
     pub window_stalled: bool,
     pub last_cap: i32,
     pub failing_endpoints: usize,
 }
 
+/// `StallMonitor::SavedCheckpoint`: one saved batch in the stall window.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SavedCheckpoint {
+    pub wns: f32,
+    pub failing_endpoints: usize,
+    pub work: f64,
+}
+
+/// `StallMonitor::Stall`, its printed value the enumerator's index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stall {
+    None = 0,
+    Moves = 1,
+    Batches = 2,
+}
+
 impl StallMonitor {
-    /// `reset(initial_tns, reference_period)`.
+    /// `reset(initial_tns, reference_period)`: the counters and the window cleared; the last cap
+    /// and failing endpoint count (`beginBatch`'s) kept.
     pub fn reset(&mut self, initial_tns: f32, reference_period: f32) {
         *self = StallMonitor { initial_tns, reference_period, last_cap: self.last_cap, failing_endpoints: self.failing_endpoints, ..StallMonitor::default() };
     }
@@ -240,6 +262,135 @@ impl StallMonitor {
     pub fn begin_batch(&mut self, batch_cap: i32, failing_endpoints: usize) {
         self.last_cap = batch_cap;
         self.failing_endpoints = failing_endpoints;
+    }
+
+    /// `endBatch(committed_moves)`.
+    pub fn end_batch(&mut self, committed_moves: i32) {
+        self.last_batch_moves = committed_moves;
+    }
+
+    /// `onSaved(prev_tns, best_wns, wns, tns, work)`: progress is a WNS gain over the best
+    /// checkpoint past `progress_wns_period_pct` of the reference period, or a TNS gain over the
+    /// previous checkpoint past `progress_tns_pct` of |initial TNS|. The window takes the save;
+    /// WNS stalls count while WNS does not progress; without progress the batch and its moves
+    /// count as stalled (a salvaged batch counts twice). Returns the stalled moves after the
+    /// save (the profiler event `stall_moves_after_save`).
+    pub fn on_saved(&mut self, cfg: &ParallelEvalConfig, prev_tns: f32, best_wns: f32, wns: f32, tns: f32, work: f64) -> i32 {
+        let tns_step = self.initial_tns.abs() * cfg.progress_tns_pct / 100.0;
+        let wns_step = self.reference_period * cfg.progress_wns_period_pct / 100.0;
+        let wns_progressed = wns - best_wns > wns_step;
+        let tns_progressed = tns - prev_tns > tns_step;
+        let progressed = wns_progressed || tns_progressed;
+        self.update_window(cfg, wns, tns_progressed, work);
+        self.wns_stall_batches = if wns_progressed { 0 } else { self.wns_stall_batches + 1 };
+        self.stalled_batches = if progressed { 0 } else { self.stalled_batches + 1 };
+        self.stalled_moves = if progressed { 0 } else { self.stalled_moves + self.last_batch_moves };
+        self.last_batch_moves = 0;
+        self.stalled_moves
+    }
+
+    /// `weightsPriority`: WNS stalled, for at most `bottleneck_max_wns_stall_batches` saves.
+    pub fn weights_priority(&self, cfg: &ParallelEvalConfig) -> bool {
+        self.wns_stall_batches > 0 && self.wns_stall_batches <= cfg.priority.bottleneck_max_wns_stall_batches
+    }
+
+    /// `stall`: the stalled moves reach the move budget, else the stalled batches reach
+    /// `stall_max_batches`.
+    pub fn stall(&self, cfg: &ParallelEvalConfig) -> Stall {
+        if self.stalled_moves >= self.move_budget(cfg) {
+            return Stall::Moves;
+        }
+        if self.stalled_batches >= cfg.stall_max_batches {
+            return Stall::Batches;
+        }
+        Stall::None
+    }
+
+    /// `moveBudget`: `stall_batches` batches at the larger of the configured and the last cap.
+    pub fn move_budget(&self, cfg: &ParallelEvalConfig) -> i32 {
+        cfg.stall_batches * cfg.min_batch_cap.max(self.last_cap)
+    }
+
+    /// `updateWindow`: the save goes on the window; once it holds more than `stall_window` the
+    /// oldest drops, and — unless TNS progressed, or the window spent less than
+    /// `stall_window_min_work` — the window stalls when neither the average WNS gain per interval
+    /// reaches `stall_wns_period_pct` of the reference period nor the failing endpoints fall by
+    /// `stall_failing_endpoint_pct` of the last count per interval.
+    fn update_window(&mut self, cfg: &ParallelEvalConfig, wns: f32, tns_progressed: bool, work: f64) {
+        self.window.push_back(SavedCheckpoint { wns, failing_endpoints: self.failing_endpoints, work });
+        if self.window.len() as i32 <= cfg.stall_window {
+            return;
+        }
+        self.window.pop_front();
+        if tns_progressed {
+            return;
+        }
+        let (Some(&first), Some(&last)) = (self.window.front(), self.window.back()) else { return };
+        if last.work - first.work < f64::from(cfg.stall_window_min_work) {
+            return;
+        }
+        let intervals = (self.window.len() - 1) as f32;
+        let wns_gain = (last.wns - first.wns) / intervals;
+        let failing_endpoint_gain = first.failing_endpoints as f32 - last.failing_endpoints as f32;
+        let wns_moving = wns_gain >= self.reference_period * cfg.stall_wns_period_pct / 100.0;
+        let failing_endpoints_moving = failing_endpoint_gain / intervals >= cfg.stall_failing_endpoint_pct / 100.0 * last.failing_endpoints as f32;
+        if !wns_moving && !failing_endpoints_moving {
+            self.window_stalled = true;
+            pe_event("stall_window_triggered", "", "", 1);
+        }
+    }
+}
+
+/// `WorkMeter`: the batch stage's work in seconds from counts — timing updates times the graph's
+/// vertices, the nets each update re-estimates, the estimates, the rebuffer plans, the endpoints
+/// evaluated — times the config's weights. No wall clock, so the stall and tail budgets are
+/// portable.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WorkMeter {
+    pub vertices: f64,
+    pub timing_updates: u64,
+    pub pending_nets: u64,
+    pub estimates: u64,
+    pub plan_requests: u64,
+    pub endpoints: u64,
+}
+
+impl WorkMeter {
+    /// `reset(graph_vertices)`.
+    pub fn reset(&mut self, graph_vertices: usize) {
+        *self = WorkMeter { vertices: graph_vertices as f64, ..WorkMeter::default() };
+    }
+
+    /// `addTimingUpdate(pending_nets)`.
+    pub fn add_timing_update(&mut self, pending_nets: usize) {
+        self.timing_updates += 1;
+        self.pending_nets += pending_nets as u64;
+        pe_event("work_timing_updates", "", "", 1);
+        pe_event("work_pending_nets", "", "", pending_nets);
+    }
+
+    /// `addEstimates(estimates)`.
+    pub fn add_estimates(&mut self, estimates: usize) {
+        self.estimates += estimates as u64;
+    }
+
+    /// `addPlanRequest`.
+    pub fn add_plan_request(&mut self) {
+        self.plan_requests += 1;
+    }
+
+    /// `addEndpoints(endpoints)`.
+    pub fn add_endpoints(&mut self, endpoints: usize) {
+        self.endpoints += endpoints as u64;
+    }
+
+    /// `seconds(config)`, in double as the reference computes it.
+    pub fn seconds(&self, cfg: &ParallelEvalConfig) -> f64 {
+        f64::from(cfg.work_sta_per_vertex) * self.vertices * self.timing_updates as f64
+            + f64::from(cfg.work_per_pending_net) * self.pending_nets as f64
+            + f64::from(cfg.work_per_estimate) * self.estimates as f64
+            + f64::from(cfg.work_per_plan) * self.plan_requests as f64
+            + f64::from(cfg.work_per_endpoint) * self.endpoints as f64
     }
 }
 
@@ -318,6 +469,9 @@ pub struct Candidate {
     pub estimate: Estimate,
     pub desc: String,
     pub impact: MoveImpact,
+    /// A RebufferMt candidate's tree plan (`plan_`): the planner's arena as planning left it and
+    /// the plan's root, which its `apply` exports. None for every other move.
+    pub tree: Option<(std::sync::Arc<Vec<crate::rebuffer::Node>>, usize)>,
 }
 
 /// `Estimate`: legality, the score the batch ranks by, and the parts the printer shows.
@@ -632,7 +786,15 @@ pub struct ParallelEval {
     pub reference_period: f32,
     pub graph_vertices: usize,
     pub converged: bool,
+    /// `markRunComplete`'s result (`result_`).
+    pub result: bool,
     pub stall: StallMonitor,
+    pub work: WorkMeter,
+    /// `batch_instances_`: the committed batch's targets' instances by name, read before each
+    /// move (`InstanceRecord`).
+    pub batch_instances: Vec<String>,
+    /// `batch_swaps_`: the batch's single-instance size and VT swaps a salvage can revert.
+    pub batch_swaps: Vec<SwapRecord>,
     /// `critPathLoadPins`: every load pin on a collected worst path.
     pub crit_path_load_pins: HashSet<String>,
     /// The phase's progress-row marker (`phaseMarkerForIndex`).
@@ -664,11 +826,32 @@ impl ParallelEval {
             reference_period: 0.0,
             graph_vertices: 0,
             converged: false,
+            result: false,
             stall: StallMonitor::default(),
+            work: WorkMeter::default(),
+            batch_instances: Vec::new(),
+            batch_swaps: Vec::new(),
             crit_path_load_pins: HashSet::new(),
             marker,
         }
     }
+}
+
+/// `SwapRecord`: a committed size or VT swap — its evaluation, its instance and the cell it
+/// replaced (the location is the instance's own: a swap does not move it).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SwapRecord {
+    pub evaluation_index: usize,
+    pub inst: String,
+    pub before_cell: String,
+}
+
+/// `MoveResult` of a candidate's `apply`: accepted, the move count and the touched instances.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ApplyResult {
+    pub accepted: bool,
+    pub move_count: i64,
+    pub touched: Vec<String>,
 }
 
 /// `selectMoveSequence`'s exclusion: BufferToInverters has no gain estimate to rank it; Clone,
@@ -811,6 +994,7 @@ impl Repair<'_, '_> {
         pe.reference_period = reference_period(self.ctx.ssdc, pe.checkpoint_wns);
         pe.stall.reset(pe.checkpoint_tns, pe.reference_period);
         pe.graph_vertices = self.pe_graph_vertices()?;
+        pe.work.reset(pe.graph_vertices);
         self.debug("repair_setup", 1, format!("PARALLEL_EVAL reference clock period {:.3e}", pe.reference_period));
         Ok(())
     }
@@ -822,35 +1006,432 @@ impl Repair<'_, '_> {
         super::timed_all(ctx, self.design.as_design(), &mut self.timer, edits, |gs, _, _| Ok(gs[0].vertices.len()))
     }
 
-    /// `iterate`: one batch. Collect, weigh, evaluate; then commit, judge, stop (S3 onward: not
-    /// modelled).
+    /// `iterate`: one batch. Collect, weigh, evaluate; then commit, judge, stop.
     fn pe_iterate(&mut self, pe: &mut ParallelEval) -> Result<(), Stop> {
+        pe_trace(&format!("VYGP|iter|{}|converged={}\n", pe.batch_index, u8::from(pe.converged)));
         if pe.converged {
             return Ok(());
         }
+        // `tabu_.expire(batch_index_)`: the tabu list fills only on an undo, which is refused.
         if self.pe_finish_if_no_setup_violations(pe)? || pe_finish_at_max_area() {
             return Ok(());
         }
         let scope = self.pe_collect_target_endpoints(pe)?;
-        // `analyzeBottlenecks`: the weights apply only while saved batches stall WNS, which no
-        // batch before the first commit does.
-        if pe.stall.wns_stall_batches > 0 {
-            return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: analyzeBottlenecks is not modelled".into()));
-        }
+        pe_analyze_bottlenecks(pe)?;
+        let pre_batch_wns = self.timing.worst().0;
+        pe_trace(&format!("VYGP|prewns|{}|{}\n", pe.batch_index, e9(pre_batch_wns)));
         let pool = self.pe_evaluate_targets(pe, scope)?;
         if pool.targets.is_empty() {
-            return Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: a batch without targets (finishWithoutTargets) is not modelled".into()));
+            self.pe_finish_without_targets(pe)?;
+            return Ok(());
         }
-        Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: the batch commit (commitBatch onward) is not modelled".into()))
+        self.pe_open_batch_journal(pe)?;
+        let batch_moves = self.pe_commit_batch(pe, &pool.targets, &pool.evaluations, &pool.selection)?;
+        pe_trace(&format!("VYGP|cmoves|{}|{batch_moves}|committed={}|tentative={}\n", pe.batch_index, pe.committed_moves, pe.tentative_moves));
+        if batch_moves > 0 {
+            self.pe_update_timing(pe)?;
+        }
+        pe.batch_index += 1;
+        self.pe_judge_batch(pe, batch_moves)?;
+        self.pe_apply_stop_rules(pe, batch_moves)?;
+        self.pe_print_tracker_batch_summary(pe)?;
+        pe.batch_swaps.clear();
+        Ok(())
     }
 
-    /// `finishIfNoSetupViolations`: WNS at or above the margin ends the run (its `finish`: not
-    /// modelled).
-    fn pe_finish_if_no_setup_violations(&mut self, _pe: &mut ParallelEval) -> Result<bool, Stop> {
-        if fuzzy::less(self.timing.worst().0, self.ctx.margin) {
+    /// `judgeBatch`: the QoR after the batch, the stall monitor's batch end, and the verdict — a
+    /// batch the checkpoint accepts is saved. A missed batch (`noteMissedBatch`, the salvage,
+    /// `settleMissedBatch`) is not modelled.
+    fn pe_judge_batch(&mut self, pe: &mut ParallelEval, batch_moves: i32) -> Result<bool, Stop> {
+        let (wns, tns) = self.pe_measure_qor();
+        pe.stall.end_batch(batch_moves);
+        let utilization_legal = pe_within_max_utilization();
+        pe_trace(&format!(
+            "VYGP|judge|{}|wns={}|tns={}|ck_wns={}|ck_tns={}|best={}|tol={}|util={}\n",
+            pe.batch_index,
+            e9(wns),
+            e9(tns),
+            e9(pe.checkpoint_wns),
+            e9(pe.checkpoint_tns),
+            e9(pe.best_checkpoint_wns),
+            e9(pe_checkpoint_wns_tolerance(pe)),
+            u8::from(utilization_legal)
+        ));
+        if utilization_legal && pe_accepts_batch(pe, wns, tns) {
+            if !fuzzy::less(pe.checkpoint_wns, wns) {
+                pe_event("checkpoints_saved_wns_tolerance", "", "", 1);
+            }
+            pe_trace(&format!("VYGP|verdict|{}|save\n", pe.batch_index));
+            self.pe_save_batch_checkpoint(pe, wns, tns)?;
+            return Ok(true);
+        }
+        Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -phases PARALLEL_EVAL: a missed batch (noteMissedBatch, salvageMissedBatch, settleMissedBatch) is not modelled (batch {})", pe.batch_index)))
+    }
+
+    /// `measureQor`: the collector's worst slack and TNS.
+    fn pe_measure_qor(&self) -> (f32, f32) {
+        (self.timing.worst().0, self.timing.tns())
+    }
+
+    /// `finishIfNoSetupViolations`: WNS at or above the margin ends the run, an open journal
+    /// saved first; the run complete with result true.
+    fn pe_finish_if_no_setup_violations(&mut self, pe: &mut ParallelEval) -> Result<bool, Stop> {
+        let (wns, tns) = self.pe_measure_qor();
+        if fuzzy::less(wns, self.ctx.margin) {
             return Ok(false);
         }
-        Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL with no setup violation (finish): not modelled".into()))
+        if pe.batch_journal_open {
+            self.pe_save_batch_checkpoint(pe, wns, tns)?;
+        }
+        pe_trace(&format!("VYGP|end|{}|no_setup_violations|journal={}\n", pe.batch_index, u8::from(pe.batch_journal_open)));
+        pe_stop("no_setup_violations");
+        pe_mark_run_complete(pe, true);
+        Ok(true)
+    }
+
+    /// `stopAtCheckpoint(reason)`: the open batch undone (no tail runs), the run complete with
+    /// result false.
+    fn pe_stop_at_checkpoint(&mut self, pe: &mut ParallelEval, reason: &str) -> Result<(), Stop> {
+        pe_trace(&format!("VYGP|end|{}|{reason}|at_checkpoint\n", pe.batch_index));
+        pe_stop(reason);
+        self.pe_restore_batch_checkpoint(pe)?;
+        pe_mark_run_complete(pe, false);
+        Ok(())
+    }
+
+    /// `finishWithoutTargets`.
+    fn pe_finish_without_targets(&mut self, pe: &mut ParallelEval) -> Result<(), Stop> {
+        pe_trace(&format!("VYGP|end|{}|no_targets\n", pe.batch_index));
+        pe_stop("no_targets");
+        self.pe_restore_batch_checkpoint(pe)?;
+        pe_mark_run_complete(pe, false);
+        Ok(())
+    }
+
+    /// `openBatchJournal`: the committer's journal begun once per open batch run.
+    fn pe_open_batch_journal(&mut self, pe: &mut ParallelEval) -> Result<(), Stop> {
+        if !pe.batch_journal_open {
+            self.begin_journal()?;
+            pe.batch_journal_open = true;
+        }
+        Ok(())
+    }
+
+    /// `commitBatch(evaluations, selection)`: each selected evaluation's best candidate in
+    /// selection order — its instance's name read before the move, the swap remembered, the
+    /// candidate committed (`MoveCommitter::commit`: `apply`, then the result recorded in the
+    /// open level); an accepted move keeps its record, its swap when the move touched only its
+    /// instance once, and is tracked as an attempt after the apply.
+    fn pe_commit_batch(&mut self, pe: &mut ParallelEval, targets: &[Target], evaluations: &[TargetEvaluation], selection: &BatchSelection) -> Result<i32, Stop> {
+        let mut batch_moves = 0;
+        pe.batch_instances.clear();
+        pe.batch_swaps.clear();
+        for &evaluation_index in &selection.evaluation_indices {
+            let evaluation = &evaluations[evaluation_index];
+            let Some(candidate) = evaluation.best_candidate() else { continue };
+            let target = &targets[evaluation_index];
+            let record = target.inst.clone();
+            let swap = pe_record_swap(candidate, target, evaluation_index);
+            let result = self.pe_commit(candidate, target)?;
+            let front = result.touched.first().is_some_and(|i| *i == target.inst);
+            let keep = swap.is_some() && result.move_count == 1 && result.touched.len() == 1 && front;
+            pe_trace(&format!(
+                "VYGP|cmt|{}|{evaluation_index}|{}|{record}|accepted={}|moves={}|touched={}|front={}|swap={}|kept={}\n",
+                pe.batch_index,
+                candidate.kind.name(),
+                u8::from(result.accepted),
+                result.move_count,
+                result.touched.len(),
+                u8::from(front),
+                u8::from(swap.is_some()),
+                u8::from(result.accepted && keep)
+            ));
+            if !result.accepted {
+                continue;
+            }
+            pe.batch_instances.push(record);
+            if let (true, Some(swap)) = (keep, swap) {
+                pe.batch_swaps.push(swap);
+            }
+            if self.tracker_level() >= 2 {
+                self.trk_set_current_endpoint(&target.endpoint_pin)?;
+                self.trk_attempt(&target.driver_pin, candidate.kind)?;
+            }
+            batch_moves += 1;
+            pe.committed_moves += 1;
+            pe.tentative_moves += 1;
+        }
+        Ok(batch_moves)
+    }
+
+    /// `MoveCommitter::commit(candidate)`: `apply`, then an accepted result recorded and kept in
+    /// the open journal level.
+    fn pe_commit(&mut self, candidate: &Candidate, target: &Target) -> Result<ApplyResult, Stop> {
+        let result = self.pe_apply(candidate, target)?;
+        if result.accepted {
+            self.commit(super::MoveResult { kind: pe_result_type(candidate.kind), count: result.move_count, insts: result.touched.clone() });
+        }
+        Ok(result)
+    }
+
+    /// The candidates' `apply`, per move (`*MtCandidate::apply`).
+    fn pe_apply(&mut self, c: &Candidate, target: &Target) -> Result<ApplyResult, Stop> {
+        let accepted = |touched: String, move_count: i64| ApplyResult { accepted: true, move_count, touched: vec![touched] };
+        let rejected = ApplyResult::default();
+        match c.kind {
+            // SizeUpMtCandidate: the max-capacitance check again on the state the batch has made
+            // (a REJECT), then `replaceCell`.
+            Move::SizeUp => {
+                if !self.pe_replacement_preserves_max_cap(target, &c.desc)? {
+                    self.debug("opt_moves", 1, format!("REJECT size_up_mt {}: {} -> {} max-cap re-check failed", target.driver_pin, target.cell, c.desc));
+                    return Ok(rejected);
+                }
+                self.design.swap_master(&target.inst, &c.desc).map_err(|e| Stop::error("RSZ-REPLACE", e))?;
+                self.debug("opt_moves", 1, format!("ACCEPT size_up_mt {}: {} -> {}", target.driver_pin, target.cell, c.desc));
+                Ok(accepted(target.inst.clone(), 1))
+            }
+            // VtSwapMtCandidate: `replaceCell`.
+            Move::VtSwap => {
+                self.design.swap_master(&target.inst, &c.desc).map_err(|e| Stop::error("RSZ-REPLACE", e))?;
+                self.debug("opt_moves", 1, format!("ACCEPT vt_swap_mt {}: {} -> {}", target.driver_pin, target.cell, c.desc));
+                Ok(accepted(target.inst.clone(), 1))
+            }
+            // SwapPinsMtCandidate: the ACCEPT line, then `swapPins(driver, input, swap port)`.
+            Move::SwapPins => {
+                let Some(input) = &target.swap_pins_input else { return Err(Stop::error("RSZ-SWAP", format!("{}: a SwapPins candidate without its input", target.driver_pin))) };
+                self.debug("swap_pins_move", 1, format!("ACCEPT SwapPinsMove {}: Cell {}, pins {} <-> {}", target.driver_pin, target.cell, input.input_port, c.desc));
+                match self.design.swap_pins(&target.inst, &input.input_port, &c.desc).map_err(|e| Stop::error("RSZ-SWAP", e))? {
+                    super::PinSwap::DontTouch(_) => Ok(rejected),
+                    super::PinSwap::Swapped | super::PinSwap::NoNet => Ok(accepted(target.inst.clone(), 1)),
+                }
+            }
+            // UnbufferMtCandidate: `removeBuffer(buffer)`.
+            Move::Unbuffer => {
+                self.pe_remove_buffer(&target.inst, &target.cell)?;
+                Ok(accepted(target.inst.clone(), 1))
+            }
+            // SizeDownFanoutMtCandidate: the load's `replaceCell` to the step down.
+            Move::SizeDownFanout => {
+                let Some(load) = target.size_down_fanout_loads.iter().find(|l| format!("{}/{}", l.pin, if l.step_down.cell.is_empty() { "-" } else { &l.step_down.cell }) == c.desc) else {
+                    return Err(Stop::error("RSZ-REPLACE", format!("{}: SizeDownFanout candidate {} without its load", target.driver_pin, c.desc)));
+                };
+                self.design.swap_master(&load.inst, &load.step_down.cell).map_err(|e| Stop::error("RSZ-REPLACE", e))?;
+                self.debug("size_down_fanout_move", 3, format!("ACCEPT SizeDownFanoutMove {} -> {}: ({} -> {}) slack={}", target.driver_pin, load.pin, load.cell, load.step_down.cell, crate::repair_timing::delay_as_string(load.load_slack, 3, self.ctx.time_scale)));
+                Ok(accepted(load.inst.clone(), 1))
+            }
+            // SplitLoadMtCandidate: a buffer before a copy of the loads, then its resize to the
+            // target slew (the insertion invalidates both nets).
+            Move::SplitLoad => {
+                let Some(input) = &target.split_load_input else { return Err(Stop::error("RSZ-INSERT", format!("{}: a SplitLoad candidate without its input", target.driver_pin))) };
+                let rep = match self.design.insert_buffer_before_loads(Some(&input.drvr_net), &input.load_pins, &input.buffer_cell, input.drvr_loc, "split", false, "IF_NEEDED") {
+                    Ok(r) => r,
+                    Err(_) => {
+                        self.debug("split_load_move", 2, format!("REJECT SplitLoadMove {}: Couldn't insert buffer", target.driver_pin));
+                        return Ok(rejected);
+                    }
+                };
+                self.debug("split_load_move", 1, format!("ACCEPT SplitLoadMove {}: Inserted buffer {}", target.driver_pin, rep.inst));
+                let cell = input.buffer_cell.clone();
+                self.resize_to_target_slew(&rep, &cell)?;
+                Ok(accepted(rep.inst, 1))
+            }
+            // RebufferMtCandidate: `applyRebufferTreePlan(plan, "rebuffer_mt")` (exportBufferTree
+            // on the driver's flat net); accepted when it inserted any buffer, touching the driver.
+            Move::Buffer => {
+                let Some((nodes, root)) = c.tree.clone() else { return Err(Stop::error("RSZ-REBUFFER", format!("{}: a RebufferMt candidate without its tree", target.driver_pin))) };
+                pe_event("buffer_tree_apply_requests", "", "", 1);
+                let d = self.design.as_design();
+                let Some(net) = d.netlist().nets.iter().find(|n| n.pins.iter().any(|p| d.netlist().pin_name(p) == target.driver_pin)).map(|n| n.name.clone()) else { return Ok(rejected) };
+                let (mut net, mut count, mut inputs, mut loads) = (net, 0i64, HashMap::new(), Vec::new());
+                self.export_buffer_tree(&nodes, root, &mut net, &mut loads, &mut count, &mut inputs, "rebuffer_mt")?;
+                if count <= 0 {
+                    self.debug("rebuffer_mt", 1, format!("REJECT rebuffer_mt {}: exportBufferTree failed", target.driver_pin));
+                    return Ok(rejected);
+                }
+                Ok(accepted(target.inst.clone(), count))
+            }
+            other => Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -phases PARALLEL_EVAL: the apply of {} is not modelled", other.name()))),
+        }
+    }
+
+    /// `Resizer::replacementPreservesMaxCap(inst, replacement, mode)` at the apply, on the state
+    /// the batch has made: for each input pin of the instance with drivers — a register clock
+    /// pin of an ideal clock and a scan pin skipped — a capacitance growth must fit every
+    /// driver's `maxCapIncrease` (`checkCapacitance` over the scenes now). While no earlier move
+    /// of the batch edited one of the instance's fanin nets, nothing it reads changed since
+    /// `prepareInputCapBudgets`, whose stricter budgets the candidate already passed: true. Else
+    /// the timer is asked on the edits so far (the reference's never rejects in the corpus: the
+    /// reject branch is unwitnessed).
+    fn pe_replacement_preserves_max_cap(&mut self, target: &Target, replacement: &str) -> Result<bool, Stop> {
+        let edited = self.design.pending_nets();
+        let nl = self.design.as_design().netlist();
+        let fanin_edited = nl.nets.iter().any(|n| edited.contains(&n.name) && n.pins.iter().any(|p| matches!(p, vyges_sta::netlist::Conn::Inst(k, _) if nl.insts[*k].0 == target.inst)));
+        if !fanin_edited {
+            return Ok(true);
+        }
+        let ctx = self.ctx;
+        let (Some(current), Some(rep)) = (ctx.libs.link_cell(&target.cell), ctx.libs.link_cell(replacement)) else { return Ok(true) };
+        let inst = target.inst.clone();
+        let edits = self.design.take_timer_edits();
+        let design = self.design.as_design();
+        super::timed_all(ctx, design, &mut self.timer, edits, |gs, _, _| {
+            let g = &gs[0];
+            let sc = crate::timing::Scenes::new(gs);
+            let parasitics: Vec<&HashMap<String, vyges_sta::graph::NetParasitics>> = (0..gs.len()).map(|k| design.parasitics(k)).collect();
+            let ideal: std::collections::BTreeSet<usize> = g.ideal_clock.iter().copied().collect();
+            for (u, ux) in g.vertices.iter().enumerate() {
+                if ux.is_driver || !matches!(&ux.conn, vyges_sta::netlist::Conn::Inst(k, _) if g.netlist.insts[*k].0 == inst) {
+                    continue;
+                }
+                let Some(port) = ux.port.as_deref() else { continue };
+                if !current.port(port).is_some_and(|p| matches!(p.direction, vyges_sta::liberty::Direction::Input | vyges_sta::liberty::Direction::Bidirect)) {
+                    continue;
+                }
+                let reg_clk = current.arc_sets.iter().any(|a| a.from == port && matches!(a.role, vyges_sta::liberty::Role::RegClkToQ | vyges_sta::liberty::Role::LatchEnToQ));
+                if super::max_cap_skips_pin(reg_clk, Some(ideal.contains(&u))) || super::is_scan_pin(current, port) {
+                    continue;
+                }
+                let cap_delta = super::input_pin_capacitance(rep, port) - super::input_pin_capacitance(current, port);
+                if cap_delta <= 0.0 {
+                    continue;
+                }
+                for d in crate::timing::net_drivers(g, u) {
+                    let (cap, max_cap, slack, limited, _) = crate::timing::check_capacitance(&sc, d, &parasitics, &ideal, ctx.limits);
+                    if cap_delta > super::max_cap_increase(cap, max_cap, slack, limited) {
+                        return Ok(false);
+                    }
+                }
+            }
+            Ok(true)
+        })
+    }
+
+    /// `Resizer::removeBuffer(buffer)` as the serial Unbuffer applies it: its debug lines, the
+    /// nets named as they stand before the removal.
+    fn pe_remove_buffer(&mut self, inst: &str, cell: &str) -> Result<(), Stop> {
+        let Some((i, o)) = self.ctx.libs.link_cell(cell).and_then(|c| c.buffer_ports()).map(|(i, o)| (i.name.clone(), o.name.clone())) else {
+            return Err(Stop::error("RSZ-0168", format!("{inst}: {cell} has no buffer ports")));
+        };
+        self.debug("repair_setup", 3, format!("remove_buffer {inst} ({cell})"));
+        let (in_name, out_name) = (self.net_display_name(inst, &i), self.net_display_name(inst, &o));
+        let removed = self.design.remove_buffer(inst, &i, &o).map_err(|e| Stop::error("RSZ-0168", e))?;
+        let h = self.ctx.hierarchy;
+        let in_name = in_name.unwrap_or_else(|| crate::repair_timing::network_name(&removed.in_net, h).to_string());
+        let out_name = out_name.unwrap_or_else(|| crate::repair_timing::network_name(&removed.out_net, h).to_string());
+        self.debug("remove_buffer", 1, format!("remove_buffer {in_name} (input net) - {inst} ({cell}) - {out_name} (output net)"));
+        Ok(())
+    }
+
+    /// `noteTimingUpdate`: the work meter's timing update with the estimator's pending nets.
+    fn pe_note_timing_update(&mut self, pe: &mut ParallelEval) {
+        let pending = self.design.pending_nets().len();
+        pe.work.add_timing_update(pending);
+    }
+
+    /// `updateTiming`: `noteTimingUpdate`, then `updateParasiticsAndTiming`.
+    fn pe_update_timing(&mut self, pe: &mut ParallelEval) -> Result<(), Stop> {
+        self.pe_note_timing_update(pe);
+        self.retime(&[])
+    }
+
+    /// `saveBatchCheckpoint(wns, tns)`: the open journal committed (timing is current), the
+    /// stall monitor's save with the work so far, the checkpoint and the best WNS moved, the
+    /// tentative moves and the misses cleared.
+    fn pe_save_batch_checkpoint(&mut self, pe: &mut ParallelEval, wns: f32, tns: f32) -> Result<(), Stop> {
+        pe_trace(&format!("VYGP|ckpt|{}|wns={}|tns={}|journal={}\n", pe.batch_index, e9(wns), e9(tns), u8::from(pe.batch_journal_open)));
+        pe_event("checkpoints_saved", "", "", 1);
+        if pe.batch_journal_open {
+            self.commit_journal()?;
+            pe.batch_journal_open = false;
+        }
+        let cfg = pe.config.parallel_eval;
+        let work = pe.work.seconds(&cfg);
+        let stalled = pe.stall.on_saved(&cfg, pe.checkpoint_tns, pe.best_checkpoint_wns, wns, tns, work);
+        pe_event("stall_moves_after_save", "", "", stalled.max(0) as usize);
+        pe.checkpoint_wns = wns;
+        pe.checkpoint_tns = tns;
+        pe.best_checkpoint_wns = pe.best_checkpoint_wns.max(wns);
+        pe.tentative_moves = 0;
+        pe.checkpoint_misses = 0;
+        Ok(())
+    }
+
+    /// `restoreBatchCheckpoint`: an open journal rolled back, after the work meter's update.
+    fn pe_restore_batch_checkpoint(&mut self, pe: &mut ParallelEval) -> Result<(), Stop> {
+        if !pe.batch_journal_open {
+            return Ok(());
+        }
+        pe_trace(&format!("VYGP|restore|{}|tentative={}\n", pe.batch_index, pe.tentative_moves));
+        pe_event("checkpoints_restored", "", "", 1);
+        self.pe_note_timing_update(pe);
+        self.pe_roll_back_journal(pe)
+    }
+
+    /// `rollBackJournal`: the committer's restore (the design area is read live here, so
+    /// `recountDesignAreaAfterUndo` has nothing to do), the tentative moves uncounted.
+    fn pe_roll_back_journal(&mut self, pe: &mut ParallelEval) -> Result<(), Stop> {
+        self.restore_journal(&[])?;
+        pe.batch_journal_open = false;
+        pe.committed_moves -= pe.tentative_moves;
+        pe.tentative_moves = 0;
+        Ok(())
+    }
+
+    /// `applyStopRules(batch_moves)`: no violation left finishes; `-max_iterations` stops at the
+    /// checkpoint; then (no tail runs) no committed move, a stalled window, a stall, or the
+    /// misses at their limit end the batches (`startTailOrFinish`).
+    fn pe_apply_stop_rules(&mut self, pe: &mut ParallelEval, batch_moves: i32) -> Result<(), Stop> {
+        let cfg = pe.config.parallel_eval;
+        let stall = pe.stall.stall(&cfg);
+        pe_trace(&format!("VYGP|rule|{}|moves={batch_moves}|misses={}|stall={}|window={}|tail=0|committed={}\n", pe.batch_index, pe.checkpoint_misses, stall as i32, u8::from(pe.stall.window_stalled), pe.committed_moves));
+        if self.pe_finish_if_no_setup_violations(pe)? {
+            return Ok(());
+        }
+        if self.args.max_iterations > 0 && i64::from(pe.batch_index) >= self.args.max_iterations {
+            return self.pe_stop_at_checkpoint(pe, "max_iterations");
+        }
+        if batch_moves == 0 {
+            return self.pe_start_tail_or_finish(pe, "no_committed_moves");
+        }
+        if pe.stall.window_stalled {
+            return self.pe_start_tail_or_finish(pe, "stalled_window");
+        }
+        match stall {
+            Stall::Moves => return self.pe_start_tail_or_finish(pe, "stalled_moves"),
+            Stall::Batches => return self.pe_start_tail_or_finish(pe, "stalled_batches"),
+            Stall::None => {}
+        }
+        if pe.checkpoint_misses >= cfg.max_checkpoint_misses {
+            return self.pe_start_tail_or_finish(pe, "max_checkpoint_misses");
+        }
+        Ok(())
+    }
+
+    /// `startTailOrFinish(reason)`: a run that kept no move retries with small batches first
+    /// (not modelled); else the WNS tail (not modelled) when its config allows one; else the run
+    /// ends, complete with result false.
+    fn pe_start_tail_or_finish(&mut self, pe: &mut ParallelEval, reason: &str) -> Result<(), Stop> {
+        pe_trace(&format!("VYGP|end|{}|{reason}|tail_or_finish|retry_started={}|committed={}\n", pe.batch_index, u8::from(pe.small_batch_retry_started), pe.committed_moves));
+        if !pe.small_batch_retry_started && pe.committed_moves == 0 {
+            return Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -phases PARALLEL_EVAL: the small-batch retry (startSmallBatchRetry, after {reason}) is not modelled")));
+        }
+        // `WnsTail::start`: refused with no tail endpoints configured (it starts once per run).
+        if pe.config.parallel_eval.wns_tail_endpoints > 0 {
+            return Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -phases PARALLEL_EVAL: the WNS tail (startWnsTail, after {reason}) is not modelled")));
+        }
+        pe_trace(&format!("VYGP|end|{}|{reason}|finish\n", pe.batch_index));
+        pe_stop(reason);
+        pe_mark_run_complete(pe, false);
+        Ok(())
+    }
+
+    /// `printTrackerBatchSummary`: the tracker's batch summary and endpoint profile once the
+    /// journal is closed (the verdict saved or undid the batch).
+    fn pe_print_tracker_batch_summary(&mut self, pe: &ParallelEval) -> Result<(), Stop> {
+        if !pe.batch_journal_open {
+            self.trk_phase_summary("PARALLEL_EVAL Batch Summary", Some("PARALLEL_EVAL Batch Endpoint Profiler"))?;
+        }
+        Ok(())
     }
 
     /// `collectTargetEndpoints`: the collector re-initialized, the progress row (every batch
@@ -866,7 +1447,7 @@ impl Repair<'_, '_> {
         }
         let failing_endpoint_count = self.collector_violating;
         let target_endpoints = failing_endpoint_count.min(pe.max_end_repairs);
-        let batch_cap = pe_effective_batch_cap(pe, failing_endpoint_count);
+        let batch_cap = pe_effective_batch_cap(pe, target_endpoints);
         pe.stall.begin_batch(batch_cap, failing_endpoint_count);
         let mut t = format!("VYGP|scope|{}|fep={failing_endpoint_count}|target_endpoints={target_endpoints}|cap={batch_cap}\n", pe.batch_index);
         for (i, (pin, slack)) in self.collector_ends.iter().enumerate() {
@@ -957,7 +1538,7 @@ impl Repair<'_, '_> {
             }
             pe_event("batch_eval_chunks_extended", "", "", 1);
         }
-        // `work_.addEndpoints`: the work meter feeds the stall and tail budgets (not modelled).
+        pe.work.add_endpoints(next_endpoint);
         pe_event("batch_endpoints_evaluated", "", "", next_endpoint);
         if !pool.targets.is_empty() {
             pe_record_selection(&pool);
@@ -1143,15 +1724,78 @@ impl Repair<'_, '_> {
 }
 
 /// `effectiveBatchCap` before the tail and the small-batch retry (S5): `adaptiveBatchSize`.
-fn pe_effective_batch_cap(pe: &ParallelEval, failing_endpoint_count: usize) -> i32 {
+fn pe_effective_batch_cap(pe: &ParallelEval, target_endpoints: usize) -> i32 {
     let cfg = pe.config.parallel_eval;
-    adaptive_batch_size(failing_endpoint_count, cfg.min_batch_cap, cfg.max_batch_cap)
+    if pe.small_batch_retry_started {
+        return cfg.retry_batch_cap;
+    }
+    adaptive_batch_size(target_endpoints, cfg.min_batch_cap, cfg.max_batch_cap)
 }
 
 /// `finishAtMaxArea`: `-max_utilization` is refused before the policy runs, so the design is
 /// always within it.
 fn pe_finish_at_max_area() -> bool {
     false
+}
+
+/// `withinMaxUtilization`: `!overMaxArea()`; `-max_utilization` is refused before the policy
+/// runs, so any area is legal.
+fn pe_within_max_utilization() -> bool {
+    true
+}
+
+/// `analyzeBottlenecks`: the weights apply only while saved batches stall WNS
+/// (`weightsPriority`); their analysis is not modelled.
+fn pe_analyze_bottlenecks(pe: &ParallelEval) -> Result<(), Stop> {
+    if !pe.stall.weights_priority(&pe.config.parallel_eval) {
+        return Ok(());
+    }
+    Err(Stop::refused("RSZ-ABSENT", "repair_timing -phases PARALLEL_EVAL: analyzeBottlenecks is not modelled".into()))
+}
+
+/// `checkpointWnsTolerance`: `checkpoint_wns_tolerance_period_pct` of the reference period (0
+/// while the WNS tail runs; it never does here).
+fn pe_checkpoint_wns_tolerance(pe: &ParallelEval) -> f32 {
+    pe.reference_period * pe.config.parallel_eval.checkpoint_wns_tolerance_period_pct / 100.0
+}
+
+/// `batchImprovesCheckpoint`: WNS strictly better than the checkpoint's; else, WNS within the
+/// band (fuzzily equal to the checkpoint's, or at least the best less the tolerance), TNS
+/// strictly better.
+pub fn batch_improves_checkpoint(checkpoint_wns: f32, checkpoint_tns: f32, current_wns: f32, current_tns: f32, best_wns: f32, wns_tolerance: f32) -> bool {
+    if fuzzy::less(checkpoint_wns, current_wns) {
+        return true;
+    }
+    let wns_within_band = fuzzy::equal(checkpoint_wns, current_wns) || fuzzy::less_equal(best_wns - wns_tolerance, current_wns);
+    wns_within_band && fuzzy::less(checkpoint_tns, current_tns)
+}
+
+/// `acceptsBatch` (the tail's TNS bound applies only while it runs, which it never does here).
+fn pe_accepts_batch(pe: &ParallelEval, wns_after: f32, tns_after: f32) -> bool {
+    batch_improves_checkpoint(pe.checkpoint_wns, pe.checkpoint_tns, wns_after, tns_after, pe.best_checkpoint_wns, pe_checkpoint_wns_tolerance(pe))
+}
+
+/// `recordSwap`: a size or VT swap remembers the cell it replaces. (`replaceCell` finds masters
+/// by the liberty cell's name, and every master here is named as its cell, so the check that the
+/// name maps to the instance's master always holds.)
+fn pe_record_swap(candidate: &Candidate, target: &Target, evaluation_index: usize) -> Option<SwapRecord> {
+    matches!(candidate.kind, Move::SizeUp | Move::VtSwap).then(|| SwapRecord { evaluation_index, inst: target.inst.clone(), before_cell: target.cell.clone() })
+}
+
+/// The `MoveResult` type an Mt candidate reports (its own move type: RebufferMt is kBuffer).
+fn pe_result_type(m: Move) -> Move {
+    m
+}
+
+/// `RepairSetupProfiler::stop(reason)`, as the printer writes it.
+fn pe_stop(reason: &str) {
+    pe_event("stop", &format!("stop_{reason}"), "", 1);
+}
+
+/// `markRunComplete(result)`.
+fn pe_mark_run_complete(pe: &mut ParallelEval, result: bool) {
+    pe.result = result;
+    pe.converged = true;
 }
 
 /// The load pins of an expanded path from its start index: the pins its vertices are not drivers
@@ -1264,6 +1908,7 @@ fn pe_plan_generation(pe: &mut ParallelEval, target: &mut Target, facts: &PlanFa
         }
         if m == Move::Buffer {
             pe.rebuffer_targets_in_batch += 1;
+            pe.work.add_plan_request();
         }
         pe_prepare_inputs(m, target, facts, plan, &pe.config, &pe.crit_path_load_pins)?;
         trace.push_str(&format!("VYGP|inputs|{b}|{pin}|{}|{}\n", m.name(), pe_inputs_line(m, target)));
@@ -1322,20 +1967,21 @@ fn rebuffer_mt_generate(target: &Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtC
         return Ok(Vec::new());
     }
     let Some(load_pin) = target.load_pin.as_deref() else { return Ok(Vec::new()) };
-    let plans = rebuffer_mt_make_tree_plans(target, plan, cfg, load_pin, rb)?;
-    Ok(rebuffer_mt_add_tree_plan_candidates(target, plan, cfg, &plans, rb))
+    let (plans, arena) = rebuffer_mt_make_tree_plans(target, plan, cfg, load_pin, rb)?;
+    Ok(rebuffer_mt_add_tree_plan_candidates(target, plan, cfg, &plans, &arena, rb))
 }
 
 /// `RebufferMtGenerator::makeTreePlans`: `makeRebufferTreePlans` on the prepared net (none without
 /// one), then the plan gates: no tree without buffers or with a dont-touch load behind a buffer;
 /// a one-buffer tree only with `allow_rebuffer_mt_single_buffer`; no tree past the score cap —
 /// the anchor tree exempt from the last two.
-fn rebuffer_mt_make_tree_plans(target: &Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtConfig, load_pin: &str, rb: &mut String) -> Result<Vec<crate::rebuffer::TreePlan>, Stop> {
-    let Some((bn, root)) = target.rebuffer_net.as_ref() else { return Ok(Vec::new()) };
+fn rebuffer_mt_make_tree_plans(target: &Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtConfig, load_pin: &str, rb: &mut String) -> Result<(Vec<crate::rebuffer::TreePlan>, std::sync::Arc<Vec<crate::rebuffer::Node>>), Stop> {
+    let none = || (Vec::new(), std::sync::Arc::new(Vec::new()));
+    let Some((bn, root)) = target.rebuffer_net.as_ref() else { return Ok(none()) };
     let rctx = plan.ctx.rebuffer.ok_or_else(|| Stop::refused("RSZ-ABSENT", "RebufferMt without characterized buffers".into()))?;
     let g = &plan.gs[0];
-    let Some(drvr) = g.vertices.iter().position(|x| x.name == target.driver_pin && x.is_driver) else { return Ok(Vec::new()) };
-    let Some(probe) = super::rebuffer_probe_of_net(plan.ctx, plan.gs, plan.ss, plan.design, drvr, bn, *root) else { return Ok(Vec::new()) };
+    let Some(drvr) = g.vertices.iter().position(|x| x.name == target.driver_pin && x.is_driver) else { return Ok(none()) };
+    let Some(probe) = super::rebuffer_probe_of_net(plan.ctx, plan.gs, plan.ss, plan.design, drvr, bn, *root) else { return Ok(none()) };
     if let Some(w) = probe.warnings.first() {
         return Err(Stop::refused("RSZ-ABSENT", format!("RebufferMt planning warnings are not modelled: {w}")));
     }
@@ -1364,7 +2010,7 @@ fn rebuffer_mt_make_tree_plans(target: &Target, plan: &PlanTimer<'_, '_, '_>, cf
         }
         !(!p.anchor_tree && cfg.rebuffer_mt_max_score > 0.0 && p.driver_slack_gain.abs() > cfg.rebuffer_mt_max_score)
     });
-    Ok(plans)
+    Ok((plans, std::sync::Arc::new(rbuf.nodes)))
 }
 
 /// `hasDontTouchLoadBehindBuffer`: a load behind a buffer that is dont-touch (`Resizer::dontTouch`:
@@ -1381,7 +2027,7 @@ fn rebuffer_has_dont_touch_load_behind_buffer(plan: &PlanTimer<'_, '_, '_>, p: &
 
 /// `addTreePlanCandidates` with `makeSideContexts`: one candidate per plan; its side contexts the
 /// plan's other loads that have load timing, in load-path order.
-fn rebuffer_mt_add_tree_plan_candidates(target: &Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtConfig, plans: &[crate::rebuffer::TreePlan], rb: &mut String) -> Vec<Candidate> {
+fn rebuffer_mt_add_tree_plan_candidates(target: &Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtConfig, plans: &[crate::rebuffer::TreePlan], arena: &std::sync::Arc<Vec<crate::rebuffer::Node>>, rb: &mut String) -> Vec<Candidate> {
     let mut out = Vec::with_capacity(plans.len());
     for p in plans {
         let sides = rebuffer_make_side_contexts(p, &target.rebuffer_load_timing);
@@ -1391,6 +2037,7 @@ fn rebuffer_mt_add_tree_plan_candidates(target: &Target, plan: &PlanTimer<'_, '_
             estimate: rebuffer_mt_estimate(plan.ctx.libs, context, target, p, &sides, cfg, rb),
             desc: format!("bufs={}/loads={}/anchor={}/dsg={:.6}/cap={:.6}", p.buffer_count, p.load_count, u8::from(p.anchor_tree), p.driver_slack_gain, p.tree_input_cap),
             impact: rebuffer_mt_impact(target, plan, p),
+            tree: Some((arena.clone(), p.tree)),
         });
     }
     out
@@ -1490,7 +2137,7 @@ fn rebuffer_impact_on(mut impact: MoveImpact, names: &ImpactNames<'_>, net: Opti
 /// for a gain of zero, a negative one, or none at all).
 fn unbuffer_mt_generate(target: &Target, impact: impl FnOnce() -> MoveImpact) -> Vec<Candidate> {
     match target.unbuffer_gain {
-        Some(gain) if gain > 0.0 => vec![Candidate { kind: Move::Unbuffer, estimate: unbuffer_mt_estimate(gain), desc: "remove".into(), impact: impact() }],
+        Some(gain) if gain > 0.0 => vec![Candidate { kind: Move::Unbuffer, estimate: unbuffer_mt_estimate(gain), desc: "remove".into(), impact: impact(), tree: None }],
         _ => Vec::new(),
     }
 }
@@ -1565,7 +2212,7 @@ fn swap_pins_mt_generate(target: &Target, names: &ImpactNames<'_>) -> Vec<Candid
     }
     let Some(swap) = swap else { return Vec::new() };
     let estimate = swap_pins_mt_estimate(input, swap, target.estimator_context.as_ref());
-    vec![Candidate { kind: Move::SwapPins, estimate, desc: swap.port.clone(), impact: swap_pins_mt_impact(target, names, input, swap) }]
+    vec![Candidate { kind: Move::SwapPins, estimate, desc: swap.port.clone(), impact: swap_pins_mt_impact(target, names, input, swap), tree: None }]
 }
 
 /// `SwapPinsMtCandidate::estimate`: the gain is the input's delay less the swap's. Without a side
@@ -1626,7 +2273,7 @@ fn size_up_mt_generate(target: &Target, ctx: &super::Ctx<'_>, cfg: &MtConfig, na
             continue;
         }
         let estimate = size_up_mt_estimate(ctx.libs, target, &replacement, cfg.size_up_mt_score_scale)?;
-        candidates.push(Candidate { kind: Move::SizeUp, estimate, impact: cell_swap_impact(target, names, &target.inst), desc: replacement });
+        candidates.push(Candidate { kind: Move::SizeUp, estimate, impact: cell_swap_impact(target, names, &target.inst), desc: replacement, tree: None });
     }
     Ok(candidates)
 }
@@ -1798,7 +2445,7 @@ fn vt_swap_mt_generate(target: &Target, ctx: &super::Ctx<'_>, cfg: &MtConfig, na
             continue;
         }
         let estimate = vt_swap_mt_estimate(ctx.libs, target, &cell)?;
-        candidates.push(Candidate { kind: Move::VtSwap, estimate, impact: cell_swap_impact(target, names, &target.inst), desc: cell });
+        candidates.push(Candidate { kind: Move::VtSwap, estimate, impact: cell_swap_impact(target, names, &target.inst), desc: cell, tree: None });
     }
     Ok(candidates)
 }
@@ -1822,6 +2469,7 @@ fn size_down_fanout_mt_generate(target: &Target, libs: &crate::preamble::Libs, c
             estimate: size_down_fanout_mt_estimate_of(&d, cfg.size_down_fanout_mt_score_scale),
             desc: format!("{}/{}", load.pin, if step_down.cell.is_empty() { "-" } else { &step_down.cell }),
             impact: size_down_fanout_mt_impact(target, names, &load.inst),
+            tree: None,
         });
     }
     candidates
@@ -1868,6 +2516,7 @@ fn split_load_mt_generate(target: &Target, libs: &crate::preamble::Libs, cfg: &M
         estimate: split_load_mt_estimate(libs, context, input, cfg.split_load_mt_score_scale),
         desc: format!("{}/{}", dash(&input.buffer_cell), dash(&input.resized_cell)),
         impact: split_load_mt_impact(target, names, input),
+        tree: None,
     }]
 }
 
@@ -1928,7 +2577,7 @@ fn split_load_mt_impact(target: &Target, names: &ImpactNames<'_>, input: &SplitL
 /// `estimateTargets`: each target's candidates estimated in order (done at generation here; the
 /// estimates read nothing the other targets change), then `estimateTarget` on each. The trace prints every candidate, then
 /// the best, per target; the best only once every generator is modelled.
-fn pe_estimate_targets(pe: &ParallelEval, targets: &[Target], generated: Vec<Vec<Candidate>>) -> Vec<TargetEvaluation> {
+fn pe_estimate_targets(pe: &mut ParallelEval, targets: &[Target], generated: Vec<Vec<Candidate>>) -> Vec<TargetEvaluation> {
     let all = pe.generators.iter().all(|&m| generate_modelled(m));
     let permissive = pe_wns_tail_active(pe);
     let mut trace = String::new();
@@ -1944,6 +2593,10 @@ fn pe_estimate_targets(pe: &ParallelEval, targets: &[Target], generated: Vec<Vec
         evaluations.push(TargetEvaluation { candidates, best });
     }
     pe_trace(&trace);
+    // The candidate counters fold in after the estimates.
+    for evaluation in &evaluations {
+        pe.work.add_estimates(evaluation.candidates.len());
+    }
     evaluations
 }
 
@@ -2007,7 +2660,7 @@ fn pe_make_batch_candidates(pe: &ParallelEval, targets: &[Target], evaluations: 
 /// `StallMonitor::weightsPriority`: a saved batch left WNS unchanged, for at most
 /// `bottleneck_max_wns_stall_batches` such batches.
 fn pe_stall_weights_priority(pe: &ParallelEval) -> bool {
-    pe.stall.wns_stall_batches > 0 && pe.stall.wns_stall_batches <= pe.config.parallel_eval.priority.bottleneck_max_wns_stall_batches
+    pe.stall.weights_priority(&pe.config.parallel_eval)
 }
 
 /// The trace's batch-candidate lines as the printer writes them after `makeBatchCandidates`:
@@ -3381,7 +4034,7 @@ mod tests {
     // first legal candidate with a strictly greater score.
     #[test]
     fn estimate_target_keeps_the_first_of_equal_scores_and_admits_the_tail() {
-        let c = |kind: Move, legal: bool, tail: bool, score: f32| Candidate { kind, estimate: Estimate { legal, score, raw_gain: None, reason: "x", tail_admissible: tail, side_loss: None, sequential_penalty: None, sequential_side_loss: None }, desc: String::new(), impact: MoveImpact::default() };
+        let c = |kind: Move, legal: bool, tail: bool, score: f32| Candidate { kind, estimate: Estimate { legal, score, raw_gain: None, reason: "x", tail_admissible: tail, side_loss: None, sequential_penalty: None, sequential_side_loss: None }, desc: String::new(), impact: MoveImpact::default(), tree: None };
         let mut cs = vec![c(Move::Unbuffer, false, false, 9.0), c(Move::SizeUp, true, false, 2.0), c(Move::SwapPins, true, false, 2.0), c(Move::VtSwap, false, true, 3.0)];
         let mut strict = cs.clone();
         assert_eq!(estimate_target(&mut strict, false), Some(1));
@@ -3716,7 +4369,7 @@ mod tests {
     #[test]
     fn batch_candidates_are_the_best_of_each_evaluation_in_pool_order() {
         let pe = ParallelEval::new(for_parallel_eval(Effort::High), '*');
-        let cand = |score: f32, inst: &str| Candidate { kind: Move::SizeUp, estimate: Estimate { legal: true, score, raw_gain: None, reason: "estimate_legal", tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None }, desc: String::new(), impact: MoveImpact { complete: true, write_instances: vec![inst.into()], ..MoveImpact::default() } };
+        let cand = |score: f32, inst: &str| Candidate { kind: Move::SizeUp, estimate: Estimate { legal: true, score, raw_gain: None, reason: "estimate_legal", tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None }, desc: String::new(), impact: MoveImpact { complete: true, write_instances: vec![inst.into()], ..MoveImpact::default() }, tree: None };
         let mut targets = vec![target_at(0), target_at(1), target_at(2)];
         targets[2].slack = -3e-10;
         let evaluations = vec![TargetEvaluation { candidates: vec![cand(1.0, "a"), cand(2.0, "b")], best: Some(1) }, TargetEvaluation { candidates: vec![cand(5.0, "c")], best: None }, TargetEvaluation { candidates: vec![cand(3.0, "d")], best: Some(0) }];
@@ -3788,5 +4441,88 @@ mod tests {
         assert_eq!(s.iter().map(|c| c.load_pin.as_str()).collect::<Vec<_>>(), ["b/A", "a/A"]);
         assert_eq!((s[0].current_driver_to_load_delay, s[0].current_slack, s[0].weight), (2.0, -1.0, 0.5));
         assert!(rebuffer_make_side_contexts(&p, &[]).is_empty());
+    }
+
+    /// `batchImprovesCheckpoint` (upstream SetupParallelEvalPolicy): a strictly better WNS
+    /// accepts; else WNS fuzzily equal to the checkpoint's, or at least the best less the
+    /// tolerance, AND a strictly better TNS; else not.
+    #[test]
+    fn batch_improves_checkpoint_follows_the_wns_band_and_tns() {
+        // Strictly better WNS: accepted whatever TNS does.
+        assert!(batch_improves_checkpoint(-2e-10, -1e-9, -1e-10, -5e-9, -2e-10, 0.0));
+        // WNS equal, TNS better: accepted; TNS equal or worse: not.
+        assert!(batch_improves_checkpoint(-2e-10, -1e-9, -2e-10, -0.5e-9, -2e-10, 0.0));
+        assert!(!batch_improves_checkpoint(-2e-10, -1e-9, -2e-10, -1e-9, -2e-10, 0.0));
+        // WNS slightly worse but within the tolerance of the best, TNS better: accepted.
+        assert!(batch_improves_checkpoint(-2e-10, -1e-9, -2.05e-10, -0.5e-9, -2e-10, 1e-11));
+        // Outside the band: not, even with a better TNS.
+        assert!(!batch_improves_checkpoint(-2e-10, -1e-9, -2.5e-10, -0.5e-9, -2e-10, 1e-11));
+    }
+
+    /// `StallMonitor::onSaved` / `stall` / `moveBudget` (upstream ParallelEvalState): progress is
+    /// a WNS gain over the best past `progress_wns_period_pct` of the reference period, or a TNS
+    /// gain over the previous checkpoint past `progress_tns_pct` of |initial TNS|; without it the
+    /// batch and its moves count as stalled; the move budget is `stall_batches` times the larger
+    /// of `min_batch_cap` and the last cap.
+    #[test]
+    fn stall_monitor_counts_saves_without_progress() {
+        let cfg = ParallelEvalConfig::default();
+        let mut m = StallMonitor::default();
+        m.reset(-1e-9, 1e-9);
+        m.begin_batch(64, 10);
+        m.end_batch(30);
+        // WNS +1e-12 (> 0.04% of 1 ns = 4e-13): progress, nothing stalled.
+        assert_eq!(m.on_saved(&cfg, -1e-9, -2e-10, -1.99e-10, -1e-9, 0.0), 0);
+        assert_eq!((m.stalled_batches, m.wns_stall_batches), (0, 0));
+        // No WNS gain and a TNS gain below 0.5% of 1e-9: the batch's 20 moves stall.
+        m.end_batch(20);
+        assert_eq!(m.on_saved(&cfg, -1e-9, -1.99e-10, -1.99e-10, -0.999e-9, 0.0), 20);
+        assert_eq!((m.stalled_batches, m.wns_stall_batches), (1, 1));
+        assert_eq!(m.move_budget(&cfg), 6 * 64);
+        assert_eq!(m.stall(&cfg), Stall::None);
+        m.stalled_moves = 6 * 64;
+        assert_eq!(m.stall(&cfg), Stall::Moves);
+        m.stalled_moves = 0;
+        m.stalled_batches = cfg.stall_max_batches;
+        assert_eq!(m.stall(&cfg), Stall::Batches);
+        // weightsPriority: stalled, at most bottleneck_max_wns_stall_batches saves.
+        assert!(m.weights_priority(&cfg));
+        m.wns_stall_batches = cfg.priority.bottleneck_max_wns_stall_batches + 1;
+        assert!(!m.weights_priority(&cfg));
+    }
+
+    /// `StallMonitor::updateWindow`: once the window holds more than `stall_window` saves and
+    /// spent at least `stall_window_min_work`, neither WNS nor the failing endpoints moving
+    /// stalls it; a TNS-progress save never does.
+    #[test]
+    fn stall_window_stalls_only_a_costly_flat_window() {
+        let cfg = ParallelEvalConfig::default();
+        let mut m = StallMonitor::default();
+        m.reset(-1e-9, 1e-9);
+        m.begin_batch(64, 10);
+        for k in 0..=cfg.stall_window {
+            m.on_saved(&cfg, -1e-9, -2e-10, -2e-10, -1e-9, f64::from(k) * 10.0);
+        }
+        assert!(m.window_stalled, "flat WNS and endpoints over 60 work units stall the window");
+        let mut cheap = StallMonitor::default();
+        cheap.reset(-1e-9, 1e-9);
+        for k in 0..=cfg.stall_window {
+            cheap.on_saved(&cfg, -1e-9, -2e-10, -2e-10, -1e-9, f64::from(k));
+        }
+        assert!(!cheap.window_stalled, "a window under stall_window_min_work is never cut");
+    }
+
+    /// `WorkMeter::seconds`: each count times its weight, the timing updates times the vertices.
+    #[test]
+    fn work_meter_weighs_counts() {
+        let cfg = ParallelEvalConfig::default();
+        let mut w = WorkMeter::default();
+        w.reset(1000);
+        w.add_timing_update(10);
+        w.add_estimates(4);
+        w.add_plan_request();
+        w.add_endpoints(3);
+        let want = 5.0e-7f32 as f64 * 1000.0 + 1.93e-3f32 as f64 * 10.0 + 1.35e-5f32 as f64 * 4.0 + 1.14e-3f32 as f64 + 5.65e-4f32 as f64 * 3.0;
+        assert_eq!(w.seconds(&cfg), want);
     }
 }

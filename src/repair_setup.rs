@@ -1482,7 +1482,7 @@ impl Repair<'_, '_> {
             let mut inputs: HashMap<usize, String> = HashMap::new();
             let mut loads = Vec::new();
             let mut net = net;
-            self.export_buffer_tree(&rb, area_tree, &mut net, &mut loads, &mut count, &mut inputs, "place")?;
+            self.export_buffer_tree(&rb.nodes, area_tree, &mut net, &mut loads, &mut count, &mut inputs, "place")?;
             inserted += count;
             for (inst, ip, op) in &old {
                 self.design.remove_buffer(inst, ip, op).map_err(|e| Stop::error("RSZ-0168", e))?;
@@ -2321,6 +2321,9 @@ pub trait SetupDesign: Design {
     fn ok_to_buffer_net(&self, drvr_pin: &str) -> bool;
     /// `Resizer::dontTouch(pin)`: its instance or its net is dont_touch.
     fn pin_dont_touch(&self, pin: &str) -> bool;
+    /// The estimator's invalid nets (`parasitics_invalid_`): what the next `updateParasitics`
+    /// re-estimates (`pendingNetCount` is their count).
+    fn pending_nets(&self) -> BTreeSet<String>;
     /// The instance's odb id (the slot its `Instance*` addresses).
     fn inst_id(&self, inst: &str) -> u32;
     /// `CloneCandidate::applyClone`: `makeInstance(cell, "clone", parent, loc)` in the driver's
@@ -4934,7 +4937,7 @@ impl Repair<'_, '_> {
         let mut inputs: HashMap<usize, String> = HashMap::new();
         let mut loads = Vec::new();
         let mut net = net;
-        self.export_buffer_tree(&rb, root, &mut net, &mut loads, &mut count, &mut inputs, "rebuffer")?;
+        self.export_buffer_tree(&rb.nodes, root, &mut net, &mut loads, &mut count, &mut inputs, "rebuffer")?;
         self.debug("rebuffer", 2, "-------------------------------".into());
         Ok(count)
     }
@@ -4945,12 +4948,12 @@ impl Repair<'_, '_> {
     #[allow(clippy::too_many_arguments)]
     /// `net`: the original driver net (the reference's `Net*`), its name as it stands — a buffer
     /// before a port load names the new net after the port and renames this one.
-    fn export_buffer_tree(&mut self, rb: &rebuffer::Rebuf<'_>, n: usize, net: &mut String, current: &mut Vec<String>, count: &mut i64, inputs: &mut HashMap<usize, String>, base: &str) -> Result<(), Stop> {
-        match rb.nodes[n].kind.clone() {
-            rebuffer::Kind::Wire { r } | rebuffer::Kind::Via { r, .. } => self.export_buffer_tree(rb, r, net, current, count, inputs, base),
+    fn export_buffer_tree(&mut self, nodes: &[rebuffer::Node], n: usize, net: &mut String, current: &mut Vec<String>, count: &mut i64, inputs: &mut HashMap<usize, String>, base: &str) -> Result<(), Stop> {
+        match nodes[n].kind.clone() {
+            rebuffer::Kind::Wire { r } | rebuffer::Kind::Via { r, .. } => self.export_buffer_tree(nodes, r, net, current, count, inputs, base),
             rebuffer::Kind::Junction { r, r2 } => {
-                self.export_buffer_tree(rb, r, net, current, count, inputs, base)?;
-                self.export_buffer_tree(rb, r2, net, current, count, inputs, base)
+                self.export_buffer_tree(nodes, r, net, current, count, inputs, base)?;
+                self.export_buffer_tree(nodes, r2, net, current, count, inputs, base)
             }
             rebuffer::Kind::Load { pin } => {
                 if self.design.pin_dont_touch(&pin) {
@@ -4962,7 +4965,7 @@ impl Repair<'_, '_> {
             }
             rebuffer::Kind::Buffer { cell, r } => {
                 let mut child = Vec::new();
-                self.export_buffer_tree(rb, r, net, &mut child, count, inputs, base)?;
+                self.export_buffer_tree(nodes, r, net, &mut child, count, inputs, base)?;
                 if child.is_empty() {
                     return Ok(());
                 }
@@ -4970,7 +4973,7 @@ impl Repair<'_, '_> {
                 let id = |p: &String, info: &crate::timing::NetInfo| info.pin_id.get(p).copied().unwrap_or(u64::MAX);
                 let info = self.design.net_info().clone();
                 child.sort_by_key(|p| id(p, &info));
-                let at = (rb.nodes[n].x, rb.nodes[n].y);
+                let at = (nodes[n].x, nodes[n].y);
                 let rep = self.design.insert_buffer_before_loads(Some(net.as_str()), &child, &cell, at, base, true, "ALWAYS").map_err(|e| Stop::error("RSZ-INSERT", e))?;
                 *count += 1;
                 // the buffer's input is on the original net: its name now (renamed for a port load)
