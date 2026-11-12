@@ -123,6 +123,18 @@ impl Repair<'_, '_> {
         Ok(())
     }
 
+    /// `MoveTracker::rejectPendingMove(driver pin, moveName(type))` (its bool is not read).
+    pub(super) fn trk_reject_pending(&mut self, pin: &str, m: Move) -> Result<(), Stop> {
+        if self.moves.is_none() {
+            return Ok(());
+        }
+        let id = self.trk_id(pin)?;
+        if let Some(t) = self.moves.as_mut() {
+            t.reject_pending_move(id, move_name(m));
+        }
+        Ok(())
+    }
+
     /// `MoveCommitter::capturePrePhaseSlack`.
     pub(super) fn trk_capture_pre_phase_slack(&mut self) -> Result<(), Stop> {
         let Some(ids) = self.moves.as_ref().map(|m| m.endpoint_slack_pins()) else { return Ok(()) };

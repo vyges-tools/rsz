@@ -269,6 +269,13 @@ impl StallMonitor {
         self.last_batch_moves = committed_moves;
     }
 
+    /// `onMissed`: the batch's moves count against the stall budget.
+    pub fn on_missed(&mut self) {
+        self.stalled_batches += 1;
+        self.stalled_moves += self.last_batch_moves;
+        self.last_batch_moves = 0;
+    }
+
     /// `onSaved(prev_tns, best_wns, wns, tns, work)`: progress is a WNS gain over the best
     /// checkpoint past `progress_wns_period_pct` of the reference period, or a TNS gain over the
     /// previous checkpoint past `progress_tns_pct` of |initial TNS|. The window takes the save;
@@ -472,6 +479,9 @@ pub struct Candidate {
     /// A RebufferMt candidate's tree plan (`plan_`): the planner's arena as planning left it and
     /// the plan's root, which its `apply` exports. None for every other move.
     pub tree: Option<(std::sync::Arc<Vec<crate::rebuffer::Node>>, usize)>,
+    /// A RebufferMt candidate's side contexts' load pins (`guardedSidePins`); the other moves'
+    /// come from their target ([`pe_guarded_side_pins`]).
+    pub rebuffer_side_pins: Vec<String>,
 }
 
 /// `Estimate`: legality, the score the batch ranks by, and the parts the printer shows.
@@ -790,11 +800,15 @@ pub struct ParallelEval {
     pub result: bool,
     pub stall: StallMonitor,
     pub work: WorkMeter,
-    /// `batch_instances_`: the committed batch's targets' instances by name, read before each
-    /// move (`InstanceRecord`).
-    pub batch_instances: Vec<String>,
+    /// `batch_instances_`: the committed batch's targets' instances (`InstanceRecord`: the name
+    /// read before each move, and the odb slot the reference's `Instance*` addresses).
+    pub batch_instances: Vec<InstanceRecord>,
+    /// `batch_candidates_`: the committed candidates, by evaluation index, in commit order.
+    pub batch_candidates: Vec<usize>,
     /// `batch_swaps_`: the batch's single-instance size and VT swaps a salvage can revert.
     pub batch_swaps: Vec<SwapRecord>,
+    /// `tabu_`.
+    pub tabu: MissTabu,
     /// `critPathLoadPins`: every load pin on a collected worst path.
     pub crit_path_load_pins: HashSet<String>,
     /// The phase's progress-row marker (`phaseMarkerForIndex`).
@@ -830,7 +844,9 @@ impl ParallelEval {
             stall: StallMonitor::default(),
             work: WorkMeter::default(),
             batch_instances: Vec::new(),
+            batch_candidates: Vec::new(),
             batch_swaps: Vec::new(),
+            tabu: MissTabu::default(),
             crit_path_load_pins: HashSet::new(),
             marker,
         }
@@ -838,12 +854,84 @@ impl ParallelEval {
 }
 
 /// `SwapRecord`: a committed size or VT swap — its evaluation, its instance and the cell it
-/// replaced (the location is the instance's own: a swap does not move it).
+/// replaced (the location is the instance's own: a swap does not move it), the move's result
+/// once kept, and whether a salvage reverted it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SwapRecord {
     pub evaluation_index: usize,
     pub inst: String,
     pub before_cell: String,
+    pub result: ApplyResult,
+    pub reverted: bool,
+}
+
+/// `InstanceRecord`: an instance's name read before a move, and its odb slot (the reference's
+/// `Instance*`). `keptInstances` keeps a record whose name still finds the same slot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstanceRecord {
+    pub name: String,
+    pub id: u32,
+}
+
+/// `MissTabu`: instances skipped for `miss_tabu_batches` batches after a miss, and those excluded
+/// for the run after `max_undos_per_instance` undone batches. Keyed by the odb slot (the
+/// reference's address) with the name recorded: an entry counts only while the slot still holds
+/// an instance of that name (a deleted instance's slot can go to another instance). Lookups and
+/// erasure only, so the maps' order decides nothing.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MissTabu {
+    pub until: HashMap<u32, (String, i32)>,
+    pub undo_counts: HashMap<u32, (String, i32)>,
+    pub excluded: HashMap<u32, String>,
+}
+
+impl MissTabu {
+    /// `reset`.
+    pub fn reset(&mut self) {
+        *self = MissTabu::default();
+    }
+
+    /// `addTabu(inst, now)`: skipped until batch `now + miss_tabu_batches`.
+    pub fn add_tabu(&mut self, cfg: &ParallelEvalConfig, id: u32, name: &str, now: i32) {
+        self.until.insert(id, (name.to_string(), now + cfg.miss_tabu_batches));
+    }
+
+    /// `recordUndo(inst, now)`: `addTabu` plus the undo count (an entry left by another
+    /// instance in the slot starts over); true once the count reaches `max_undos_per_instance`
+    /// and the instance is excluded.
+    pub fn record_undo(&mut self, cfg: &ParallelEvalConfig, id: u32, name: &str, now: i32) -> bool {
+        self.add_tabu(cfg, id, name, now);
+        if !self.undo_counts.get(&id).is_some_and(|(n, _)| n == name) {
+            self.undo_counts.insert(id, (name.to_string(), 0));
+        }
+        let count = self.undo_counts.get_mut(&id).expect("the entry was inserted above");
+        count.1 += 1;
+        if count.1 >= cfg.max_undos_per_instance {
+            self.excluded.insert(id, name.to_string());
+            return true;
+        }
+        false
+    }
+
+    /// `expire(now)`: the tabu entries ending at or before `now` dropped.
+    pub fn expire(&mut self, now: i32) {
+        self.until.retain(|_, (_, until)| *until > now);
+    }
+
+    /// `clearTemporary`: the tabu dropped, the exclusions kept.
+    pub fn clear_temporary(&mut self) {
+        self.until.clear();
+    }
+
+    /// `isExcluded`.
+    pub fn is_excluded(&self, id: u32, name: &str) -> bool {
+        self.excluded.get(&id).is_some_and(|n| n == name)
+    }
+
+    /// `isTabu`.
+    pub fn is_tabu(&self, id: u32, name: &str) -> bool {
+        self.until.get(&id).is_some_and(|(n, _)| n == name)
+    }
 }
 
 /// `MoveResult` of a candidate's `apply`: accepted, the move count and the touched instances.
@@ -917,8 +1005,10 @@ impl Repair<'_, '_> {
         let mut pe = ParallelEval::new(config, marker);
         self.pe_select_move_sequence(&mut pe);
         pe_build_move_generators(&mut pe);
-        // The reserve follows the margin the targets are collected with: in before the copy.
-        pe.selector = BatchSelectorConfig { slack_margin: self.ctx.margin, ..pe.config.parallel_eval.selector };
+        // The reserve follows the margin the targets are collected with: written into the
+        // policy config's selector (which the retry rebuilds from), then the selector made.
+        pe.config.parallel_eval.selector.slack_margin = self.ctx.margin;
+        pe.selector = pe.config.parallel_eval.selector;
         pe_reset_run_state(&mut pe);
         self.pe_collector_init();
         self.pe_max_end_repairs(&mut pe);
@@ -1012,7 +1102,7 @@ impl Repair<'_, '_> {
         if pe.converged {
             return Ok(());
         }
-        // `tabu_.expire(batch_index_)`: the tabu list fills only on an undo, which is refused.
+        pe.tabu.expire(pe.batch_index);
         if self.pe_finish_if_no_setup_violations(pe)? || pe_finish_at_max_area() {
             return Ok(());
         }
@@ -1026,25 +1116,26 @@ impl Repair<'_, '_> {
             return Ok(());
         }
         self.pe_open_batch_journal(pe)?;
-        let batch_moves = self.pe_commit_batch(pe, &pool.targets, &pool.evaluations, &pool.selection)?;
+        let mut batch_moves = self.pe_commit_batch(pe, &pool.targets, &pool.evaluations, &pool.selection, None)?;
         pe_trace(&format!("VYGP|cmoves|{}|{batch_moves}|committed={}|tentative={}\n", pe.batch_index, pe.committed_moves, pe.tentative_moves));
         if batch_moves > 0 {
             self.pe_update_timing(pe)?;
         }
         pe.batch_index += 1;
-        self.pe_judge_batch(pe, batch_moves)?;
+        self.pe_judge_batch(pe, &pool, pre_batch_wns, &mut batch_moves)?;
         self.pe_apply_stop_rules(pe, batch_moves)?;
         self.pe_print_tracker_batch_summary(pe)?;
+        pe.batch_candidates.clear();
         pe.batch_swaps.clear();
         Ok(())
     }
 
     /// `judgeBatch`: the QoR after the batch, the stall monitor's batch end, and the verdict — a
-    /// batch the checkpoint accepts is saved. A missed batch (`noteMissedBatch`, the salvage,
-    /// `settleMissedBatch`) is not modelled.
-    fn pe_judge_batch(&mut self, pe: &mut ParallelEval, batch_moves: i32) -> Result<bool, Stop> {
+    /// batch the checkpoint accepts is saved; a missed one is noted, then salvaged when it can be,
+    /// else settled (undone: the WNS tail's speculation is not modelled).
+    fn pe_judge_batch(&mut self, pe: &mut ParallelEval, pool: &BatchPool, pre_batch_wns: f32, batch_moves: &mut i32) -> Result<bool, Stop> {
         let (wns, tns) = self.pe_measure_qor();
-        pe.stall.end_batch(batch_moves);
+        pe.stall.end_batch(*batch_moves);
         let utilization_legal = pe_within_max_utilization();
         pe_trace(&format!(
             "VYGP|judge|{}|wns={}|tns={}|ck_wns={}|ck_tns={}|best={}|tol={}|util={}\n",
@@ -1065,7 +1156,248 @@ impl Repair<'_, '_> {
             self.pe_save_batch_checkpoint(pe, wns, tns)?;
             return Ok(true);
         }
-        Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -phases PARALLEL_EVAL: a missed batch (noteMissedBatch, salvageMissedBatch, settleMissedBatch) is not modelled (batch {})", pe.batch_index)))
+        pe_note_missed_batch(pe, utilization_legal);
+        if self.pe_salvage_missed_batch(pe, pool, pre_batch_wns, batch_moves)? {
+            pe_trace(&format!("VYGP|verdict|{}|salvaged\n", pe.batch_index));
+            return Ok(true);
+        }
+        pe_trace(&format!("VYGP|verdict|{}|missed\n", pe.batch_index));
+        self.pe_settle_missed_batch(pe)?;
+        Ok(false)
+    }
+
+    /// `settleMissedBatch`: the tail's speculation keeps a missed batch only while the tail runs
+    /// (it never does here), so the batch is undone (`undoMissedBatch`).
+    fn pe_settle_missed_batch(&mut self, pe: &mut ParallelEval) -> Result<(), Stop> {
+        pe_trace(&format!("VYGP|settle|{}|undo\n", pe.batch_index));
+        self.pe_undo_batch(pe)
+    }
+
+    /// `undoBatch` (no speculative batches): the open journal rolled back after the work meter's
+    /// update; the batch's instances the rollback kept go on the tabu list with their undo count.
+    fn pe_undo_batch(&mut self, pe: &mut ParallelEval) -> Result<(), Stop> {
+        if !pe.batch_journal_open {
+            return Ok(());
+        }
+        pe_trace(&format!("VYGP|undo|{}|tentative={}|speculative=0|instances={}\n", pe.batch_index, pe.tentative_moves, pe.batch_instances.len()));
+        pe_event("batches_undone", "", "", 1);
+        pe_event("moves_undone", "", "", pe.tentative_moves.max(0) as usize);
+        self.pe_note_timing_update(pe);
+        self.pe_roll_back_journal(pe)?;
+        let cfg = pe.config.parallel_eval;
+        for record in self.pe_kept_instances(&pe.batch_instances) {
+            let blocked = pe.tabu.record_undo(&cfg, record.id, &record.name, pe.batch_index);
+            pe_trace(&format!("VYGP|undo|{}|tabu|undo|{}|blocked={}\n", pe.batch_index, record.name, u8::from(blocked)));
+            if blocked {
+                pe_event("undo_blocked_instances", "", "", 1);
+            }
+        }
+        pe.batch_instances.clear();
+        Ok(())
+    }
+
+    /// `keptInstances`: the records whose name still finds the instance in the same slot.
+    fn pe_kept_instances(&self, records: &[InstanceRecord]) -> Vec<InstanceRecord> {
+        records.iter().filter(|r| self.design.inst_id(&r.name) == r.id && r.id != u32::MAX).cloned().collect()
+    }
+
+    /// `salvageMissedBatch`: with the journal open and moves committed, no buffer removed (a
+    /// removed buffer comes back as a new instance on rollback), and some but not all moves
+    /// culprits: the culprits go on the tabu list and are reverted — cell swaps in place, else
+    /// the batch rolled back and re-committed without them — then the batch is timed and judged
+    /// again; spared victims get a second pass.
+    fn pe_salvage_missed_batch(&mut self, pe: &mut ParallelEval, pool: &BatchPool, pre_batch_wns: f32, batch_moves: &mut i32) -> Result<bool, Stop> {
+        let b = pe.batch_index;
+        if !pe.batch_journal_open || pe.batch_candidates.is_empty() {
+            pe_trace(&format!("VYGP|salv|{b}|skip=journal_or_empty\n"));
+            return Ok(false);
+        }
+        if pe.batch_candidates.iter().any(|&k| pool.evaluations[k].best_candidate().is_some_and(|c| c.kind == Move::Unbuffer)) {
+            pe_event("batch_salvage_skipped_removal", "", "", 1);
+            pe_trace(&format!("VYGP|salv|{b}|skip=removal\n"));
+            return Ok(false);
+        }
+        let batch_size = pe.batch_candidates.len();
+        let (culprits, mut victims) = self.pe_find_batch_culprits(pe, pool, pre_batch_wns)?;
+        if culprits.is_empty() || culprits.len() >= batch_size {
+            pe_trace(&format!("VYGP|salv|{b}|skip=culprits|n={}|batch={batch_size}\n", culprits.len()));
+            return Ok(false);
+        }
+        pe_event("batch_salvage_attempts", "", "", 1);
+        pe_event("batch_culprits", "", "", culprits.len());
+        let cfg = pe.config.parallel_eval;
+        let mut skip: HashSet<usize> = HashSet::new();
+        let tabu_moves = |pe: &mut ParallelEval, skip: &mut HashSet<usize>, moves: &[usize], id: &dyn Fn(&str) -> u32| {
+            for &k in moves {
+                skip.insert(k);
+                let inst = &pool.targets[k].inst;
+                pe.tabu.add_tabu(&cfg, id(inst), inst, pe.batch_index);
+            }
+        };
+        let design = &self.design;
+        tabu_moves(pe, &mut skip, &culprits, &|i| design.inst_id(i));
+        let mut in_place = true;
+        let mut blocked = culprits;
+        for pass in 0..2 {
+            pe_trace(&format!("VYGP|salv|{b}|pass={pass}|in_place={}|blocked={}\n", u8::from(in_place), blocked.len()));
+            if in_place && self.pe_revert_in_place(pe, pool, &blocked, batch_moves)? {
+                pe_event("batch_salvage_in_place", "", "", 1);
+            } else {
+                in_place = false;
+                self.pe_note_timing_update(pe);
+                self.pe_roll_back_journal(pe)?;
+                self.pe_open_batch_journal(pe)?;
+                *batch_moves = self.pe_commit_batch(pe, &pool.targets, &pool.evaluations, &pool.selection, Some(&skip))?;
+                pe_trace(&format!("VYGP|salv|{b}|recommit={batch_moves}\n"));
+                if *batch_moves == 0 {
+                    return Ok(false);
+                }
+            }
+            self.pe_update_timing(pe)?;
+            let (wns, tns) = self.pe_measure_qor();
+            pe_trace(&format!("VYGP|salv|{b}|after|wns={}|tns={}|util={}\n", e9(wns), e9(tns), u8::from(pe_within_max_utilization())));
+            if pe_within_max_utilization() && pe_accepts_batch(pe, wns, tns) {
+                pe_event("batches_salvaged", "", "", 1);
+                self.pe_save_batch_checkpoint(pe, wns, tns)?;
+                return Ok(true);
+            }
+            if victims.is_empty() || skip.len() + victims.len() >= batch_size {
+                break;
+            }
+            pe_event("batch_salvage_second_pass", "", "", 1);
+            let design = &self.design;
+            tabu_moves(pe, &mut skip, &victims, &|i| design.inst_id(i));
+            blocked = std::mem::take(&mut victims);
+        }
+        pe_event("batch_salvage_failed", "", "", 1);
+        pe_trace(&format!("VYGP|salv|{b}|failed\n"));
+        Ok(false)
+    }
+
+    /// `findBatchCulprits(pre_batch_wns, spared)`: per committed move in commit order — a move
+    /// whose own endpoint ends below the slack it was collected with is a culprit, unless it is
+    /// a cell swap whose own stages did not slow down (`selfStageDelayDelta` at or below 0: a
+    /// victim); a move not yet a culprit is one when a guarded side pin ends below the
+    /// pre-batch WNS. Victims with no culprit are the culprits (the endpoint fallback); else
+    /// they are spared. All slacks and delays are read on the timer as the batch left it.
+    fn pe_find_batch_culprits(&mut self, pe: &ParallelEval, pool: &BatchPool, pre_batch_wns: f32) -> Result<(Vec<usize>, Vec<usize>), Stop> {
+        let ctx = self.ctx;
+        let edits = self.design.take_timer_edits();
+        let design = self.design.as_design();
+        let batch: Vec<usize> = pe.batch_candidates.clone();
+        let ratio = pe.config.parallel_eval.culprit_delay_ratio;
+        let rows = super::timed_all(ctx, design, &mut self.timer, edits, |gs, ss, _| {
+            let mut rows = Vec::with_capacity(batch.len());
+            for &k in &batch {
+                let target = &pool.targets[k];
+                let candidate = pool.evaluations[k].best_candidate().expect("a committed evaluation has its best candidate");
+                let eslack = pe_load_slack(gs, ss, &target.endpoint_pin);
+                let mut culprit = false;
+                let mut victim = false;
+                let mut self_delta = None;
+                if let Some(es) = eslack {
+                    if fuzzy::less(es, target.slack) {
+                        culprit = true;
+                        self_delta = pe_self_stage_delay_delta(ctx, gs, candidate, target, ratio);
+                        if self_delta.is_some_and(|d| d <= 0.0) {
+                            victim = true;
+                            culprit = false;
+                        }
+                    }
+                }
+                let endpoint_culprit = culprit;
+                if !culprit {
+                    culprit = pe_guarded_side_pins(candidate, target).iter().any(|pin| pe_load_slack(gs, ss, pin).is_some_and(|sl| fuzzy::less(sl, pre_batch_wns)));
+                }
+                rows.push((k, candidate.kind.name(), target.driver_pin.clone(), eslack, target.slack, self_delta, endpoint_culprit, culprit, victim));
+            }
+            Ok(rows)
+        })?;
+        let (mut culprits, mut victims) = (Vec::new(), Vec::new());
+        let mut t = String::new();
+        for (k, name, pin, eslack, tslack, self_delta, ep, culprit, victim) in rows {
+            t.push_str(&format!(
+                "VYGP|cul|{}|{name}|{pin}|eslack={}|tslack={}|self={}|ep={}|culprit={}|victim={}\n",
+                pe.batch_index,
+                eslack.map_or("-".to_string(), e9),
+                e9(tslack),
+                self_delta.map_or("-".to_string(), e9),
+                u8::from(ep),
+                u8::from(culprit),
+                u8::from(victim)
+            ));
+            if culprit {
+                culprits.push(k);
+            } else if victim {
+                victims.push(k);
+            }
+        }
+        if !victims.is_empty() {
+            pe_event("batch_victims_spared", "", "", victims.len());
+            if culprits.is_empty() {
+                pe_event("batch_culprits_endpoint_fallback", "", "", 1);
+                t.push_str(&format!("VYGP|culres|{}|culprits={}|victims=0|fallback=1\n", pe.batch_index, victims.len()));
+                pe_trace(&t);
+                return Ok((victims, Vec::new()));
+            }
+        }
+        t.push_str(&format!("VYGP|culres|{}|culprits={}|victims={}|fallback=0\n", pe.batch_index, culprits.len(), victims.len()));
+        pe_trace(&t);
+        Ok((culprits, victims))
+    }
+
+    /// `revertInPlace(moves, batch_moves)`: every move must be a recorded cell swap (else
+    /// nothing is reverted); each not yet reverted goes back to its old cell (`replaceCell`, in
+    /// the open journal) and its pending accounting is dropped (`rejectPendingCellMove`).
+    fn pe_revert_in_place(&mut self, pe: &mut ParallelEval, pool: &BatchPool, moves: &[usize], batch_moves: &mut i32) -> Result<bool, Stop> {
+        let mut swaps = Vec::with_capacity(moves.len());
+        for &k in moves {
+            let Some(at) = pe.batch_swaps.iter().position(|sw| sw.evaluation_index == k) else {
+                pe_trace(&format!("VYGP|revert|{}|no_swap\n", pe.batch_index));
+                return Ok(false);
+            };
+            if !pe.batch_swaps[at].reverted {
+                swaps.push(at);
+            }
+        }
+        for &at in &swaps {
+            let sw = pe.batch_swaps[at].clone();
+            self.design.swap_master(&sw.inst, &sw.before_cell).map_err(|e| Stop::error("RSZ-2037", format!("PARALLEL_EVAL salvage could not revert a cell swap: {e}")))?;
+            // `setLocation(x, y)` back to where it was: a cell swap does not move the instance.
+            let kind = pool.evaluations[sw.evaluation_index].best_candidate().expect("a recorded swap is a committed evaluation's best candidate").kind;
+            self.pe_reject_pending_cell_move(&sw.result, pe_result_type(kind), &pool.targets[sw.evaluation_index].driver_pin)?;
+            pe.batch_swaps[at].reverted = true;
+        }
+        let reverted = swaps.len() as i32;
+        pe_trace(&format!("VYGP|revert|{}|n={reverted}\n", pe.batch_index));
+        *batch_moves -= reverted;
+        pe.committed_moves -= reverted;
+        pe.tentative_moves -= reverted;
+        pe_event("batch_salvage_in_place_reverts", "", "", reverted.max(0) as usize);
+        Ok(true)
+    }
+
+    /// `MoveCommitter::rejectPendingCellMove(result, driver_pin)`: the latest matching accepted
+    /// size or VT swap in the open level unrecorded, the tracker's pending move of the driver
+    /// rejected, and the result dropped from the level. The legacy rejected-move count feeds only
+    /// the `opt_moves` TOTAL debug line, which is not printed: not kept. A false return is
+    /// RSZ-2038 at the caller.
+    fn pe_reject_pending_cell_move(&mut self, result: &ApplyResult, kind: Move, driver_pin: &str) -> Result<(), Stop> {
+        if !result.accepted || result.move_count != 1 || result.touched.len() != 1 || !matches!(kind, Move::SizeUp | Move::VtSwap) {
+            return Err(Stop::error("RSZ-2038", "PARALLEL_EVAL salvage lost its pending cell move".into()));
+        }
+        let ids: Vec<u32> = result.touched.iter().map(|i| self.design.inst_id(i)).collect();
+        let Some(level) = self.committer.levels.last_mut() else { return Err(Stop::error("RSZ-2038", "PARALLEL_EVAL salvage lost its pending cell move".into())) };
+        let Some(at) = level.iter().rposition(|(r, rid)| r.kind == kind && r.count == 1 && *rid == ids) else {
+            return Err(Stop::error("RSZ-2038", "PARALLEL_EVAL salvage lost its pending cell move".into()));
+        };
+        let (r, rid) = level[at].clone();
+        self.committer.unrecord(&r, &rid);
+        self.trk_reject_pending(driver_pin, kind)?;
+        if let Some(level) = self.committer.levels.last_mut() {
+            level.remove(at);
+        }
+        Ok(())
     }
 
     /// `measureQor`: the collector's worst slack and TNS.
@@ -1122,23 +1454,29 @@ impl Repair<'_, '_> {
     /// candidate committed (`MoveCommitter::commit`: `apply`, then the result recorded in the
     /// open level); an accepted move keeps its record, its swap when the move touched only its
     /// instance once, and is tracked as an attempt after the apply.
-    fn pe_commit_batch(&mut self, pe: &mut ParallelEval, targets: &[Target], evaluations: &[TargetEvaluation], selection: &BatchSelection) -> Result<i32, Stop> {
+    fn pe_commit_batch(&mut self, pe: &mut ParallelEval, targets: &[Target], evaluations: &[TargetEvaluation], selection: &BatchSelection, skip: Option<&HashSet<usize>>) -> Result<i32, Stop> {
         let mut batch_moves = 0;
         pe.batch_instances.clear();
+        pe.batch_candidates.clear();
         pe.batch_swaps.clear();
         for &evaluation_index in &selection.evaluation_indices {
             let evaluation = &evaluations[evaluation_index];
             let Some(candidate) = evaluation.best_candidate() else { continue };
+            if skip.is_some_and(|sk| sk.contains(&evaluation_index)) {
+                pe_trace(&format!("VYGP|cskip|{}|{evaluation_index}\n", pe.batch_index));
+                continue;
+            }
             let target = &targets[evaluation_index];
-            let record = target.inst.clone();
+            let record = InstanceRecord { name: target.inst.clone(), id: self.design.inst_id(&target.inst) };
             let swap = pe_record_swap(candidate, target, evaluation_index);
             let result = self.pe_commit(candidate, target)?;
             let front = result.touched.first().is_some_and(|i| *i == target.inst);
             let keep = swap.is_some() && result.move_count == 1 && result.touched.len() == 1 && front;
             pe_trace(&format!(
-                "VYGP|cmt|{}|{evaluation_index}|{}|{record}|accepted={}|moves={}|touched={}|front={}|swap={}|kept={}\n",
+                "VYGP|cmt|{}|{evaluation_index}|{}|{}|accepted={}|moves={}|touched={}|front={}|swap={}|kept={}\n",
                 pe.batch_index,
                 candidate.kind.name(),
+                record.name,
                 u8::from(result.accepted),
                 result.move_count,
                 result.touched.len(),
@@ -1150,7 +1488,9 @@ impl Repair<'_, '_> {
                 continue;
             }
             pe.batch_instances.push(record);
-            if let (true, Some(swap)) = (keep, swap) {
+            pe.batch_candidates.push(evaluation_index);
+            if let (true, Some(mut swap)) = (keep, swap) {
+                swap.result = result.clone();
                 pe.batch_swaps.push(swap);
             }
             if self.tracker_level() >= 2 {
@@ -1413,7 +1753,9 @@ impl Repair<'_, '_> {
     fn pe_start_tail_or_finish(&mut self, pe: &mut ParallelEval, reason: &str) -> Result<(), Stop> {
         pe_trace(&format!("VYGP|end|{}|{reason}|tail_or_finish|retry_started={}|committed={}\n", pe.batch_index, u8::from(pe.small_batch_retry_started), pe.committed_moves));
         if !pe.small_batch_retry_started && pe.committed_moves == 0 {
-            return Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -phases PARALLEL_EVAL: the small-batch retry (startSmallBatchRetry, after {reason}) is not modelled")));
+            pe_trace(&format!("VYGP|retry|{}\n", pe.batch_index));
+            pe_start_small_batch_retry(pe);
+            return Ok(());
         }
         // `WnsTail::start`: refused with no tail endpoints configured (it starts once per run).
         if pe.config.parallel_eval.wns_tail_endpoints > 0 {
@@ -1779,12 +2121,103 @@ fn pe_accepts_batch(pe: &ParallelEval, wns_after: f32, tns_after: f32) -> bool {
 /// by the liberty cell's name, and every master here is named as its cell, so the check that the
 /// name maps to the instance's master always holds.)
 fn pe_record_swap(candidate: &Candidate, target: &Target, evaluation_index: usize) -> Option<SwapRecord> {
-    matches!(candidate.kind, Move::SizeUp | Move::VtSwap).then(|| SwapRecord { evaluation_index, inst: target.inst.clone(), before_cell: target.cell.clone() })
+    matches!(candidate.kind, Move::SizeUp | Move::VtSwap).then(|| SwapRecord { evaluation_index, inst: target.inst.clone(), before_cell: target.cell.clone(), result: ApplyResult::default(), reverted: false })
 }
 
 /// The `MoveResult` type an Mt candidate reports (its own move type: RebufferMt is kBuffer).
 fn pe_result_type(m: Move) -> Move {
     m
+}
+
+/// `noteMissedBatch(utilization_legal)`: the miss counted against the stall budget (the
+/// utilization warning, RSZ-2033, needs `-max_utilization`, which is refused).
+fn pe_note_missed_batch(pe: &mut ParallelEval, utilization_legal: bool) {
+    pe.checkpoint_misses += 1;
+    pe_trace(&format!("VYGP|miss|{}|misses={}|util={}\n", pe.batch_index, pe.checkpoint_misses, u8::from(utilization_legal)));
+    pe.stall.on_missed();
+    pe_event("checkpoint_misses", "", "", 1);
+}
+
+/// `startSmallBatchRetry`: once, after a run that kept no move — misses cleared, the stall
+/// monitor reset, the temporary tabu dropped, and a new selector from the policy config's
+/// (which carries the setup slack margin) without its score floor and worst-path reserve.
+fn pe_start_small_batch_retry(pe: &mut ParallelEval) {
+    pe_event("retry", "retries", "", 1);
+    pe.small_batch_retry_started = true;
+    pe.checkpoint_misses = 0;
+    pe.stall.reset(pe.checkpoint_tns, pe.reference_period);
+    pe.tabu.clear_temporary();
+    pe.selector = BatchSelectorConfig { min_score_ratio: 0.0, wns_reserve_pct: 0, ..pe.config.parallel_eval.selector };
+}
+
+/// `MoveCandidate::guardedSidePins`: a cell swap's fanin side loads (`faninSidePins`), a pin
+/// swap's displaced pin, a split's moved loads, a rebuffer's side contexts' loads; none for the
+/// rest.
+fn pe_guarded_side_pins(c: &Candidate, target: &Target) -> Vec<String> {
+    match c.kind {
+        Move::SizeUp | Move::VtSwap => target.estimator_context.as_ref().map(|ctx| ctx.fanin_side_nets.iter().flat_map(|n| n.loads.iter().map(|l| l.pin.clone())).collect()).unwrap_or_default(),
+        Move::SwapPins => target.swap_pins_input.as_ref().and_then(|i| i.equivalents.iter().find(|e| e.port == c.desc)).and_then(|e| e.pin.clone()).into_iter().collect(),
+        Move::SplitLoad => target.split_load_input.as_ref().map(|i| i.moved_loads.iter().map(|l| l.pin.clone()).collect()).unwrap_or_default(),
+        Move::Buffer => c.rebuffer_side_pins.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// `sta_->slack(graph->pinLoadVertex(pin), max)`: the least max slack of the pin's load vertex
+/// over the scenes; none without one.
+fn pe_load_slack(gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], pin: &str) -> Option<f32> {
+    let mut slack: Option<f32> = None;
+    for (k, g) in gs.iter().enumerate() {
+        let Some(u) = g.vertices.iter().position(|x| x.name == pin && !x.is_driver) else { continue };
+        let v = ss[k].slack_of(u, MAX, None);
+        slack = Some(match slack {
+            Some(s) if !fuzzy::less(v, s) => s,
+            _ => v,
+        });
+    }
+    slack
+}
+
+/// `selfStageDelayDelta(candidate)`: a cell swap's own arc and its fanin arc (the window's
+/// target stage and the one before it), each stage's graph delay now (`graphStageDelay`) less
+/// its prepared delay, less `culprit_delay_ratio` of the stages' prepared total. None for other
+/// moves, without a window, or when a stage has no matching arc on the graph.
+fn pe_self_stage_delay_delta(ctx: &super::Ctx<'_>, gs: &[vyges_sta::graph::Graph<'_>], c: &Candidate, target: &Target, culprit_delay_ratio: f32) -> Option<f32> {
+    if !matches!(c.kind, Move::SizeUp | Move::VtSwap) {
+        return None;
+    }
+    let state = target.estimator_context.as_ref()?;
+    if state.path_stages.is_empty() {
+        return None;
+    }
+    let (mut delta, mut baseline) = (0.0f32, 0.0f32);
+    let first = state.target_stage_index.saturating_sub(1);
+    for stage in &state.path_stages[first..=state.target_stage_index] {
+        let delay = pe_graph_stage_delay(ctx, gs, stage)?;
+        delta += delay - stage.current_delay;
+        baseline += stage.current_delay;
+    }
+    Some(delta - culprit_delay_ratio * baseline.abs())
+}
+
+/// `graphStageDelay(stage)`: the driver's first non-wire in-edge (the reference's in-edge
+/// iterator order, the reverse of ours) whose arc set holds an arc matching the stage's
+/// reference arc exactly (`findMatchingTimingArc`: the swapped cell has a new arc set), its max
+/// delay at the stage's scene.
+fn pe_graph_stage_delay(ctx: &super::Ctx<'_>, gs: &[vyges_sta::graph::Graph<'_>], stage: &crate::delay_estimator::DelayStageState) -> Option<f32> {
+    let arc = &stage.arc;
+    let ref_cell = ctx.libs.scene_cell(arc.scene, &arc.cell)?;
+    let ref_set = ref_cell.arc_sets.get(arc.set)?;
+    let g = gs.get(arc.scene)?;
+    let driver = g.vertices.iter().position(|x| x.name == stage.driver_pin && x.is_driver)?;
+    for &e in g.in_edges[driver].iter().rev() {
+        let vyges_sta::graph::EdgeKind::Gate { set } = g.edges[e].kind else { continue };
+        let cand_set = g.arc_set(e, set);
+        if let Some(k) = crate::delay_estimator::find_matching_arc(ref_set, arc.arc, cand_set) {
+            return Some(g.delay[e][k][MAX]);
+        }
+    }
+    None
 }
 
 /// `RepairSetupProfiler::stop(reason)`, as the printer writes it.
@@ -1893,6 +2326,18 @@ fn plan_modelled(m: Move) -> bool {
 fn pe_plan_generation(pe: &mut ParallelEval, target: &mut Target, facts: &PlanFacts, plan: &PlanTimer<'_, '_, '_>, trace: &mut String) -> Result<(), String> {
     let pin = target.driver_pin.clone();
     let b = pe.batch_index;
+    // The miss tabu first: an excluded or tabu instance plans no generator.
+    let id = (plan.inst_id)(&target.inst);
+    if pe.tabu.is_excluded(id, &target.inst) {
+        trace.push_str(&format!("VYGP|plan|{b}|{pin}|skip=undo_blocked\n"));
+        pe_event("skip_undo_blocked", "", "", 1);
+        return Ok(());
+    }
+    if pe.tabu.is_tabu(id, &target.inst) {
+        trace.push_str(&format!("VYGP|plan|{b}|{pin}|skip=miss_tabu\n"));
+        pe_event("skip_miss_tabu", "", "", 1);
+        return Ok(());
+    }
     let mut planned = Vec::new();
     for m in pe.generators.clone() {
         if !plan_modelled(m) {
@@ -2038,6 +2483,7 @@ fn rebuffer_mt_add_tree_plan_candidates(target: &Target, plan: &PlanTimer<'_, '_
             desc: format!("bufs={}/loads={}/anchor={}/dsg={:.6}/cap={:.6}", p.buffer_count, p.load_count, u8::from(p.anchor_tree), p.driver_slack_gain, p.tree_input_cap),
             impact: rebuffer_mt_impact(target, plan, p),
             tree: Some((arena.clone(), p.tree)),
+            rebuffer_side_pins: sides.iter().map(|side| side.load_pin.clone()).collect(),
         });
     }
     out
@@ -2137,7 +2583,7 @@ fn rebuffer_impact_on(mut impact: MoveImpact, names: &ImpactNames<'_>, net: Opti
 /// for a gain of zero, a negative one, or none at all).
 fn unbuffer_mt_generate(target: &Target, impact: impl FnOnce() -> MoveImpact) -> Vec<Candidate> {
     match target.unbuffer_gain {
-        Some(gain) if gain > 0.0 => vec![Candidate { kind: Move::Unbuffer, estimate: unbuffer_mt_estimate(gain), desc: "remove".into(), impact: impact(), tree: None }],
+        Some(gain) if gain > 0.0 => vec![Candidate { kind: Move::Unbuffer, estimate: unbuffer_mt_estimate(gain), desc: "remove".into(), impact: impact(), tree: None, rebuffer_side_pins: Vec::new() }],
         _ => Vec::new(),
     }
 }
@@ -2212,7 +2658,7 @@ fn swap_pins_mt_generate(target: &Target, names: &ImpactNames<'_>) -> Vec<Candid
     }
     let Some(swap) = swap else { return Vec::new() };
     let estimate = swap_pins_mt_estimate(input, swap, target.estimator_context.as_ref());
-    vec![Candidate { kind: Move::SwapPins, estimate, desc: swap.port.clone(), impact: swap_pins_mt_impact(target, names, input, swap), tree: None }]
+    vec![Candidate { kind: Move::SwapPins, estimate, desc: swap.port.clone(), impact: swap_pins_mt_impact(target, names, input, swap), tree: None, rebuffer_side_pins: Vec::new() }]
 }
 
 /// `SwapPinsMtCandidate::estimate`: the gain is the input's delay less the swap's. Without a side
@@ -2273,7 +2719,7 @@ fn size_up_mt_generate(target: &Target, ctx: &super::Ctx<'_>, cfg: &MtConfig, na
             continue;
         }
         let estimate = size_up_mt_estimate(ctx.libs, target, &replacement, cfg.size_up_mt_score_scale)?;
-        candidates.push(Candidate { kind: Move::SizeUp, estimate, impact: cell_swap_impact(target, names, &target.inst), desc: replacement, tree: None });
+        candidates.push(Candidate { kind: Move::SizeUp, estimate, impact: cell_swap_impact(target, names, &target.inst), desc: replacement, tree: None, rebuffer_side_pins: Vec::new() });
     }
     Ok(candidates)
 }
@@ -2445,7 +2891,7 @@ fn vt_swap_mt_generate(target: &Target, ctx: &super::Ctx<'_>, cfg: &MtConfig, na
             continue;
         }
         let estimate = vt_swap_mt_estimate(ctx.libs, target, &cell)?;
-        candidates.push(Candidate { kind: Move::VtSwap, estimate, impact: cell_swap_impact(target, names, &target.inst), desc: cell, tree: None });
+        candidates.push(Candidate { kind: Move::VtSwap, estimate, impact: cell_swap_impact(target, names, &target.inst), desc: cell, tree: None, rebuffer_side_pins: Vec::new() });
     }
     Ok(candidates)
 }
@@ -2469,7 +2915,7 @@ fn size_down_fanout_mt_generate(target: &Target, libs: &crate::preamble::Libs, c
             estimate: size_down_fanout_mt_estimate_of(&d, cfg.size_down_fanout_mt_score_scale),
             desc: format!("{}/{}", load.pin, if step_down.cell.is_empty() { "-" } else { &step_down.cell }),
             impact: size_down_fanout_mt_impact(target, names, &load.inst),
-            tree: None,
+            tree: None, rebuffer_side_pins: Vec::new(),
         });
     }
     candidates
@@ -2516,7 +2962,7 @@ fn split_load_mt_generate(target: &Target, libs: &crate::preamble::Libs, cfg: &M
         estimate: split_load_mt_estimate(libs, context, input, cfg.split_load_mt_score_scale),
         desc: format!("{}/{}", dash(&input.buffer_cell), dash(&input.resized_cell)),
         impact: split_load_mt_impact(target, names, input),
-        tree: None,
+        tree: None, rebuffer_side_pins: Vec::new(),
     }]
 }
 
@@ -3601,6 +4047,7 @@ fn pe_build_move_generators(pe: &mut ParallelEval) {
 
 /// `resetRunState`.
 fn pe_reset_run_state(pe: &mut ParallelEval) {
+    pe.tabu.reset();
     pe.committed_moves = 0;
     pe.batch_index = 0;
     pe.tentative_moves = 0;
@@ -4034,7 +4481,7 @@ mod tests {
     // first legal candidate with a strictly greater score.
     #[test]
     fn estimate_target_keeps_the_first_of_equal_scores_and_admits_the_tail() {
-        let c = |kind: Move, legal: bool, tail: bool, score: f32| Candidate { kind, estimate: Estimate { legal, score, raw_gain: None, reason: "x", tail_admissible: tail, side_loss: None, sequential_penalty: None, sequential_side_loss: None }, desc: String::new(), impact: MoveImpact::default(), tree: None };
+        let c = |kind: Move, legal: bool, tail: bool, score: f32| Candidate { kind, estimate: Estimate { legal, score, raw_gain: None, reason: "x", tail_admissible: tail, side_loss: None, sequential_penalty: None, sequential_side_loss: None }, desc: String::new(), impact: MoveImpact::default(), tree: None, rebuffer_side_pins: Vec::new() };
         let mut cs = vec![c(Move::Unbuffer, false, false, 9.0), c(Move::SizeUp, true, false, 2.0), c(Move::SwapPins, true, false, 2.0), c(Move::VtSwap, false, true, 3.0)];
         let mut strict = cs.clone();
         assert_eq!(estimate_target(&mut strict, false), Some(1));
@@ -4369,7 +4816,7 @@ mod tests {
     #[test]
     fn batch_candidates_are_the_best_of_each_evaluation_in_pool_order() {
         let pe = ParallelEval::new(for_parallel_eval(Effort::High), '*');
-        let cand = |score: f32, inst: &str| Candidate { kind: Move::SizeUp, estimate: Estimate { legal: true, score, raw_gain: None, reason: "estimate_legal", tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None }, desc: String::new(), impact: MoveImpact { complete: true, write_instances: vec![inst.into()], ..MoveImpact::default() }, tree: None };
+        let cand = |score: f32, inst: &str| Candidate { kind: Move::SizeUp, estimate: Estimate { legal: true, score, raw_gain: None, reason: "estimate_legal", tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None }, desc: String::new(), impact: MoveImpact { complete: true, write_instances: vec![inst.into()], ..MoveImpact::default() }, tree: None, rebuffer_side_pins: Vec::new() };
         let mut targets = vec![target_at(0), target_at(1), target_at(2)];
         targets[2].slack = -3e-10;
         let evaluations = vec![TargetEvaluation { candidates: vec![cand(1.0, "a"), cand(2.0, "b")], best: Some(1) }, TargetEvaluation { candidates: vec![cand(5.0, "c")], best: None }, TargetEvaluation { candidates: vec![cand(3.0, "d")], best: Some(0) }];
@@ -4464,6 +4911,86 @@ mod tests {
     /// gain over the previous checkpoint past `progress_tns_pct` of |initial TNS|; without it the
     /// batch and its moves count as stalled; the move budget is `stall_batches` times the larger
     /// of `min_batch_cap` and the last cap.
+    /// `MissTabu` (upstream ParallelEvalState): `addTabu` skips an instance until batch
+    /// `now + miss_tabu_batches`, and `expire(now)` drops entries ending at or before `now`;
+    /// `recordUndo` also counts undos and excludes the instance once the count reaches
+    /// `max_undos_per_instance` (true on that call); every entry counts only while its slot holds
+    /// an instance of the recorded name (a new instance in the slot starts over);
+    /// `clearTemporary` drops the tabu and keeps the exclusions.
+    #[test]
+    fn miss_tabu_expires_counts_undos_and_checks_the_slot_name() {
+        let cfg = ParallelEvalConfig::default();
+        let mut t = MissTabu::default();
+        t.add_tabu(&cfg, 7, "u1", 3);
+        assert!(t.is_tabu(7, "u1"));
+        assert!(!t.is_tabu(7, "u2"), "another instance in the slot is not tabu");
+        t.expire(3 + cfg.miss_tabu_batches - 1);
+        assert!(t.is_tabu(7, "u1"));
+        t.expire(3 + cfg.miss_tabu_batches);
+        assert!(!t.is_tabu(7, "u1"), "an entry ending at now is dropped");
+        for k in 1..cfg.max_undos_per_instance {
+            assert!(!t.record_undo(&cfg, 7, "u1", k), "undo {k} of {}", cfg.max_undos_per_instance);
+        }
+        // A new instance in the slot starts its count over.
+        assert!(!t.record_undo(&cfg, 7, "u9", 5));
+        assert_eq!(t.undo_counts[&7], ("u9".to_string(), 1));
+        for k in 1..cfg.max_undos_per_instance {
+            assert_eq!(t.record_undo(&cfg, 7, "u9", 5 + k), k + 1 == cfg.max_undos_per_instance);
+        }
+        assert!(t.is_excluded(7, "u9") && !t.is_excluded(7, "u1"));
+        t.clear_temporary();
+        assert!(!t.is_tabu(7, "u9") && t.is_excluded(7, "u9"));
+    }
+
+    /// `guardedSidePins` (upstream move/*MtCandidate): SizeUp and VtSwap guard every fanin side
+    /// net's loads (`faninSidePins`), SwapPins the displaced input's pin, SplitLoad the moved
+    /// loads, Rebuffer its side contexts' load pins; the rest (Unbuffer, SizeDownFanout) none.
+    #[test]
+    fn each_move_guards_its_own_side_pins() {
+        use crate::delay_estimator::{EstimatorContext, FaninSideNet, SideLoad};
+        let load = |pin: &str| SideLoad { pin: pin.into(), slack: 0.0, weight: 1.0 };
+        let mut t = target_at(2);
+        let mut ctx = EstimatorContext::new(2);
+        ctx.fanin_side_nets = vec![
+            FaninSideNet { input_port: "A".into(), input_cap: 0.0, delay_per_cap: 0.0, selected_arc: true, loads: vec![load("x/A"), load("y/A")] },
+            FaninSideNet { input_port: "B".into(), input_cap: 0.0, delay_per_cap: 0.0, selected_arc: false, loads: vec![load("z/B")] },
+        ];
+        t.estimator_context = Some(ctx);
+        t.swap_pins_input = Some(SwapPinsInput { input_port: "A".into(), input_delay: 0.0, equivalents: vec![
+            SwapPinsEquivalent { port: "B".into(), delay: 0.0, pin: Some("b1/B".into()), slack: 0.0 },
+            SwapPinsEquivalent { port: "C".into(), delay: 0.0, pin: None, slack: 0.0 },
+        ] });
+        let c = |kind: Move, desc: &str, sides: Vec<String>| Candidate { kind, estimate: Estimate { legal: true, score: 1.0, raw_gain: None, reason: "x", tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None }, desc: desc.into(), impact: MoveImpact::default(), tree: None, rebuffer_side_pins: sides };
+        let fanin = vec!["x/A".to_string(), "y/A".into(), "z/B".into()];
+        assert_eq!(pe_guarded_side_pins(&c(Move::SizeUp, "BUF_X2", Vec::new()), &t), fanin);
+        assert_eq!(pe_guarded_side_pins(&c(Move::VtSwap, "BUF_X1_LVT", Vec::new()), &t), fanin);
+        assert_eq!(pe_guarded_side_pins(&c(Move::SwapPins, "B", Vec::new()), &t), vec!["b1/B".to_string()]);
+        assert!(pe_guarded_side_pins(&c(Move::SwapPins, "C", Vec::new()), &t).is_empty(), "no pin on the equivalent");
+        assert_eq!(pe_guarded_side_pins(&c(Move::Buffer, "", vec!["s/A".into()]), &t), vec!["s/A".to_string()]);
+        assert!(pe_guarded_side_pins(&c(Move::Unbuffer, "remove", Vec::new()), &t).is_empty());
+        assert!(pe_guarded_side_pins(&c(Move::SizeDownFanout, "", Vec::new()), &t).is_empty());
+    }
+
+    /// `startSmallBatchRetry` (upstream SetupParallelEvalPolicy): once; misses cleared, the
+    /// temporary tabu dropped (exclusions kept), and a NEW selector from the policy config's
+    /// (which carries the setup slack margin) without the score floor and worst-path reserve.
+    #[test]
+    fn the_small_batch_retry_rebuilds_the_selector_from_the_config() {
+        let mut pe = ParallelEval::new(for_parallel_eval(Effort::High), 'P');
+        pe.config.parallel_eval.selector.slack_margin = 2e-11;
+        pe.selector = BatchSelectorConfig { slack_margin: -1.0, ..pe.config.parallel_eval.selector };
+        pe.checkpoint_misses = 8;
+        let cfg = pe.config.parallel_eval;
+        pe.tabu.add_tabu(&cfg, 1, "a", 0);
+        pe.tabu.excluded.insert(2, "b".into());
+        pe_start_small_batch_retry(&mut pe);
+        assert!(pe.small_batch_retry_started);
+        assert_eq!(pe.checkpoint_misses, 0);
+        assert_eq!((pe.selector.min_score_ratio, pe.selector.wns_reserve_pct, pe.selector.slack_margin), (0.0, 0, 2e-11));
+        assert_eq!(pe.selector.score_floor_start, cfg.selector.score_floor_start);
+        assert!(!pe.tabu.is_tabu(1, "a") && pe.tabu.is_excluded(2, "b"));
+    }
+
     #[test]
     fn stall_monitor_counts_saves_without_progress() {
         let cfg = ParallelEvalConfig::default();

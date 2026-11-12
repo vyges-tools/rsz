@@ -620,6 +620,17 @@ impl Moves {
         self.finalize_moves(level, State::Reject);
     }
 
+    /// `rejectPendingMove(pin, type)`: the latest move of that pin and type in the innermost open
+    /// journal's level finalized as rejected (charged to the current endpoint) and dropped; false
+    /// with no open journal or no such move (the flat bucket is not searched).
+    pub fn reject_pending_move(&mut self, pin: PinKey, move_type: &'static str) -> bool {
+        let Some(level) = self.levels.last_mut() else { return false };
+        let Some(at) = level.iter().rposition(|&(p, t)| p == pin && t == move_type) else { return false };
+        let item = level.remove(at);
+        self.finalize_moves(vec![item], State::Reject);
+        true
+    }
+
     /// `beginJournal` / `commitJournal` (outermost: committed; nested: into the parent) /
     /// `restoreJournal` (rejected).
     pub fn begin_journal(&mut self) {
