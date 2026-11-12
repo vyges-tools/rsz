@@ -631,10 +631,10 @@ fn timed_levels<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits:
             };
             s.push_str(&format!("{} {} {}", vx.name, slack(0), slack(1)));
             if full {
-                for rf in 0..2 {
+                for (rf, slew) in g.slew[v].iter().enumerate() {
                     let arr = search.paths[v].iter().filter(|p| p.tag.mm == MAX && p.tag.rf == rf && !p.tag.is_clock)
                         .map(|p| p.arrival).fold(-INF, f32::max);
-                    s.push_str(&format!(" {:.6} {:.6}", f64::from(arr) * 1e15, f64::from(g.slew[v][rf][MAX]) * 1e15));
+                    s.push_str(&format!(" {:.6} {:.6}", f64::from(arr) * 1e15, f64::from(slew[MAX]) * 1e15));
                 }
             }
             s.push('\n');

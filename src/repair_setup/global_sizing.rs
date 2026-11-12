@@ -197,8 +197,7 @@ impl<'v, 'g> View<'v, 'g> {
     /// `Sta::slew(vertex, riseFall, scenes, max)`: the fuzzily greatest max slew.
     fn slew(&self, v: usize) -> f32 {
         let mut m = -vyges_sta::search::INF_SLACK;
-        for rf in 0..2 {
-            let x = self.g.slew[v][rf][MAX];
+        for x in self.g.slew[v].iter().map(|s| s[MAX]) {
             if fuzzy::greater(x, m) {
                 m = x;
             }
@@ -303,8 +302,8 @@ impl GsEnv<'_> {
         let Some(c) = self.ctx.libs.link_cell(cell) else { return 0.0 };
         let Some(p) = c.port(port) else { return 0.0 };
         let mut cap = 0.0f32;
-        for rf in 0..2 {
-            cap = cap.max(p.capacitance[rf][MAX]);
+        for c in &p.capacitance {
+            cap = cap.max(c[MAX]);
         }
         cap
     }
