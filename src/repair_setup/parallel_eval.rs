@@ -1444,7 +1444,7 @@ impl Repair<'_, '_> {
             return Ok(());
         }
         pe.tabu.expire(pe.batch_index);
-        if self.pe_finish_if_no_setup_violations(pe)? || pe_finish_at_max_area() {
+        if self.pe_finish_if_no_setup_violations(pe)? || self.pe_finish_at_max_area(pe)? {
             return Ok(());
         }
         let scope = self.pe_collect_target_endpoints(pe)?;
@@ -1481,7 +1481,7 @@ impl Repair<'_, '_> {
     fn pe_judge_batch(&mut self, pe: &mut ParallelEval, pool: &BatchPool, pre_batch_wns: f32, batch_moves: &mut i32) -> Result<bool, Stop> {
         let (wns, tns) = self.pe_measure_qor();
         pe.stall.end_batch(*batch_moves);
-        let utilization_legal = pe_within_max_utilization();
+        let utilization_legal = self.pe_within_max_utilization();
         pe_trace(&format!(
             "VYGP|judge|{}|wns={}|tns={}|ck_wns={}|ck_tns={}|best={}|tol={}|util={}\n",
             pe.batch_index,
@@ -1501,7 +1501,7 @@ impl Repair<'_, '_> {
             self.pe_save_batch_checkpoint(pe, wns, tns)?;
             return Ok(true);
         }
-        pe_note_missed_batch(pe, utilization_legal);
+        self.pe_note_missed_batch(pe, utilization_legal);
         if self.pe_salvage_missed_batch(pe, pool, pre_batch_wns, batch_moves)? {
             pe_trace(&format!("VYGP|verdict|{}|salvaged\n", pe.batch_index));
             return Ok(true);
@@ -1549,7 +1549,7 @@ impl Repair<'_, '_> {
     /// the open journal; otherwise the batch is undone (`undoMissedBatch`).
     fn pe_settle_missed_batch(&mut self, pe: &mut ParallelEval, batch_moves: i32) -> Result<(), Stop> {
         let cfg = pe.config.parallel_eval;
-        if pe.tail.active && batch_moves > 0 && pe_within_max_utilization() && pe.tail.may_speculate(&cfg) {
+        if pe.tail.active && batch_moves > 0 && self.pe_within_max_utilization() && pe.tail.may_speculate(&cfg) {
             pe_trace(&format!("VYGP|settle|{}|speculate\n", pe.batch_index));
             pe.tail.keep_speculative(&pe.batch_instances);
             pe_event("wns_tail_speculate", "wns_tail_speculative_batches", "", 1);
@@ -1663,8 +1663,8 @@ impl Repair<'_, '_> {
             }
             self.pe_update_timing(pe)?;
             let (wns, tns) = self.pe_measure_qor();
-            pe_trace(&format!("VYGP|salv|{b}|after|wns={}|tns={}|util={}\n", e9(wns), e9(tns), u8::from(pe_within_max_utilization())));
-            if pe_within_max_utilization() && pe_accepts_batch(pe, wns, tns) {
+            pe_trace(&format!("VYGP|salv|{b}|after|wns={}|tns={}|util={}\n", e9(wns), e9(tns), u8::from(self.pe_within_max_utilization())));
+            if self.pe_within_max_utilization() && pe_accepts_batch(pe, wns, tns) {
                 pe_event("batches_salvaged", "", "", 1);
                 self.pe_save_batch_checkpoint(pe, wns, tns)?;
                 return Ok(true);
@@ -1827,6 +1827,47 @@ impl Repair<'_, '_> {
         pe_stop("no_setup_violations");
         pe_mark_run_complete(pe, true);
         Ok(true)
+    }
+
+    /// `finishAtMaxArea`: as LEGACY, nothing runs at the `-max_utilization` area. The verdict
+    /// keeps batches below it, so normally only a design that starts there stops here.
+    fn pe_finish_at_max_area(&mut self, pe: &mut ParallelEval) -> Result<bool, Stop> {
+        if self.pe_within_max_utilization() {
+            return Ok(false);
+        }
+        self.pe_stop_at_checkpoint(pe, "max_area")?;
+        Ok(true)
+    }
+
+    /// `withinMaxUtilization`: `!overMaxArea()`; without `-max_utilization` any area is legal.
+    fn pe_within_max_utilization(&self) -> bool {
+        !self.over_max_area()
+    }
+
+    /// `noteMissedBatch(utilization_legal)`: the miss counted against the stall budget; one over
+    /// the area limit is also a utilization reject, and the first warns (RSZ-2033): the undone
+    /// batches leave the design below the limit, so nothing else would show it. The area it names
+    /// is the progress table's (`computeDesignArea`), not the tracked one.
+    fn pe_note_missed_batch(&mut self, pe: &mut ParallelEval, utilization_legal: bool) {
+        pe.checkpoint_misses += 1;
+        pe_trace(&format!("VYGP|miss|{}|misses={}|util={}\n", pe.batch_index, pe.checkpoint_misses, u8::from(utilization_legal)));
+        pe.stall.on_missed();
+        pe_event("checkpoint_misses", "", "", 1);
+        if !utilization_legal {
+            pe_event("checkpoint_reject_utilization", "", "", 1);
+            if !pe.max_utilization_warned {
+                pe.max_utilization_warned = true;
+                let core_area = self.design.core_area();
+                let line = format!(
+                    "[WARNING RSZ-2033] PARALLEL_EVAL reached the -max_utilization limit of {:.2}%: batch {} would grow the design area to {:.1} um^2, over the {:.1} um^2 limit. Batches over the limit are undone.",
+                    100.0 * self.max_area / core_area,
+                    pe.batch_index,
+                    self.design.design_area() * 1e12,
+                    self.max_area * 1e12
+                );
+                self.report(line);
+            }
+        }
     }
 
     /// `stopAtCheckpoint(reason)`: the open batch (or speculative run) undone, a running tail
@@ -2124,10 +2165,12 @@ impl Repair<'_, '_> {
         self.pe_roll_back_journal(pe)
     }
 
-    /// `rollBackJournal`: the committer's restore (the design area is read live here, so
-    /// `recountDesignAreaAfterUndo` has nothing to do), the tentative moves uncounted.
+    /// `rollBackJournal`: the committer's restore, the tracked area counted again under a limit
+    /// (`recountDesignAreaAfterUndo`: `init` counted it before the undo), the tentative moves
+    /// uncounted.
     fn pe_roll_back_journal(&mut self, pe: &mut ParallelEval) -> Result<(), Stop> {
         self.restore_journal(&[])?;
+        self.recount_design_area_after_undo();
         pe.batch_journal_open = false;
         pe.committed_moves -= pe.tentative_moves;
         pe.tentative_moves = 0;
@@ -2563,17 +2606,6 @@ fn pe_effective_batch_cap(pe: &ParallelEval, target_endpoints: usize) -> i32 {
     adaptive_batch_size(target_endpoints, cfg.min_batch_cap, cfg.max_batch_cap)
 }
 
-/// `finishAtMaxArea`: `-max_utilization` is refused before the policy runs, so the design is
-/// always within it.
-fn pe_finish_at_max_area() -> bool {
-    false
-}
-
-/// `withinMaxUtilization`: `!overMaxArea()`; `-max_utilization` is refused before the policy
-/// runs, so any area is legal.
-fn pe_within_max_utilization() -> bool {
-    true
-}
 
 
 /// `checkpointWnsTolerance`: `checkpoint_wns_tolerance_period_pct` of the reference period; 0
@@ -2624,14 +2656,6 @@ fn pe_result_type(m: Move) -> Move {
     m
 }
 
-/// `noteMissedBatch(utilization_legal)`: the miss counted against the stall budget (the
-/// utilization warning, RSZ-2033, needs `-max_utilization`, which is refused).
-fn pe_note_missed_batch(pe: &mut ParallelEval, utilization_legal: bool) {
-    pe.checkpoint_misses += 1;
-    pe_trace(&format!("VYGP|miss|{}|misses={}|util={}\n", pe.batch_index, pe.checkpoint_misses, u8::from(utilization_legal)));
-    pe.stall.on_missed();
-    pe_event("checkpoint_misses", "", "", 1);
-}
 
 /// `startSmallBatchRetry`: once, after a run that kept no move — misses cleared, the stall
 /// monitor reset, the temporary tabu dropped, and a new selector from the policy config's

@@ -2223,6 +2223,8 @@ struct Repair<'c, 'd> {
     committer: Committer,
     out: Outcome,
     initial_design_area: f64,
+    /// `max_area_` (`setMaxUtilization`: the core area times `-max_utilization`): 0 for no limit.
+    max_area: f64,
     // MainRepairState
     opto_iteration: i64,
     initial_tns: f32,
@@ -2298,6 +2300,13 @@ pub trait SetupDesign: Design {
     fn master_area(&self, cell: &str) -> f64;
     /// `Resizer::coreArea`: `dbuToMeters(core dx) × dbuToMeters(core dy)` (0 without a core).
     fn core_area(&self) -> f64;
+    /// `Resizer::design_area_`, the area `overMaxArea` reads: counted by `initDesignArea`, then
+    /// moved by each edit (`designAreaIncr`). A design that tracks nothing counts it live.
+    fn tracked_design_area(&self) -> f64 {
+        self.design_area()
+    }
+    /// `Resizer::initDesignArea`: the tracked area counted afresh.
+    fn init_design_area(&mut self) {}
     fn as_design(&self) -> &dyn Design;
     /// `odb::dbDatabase::beginEco`: a nested journal level.
     fn begin_journal(&mut self) -> Result<(), String>;
@@ -2873,6 +2882,20 @@ fn resize_to_target_slew(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, r: &crate:
 
 /// `Optimizer::run` for the LEGACY phase: the phase, then the final report.
 impl<'c, 'd> Repair<'c, 'd> {
+    /// `Resizer::overMaxArea`: a limit, and `fuzzyGreaterEqual` of the tracked area and the limit
+    /// (`float` arguments).
+    fn over_max_area(&self) -> bool {
+        over_max_area(self.design.tracked_design_area(), self.max_area)
+    }
+
+    /// `Resizer::recountDesignAreaAfterUndo`: under a limit, the tracked area counted afresh
+    /// (`init` counted it before the undo).
+    fn recount_design_area_after_undo(&mut self) {
+        if self.max_area != 0.0 {
+            self.design.init_design_area();
+        }
+    }
+
     /// `RepairSetupContext` over the design: the timer, the first timing, the area and TNS before
     /// any move.
     fn new(ctx: &'c Ctx<'c>, design: &'d mut dyn SetupDesign, args: &'c Args) -> Result<Repair<'c, 'd>, Stop> {
@@ -2880,6 +2903,8 @@ impl<'c, 'd> Repair<'c, 'd> {
         let timing = snapshot(ctx, design.as_design(), &[], &mut timer, TimerEdits::default())?;
         // RepairSetupContext: the area and TNS before any move.
         let initial_design_area = design.design_area();
+        // `Resizer::init`: `initDesignArea`.
+        design.init_design_area();
         let initial_tns = timing.tns();
         Ok(Repair {
             ctx,
@@ -2892,6 +2917,7 @@ impl<'c, 'd> Repair<'c, 'd> {
             committer: Committer::default(),
             out: Outcome::default(),
             initial_design_area,
+            max_area: 0.0,
             opto_iteration: 0,
             initial_tns,
             prev_tns: initial_tns,
@@ -2923,10 +2949,24 @@ impl<'c, 'd> Repair<'c, 'd> {
 }
 
 pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) -> Result<Outcome, Stop> {
-    if args.max_utilization.is_some() {
-        return Err(Stop::refused("RSZ-ABSENT", "repair_timing -max_utilization: not modelled".into()));
-    }
+    // `parse_max_util` then `setMaxUtilization`, before the repair. Only PARALLEL_EVAL alone reads
+    // the limit here; LEGACY and the other policies stop on it in ways not modelled.
+    let max_area = match args.max_utilization.as_deref() {
+        None => 0.0,
+        Some(v) => {
+            let u: f64 = v.parse().map_err(|_| Stop::error("RSZ-0004", "-max_utilization must be between 0 and 100%.".into()))?;
+            if !(0.0..=100.0).contains(&u) {
+                return Err(Stop::error("RSZ-0004", "-max_utilization must be between 0 and 100%.".into()));
+            }
+            let pe_alone = matches!(args.phases.as_deref().map(crate::repair_timing::phase_plan), Some(crate::repair_timing::PhasePlan::ParallelEval));
+            if !pe_alone {
+                return Err(Stop::refused("RSZ-ABSENT", "repair_timing -max_utilization outside PARALLEL_EVAL alone: not modelled".into()));
+            }
+            design.core_area() * (u / 100.0)
+        }
+    };
     let mut r = Repair::new(ctx, design, args)?;
+    r.max_area = max_area;
     // `SetupLegacyBase::start`: with the move tracker on, `captureInitialSlackDistribution` (and
     // `captureOriginalEndpointSlack`, read only by the level-2 profiles) after RSZ-0099.
     // A policy alone with no legacy start captures nothing here (GLOBAL_SIZING never does: "No
@@ -4347,7 +4387,7 @@ impl Repair<'_, '_> {
                 }
                 self.debug("repair_setup", 3, format!("{phase} Phase: Allowing decreasing slack for {}/{DECREASING_SLACK_MAX_PASSES} passes", es.decreasing_slack_passes));
             }
-            // overMaxArea: -max_utilization is refused, so never.
+            // overMaxArea: -max_utilization is refused outside PARALLEL_EVAL, so never.
             // The first endpoint follows the worst one only when it moves, taking its slack with
             // it (`prev_end_slack` stays the high-water mark — upstream 6d88a0eb5b8); then
             // `useWorstEndpoint` and `setCurrentEndpoint`.
@@ -5764,6 +5804,10 @@ impl Repair<'_, '_> {
         if fuzzy::less(wns, self.ctx.margin) {
             self.report("[WARNING RSZ-0062] Unable to repair all setup violations.".to_string());
         }
+        // `Optimizer::repairSetup`'s last check: RSZ-0025 is an error (it throws).
+        if self.over_max_area() {
+            return Err(Stop::refused("RSZ-0025", "the run ends over -max_utilization (RSZ-0025, an error): not modelled".into()));
+        }
         Ok(())
     }
 }
@@ -5815,9 +5859,32 @@ fn path_improved(end_slack: f32, worst_slack: f32, prev_end_slack: f32, prev_wor
     fuzzy::greater(worst_slack, prev_worst_slack) || (fuzzy::equal(worst_slack, prev_worst_slack) && fuzzy::greater(end_slack, prev_end_slack))
 }
 
+/// `Resizer::overMaxArea`: `max_area_ && fuzzyGreaterEqual(design_area_, max_area_)` — 0 means no
+/// limit; both doubles narrowed to `float` (`fuzzyGreaterEqual` takes floats).
+fn over_max_area(design_area: f64, max_area: f64) -> bool {
+    max_area != 0.0 && {
+        let (a, m) = (design_area as f32, max_area as f32);
+        a > m || fuzzy::equal(a, m)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Resizer::overMaxArea`: no limit (0) is never over; at the limit is over
+    /// (`fuzzyGreaterEqual`), and so is a hair below it — the comparison is on `float`s within
+    /// the fuzzy tolerance, not on the doubles.
+    #[test]
+    fn the_area_limit_is_reached_at_it_within_float_fuzz() {
+        assert!(!over_max_area(1.0e-9, 0.0), "max_area 0 means no -max_utilization");
+        let m = 894.0e-12;
+        assert!(over_max_area(m, m));
+        assert!(over_max_area(m * (1.0 + 1e-12), m), "the doubles differ, the floats do not");
+        assert!(over_max_area(m * (1.0 - 1e-8), m), "a hair below is fuzzily equal: over");
+        assert!(!over_max_area(m * 0.999, m));
+        assert!(over_max_area(m * 1.001, m));
+    }
 
     /// Rules (`RepairTargetCollector` under `restrictedToPathGroup`): `endpointSlack` is the
     /// group slack, INF off the group (`getCurrentEndpointSlack` keeps the timer's own);

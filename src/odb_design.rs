@@ -78,6 +78,9 @@ pub struct CliDesign<'a> {
     /// The estimator's clock nets and constant pins, held across per-net estimates (see
     /// [`HeldSkips`]); `None` until the next estimate computes them again.
     pub skips: Option<HeldSkips>,
+    /// `Resizer::design_area_`: the area `overMaxArea` reads. `initDesignArea` counts it; each
+    /// edit moves it by its masters' areas, each narrowed to `float` (`designAreaIncr`).
+    pub area: f64,
     /// The database's edit log is recording for [`HeldSkips`] (the timer's log, when on, is the
     /// same log).
     pub skip_log: bool,
@@ -335,6 +338,11 @@ pub struct JournalState {
 }
 
 impl CliDesign<'_> {
+    /// `Resizer::designAreaIncr(float delta)`: the area narrowed to `float`, added to the double.
+    fn area_incr(&mut self, delta: f64) {
+        self.area += f64::from(delta as f32);
+    }
+
     /// After an edit: the timer's netlist and the pin order read again from the database.
     pub fn refresh(&mut self) -> Result<(), String> {
         let nl = vyges_grt::timer::netlist(self.db);
@@ -834,6 +842,9 @@ impl CliDesign<'_> {
     /// back (from the guides, not the routes the old estimate was made on).
     pub fn restore_journal_gr(&mut self) -> Result<bool, String> {
         self.pull_edits();
+        // `journalRestore` → `init()` → `initDesignArea` BEFORE the undo: the count still holds
+        // the undone edits (`recountDesignAreaAfterUndo` is the parallel policy's remedy).
+        self.area = design_area(self.db);
         let had_changes = !self.db.eco_is_empty().map_err(|e| e.to_string())?;
         self.db.eco_undo().map_err(|e| e.to_string())?;
         // An undo can bring back what the held skips no longer describe: computed again.
@@ -893,6 +904,8 @@ impl CliDesign<'_> {
             }
         }
         let inst = self.db.insert_buffer_before_loads(net, &iterms, &bterms, cell, Some(loc), reason, None, uniquify, loads_on_diff_nets).map_err(|e| e.to_string())?;
+        // `insertBufferPostProcess`: `designAreaIncr(area(master))`.
+        self.area_incr(master_area(self.db, cell));
         let at = self.clamp_loc_to_core(self.db.inst_location(&inst), cell);
         self.db.set_inst_location(&inst, at.0, at.1).map_err(|e| e.to_string())?;
         self.gr_inst_moved(&inst);
@@ -1129,9 +1142,13 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
                 self.stale_out_arcs.remove(inst);
             }
         }
+        let old = self.db.inst_master(inst);
         if !self.db.swap_master(inst, cell).map_err(|e| e.to_string())? {
             return Err(format!("swapMaster {inst} -> {cell} failed"));
         }
+        // `designAreaIncr(-area(master))`, the swap, `designAreaIncr(area(replacement))`.
+        self.area_incr(-master_area(self.db, &old));
+        self.area_incr(master_area(self.db, cell));
         // `Resizer::replaceCell`: "legalize the position of the instance in case it leaves the die".
         self.gr_legal_cell_pos(inst)?;
         self.refresh()?;
@@ -1251,6 +1268,14 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
         design_area(self.db)
     }
 
+    fn tracked_design_area(&self) -> f64 {
+        self.area
+    }
+
+    fn init_design_area(&mut self) {
+        self.area = design_area(self.db);
+    }
+
     fn master_area(&self, cell: &str) -> f64 {
         master_area(self.db, cell)
     }
@@ -1288,6 +1313,9 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
         if self.gr.is_some() {
             return self.restore_journal_gr();
         }
+        // `journalRestore` → `init()` → `initDesignArea` BEFORE the undo: the count still holds
+        // the undone edits (`recountDesignAreaAfterUndo` is the parallel policy's remedy).
+        self.area = design_area(self.db);
         let had_changes = !self.db.eco_is_empty().map_err(|e| e.to_string())?;
         self.db.eco_undo().map_err(|e| e.to_string())?;
         // An undo can bring back what the held skips no longer describe: computed again.
@@ -1378,6 +1406,8 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
         // `makeInstance(cell, "clone", parent_)`: named and created in the driver's module.
         let name = self.db.make_new_inst_name_beside(drvr_inst, "clone", "ALWAYS").map_err(e)?;
         self.db.create_inst_beside(cell, &name, drvr_inst).map_err(e)?;
+        // `Resizer::makeInstance`: `designAreaIncr(area(master))`.
+        self.area_incr(master_area(self.db, cell));
         self.db.inst_set_source_type(&name, "TIMING").map_err(e)?;
         let at = self.clamp_loc_to_core(loc, cell);
         self.db.set_inst_location(&name, at.0, at.1).map_err(e)?;
@@ -1437,6 +1467,11 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
         // The database half, in the candidate's order (disconnect, deleteInstance, makeInstance ×2,
         // makeNet, connectPin ×4, the module nets): inv1 takes the freed slot.
         let Some((inv1, inv2, mid)) = self.db.buffer_to_inverters(buffer, in_pin, out_pin, inv_cell, inv_in, inv_out).map_err(e)? else { return Ok(None) };
+        // ⚠️ The reference deletes the buffer through the network (`Sta::deleteInstance`), which
+        // leaves its area in the tracked area; each `Resizer::makeInstance` adds an inverter's.
+        for _ in 0..2 {
+            self.area_incr(master_area(self.db, inv_cell));
+        }
         // ⚠️ `makeInstance` places inv1 before inv2 exists; here both exist (inv2 unplaced) when
         // inv1 is placed. Placement reads placed instances only, so the order cannot show.
         for (name, loc) in [(&inv1, locs[0]), (&inv2, locs[1])] {
@@ -1480,7 +1515,10 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
         if in_net.is_empty() {
             return Err(format!("The input pin of buffer '{inst}' is undriven. Do not remove the buffer."));
         }
+        // `designAreaIncr(-area(master))` once the input is known driven: both paths delete it.
+        let master = self.db.inst_master(inst);
         let survivor = self.db.remove_buffer(inst, in_pin, out_pin).map_err(|e| e.to_string())?;
+        self.area_incr(-master_area(self.db, &master));
         for map in self.parasitics.iter_mut() {
             map.remove(&in_net);
             map.remove(&out_net);
@@ -1590,6 +1628,7 @@ impl CliDesign<'_> {
     /// `insertBufferPostProcess` (`setLocation`: clamped to the core, placed), and the odb
     /// callbacks: the nets on the new buffer's input and output marked invalid.
     pub fn insert_buffer_post_process(&mut self, inst: &str, cell: &str) -> Result<(), String> {
+        self.area_incr(master_area(self.db, cell));
         let at = self.clamp_loc_to_core(self.db.inst_location(inst), cell);
         self.db.set_inst_location(inst, at.0, at.1).map_err(|e| e.to_string())?;
         self.gr_inst_moved(inst);
