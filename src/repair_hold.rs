@@ -207,6 +207,8 @@ pub struct Progress {
     pub cloned: i64,
     pub initial_area: f64,
     pub design_area: f64,
+    /// Under -path_group: the group's worst hold slack and its endpoint, and its TNS.
+    pub group_row: Option<(f32, String, f32)>,
 }
 
 /// `printProgress(iteration, force, end)`: the header before row 0; a row every
@@ -219,11 +221,16 @@ pub fn print_progress(ctx: &HoldCtx<'_>, ends: &[HoldEnd], p: &Progress, iterati
     }
     if iteration % PRINT_INTERVAL == 0 || force || end {
         let points: Vec<Point> = ends.iter().map(|e| Point { pin: e.pin.clone(), slack: e.hold_slack, wns_slack: e.hold_slack }).collect();
-        let (wns, at) = worst_slack(&points);
-        let tns = total_negative_slack(&points);
+        let (wns, at, tns) = match &p.group_row {
+            Some((wns, at, tns)) => (*wns, Some(at.clone()).filter(|a| !a.is_empty()), *tns),
+            None => {
+                let (wns, at) = worst_slack(&points);
+                (wns, at.map(|a| a.pin.clone()), total_negative_slack(&points))
+            }
+        };
         let field = if end { "final".to_string() } else { iteration.to_string() };
         let growth = (p.design_area - p.initial_area) / p.initial_area * 1e2;
-        let worst_name = at.map(|a| a.pin.clone()).unwrap_or_default();
+        let worst_name = at.unwrap_or_default();
         out.report(format!(
             "{:>9} | {:>7} | {:>7} | {:>12} | {:>+7.1}% | {:>7} | {:>7} | {}",
             field,
@@ -254,5 +261,30 @@ mod tests {
         assert!(clock_tree_end(true, false), "a clock pin with no check is the clock tree's");
         assert!(!clock_tree_end(true, true), "a checked data pin in a clock network is an endpoint");
         assert!(!clock_tree_end(false, false) && !clock_tree_end(false, true));
+    }
+
+    /// Rule (`RepairHold::printProgress` under -path_group): the row reports the GROUP — WNS and
+    /// endpoint from `groupWorst(min)` (its first end), TNS the float sum of
+    /// `groupEndpointSlacks(min, 0.0)` — not the endpoints' own worst hold slack (here `b`, worse,
+    /// in another group). Witness: repair_timing_path_group5 row 0, 0.145 at `_863_/D`, while
+    /// in2reg's -0.0535 at `_881_/D` is the design's worst.
+    #[test]
+    fn a_group_progress_row_reports_the_group() {
+        let debug = BTreeMap::new();
+        let (libs, masters, sites, dont_use) = (Libs::default(), BTreeMap::new(), BTreeMap::new(), BTreeSet::new());
+        let ctx = HoldCtx { libs: &libs, masters: &masters, site_heights: &sites, dont_use: &dont_use, tgt_slews: [0.0; 2], time_scale: 1e-9, debug: &debug };
+        let ends = vec![
+            HoldEnd { pin: "a".into(), hold_slack: 0.145e-9, setup_slack: 1e-9, clock_tree_end: false },
+            HoldEnd { pin: "b".into(), hold_slack: -0.0535e-9, setup_slack: 1e-9, clock_tree_end: false },
+        ];
+        let row = |group_row: Option<(f32, String, f32)>| {
+            let p = Progress { resized: 0, inserted: 0, cloned: 0, initial_area: 1.0, design_area: 1.0, group_row };
+            let mut out = HoldOutcome::default();
+            print_progress(&ctx, &ends, &p, 1, true, false, &mut out);
+            out.lines.last().cloned().unwrap()
+        };
+        assert!(row(None).ends_with("|  -0.054 |  -0.054 | b"), "{}", row(None));
+        let g = row(Some((0.145e-9, "a".into(), 0.0)));
+        assert!(g.ends_with("|   0.145 |   0.000 | a"), "{g}");
     }
 }

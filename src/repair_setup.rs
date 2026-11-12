@@ -2390,7 +2390,7 @@ pub fn repair_hold(ctx: &Ctx<'_>, hctx: &crate::repair_hold::HoldCtx<'_>, design
     let initial_area = design.design_area();
     // `setMaxUtilization`: the core area times the fraction; 0 (no limit) without one.
     let max_area = ha.max_utilization.map_or(0.0, |u| design.core_area() * u);
-    let mut h = HoldRepair { ctx, hctx, ha, design, timer, out: crate::repair_hold::HoldOutcome::default(), inserted: 0, resized: 0, initial_area, max_buffer_count: 0, design_area: initial_area, max_area, clk_tree_pins: None };
+    let mut h = HoldRepair { ctx, hctx, ha, design, timer, out: crate::repair_hold::HoldOutcome::default(), inserted: 0, resized: 0, initial_area, max_buffer_count: 0, design_area: initial_area, max_area, clk_tree_pins: None, ends1: None };
     h.run()?;
     h.out.inserted = h.inserted;
     h.out.resized = h.resized;
@@ -2418,6 +2418,8 @@ struct HoldRepair<'c, 'd> {
     max_area: f64,
     /// `clk_tree_pins_` once `findClockTreePins` has run (`clk_tree_pins_valid_`; reset by `init`).
     clk_tree_pins: Option<BTreeSet<String>>,
+    /// Under -path_group, `ends1`: the endpoints the call repairs (fixed at its start).
+    ends1: Option<BTreeSet<String>>,
 }
 
 /// A fanout of a driver on a hold path, as `repairEndHold` reads it.
@@ -2495,6 +2497,36 @@ impl HoldRepair<'_, '_> {
         })
     }
 
+    /// `PathGroupFilter::groupEndpointSlacks(min, slack_max)`: the group's hold path ends, one
+    /// per endpoint, in the group's order (slack, then pin), each with the group's slack.
+    fn group_hold_slacks(&mut self, name: &str, slack_max: f32) -> Result<Vec<(String, f32)>, Stop> {
+        let name = crate::path_group::sta_group_name(name).to_string();
+        self.query_all(move |gs, ss, _| Ok(ss[0].group_path_ends(&name, MIN, usize::MAX, -INF, slack_max).iter().map(|e| (gs[0].vertices[e.vertex].name.clone(), e.slack)).collect()))
+    }
+
+    /// `holdSlack(end)` of each endpoint: `Sta::slack(end, min)`, or under -path_group the
+    /// group's slack there (`groupSlack`), INF where the group has no path: another group's worse
+    /// hold path at the same endpoint is not this repair's to fix.
+    fn hold_ends_by_group(&mut self) -> Result<Vec<crate::repair_hold::HoldEnd>, Stop> {
+        let mut ends = self.hold_ends()?;
+        if let Some(name) = self.ctx.path_group {
+            let group: HashMap<String, f32> = self.group_hold_slacks(name, INF)?.into_iter().collect();
+            for e in &mut ends {
+                e.hold_slack = group.get(&e.pin).copied().unwrap_or(INF);
+            }
+        }
+        Ok(ends)
+    }
+
+    /// The endpoints the call repairs (`ends1`) with their `holdSlack`s, in vertex order.
+    fn ends1_slacks(&mut self) -> Result<Vec<crate::repair_hold::HoldEnd>, Stop> {
+        let mut ends = self.hold_ends_by_group()?;
+        if let Some(keep) = &self.ends1 {
+            ends.retain(|e| keep.contains(&e.pin));
+        }
+        Ok(ends)
+    }
+
     /// `Sta::worstSlack(max)` (over every scene).
     fn setup_wns(&mut self) -> Result<f32, Stop> {
         let ctx = self.ctx;
@@ -2521,7 +2553,18 @@ impl HoldRepair<'_, '_> {
     fn progress(&mut self, iteration: i64, force: bool, end: bool) -> Result<(), Stop> {
         let prints = iteration == 0 || iteration % 10 == 0 || force || end;
         let ends = if prints { self.hold_ends()? } else { Vec::new() };
-        let p = crate::repair_hold::Progress { resized: self.resized, inserted: self.inserted, cloned: 0, initial_area: self.initial_area, design_area: if prints { self.design.design_area() } else { self.initial_area } };
+        // Under -path_group the row reports the group (`groupWorst(min)`: its first end, INF and
+        // none without one; the TNS the float sum of `groupEndpointSlacks(min, 0.0)`).
+        let group_row = match self.ctx.path_group {
+            Some(name) if prints => {
+                let all = self.group_hold_slacks(name, INF)?;
+                let tns = self.group_hold_slacks(name, 0.0)?.iter().fold(0.0f32, |t, (_, s)| t + s);
+                let (wns, at) = all.first().map_or((INF, String::new()), |(p, s)| (*s, p.clone()));
+                Some((wns, at, tns))
+            }
+            _ => None,
+        };
+        let p = crate::repair_hold::Progress { resized: self.resized, inserted: self.inserted, cloned: 0, initial_area: self.initial_area, design_area: if prints { self.design.design_area() } else { self.initial_area }, group_row };
         crate::repair_hold::print_progress(self.hctx, &ends, &p, iteration, force, end, &mut self.out);
         Ok(())
     }
@@ -2548,7 +2591,20 @@ impl HoldRepair<'_, '_> {
     /// `RepairHold::repairHold(ends, buffer, …)`.
     fn run(&mut self) -> Result<(), Stop> {
         let buffer = crate::repair_hold::find_hold_buffer(self.hctx, &mut self.out)?.ok_or_else(|| Stop::refused("RSZ-HOLD", "no hold buffer with an area: not modelled".into()))?;
-        let ends = self.hold_ends()?;
+        if self.ctx.path_group.is_some() && self.ctx.libs.scene_count() > 1 {
+            return Err(Stop::refused("RSZ-ABSENT", "repair_timing -hold -path_group over several corners: not modelled".into()));
+        }
+        // `ends1`: under -path_group the endpoints whose group hold slack is under the margin
+        // (`groupEndpointSlacks(min, hold_margin)`, then `fuzzyLess(slack, margin)`: the bound is
+        // inclusive, the test strict), in vertex order, for the whole call; else every endpoint.
+        let mut ends = self.hold_ends_by_group()?;
+        if let Some(name) = self.ctx.path_group {
+            let hm = self.ha.hold_margin as f32;
+            let keep: BTreeSet<String> = self.group_hold_slacks(name, hm)?.into_iter().filter(|(_, s)| fuzzy::less(*s, hm)).map(|(p, _)| p).collect();
+            ends.retain(|e| keep.contains(&e.pin));
+            self.ends1 = Some(keep);
+        }
+        let ends = ends;
         // `max_buffer_percent * instanceCount()` (`float`), truncated; at least 100.
         let instances = self.design.as_design().netlist().insts.len();
         self.max_buffer_count = i64::from(((self.ha.max_buffer_percent * instances as f32) as i32).max(100));
@@ -2573,7 +2629,7 @@ impl HoldRepair<'_, '_> {
             let before = self.inserted;
             self.repair_hold_pass(&mut fails, &buffer, &mut pass)?;
             self.debug("repair_hold", 1, format!("inserted {}", self.inserted - before));
-            let ends = self.hold_ends()?;
+            let ends = self.ends1_slacks()?;
             let (w, viol) = crate::repair_hold::find_hold_violations(self.hctx, &ends, margin, &mut self.out);
             worst = w;
             fails = viol.iter().map(|&i| ends[i].pin.clone()).collect();
@@ -2604,7 +2660,7 @@ impl HoldRepair<'_, '_> {
     /// slack (libc++ `std::sort`), each repaired in turn, `pass` counting them.
     fn repair_hold_pass(&mut self, fails: &mut [String], buffer: &str, pass: &mut i64) -> Result<(), Stop> {
         self.design.update_parasitics().map_err(|e| Stop::error("RSZ-EST", e))?;
-        let ends = self.hold_ends()?;
+        let ends = self.hold_ends_by_group()?;
         let slack: HashMap<String, f32> = ends.iter().map(|e| (e.pin.clone(), e.hold_slack)).collect();
         crate::order::libcxx_sort_by(fails, |a, b| slack[a] < slack[b]).map_err(|h| Stop::refused("RSZ-ORDER", format!("{} hold failures reach the sort's heap fallback, which is not modelled", h.len)))?;
         for end in fails.iter() {
@@ -2625,19 +2681,34 @@ impl HoldRepair<'_, '_> {
     fn worst_hold_path(&mut self, end: &str) -> Result<Option<(HoldPath, f32)>, Stop> {
         let end = end.to_string();
         let want_tree = self.clk_tree_pins.is_none();
+        let group = self.ctx.path_group.map(|n| crate::path_group::sta_group_name(n).to_string());
         self.query_all(move |gs, ss, cs| {
             let Some(v0) = gs[0].vertices.iter().position(|x| x.name == end) else { return Ok(None) };
+            // Under -path_group `findWorstSlackPath` is the group's worst end there
+            // (`worstGroupEnd`, one scene): the endpoint is here for the group's slack, which its
+            // worst hold path need not carry.
+            let group_end = group.as_deref().map(|name| ss[0].group_path_ends(name, MIN, usize::MAX, -INF, INF).into_iter().find(|e| e.vertex == v0));
             // `vertexWorstSlackPath(end, min)` over every scene's paths: the fuzzily least, the
             // earlier scene on a tie; the path expanded in its own scene.
             let mut worst = None;
             let mut min_slack = INF;
-            for (k, (gk, sk)) in gs.iter().zip(ss).enumerate() {
-                let Some(u) = gk.vertices.iter().position(|x| x.name == end) else { continue };
-                for p in sk.paths[u].iter().filter(|p| p.tag.mm == MIN) {
-                    let slack = p.arrival - p.required;
-                    if fuzzy::less(slack, min_slack) {
-                        min_slack = slack;
-                        worst = Some((k, u, *p));
+            match group_end {
+                Some(Some(e)) => {
+                    min_slack = e.slack;
+                    worst = Some((0, e.vertex, ss[0].paths[e.vertex][e.path]));
+                }
+                // No path of the group at the endpoint: the endpoint's own worst
+                // (`vertexWorstSlackPath`, `findWorstSlackPath`'s fallback).
+                Some(None) | None => {
+                    for (k, (gk, sk)) in gs.iter().zip(ss).enumerate() {
+                        let Some(u) = gk.vertices.iter().position(|x| x.name == end) else { continue };
+                        for p in sk.paths[u].iter().filter(|p| p.tag.mm == MIN) {
+                            let slack = p.arrival - p.required;
+                            if fuzzy::less(slack, min_slack) {
+                                min_slack = slack;
+                                worst = Some((k, u, *p));
+                            }
+                        }
                     }
                 }
             }
@@ -2729,8 +2800,17 @@ impl HoldRepair<'_, '_> {
             return Ok(());
         }
         let (sm, hm) = (self.ha.setup_margin, self.ha.hold_margin);
+        // Under -path_group only the group's path at this endpoint decides where a buffer goes
+        // and how much delay it must add, until it is met (`group_only`); other failing loads
+        // still share the buffer, setup checked.
+        let group_only = self.ctx.path_group.is_some();
+        let mut group_hold_slack = path.slack;
         for i in 0..path.vertices.len().saturating_sub(1) {
             let (pin, is_driver) = path.vertices[i].clone();
+            // `!(group_hold_slack < hold_margin)`: a slack is never NaN.
+            if group_only && f64::from(group_hold_slack) >= hm {
+                break;
+            }
             // `isClockTreeDriver` (upstream 022bcd85d2b): a hold path that starts at a clock source
             // (a clock used as data) runs through clock-tree drivers; only the data side is buffered,
             // so no other sink's clock latency moves.
@@ -2749,7 +2829,13 @@ impl HoldRepair<'_, '_> {
                     continue;
                 }
                 if f64::from(f.hold_slack) < hm {
-                    merge_into(&f.slacks, &mut slacks);
+                    let mut fs = f.slacks;
+                    if group_only {
+                        // The buffer delays both transitions by what the group needs.
+                        fs[0][MIN] = group_hold_slack;
+                        fs[1][MIN] = group_hold_slack;
+                    }
+                    merge_into(&fs, &mut slacks);
                     if f.out_port {
                         loads_have_out_port = true;
                     }
@@ -2797,6 +2883,10 @@ impl HoldRepair<'_, '_> {
                 self.design.commit_journal().map_err(|e| Stop::error("RSZ-JOURNAL", e))?;
                 self.inserted += buffers;
                 self.resized += resizes;
+                if let Some(name) = self.ctx.path_group {
+                    // `holdSlack(end_vertex)`: the group's slack there, INF without a path.
+                    group_hold_slack = self.group_hold_slacks(name, INF)?.into_iter().find(|(p, _)| p == end).map_or(INF, |(_, s)| s);
+                }
             }
         }
         Ok(())

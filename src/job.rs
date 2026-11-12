@@ -1386,7 +1386,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 // Under a group (`restrictedToPathGroup`): the group's path ends in place of the
                 // endpoints (`collectViolatingEndpoints` -> `refreshGroupSlacks`).
                 let group_ends = match path_group {
-                    Some(_) if hold_only || recover || fr.is_some() => return Err("repair_timing -path_group with -hold or -recover_power: not modelled".into()),
+                    Some(_) if recover || fr.is_some() => return Err("repair_timing -path_group with -recover_power: not modelled".into()),
                     Some(_) if libs.scene_count() > 1 => return Err("repair_timing -path_group over several corners: not modelled".into()),
                     Some(name) => Some(crate::path_group::group_ends(&g, &search, name)),
                     None => None,
