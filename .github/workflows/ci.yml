@@ -69,7 +69,7 @@ jobs:
         with:
           repository: vyges-tools/dpl
           path: vyges-tools-dpl
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           components: clippy
       - name: Test
@@ -130,7 +130,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake g++ git bison libboost-dev libboost-iostreams-dev libbz2-dev zlib1g-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
 
       # No --locked: the [patch] resolves the opendb crates to the freshly checked-out siblings @
       # main, which the committed lock file cannot know — let Cargo resolve.

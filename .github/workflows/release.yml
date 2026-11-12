@@ -142,7 +142,7 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install cmake boost bison   # bison for the LEF/DEF parsers
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: ${{ matrix.target }}
 
