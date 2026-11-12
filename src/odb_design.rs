@@ -337,7 +337,22 @@ pub struct JournalState {
     pub sdc_nets: BTreeSet<String>,
 }
 
+/// The nets an instance's deletion disconnects besides the ones the edit already accounts for
+/// (`skip`): every connected iterm's net, in iterm order, an unconnected iterm (empty) left out.
+fn nets_left_by_deletion(iterm_nets: impl Iterator<Item = String>, skip: &[&str]) -> Vec<String> {
+    iterm_nets.filter(|n| !n.is_empty() && !skip.contains(&n.as_str())).collect()
+}
+
 impl CliDesign<'_> {
+    /// The nets on an instance's other iterms (its supply pins, when the design connects them):
+    /// deleting the instance disconnects each, and `OdbCallBack::inDbITermPostDisconnect`
+    /// invalidates the net whatever it is — VDD and VSS join the estimator's pending nets (the
+    /// policy's `pendingNetCount`) until the next update finds nothing to estimate on them.
+    fn other_iterm_nets(&self, inst: &str, skip: &[&str]) -> Result<Vec<String>, String> {
+        let info = self.db.inst_iterm_info(inst).map_err(|e| e.to_string())?;
+        Ok(nets_left_by_deletion(info.into_iter().map(|(_, _, n)| n), skip))
+    }
+
     /// `Resizer::designAreaIncr(float delta)`: the area narrowed to `float`, added to the double.
     fn area_incr(&mut self, delta: f64) {
         self.area += f64::from(delta as f32);
@@ -1464,6 +1479,7 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
     fn buffer_to_inverters(&mut self, buffer: &str, in_pin: &str, out_pin: &str, inv_cell: &str, inv_in: &str, inv_out: &str, locs: [(i32, i32); 2]) -> Result<Option<(String, String)>, String> {
         let e = |x: vyges_opendb::Error| x.to_string();
         let (in_net, out_net) = (self.db.net_of(buffer, in_pin), self.db.net_of(buffer, out_pin));
+        let supplies = self.other_iterm_nets(buffer, &[&in_net, &out_net])?;
         // The database half, in the candidate's order (disconnect, deleteInstance, makeInstance ×2,
         // makeNet, connectPin ×4, the module nets): inv1 takes the freed slot.
         let Some((inv1, inv2, mid)) = self.db.buffer_to_inverters(buffer, in_pin, out_pin, inv_cell, inv_in, inv_out).map_err(e)? else { return Ok(None) };
@@ -1481,7 +1497,7 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
             self.gr_inst_moved(name);
             self.gr_legal_cell_pos(name)?;
         }
-        for n in [in_net, mid, out_net] {
+        for n in [in_net, mid, out_net].into_iter().chain(supplies) {
             self.invalidate(&n);
         }
         self.refresh()?;
@@ -1517,6 +1533,7 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
         }
         // `designAreaIncr(-area(master))` once the input is known driven: both paths delete it.
         let master = self.db.inst_master(inst);
+        let supplies = self.other_iterm_nets(inst, &[&in_net, &out_net])?;
         let survivor = self.db.remove_buffer(inst, in_pin, out_pin).map_err(|e| e.to_string())?;
         self.area_incr(-master_area(self.db, &master));
         for map in self.parasitics.iter_mut() {
@@ -1526,6 +1543,9 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
         self.invalid.remove(&in_net);
         self.invalid.remove(&out_net);
         self.invalidate(&survivor);
+        for n in &supplies {
+            self.invalidate(n);
+        }
         // A constrained net only ever survives: its constraint follows it to its name now.
         if self.sdc_nets.remove(&in_net) | self.sdc_nets.remove(&out_net) {
             self.sdc_nets.insert(survivor.clone());
@@ -1774,6 +1794,17 @@ mod tests {
     /// Upstream rule (aa89cb9694, 9ffa16d003): the output net survives a buffer removal only when
     /// it has a port and the input net has none; with ports on both sides the input net survives
     /// (before them a port on the output net alone decided it).
+    /// Upstream rule (`OdbCallBack::inDbITermPostDisconnect` at 4155ac3): every iterm
+    /// disconnect invalidates its net's parasitics, a supply net too, so deleting a buffer leaves
+    /// VDD and VSS pending (`pendingNetCount`) until the next update. Witness: the instrumented
+    /// reference on repair_setup_parallel_eval_path_group had VDD/VSS pending in exactly the 20
+    /// of 268 counts that followed an UnbufferMove.
+    #[test]
+    fn deleting_an_instance_leaves_its_supply_nets_pending() {
+        let nets = ["n1", "VDD", "", "VSS", "n2"].map(String::from);
+        assert_eq!(nets_left_by_deletion(nets.into_iter(), &["n1", "n2"]), ["VDD", "VSS"]);
+    }
+
     #[test]
     fn a_buffer_removal_keeps_the_output_net_only_when_the_input_net_has_no_port() {
         assert!(buffer_removal_keeps_output_net(false, true));

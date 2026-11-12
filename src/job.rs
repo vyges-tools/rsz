@@ -454,6 +454,8 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
     let mut timing_runs = Runs::default();
     // `makePathGroup`'s group paths, in the order the commands made them.
     let mut made_groups: Vec<vyges_sta::sdc::PathDelay> = Vec::new();
+    // The groups the script made with `rsz::resolve_path_group`, in the order it made them.
+    let mut group_order: Vec<String> = Vec::new();
     // `set_debug_level`: each (tool, group) and its level.
     let mut debug_levels: BTreeMap<(String, String), i64> = BTreeMap::new();
     let mut timing_stop: Option<String> = None;
@@ -611,6 +613,16 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
             // at their old unset defaults), so it is checked for shape and has no effect.
             "setenv" => {
                 let [_name, _value] = args.as_slice() else { return Err(format!("setenv {}: needs a name and a value", args.join(" "))) };
+            }
+            // `rsz::resolve_path_group <name>` (the script's own, before the command): makes the
+            // group when the constraints lack it. The captured SDC already has it, but written in
+            // `ExceptionPathLess` order (`WriteSdc::writeExceptions` sorts), which loses the
+            // creation order the exception ids follow; this restores it.
+            "rsz::resolve_path_group" => {
+                let [name] = args.as_slice() else { return Err(format!("rsz::resolve_path_group {}: needs one name", args.join(" "))) };
+                if !group_order.contains(name) {
+                    group_order.push(name.clone());
+                }
             }
             // `set_debug_level <tool> <group> <level>`: debug lines are not output this engine
             // scores, except a group that adds report lines (the move tracker's, RSZ-0211 on).
@@ -1196,9 +1208,6 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 // `-path_group` (`rsz::resolve_path_group`, before anything else of the command):
                 // an unknown name warns and restricts nothing; a group is not modelled yet.
                 let (path_group, path_group_lines) = rt::resolve_path_group(a.path_group.as_deref());
-                if path_group == Some("gated_clock") {
-                    return Err("repair_timing -path_group gated_clock: not modelled (the timer's gated-clock group)".into());
-                }
                 timing_runs.prefix = path_group_lines;
                 // `-recover_power` dispatches to `rsz::recover_power` in place of setup and hold:
                 // -phases, -sequence and the setup flags never reach it.
@@ -1314,6 +1323,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 // The groups earlier commands made stay in the constraints (`makeGroupPath` on the
                 // command SDC), after the file's own.
                 ssdc.path_delays.extend(made_groups.iter().cloned());
+                order_groups_by_creation(&mut ssdc.path_delays, &group_order);
                 // `resolvePathGroupName`: a known group the constraints do not name
                 // (`isPathGroupName`: no group path, nor clock, of the name) is made.
                 if let Some(name) = path_group {
@@ -1471,7 +1481,8 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     let rb_sizes_store;
                     let rb_ctx_store;
                     let mut fast_buffers: Vec<String> = Vec::new();
-                    let rb_ctx = if !hold_only && (seq.contains(&rt::Move::Buffer) || seq.contains(&rt::Move::SizeDownFanout)) {
+                    let size_down = finds_fast_buffers(&seq, plan.as_ref());
+                    let rb_ctx = if !hold_only && (seq.contains(&rt::Move::Buffer) || size_down) {
                         // `corner_` is `cmdScene()`, the first corner: scene 0.
                         let base = crate::rebuffer::Ctx { libs: &libs, sizes: &[], rc: wire_rc, dbu: db.tech_get_db_units_per_micron(), slew_shape_factor, tgt_slews, time_scale, cap_scale: lib0.cap_scale, cmd: 0, tgt: tgt_scene, layers: gr_layers.clone() };
                         let lowest = libs.link_cell(&buffers.lowest).ok_or("no lowest-drive buffer")?;
@@ -1491,7 +1502,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         };
                         let max_load = |c: &vyges_sta::liberty::Cell| crate::timing::max_load(c, &limits);
                         let ci = crate::rebuffer::CharInputs { ctx: &base, r_max, slew_limit: &slew_limit, max_input_slew: &max_input_slew, max_load: &max_load };
-                        if seq.contains(&rt::Move::SizeDownFanout) {
+                        if size_down {
                             fast_buffers = crate::rebuffer::find_fast_buffers(&ci, &buffers.cells);
                         }
                         if seq.contains(&rt::Move::Buffer) {
@@ -1983,9 +1994,61 @@ fn say(line: &Value) {
     }
 }
 
+/// The group paths `order` names, put back in their slots in `order`'s order (their creation
+/// order, which the exception ids follow: `ExceptionPath::id` is a counter); every other exception
+/// keeps its place. A group path's id orders the tags at a pin, which a debug trace reads.
+fn order_groups_by_creation(path_delays: &mut [vyges_sta::sdc::PathDelay], order: &[String]) {
+    let rank = |pd: &vyges_sta::sdc::PathDelay| pd.group.as_ref().and_then(|g| order.iter().position(|o| o == g));
+    let slots: Vec<usize> = (0..path_delays.len()).filter(|&k| rank(&path_delays[k]).is_some()).collect();
+    let mut named: Vec<vyges_sta::sdc::PathDelay> = slots.iter().map(|&k| path_delays[k].clone()).collect();
+    named.sort_by_key(|pd| rank(pd));
+    for (&k, pd) in slots.iter().zip(named) {
+        path_delays[k] = pd;
+    }
+}
+
+/// Whether the run needs the fast buffers SizeDownFanout steps a buffer load through
+/// (`Resizer::getFastBufferSizes`): LEGACY when its sequence has the move, PARALLEL_EVAL always.
+/// PARALLEL_EVAL's SizeDownFanoutMt generator runs whatever the LEGACY sequence lists, and
+/// `runRepairSetupPreamble` → `resizePreamble` → `findFastBuffers` runs unconditionally; without
+/// them a buffer load has no smaller size to step to.
+fn finds_fast_buffers(seq: &[crate::repair_timing::Move], plan: Option<&crate::repair_timing::PhasePlan>) -> bool {
+    use crate::repair_timing::{Move, PhasePlan};
+    seq.contains(&Move::SizeDownFanout) || matches!(plan, Some(PhasePlan::ParallelEval))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upstream rule (`WriteSdc::writeExceptions` sorts by `ExceptionPathLess`; `ExceptionPath`
+    /// ids count up as made): a captured SDC lists group paths by name, so the groups the script
+    /// made (`rsz::resolve_path_group reg2reg` then `in2reg`) go back to that order in their own
+    /// slots, other exceptions untouched. Witness: repair_setup_parallel_eval_path_group's seqchk
+    /// tag order at flop D pins (pe-s3a prep line 1).
+    #[test]
+    fn script_made_groups_regain_their_creation_order() {
+        let pd = |group: Option<&str>| vyges_sta::sdc::PathDelay { from_pins: Vec::new(), from_clock: false, to_pins: Vec::new(), to_clock: false, min_max: vyges_sta::liberty::MAX, ignore_clk_latency: false, break_path: false, delay: 0.0, false_path: group.is_none(), multicycle: None, thrus: Vec::new(), group: group.map(String::from) };
+        let mut v = vec![pd(Some("in2reg")), pd(None), pd(Some("mine")), pd(Some("reg2reg"))];
+        order_groups_by_creation(&mut v, &["reg2reg".to_string(), "in2reg".to_string()]);
+        let names: Vec<Option<&str>> = v.iter().map(|p| p.group.as_deref()).collect();
+        assert_eq!(names, [Some("reg2reg"), None, Some("mine"), Some("in2reg")]);
+    }
+
+    /// Upstream rule (`runRepairSetupPreamble` → `resizePreamble` → `findFastBuffers` at 4155ac3,
+    /// unconditional): PARALLEL_EVAL's SizeDownFanoutMt generator reads the fast buffers whatever
+    /// `-sequence` says, and steps a buffer load only through them (`getFastBufferSizes` is empty
+    /// for a cell outside the set). Witness: repair_setup_parallel_eval_path_group batch 30
+    /// commits SizeDownFanout `_544_` BUF_X8 → BUF_X4; with no fast buffers our size-down saw one
+    /// of `_543_/ZN`'s three loads and the stream diverged there.
+    #[test]
+    fn parallel_eval_finds_the_fast_buffers_without_size_down_in_the_sequence() {
+        use crate::repair_timing::{Move, PhasePlan};
+        assert!(finds_fast_buffers(&[Move::SizeUp], Some(&PhasePlan::ParallelEval)));
+        assert!(finds_fast_buffers(&[], Some(&PhasePlan::ParallelEval)));
+        assert!(finds_fast_buffers(&[Move::SizeDownFanout], None));
+        assert!(!finds_fast_buffers(&[Move::SizeUp, Move::Buffer], None), "LEGACY without the move never reads them");
+    }
 
     /// Upstream rule (`Resizer::findResizeSlacks` at 4155ac3): the reweight's `repairDesign` is
     /// followed by `reportViolationCounters(false, …)`, so its counters print after the progress

@@ -273,6 +273,15 @@ impl Snapshot {
         self.slack(pin)
     }
 
+    /// `Sta::worstSlack(max)`: design wide, under a group too (the least of the endpoints' own
+    /// slacks).
+    fn design_worst(&self) -> f32 {
+        if self.group {
+            return self.sta_slacks.values().copied().fold(INF, f32::min);
+        }
+        self.worst().0
+    }
+
     /// `RepairTargetCollector::worstSlack`: `Sta::worstSlack(max, wns, worst_vertex)`; under a
     /// group `groupWorst`, the group's first end (INF and none when it has none).
     fn worst(&self) -> (f32, Option<String>) {
@@ -418,11 +427,12 @@ fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], timer: &mut Tim
             None => (ends, starts, HashMap::new()),
             Some(_) if gs.len() > 1 => return Err(Stop::refused("RSZ-ABSENT", "repair_timing -path_group over several corners: not modelled".into())),
             Some(name) => {
-                let group_ends = ss[0].group_path_ends(name, MAX, usize::MAX, -INF, INF);
+                let group_ends = ss[0].group_path_ends(crate::path_group::sta_group_name(name), MAX, usize::MAX, -INF, INF);
                 let points: Vec<Point> = group_ends.iter().map(|e| Point { pin: gs[0].vertices[e.vertex].name.clone(), slack: e.slack, wns_slack: e.slack }).collect();
                 let paths: HashMap<String, (usize, usize)> = group_ends.iter().map(|e| (gs[0].vertices[e.vertex].name.clone(), (e.vertex, e.path))).collect();
-                let from_inputs = crate::path_group::group_sides(name).is_some_and(|(i, _)| i);
-                let starts: Vec<Point> = starts.into_iter().filter(|p| gs[0].vertices.iter().position(|x| x.name == p.pin).is_some_and(|v| (gs[0].is_port(v) && gs[0].vertices[v].is_driver) == from_inputs)).collect();
+                // `startpointInGroup`: every startpoint when the group starts anywhere (`kAny`).
+                let side = crate::path_group::group_starts_at_input(name);
+                let starts: Vec<Point> = starts.into_iter().filter(|p| side.is_none_or(|from_inputs| gs[0].vertices.iter().position(|x| x.name == p.pin).is_some_and(|v| (gs[0].is_port(v) && gs[0].vertices[v].is_driver) == from_inputs))).collect();
                 (points, starts, paths)
             }
         };
@@ -2997,7 +3007,7 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
         // Under a path group only LEGACY, LAST_GASP and CRIT_VT_SWAP (`findGroupFanout`) read the
         // group as the reference's do, through the collector alone; each other policy reads the
         // timer's own worst and total slacks in places.
-        if ctx.path_group.is_some() && !matches!(name.as_str(), "LEGACY" | "LAST_GASP" | "CRIT_VT_SWAP") {
+        if ctx.path_group.is_some() && !matches!(name.as_str(), "LEGACY" | "LAST_GASP" | "CRIT_VT_SWAP" | "PARALLEL_EVAL") {
             return Err(Stop::refused("RSZ-ABSENT", format!("repair_timing -path_group with the {name} phase: not modelled")));
         }
         match name.as_str() {
@@ -5905,11 +5915,15 @@ mod tests {
         assert_eq!(snap.slack("x"), INF, "an endpoint with no path in the group");
         assert_eq!(snap.sta_slack("b"), -5e-12);
         assert_eq!(snap.worst(), (-2e-12, Some("b".to_string())));
+        // PARALLEL_EVAL's pre-batch WNS (`sta_->worstSlack(max)`) is design wide under a group:
+        // the least of every endpoint's own slack, not the group's first end.
+        assert_eq!(snap.design_worst(), -9e-12);
         assert_eq!(snap.tns(), -4e-12 + 1e-30);
         let (wns, tns, worst) = snap.row(0.0);
         assert_eq!((wns, tns, worst.as_deref()), (-2e-12, -4e-12, Some("b")));
         let empty = Snapshot { ends: Vec::new(), starts: Vec::new(), paths: HashMap::new(), group: true, sta_slacks: HashMap::new() };
         assert_eq!(empty.worst(), (INF, None));
+        assert_eq!(empty.design_worst(), INF);
         // TNS is summed in float, not double: two ends of half an ulp each are lost in float (the
         // timer's double sum would keep one ulp).
         let big = -(2f32.powi(-20));

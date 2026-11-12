@@ -1449,7 +1449,9 @@ impl Repair<'_, '_> {
         }
         let scope = self.pe_collect_target_endpoints(pe)?;
         self.pe_analyze_bottlenecks(pe, &scope)?;
-        let pre_batch_wns = self.timing.worst().0;
+        // Design wide even under -path_group: the side pins of a missed batch may lie on any
+        // group's paths.
+        let pre_batch_wns = self.timing.design_worst();
         pe_trace(&format!("VYGP|prewns|{}|{}\n", pe.batch_index, e9(pre_batch_wns)));
         let pool = self.pe_evaluate_targets(pe, scope)?;
         if pool.targets.is_empty() {
@@ -1695,11 +1697,21 @@ impl Repair<'_, '_> {
         let batch: Vec<usize> = pe.batch_candidates.clone();
         let ratio = pe.config.parallel_eval.culprit_delay_ratio;
         let rows = super::timed_all(ctx, design, &mut self.timer, edits, |gs, ss, _| {
+            // A target carries the slack its endpoint was collected with, the group's under
+            // -path_group: one group query (up to the batch's highest target slack) covers the
+            // batch; an endpoint missing from it is above every target slack (INF).
+            let group_slacks: Option<HashMap<String, f32>> = ctx.path_group.map(|name| {
+                let slack_max = batch.iter().map(|&k| pool.targets[k].slack).fold(-super::INF, f32::max);
+                ss[0].group_path_ends(crate::path_group::sta_group_name(name), MAX, usize::MAX, -super::INF, slack_max).iter().map(|e| (gs[0].vertices[e.vertex].name.clone(), e.slack)).collect()
+            });
             let mut rows = Vec::with_capacity(batch.len());
             for &k in &batch {
                 let target = &pool.targets[k];
                 let candidate = pool.evaluations[k].best_candidate().expect("a committed evaluation has its best candidate");
-                let eslack = pe_load_slack(gs, ss, &target.endpoint_pin);
+                let eslack = match &group_slacks {
+                    None => pe_load_slack(gs, ss, &target.endpoint_pin),
+                    Some(g) => pe_load_slack(gs, ss, &target.endpoint_pin).map(|_| g.get(&target.endpoint_pin).copied().unwrap_or(super::INF)),
+                };
                 let mut culprit = false;
                 let mut victim = false;
                 let mut self_delta = None;

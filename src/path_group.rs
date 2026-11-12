@@ -25,6 +25,22 @@ pub fn group_sides(name: &str) -> Option<(bool, bool)> {
     }
 }
 
+/// `groupStartpointKind == kPrimaryInput` of a group name: whether its paths start at a primary
+/// input, at a register, or anywhere (`kAny`: `gated_clock`, whose `startpointInGroup` is true).
+pub fn group_starts_at_input(name: &str) -> Option<bool> {
+    group_sides(name).map(|(from_inputs, _)| from_inputs)
+}
+
+/// `staPathGroupName`: the timer's name of a group — its own, but `gated_clock` is the timer's
+/// built-in [`vyges_sta::path_group::GATED_CLK_GROUP`].
+pub fn sta_group_name(name: &str) -> &str {
+    if name == "gated_clock" {
+        vyges_sta::path_group::GATED_CLK_GROUP
+    } else {
+        name
+    }
+}
+
 /// `primaryPins`: the top ports on one side — every input that is no clock's source (`all_inputs
 /// -no_clocks`), or every output — inout ports on both.
 fn primary_pins(nl: &Netlist, inputs: bool, clock_sources: &[String]) -> Vec<String> {
@@ -73,7 +89,7 @@ pub fn make_path_group(g: &Graph<'_>, nl: &Netlist, name: &str, clock_sources: &
 /// endpoint, in the group's order (slack, then pin name: `PathEnd::cmp`), as points whose slack
 /// is the group's (`groupSlack`), not the endpoint's.
 pub fn group_ends(g: &Graph<'_>, s: &vyges_sta::search::Search<'_, '_>, name: &str) -> Vec<crate::repair_timing::Point> {
-    s.group_path_ends(name, vyges_sta::liberty::MAX, usize::MAX, -vyges_sta::search::INF_SLACK, vyges_sta::search::INF_SLACK)
+    s.group_path_ends(sta_group_name(name), vyges_sta::liberty::MAX, usize::MAX, -vyges_sta::search::INF_SLACK, vyges_sta::search::INF_SLACK)
         .into_iter()
         .map(|e| crate::repair_timing::Point { pin: g.vertices[e.vertex].name.clone(), slack: e.slack, wns_slack: e.slack })
         .collect()
@@ -138,6 +154,12 @@ mod tests {
         assert_eq!(group_sides("reg2out"), Some((false, true)));
         assert_eq!(group_sides("in2out"), Some((true, true)));
         assert_eq!(group_sides("gated_clock"), None);
+        // `staPathGroupName` / `groupStartpointKind`: gated_clock is the timer's "gated clock"
+        // group, and its paths start anywhere.
+        assert_eq!(sta_group_name("gated_clock"), "gated clock");
+        assert_eq!(sta_group_name("reg2reg"), "reg2reg");
+        assert_eq!(group_starts_at_input("gated_clock"), None);
+        assert_eq!(group_starts_at_input("in2reg"), Some(true));
     }
 
     /// Rule (`primaryPins`: `all_inputs -no_clocks` / `all_outputs`): an input that is a clock's

@@ -126,8 +126,8 @@ impl Repair<'_, '_> {
         let design: &dyn super::SetupDesign = &*self.design;
         let dont_touch = &design.net_info().dont_touch_insts;
         let mut result: Vec<CritInst> = Vec::new();
-        // Under a group, `findGroupFanout`'s side: whether its startpoints are inputs.
-        let group_from_inputs = ctx.path_group.and_then(crate::path_group::group_sides).map(|(i, _)| i);
+        // Under a group, `findGroupFanout`'s side: whether its startpoints are inputs (None: any).
+        let group_side = ctx.path_group.map(crate::path_group::group_starts_at_input);
         super::timed_all(ctx, design.as_design(), &mut self.timer, edits, |gs, ss, cs| {
             let (g, s) = (&gs[0], &ss[0]);
             let parasitics = std::slice::from_ref(design.parasitics(0));
@@ -135,7 +135,7 @@ impl Repair<'_, '_> {
             let ideal: BTreeSet<usize> = g.ideal_clock.iter().copied().collect();
             // `Vertex::isRegClk`: the from pin of a clock-to-output arc.
             let is_reg_clk = |v: usize| is_reg_clk(g, v);
-            let group_fanout = group_from_inputs.map(|from_inputs| find_group_fanout(g, &cs[0], from_inputs, &is_reg_clk));
+            let group_fanout = group_side.map(|from_inputs| find_group_fanout(g, &cs[0], from_inputs, &is_reg_clk));
             let mut visited: HashSet<usize> = HashSet::new();
             let mut crit_set: HashSet<String> = HashSet::new();
             for end in ends {
@@ -232,7 +232,7 @@ fn counts_instance(group: bool, driver: bool) -> bool {
 /// register output (`Resizer::isRegister`: a sequential cell's), on its side of the group
 /// (`startpointInGroup`: a top input exactly when the group starts at inputs) and off the clock
 /// network, forward through every edge but a timing check and one into a register clock pin.
-fn find_group_fanout(g: &vyges_sta::graph::Graph<'_>, clock_network: &BTreeSet<usize>, from_inputs: bool, is_reg_clk: &dyn Fn(usize) -> bool) -> HashSet<usize> {
+fn find_group_fanout(g: &vyges_sta::graph::Graph<'_>, clock_network: &BTreeSet<usize>, from_inputs: Option<bool>, is_reg_clk: &dyn Fn(usize) -> bool) -> HashSet<usize> {
     let register = |v: usize| {
         let vx = &g.vertices[v];
         vx.lib.and_then(|l| g.libs.get(l)).and_then(|l| l.cells.get(vx.cell.as_deref()?)).is_some_and(|c| c.is_sequential())
@@ -251,9 +251,10 @@ fn find_group_fanout(g: &vyges_sta::graph::Graph<'_>, clock_network: &BTreeSet<u
 }
 
 /// A `findGroupFanout` seed: a driver off the clock network that is a top input or a register
-/// output, a top input exactly when the group starts at inputs (`startpointInGroup`).
-fn is_group_start(driver: bool, on_clock: bool, input: bool, register: bool, from_inputs: bool) -> bool {
-    driver && !on_clock && (input || register) && input == from_inputs
+/// output, a top input exactly when the group starts at inputs (`startpointInGroup`; either when
+/// it starts anywhere, `kAny`).
+fn is_group_start(driver: bool, on_clock: bool, input: bool, register: bool, from_inputs: Option<bool>) -> bool {
+    driver && !on_clock && (input || register) && from_inputs.is_none_or(|f| input == f)
 }
 
 /// Breadth first from `seeds` along `next`: every vertex reached, the seeds included.
@@ -324,13 +325,15 @@ mod tests {
     #[test]
     fn a_groups_fanout_starts_on_its_side() {
         // (driver, on_clock, input, register)
-        assert!(is_group_start(true, false, true, false, true));
-        assert!(!is_group_start(true, false, true, false, false), "an input is no reg2reg start");
-        assert!(is_group_start(true, false, false, true, false));
-        assert!(!is_group_start(true, false, false, true, true), "a register is no in2reg start");
-        assert!(!is_group_start(true, true, false, true, false), "a clock-network pin is none");
-        assert!(!is_group_start(false, false, false, true, false), "a register's input is none");
-        assert!(!is_group_start(true, false, false, false, false), "a combinational output is none");
+        assert!(is_group_start(true, false, true, false, Some(true)));
+        assert!(!is_group_start(true, false, true, false, Some(false)), "an input is no reg2reg start");
+        assert!(is_group_start(true, false, false, true, Some(false)));
+        assert!(!is_group_start(true, false, false, true, Some(true)), "a register is no in2reg start");
+        assert!(!is_group_start(true, true, false, true, Some(false)), "a clock-network pin is none");
+        assert!(!is_group_start(false, false, false, true, Some(false)), "a register's input is none");
+        assert!(!is_group_start(true, false, false, false, Some(false)), "a combinational output is none");
+        // gated_clock (`kAny`): an input and a register output both start it.
+        assert!(is_group_start(true, false, true, false, None) && is_group_start(true, false, false, true, None));
         let next = [vec![1], vec![2, 3], vec![], vec![1]];
         let r = reach_forward(&[0], |v| next[v].clone());
         assert_eq!(r, HashSet::from([0, 1, 2, 3]));
@@ -373,7 +376,7 @@ mod tests {
         };
         let g = vyges_sta::graph::Graph::build(&libs, &netlist).unwrap();
         let clocks = crate::timing::clock_pins(&g, &["clk".to_string()]);
-        let names = |from_inputs: bool| -> BTreeSet<String> { find_group_fanout(&g, &clocks, from_inputs, &|v| is_reg_clk(&g, v)).into_iter().map(|v| g.vertices[v].name.clone()).collect() };
+        let names = |from_inputs: bool| -> BTreeSet<String> { find_group_fanout(&g, &clocks, Some(from_inputs), &|v| is_reg_clk(&g, v)).into_iter().map(|v| g.vertices[v].name.clone()).collect() };
         let set = |xs: &[&str]| -> BTreeSet<String> { xs.iter().map(|x| x.to_string()).collect() };
         assert_eq!(names(true), set(&["a", "b1/A", "b1/Z", "en", "r1/D", "r3/D"]));
         assert_eq!(names(false), set(&["b2/A", "b2/Z", "q", "r1/Q", "r2/D", "r2/Q", "r3/Q"]));
