@@ -31,6 +31,9 @@ pub struct CliDesign<'a> {
     pub clock_sources: &'a [String],
     /// `Sim`'s constant pins (`inst/term` or port name), as the timer reads them.
     pub constants: HashMap<String, bool>,
+    /// The SDC's constraint values (`set_case_analysis`, `set_logic_*`) the logic simulation seeds:
+    /// the estimator's skips, when re-made after an edit, come from a simulation under them.
+    pub constraints: vyges_est::sim::Constraints,
     /// The routing alpha in force while the repair runs.
     pub alpha: f32,
     /// Whether the estimator makes parasitics at all (not EST-0018).
@@ -680,6 +683,17 @@ impl CliDesign<'_> {
         Ok(())
     }
 
+    /// The estimator's clock nets and constant pins of the design as it is now: its own walk, the
+    /// constants under the SDC's constraint values when there are any (`isSkipPin` asks
+    /// `Sta::isConstant`).
+    fn fresh_skips(&self, timing: &vyges_est::placement::Timing<'_>) -> Result<vyges_est::placement::Skips, String> {
+        if self.constraints.case.is_empty() && self.constraints.logic.is_empty() {
+            return vyges_est::placement::skips(self.db, timing);
+        }
+        let values = vyges_est::sim::constant_pins_constrained(self.db, self.liberty, &self.constraints).map_err(|e| format!("constant propagation: {e}"))?;
+        vyges_est::placement::skips_with_constants(self.db, timing, &values)
+    }
+
     /// Holds the estimator's clock nets and constant pins of the design as it is now, with the nets
     /// an edit must name to drop them, and starts the edit log they are checked against.
     pub fn hold_skips(&mut self, skips: vyges_est::placement::Skips) -> Result<(), String> {
@@ -1004,13 +1018,13 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
             if std::env::var_os("VYGES_RSZ_SKIPS_TRACE").is_some() {
                 eprintln!("VYGSKIPS|computed|{net}");
             }
-            let skips = vyges_est::placement::skips(self.db, &timing)?;
+            let skips = self.fresh_skips(&timing)?;
             self.hold_skips(skips)?;
         }
         let skips = &self.skips.as_ref().expect("computed above").skips;
         // A check: the held sets against a fresh walk of the design as it is now.
         if std::env::var_os("VYGES_RSZ_CHECK_SKIPS").is_some() {
-            let fresh = vyges_est::placement::skips(self.db, &timing)?;
+            let fresh = self.fresh_skips(&timing)?;
             if fresh.clock_nets() != skips.clock_nets() || fresh.constant_pins() != skips.constant_pins() {
                 return Err(format!("held skips (estimating {net}): differ from a fresh walk (clock nets {}, constant pins {})", fresh.clock_nets() == skips.clock_nets(), fresh.constant_pins() == skips.constant_pins()));
             }

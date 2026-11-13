@@ -402,11 +402,12 @@ impl Reader<'_, '_> {
         self.g.vertices.iter().position(|x| x.name == name && x.is_driver == driver)
     }
 
-    /// `GraphDelayCalc::edgeFromSlew`: an ideal clock's slew (0) for a clock-to-output arc from an
-    /// ideal clock pin, else the graph's slew at the stage's min/max.
+    /// `GraphDelayCalc::edgeFromSlew`: the ideal clock's slew (`idealClkSlew`: its
+    /// `set_clock_transition`, else 0) for a clock-to-output arc from an ideal clock pin, else the
+    /// graph's slew at the stage's min/max.
     fn edge_from_slew(&self, from: usize, rf: usize, role: Role) -> f32 {
         if matches!(role, Role::RegClkToQ | Role::LatchEnToQ) && self.g.ideal_clock.contains(&from) {
-            0.0
+            crate::timing::ideal_clk_slew(self.g, from, rf, self.mm)
         } else {
             self.g.slew[from][rf][self.mm]
         }

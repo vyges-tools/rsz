@@ -561,7 +561,7 @@ fn timed_levels<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits:
         let mut gk = crate::repair_design::timer_graph(ctx.libs, k, netlist, ctx.env, ctx.master_pins)?;
         let ck = crate::timing::clock_pins(&gk, ctx.clock_sources);
         if ctx.ideal_clock {
-            gk.ideal_clock = crate::timing::clock_pins(&gk, ctx.ideal_sources).into_iter().collect();
+            crate::timing::set_ideal_clock(&mut gk, ctx.ideal_sources);
         }
         if let Some(stale) = design.stale_out_arcs() {
             gk.set_stale_out_arcs(stale);
@@ -1008,9 +1008,10 @@ fn rebuffer_probe_of_net(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>],
             let dp = sk.paths[prev.vertex].iter().find(|q| q.tag == prev.tag)?;
             let set = edge_arc_set(gk, prev.edge)?;
             let arc = &set.arcs[prev.arc];
-            // edgeFromSlew: an ideal clock pin's clock-to-output edge reads the ideal slew, 0.
+            // edgeFromSlew(..., max): an ideal clock pin's clock-to-output edge reads the ideal
+            // clock slew (`idealClkSlew`).
             let ideal_clk = set.role == Role::RegClkToQ && gk.ideal_clock.contains(&prev.vertex);
-            let from_slew = if ideal_clk { 0.0 } else { gk.slew[prev.vertex][arc.from_rf][MAX] };
+            let from_slew = if ideal_clk { crate::timing::ideal_clk_slew(gk, prev.vertex, arc.from_rf, MAX) } else { gk.slew[prev.vertex][arc.from_rf][MAX] };
             // clkPathArrival for a clock path: the ideal clock's `(insertion + edge) + latency`
             // (no insertion here), else its arrival.
             let prev_arrival = match dp.tag.clk_edge.and_then(|e| ctx.ssdc.clocks.get(e / 2).map(|c| (e, c))) {
@@ -1231,7 +1232,7 @@ fn full_probe(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], _cs: &[BTr
             let set = edge_arc_set(gk, prev.edge)?;
             let arc = &set.arcs[prev.arc];
             let ideal_clk = set.role == Role::RegClkToQ && gk.ideal_clock.contains(&prev.vertex);
-            let from_slew = if ideal_clk { 0.0 } else { gk.slew[prev.vertex][arc.from_rf][MAX] };
+            let from_slew = if ideal_clk { crate::timing::ideal_clk_slew(gk, prev.vertex, arc.from_rf, MAX) } else { gk.slew[prev.vertex][arc.from_rf][MAX] };
             let prev_arrival = match dp.tag.clk_edge.and_then(|e| ctx.ssdc.clocks.get(e / 2).map(|c| (e, c))) {
                 Some((e, c)) if dp.tag.is_clock && !c.propagated => c.edge_time(e % 2) + f32::from_bits(dp.tag.latency),
                 _ => dp.arrival,

@@ -26,15 +26,15 @@ pub struct Driver<'a> {
 }
 
 /// `RepairDesign::checkDriverArcSlew(corner, inst, arc, load_cap, limit, violation)`: the arc's
-/// slew at the lumped load from the slew on the instance's own input pin (an ideal clock's slew —
-/// 0, no `set_clock_transition` is modelled — for a register clock-to-Q arc from an ideal clock
-/// pin); over the limit, the violation is the larger excess.
+/// slew at the lumped load from the slew on the instance's own input pin (for a register
+/// clock-to-Q arc from an ideal clock pin, the ideal clock's slew at max — `idealClkSlew`: its
+/// `set_clock_transition`, else 0); over the limit, the violation is the larger excess.
 #[allow(clippy::too_many_arguments)]
 fn check_driver_arc_slew(g: &Graph<'_>, inst: &str, from: &str, role: Role, arc: &vyges_sta::liberty::Arc, load_cap: f32, limit: f32, clocks: &std::collections::BTreeSet<usize>, violation: &mut f32) {
     let Model::Gate(model) = &arc.model else { return };
     let pin = format!("{inst}/{from}");
     let Some(v) = g.vertices.iter().position(|x| x.name == pin && !x.is_driver) else { return };
-    let in_slew = if role == Role::RegClkToQ && clocks.contains(&v) { 0.0 } else { g.slew[v][arc.from_rf][MAX] };
+    let in_slew = if role == Role::RegClkToQ && clocks.contains(&v) { crate::timing::ideal_clk_slew(g, v, arc.from_rf, MAX) } else { g.slew[v][arc.from_rf][MAX] };
     let (_, arc_slew) = model.gate_delay(in_slew, load_cap);
     if arc_slew > limit {
         *violation = (arc_slew - limit).max(*violation);

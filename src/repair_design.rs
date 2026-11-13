@@ -541,8 +541,9 @@ pub fn timer_graph<'n>(libs: &'n Libs, k: usize, netlist: &'n vyges_sta::netlist
 }
 
 /// Scene `k`'s graph as repair_design times it: its clocks are ideal (a propagated clock is
-/// refused), so a register's clock-to-output arc reads the clock's own slew, 0, not its pin's —
-/// which a clock wire's parasitics (global-route ones) make non-zero.
+/// refused), so a register's clock-to-output arc reads the clock's own slew (`idealClkSlew`: its
+/// `set_clock_transition`, else 0), not its pin's — which a clock wire's parasitics (global-route
+/// ones) make non-zero.
 fn scene_graph<'n>(inputs: &Inputs<'n>, k: usize, netlist: NetlistRef<'n>) -> Result<Graph<'n>, Stop> {
     let libs = inputs.libs.scene_slice(k);
     let mut g = match netlist {
@@ -551,7 +552,7 @@ fn scene_graph<'n>(inputs: &Inputs<'n>, k: usize, netlist: NetlistRef<'n>) -> Re
     }
     .map_err(|e| Stop::refused("RSZ-TIMER", e))?;
     g.sdc = inputs.sdc.clone();
-    g.ideal_clock = timing::clock_pins(&g, inputs.clock_sources).into_iter().collect();
+    timing::set_ideal_clock(&mut g, inputs.clock_sources);
     Ok(g)
 }
 

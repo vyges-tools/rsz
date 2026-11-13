@@ -317,11 +317,17 @@ pub fn is_valid_sig_type(sig_type: &str) -> bool {
 /// clock's source pins over wire edges and COMBINATIONAL arcs only (`ClkTreeSearchPred`), never
 /// into another clock's source pin (`ClkSearchPred::searchTo`). Membership only.
 pub fn clock_pins(g: &Graph<'_>, sources: &[String]) -> std::collections::BTreeSet<usize> {
+    clock_pins_from(g, sources, sources)
+}
+
+/// [`clock_pins`] of the clock whose source pins are `start`, never entering a pin of `stop` (every
+/// clock's sources, `isLeafPinClock`) other than its own.
+fn clock_pins_from(g: &Graph<'_>, start: &[String], stop: &[String]) -> std::collections::BTreeSet<usize> {
     use vyges_sta::graph::EdgeKind;
-    let source_v: Vec<usize> = sources.iter().filter_map(|s| g.vertices.iter().position(|v| &v.name == s)).collect();
+    let source_v: Vec<usize> = start.iter().chain(stop).filter_map(|s| g.vertices.iter().position(|v| &v.name == s)).collect();
     let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
-    for &v in &source_v {
+    for v in start.iter().filter_map(|s| g.vertices.iter().position(|v| &v.name == s)) {
         if seen.insert(v) {
             queue.push_back(v);
         }
@@ -343,6 +349,60 @@ pub fn clock_pins(g: &Graph<'_>, sources: &[String]) -> std::collections::BTreeS
         }
     }
     seen
+}
+
+/// The timer's ideal clocks: the network of the clocks whose sources are `sources`
+/// ([`clock_pins`], `ClkNetwork::isIdealClock`) and, at each of its pins, the ideal clock slew
+/// ([`ideal_clock_slews`]) a register's clock-to-output arc and a timing check read there.
+pub fn set_ideal_clock(g: &mut Graph<'_>, sources: &[String]) {
+    g.ideal_clock = clock_pins(g, sources).into_iter().collect();
+    g.ideal_clock_slew = ideal_clock_slews(g, sources);
+}
+
+/// `ClkNetwork::idealClkSlew(pin, rf, min_max)` at one pin of the ideal clock network, as
+/// [`ideal_clock_slews`] left it on the graph (0 where none is held).
+pub fn ideal_clk_slew(g: &Graph<'_>, v: usize, rf: usize, mm: usize) -> f32 {
+    g.ideal_clock_slew.get(&v).map_or(0.0, |s| s[rf][mm])
+}
+
+/// `ClkNetwork::idealClkSlew(pin, rf, min_max)` at every pin of the ideal clock network: over the
+/// ideal clocks whose own network (`findClkPins(ideal_only)`, one walk per clock from its sources)
+/// reaches the pin, the largest slew for max and the smallest for min (`MinMax::compare` from
+/// `initValue`), a slew no `set_clock_transition` set counting 0 (`Clock::slew`). Empty when no
+/// clock has a transition: every pin reads 0 (`idealClkSlew` with no clock, or all at 0).
+pub fn ideal_clock_slews(g: &Graph<'_>, sources: &[String]) -> std::collections::HashMap<usize, [[f32; 2]; 2]> {
+    use vyges_sta::liberty::{MAX, MIN};
+    let mut out: std::collections::HashMap<usize, [[f32; 2]; 2]> = std::collections::HashMap::new();
+    let clocks: Vec<&vyges_sta::graph::ClockSlew> = g.sdc.clock_slews.iter().filter(|c| !c.sources.is_empty() && c.sources.iter().all(|s| sources.contains(s))).collect();
+    if clocks.is_empty() {
+        return out;
+    }
+    // A clock without a transition still takes part in the fold, at 0, where it reaches a pin.
+    // (sources, slew per rise/fall and min/max).
+    type Slews = [[Option<f32>; 2]; 2];
+    let mut with_zero: Vec<(Vec<String>, Slews)> = clocks.iter().map(|c| (c.sources.clone(), c.slew)).collect();
+    let mut rest: Vec<&String> = sources.iter().filter(|s| !clocks.iter().any(|c| c.sources.contains(s))).collect();
+    rest.dedup();
+    with_zero.extend(rest.into_iter().map(|s| (vec![s.clone()], [[None; 2]; 2])));
+    let init = [[f32::INFINITY, -f32::INFINITY]; 2];
+    for (start, slew) in &with_zero {
+        for v in clock_pins_from(g, start, sources) {
+            if !g.ideal_clock.contains(&v) {
+                continue;
+            }
+            let s = out.entry(v).or_insert(init);
+            for rf in 0..2 {
+                let (lo, hi) = (slew[rf][MIN].unwrap_or(0.0), slew[rf][MAX].unwrap_or(0.0));
+                if lo < s[rf][MIN] {
+                    s[rf][MIN] = lo;
+                }
+                if hi > s[rf][MAX] {
+                    s[rf][MAX] = hi;
+                }
+            }
+        }
+    }
+    out
 }
 
 /// `Network::connectedPinIterator(pin)` on a flat netlist: the pins of the pin's net, as a
@@ -636,6 +696,73 @@ mod tests {
 
     fn lib(default_max: Option<f32>) -> Library {
         Library { default_max_transition: default_max, ..Default::default() }
+    }
+
+    /// Two clocks through buffers to flops: `ca` -> b1 -> r1/CK and `cb` -> b2 -> r2/CK, and a
+    /// mux-free merge: `ca` also reaches r2/CK through b3 (two clocks at one pin).
+    fn two_clock_graph_libs() -> Vec<Library> {
+        let text = "library (t) { time_unit : \"1ns\"; capacitive_load_unit (1, pf);\n\
+            cell (BUF) { pin (A) { direction : input; capacitance : 0.001; }\n\
+              pin (X) { direction : output; function : \"A\"; timing () { related_pin : \"A\"; timing_sense : positive_unate; cell_rise (scalar) { values (\"0.01\"); } cell_fall (scalar) { values (\"0.01\"); } rise_transition (scalar) { values (\"0.01\"); } fall_transition (scalar) { values (\"0.01\"); } } } }\n\
+            cell (AND) { pin (A) { direction : input; capacitance : 0.001; } pin (B) { direction : input; capacitance : 0.001; }\n\
+              pin (X) { direction : output; function : \"A&B\"; timing () { related_pin : \"A\"; timing_sense : positive_unate; cell_rise (scalar) { values (\"0.01\"); } cell_fall (scalar) { values (\"0.01\"); } rise_transition (scalar) { values (\"0.01\"); } fall_transition (scalar) { values (\"0.01\"); } } timing () { related_pin : \"B\"; timing_sense : positive_unate; cell_rise (scalar) { values (\"0.01\"); } cell_fall (scalar) { values (\"0.01\"); } rise_transition (scalar) { values (\"0.01\"); } fall_transition (scalar) { values (\"0.01\"); } } } }\n\
+            cell (DFF) { ff (IQ, IQN) { next_state : \"D\"; clocked_on : \"CK\"; }\n\
+              pin (D) { direction : input; capacitance : 0.001; timing () { related_pin : \"CK\"; timing_type : setup_rising; } }\n\
+              pin (CK) { direction : input; clock : true; capacitance : 0.001; }\n\
+              pin (Q) { direction : output; function : \"IQ\"; timing () { related_pin : \"CK\"; timing_type : rising_edge; } } }\n}\n";
+        vec![Library::read(&vyges_sta::liberty_parse::parse(text).unwrap()).unwrap()]
+    }
+
+    fn two_clock_netlist() -> vyges_sta::netlist::Netlist {
+        use vyges_sta::netlist::{inst, Conn, Net, PortDir};
+        let net = |name: &str, pins: Vec<Conn>| std::sync::Arc::new(Net { name: name.into(), pins });
+        let i = |k: usize, p: &str| Conn::Inst(k, p.into());
+        vyges_sta::netlist::Netlist {
+            insts: vec![inst("b1", "BUF"), inst("b2", "BUF"), inst("g", "AND"), inst("r1", "DFF"), inst("r2", "DFF")],
+            ports: vec![("ca".into(), PortDir::Input), ("cb".into(), PortDir::Input)],
+            nets: vec![
+                net("ca", vec![i(0, "A"), i(2, "A"), Conn::Port(0)]),
+                net("cb", vec![i(1, "A"), i(2, "B"), Conn::Port(1)]),
+                net("n1", vec![i(0, "X"), i(3, "CK")]),
+                net("n2", vec![i(1, "X")]),
+                net("n3", vec![i(2, "X"), i(4, "CK")]),
+            ],
+        }
+    }
+
+    // Rule (`ClkNetwork::idealClkSlew`): at a pin of the ideal clock network, over the ideal clocks
+    // whose own network (`findClkPins`, one walk per clock) reaches it, the LARGEST slew for max and
+    // the SMALLEST for min (`MinMax::compare` from `initValue`), a clock with no
+    // `set_clock_transition` counting 0 (`Clock::slew`); 0 with no transition anywhere. A clock's
+    // walk never enters another clock's source (`ClkSearchPred::searchTo`).
+    #[test]
+    fn ideal_clock_slew_folds_the_clocks_reaching_each_pin() {
+        use vyges_sta::graph::ClockSlew;
+        use vyges_sta::liberty::MIN;
+        let libs = two_clock_graph_libs();
+        let nl = two_clock_netlist();
+        let mut g = Graph::build(&libs, &nl).unwrap();
+        let sources = vec!["ca".to_string(), "cb".to_string()];
+        let v = |g: &Graph<'_>, n: &str| g.vertices.iter().position(|x| x.name == n && !x.is_driver).unwrap();
+        // no transition: every pin reads 0
+        set_ideal_clock(&mut g, &sources);
+        assert!(g.ideal_clock_slew.is_empty());
+        assert_eq!(ideal_clk_slew(&g, v(&g, "r1/CK"), RISE, MAX), 0.0);
+        // `ca` 0.3 (rise max 0.5), `cb` none: r1/CK (ca only) reads ca's; r2/CK (both) reads the
+        // larger for max and cb's 0 for min
+        g.sdc.clock_slews = vec![ClockSlew { name: "a".into(), sources: vec!["ca".into()], slew: [[Some(0.3), Some(0.5)], [Some(0.3), Some(0.3)]] }];
+        set_ideal_clock(&mut g, &sources);
+        let (r1, r2) = (v(&g, "r1/CK"), v(&g, "r2/CK"));
+        assert_eq!((ideal_clk_slew(&g, r1, RISE, MAX), ideal_clk_slew(&g, r1, RISE, MIN), ideal_clk_slew(&g, r1, FALL, MAX)), (0.5, 0.3, 0.3));
+        assert_eq!((ideal_clk_slew(&g, r2, RISE, MAX), ideal_clk_slew(&g, r2, RISE, MIN)), (0.5, 0.0));
+        // both set: max the larger, min the smaller
+        g.sdc.clock_slews.push(ClockSlew { name: "b".into(), sources: vec!["cb".into()], slew: [[Some(0.1), Some(0.7)], [None, None]] });
+        set_ideal_clock(&mut g, &sources);
+        assert_eq!((ideal_clk_slew(&g, r2, RISE, MAX), ideal_clk_slew(&g, r2, RISE, MIN), ideal_clk_slew(&g, r2, FALL, MAX)), (0.7, 0.1, 0.3));
+        assert_eq!(ideal_clk_slew(&g, r1, RISE, MAX), 0.5, "cb's network does not reach r1");
+        // a clock that is not ideal here (its source not among the ideal sources) takes no part
+        set_ideal_clock(&mut g, &["ca".to_string()]);
+        assert_eq!(ideal_clk_slew(&g, v(&g, "r2/CK"), RISE, MAX), 0.5);
     }
 
     fn port(name: &str, direction: Direction, max_cap: Option<f32>) -> vyges_sta::liberty::Port {

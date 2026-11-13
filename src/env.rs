@@ -15,6 +15,9 @@ use crate::preamble::{Libs, Master};
 // that times a design from loom maps it one way; kept here under the names the engines call.
 pub use vyges_sta::load::{expanded_io_delays, min_max_all, path_delays, port_collection, rise_fall, search_sdc, search_sdc_on};
 
+/// No SDC constraint value: the estimator's skips are its own simulation's.
+static NO_CONSTRAINTS: std::sync::LazyLock<vyges_est::sim::Constraints> = std::sync::LazyLock::new(vyges_est::sim::Constraints::default);
+
 thread_local! {
     static LUT: vyges_stt::flute::lut::Lut = vyges_stt::flute::lut::load_tables(vyges_stt::flute::lut::MAX_LUT_DEGREE).expect("flute tables");
 }
@@ -107,25 +110,25 @@ enum Propagation<'c> {
 
 #[allow(clippy::too_many_arguments)]
 pub fn placement_parasitics_at(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagated: bool, alpha: f32, scenes: usize, port_caps: &PortCaps) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
-    parasitics_held(db, rc, liberty, clock_sources, Propagation::All(propagated), alpha, scenes, port_caps, None)
+    parasitics_held(db, rc, liberty, clock_sources, Propagation::All(propagated), alpha, scenes, port_caps, None, &NO_CONSTRAINTS)
 }
 
 /// [`placement_parasitics_at`] with propagation read per clock (`clocks`, est 8e440c9).
 #[allow(clippy::too_many_arguments)]
 pub fn placement_parasitics_per_clock(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], clocks: &vyges_est::placement::Clocks, alpha: f32, scenes: usize, port_caps: &PortCaps) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
-    parasitics_held(db, rc, liberty, clock_sources, Propagation::PerClock(clocks), alpha, scenes, port_caps, None)
+    parasitics_held(db, rc, liberty, clock_sources, Propagation::PerClock(clocks), alpha, scenes, port_caps, None, &NO_CONSTRAINTS)
 }
 
 /// [`placement_parasitics_at`] with the clock nets and constant pins of `db` as it is now, when the
 /// caller holds them (`held`); `None` walks the design for them.
 #[allow(clippy::too_many_arguments)]
 pub fn placement_parasitics_held(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagated: bool, alpha: f32, scenes: usize, port_caps: &PortCaps, held: Option<&vyges_est::placement::Skips>) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
-    parasitics_held(db, rc, liberty, clock_sources, Propagation::All(propagated), alpha, scenes, port_caps, held)
+    parasitics_held(db, rc, liberty, clock_sources, Propagation::All(propagated), alpha, scenes, port_caps, held, &NO_CONSTRAINTS)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn parasitics_held(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagation: Propagation<'_>, alpha: f32, scenes: usize, port_caps: &PortCaps, held: Option<&vyges_est::placement::Skips>) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
-    use vyges_est::placement::{estimate_wire_parasitics, estimate_wire_parasitics_with_skips, skips_with_clocks, Timing};
+fn parasitics_held(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagation: Propagation<'_>, alpha: f32, scenes: usize, port_caps: &PortCaps, held: Option<&vyges_est::placement::Skips>, constraints: &vyges_est::sim::Constraints) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
+    use vyges_est::placement::{estimate_wire_parasitics, estimate_wire_parasitics_with_skips, skips_with_clocks, skips_with_clocks_and_constants, skips_with_constants, Timing};
     if no_signal_cap(db, rc) {
         return Ok(vec![HashMap::new(); scenes]);
     }
@@ -136,7 +139,19 @@ fn parasitics_held(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty
         Propagation::PerClock(c) => c.all_propagated(),
     };
     let timing = Timing { liberty: Some(liberty), clock_sources: clock_sources.to_vec(), propagated };
-    let nets = match (held, propagation) {
+    // `isSkipPin` asks `Sta::isConstant`, under the SDC's constraint values when it has any: the
+    // skips then come from that simulation, not the estimator's own (tie cells alone).
+    let constrained = if held.is_none() && !(constraints.case.is_empty() && constraints.logic.is_empty()) {
+        let values = vyges_est::sim::constant_pins_constrained(db, liberty, constraints).map_err(|e| format!("constant propagation: {e}"))?;
+        Some(match propagation {
+            Propagation::All(_) => skips_with_constants(db, &timing, &values),
+            Propagation::PerClock(c) => skips_with_clocks_and_constants(db, &timing, c, &values),
+        }
+        .map_err(|e| e.to_string())?)
+    } else {
+        None
+    };
+    let nets = match (held.or(constrained.as_ref()), propagation) {
         (Some(skips), _) => estimate_wire_parasitics_with_skips(db, &timing, skips, alpha, &est_stt),
         (None, Propagation::All(_)) => estimate_wire_parasitics(db, &timing, alpha, &est_stt),
         (None, Propagation::PerClock(c)) => estimate_wire_parasitics_with_skips(db, &timing, &skips_with_clocks(db, &timing, c).map_err(|e| e.to_string())?, alpha, &est_stt),
@@ -160,38 +175,52 @@ fn parasitics_held(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty
 /// between the two — a netlist edit is replayed by the command that made it, not read back.
 #[allow(clippy::too_many_arguments)]
 pub fn estimate_state(db: &Db, seen: Option<&str>, netlist: &vyges_sta::netlist::Netlist, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagated: bool, alpha: f32, scenes: usize, port_caps: &PortCaps) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
-    state_held(db, seen, netlist, rc, liberty, clock_sources, Propagation::All(propagated), alpha, scenes, port_caps, None)
+    state_held(db, seen, netlist, rc, liberty, clock_sources, Propagation::All(propagated), alpha, scenes, port_caps, None, &NO_CONSTRAINTS)
 }
 
 /// [`estimate_state`] with propagation read per clock (`clocks`, est 8e440c9).
 #[allow(clippy::too_many_arguments)]
 pub fn estimate_state_per_clock(db: &Db, seen: Option<&str>, netlist: &vyges_sta::netlist::Netlist, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], clocks: &vyges_est::placement::Clocks, alpha: f32, scenes: usize, port_caps: &PortCaps) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
-    state_held(db, seen, netlist, rc, liberty, clock_sources, Propagation::PerClock(clocks), alpha, scenes, port_caps, None)
+    state_held(db, seen, netlist, rc, liberty, clock_sources, Propagation::PerClock(clocks), alpha, scenes, port_caps, None, &NO_CONSTRAINTS)
+}
+
+/// [`estimate_state_per_clock`] under the SDC's constraint values ([`sdc_constraints`]): the nets
+/// whose driver they make constant get no network (`isSkipPin`).
+#[allow(clippy::too_many_arguments)]
+pub fn estimate_state_per_clock_sdc(db: &Db, seen: Option<&str>, netlist: &vyges_sta::netlist::Netlist, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], clocks: &vyges_est::placement::Clocks, alpha: f32, scenes: usize, port_caps: &PortCaps, constraints: &vyges_est::sim::Constraints) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
+    state_held(db, seen, netlist, rc, liberty, clock_sources, Propagation::PerClock(clocks), alpha, scenes, port_caps, None, constraints)
 }
 
 /// [`estimate_state`] with `held`: the clock nets and constant pins of `db` as it is now, when the
 /// caller has them; a `seen` design is a different one, so they are not used for it.
 #[allow(clippy::too_many_arguments)]
 pub fn estimate_state_held(db: &Db, seen: Option<&str>, netlist: &vyges_sta::netlist::Netlist, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagated: bool, alpha: f32, scenes: usize, port_caps: &PortCaps, held: Option<&vyges_est::placement::Skips>) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
-    state_held(db, seen, netlist, rc, liberty, clock_sources, Propagation::All(propagated), alpha, scenes, port_caps, held)
+    state_held(db, seen, netlist, rc, liberty, clock_sources, Propagation::All(propagated), alpha, scenes, port_caps, held, &NO_CONSTRAINTS)
 }
 
 /// [`estimate_state_held`] with propagation read per clock (`clocks`, est 8e440c9).
 #[allow(clippy::too_many_arguments)]
 pub fn estimate_state_held_per_clock(db: &Db, seen: Option<&str>, netlist: &vyges_sta::netlist::Netlist, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], clocks: &vyges_est::placement::Clocks, alpha: f32, scenes: usize, port_caps: &PortCaps, held: Option<&vyges_est::placement::Skips>) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
-    state_held(db, seen, netlist, rc, liberty, clock_sources, Propagation::PerClock(clocks), alpha, scenes, port_caps, held)
+    state_held(db, seen, netlist, rc, liberty, clock_sources, Propagation::PerClock(clocks), alpha, scenes, port_caps, held, &NO_CONSTRAINTS)
+}
+
+/// [`estimate_state_held_per_clock`] under the SDC's constraint values: `held` (when used) was made
+/// under them; a `seen` design's skips are made under them too.
+#[allow(clippy::too_many_arguments)]
+pub fn estimate_state_held_per_clock_sdc(db: &Db, seen: Option<&str>, netlist: &vyges_sta::netlist::Netlist, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], clocks: &vyges_est::placement::Clocks, alpha: f32, scenes: usize, port_caps: &PortCaps, held: Option<&vyges_est::placement::Skips>, constraints: &vyges_est::sim::Constraints) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
+    state_held(db, seen, netlist, rc, liberty, clock_sources, Propagation::PerClock(clocks), alpha, scenes, port_caps, held, constraints)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn state_held(db: &Db, seen: Option<&str>, netlist: &vyges_sta::netlist::Netlist, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagation: Propagation<'_>, alpha: f32, scenes: usize, port_caps: &PortCaps, held: Option<&vyges_est::placement::Skips>) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
+fn state_held(db: &Db, seen: Option<&str>, netlist: &vyges_sta::netlist::Netlist, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagation: Propagation<'_>, alpha: f32, scenes: usize, port_caps: &PortCaps, held: Option<&vyges_est::placement::Skips>, constraints: &vyges_est::sim::Constraints) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
     match seen {
-        None => parasitics_held(db, rc, liberty, clock_sources, propagation, alpha, scenes, port_caps, held),
+        None => parasitics_held(db, rc, liberty, clock_sources, propagation, alpha, scenes, port_caps, held, constraints),
         Some(path) => {
             let seen = Db::open(path).map_err(|e| format!("{path}: {e}"))?;
             if &vyges_grt::timer::netlist(&seen) != netlist {
                 return Err("the netlist was edited between estimate_parasitics and this command by a step the job does not carry: not modelled".into());
             }
-            parasitics_held(&seen, rc, liberty, clock_sources, propagation, alpha, scenes, port_caps, None)
+            parasitics_held(&seen, rc, liberty, clock_sources, propagation, alpha, scenes, port_caps, None, constraints)
         }
     }
 }
@@ -220,6 +249,90 @@ pub fn constants_by_name(values: std::collections::BTreeMap<vyges_est::sim::Pin,
             Pin::ITerm(i, t) => (format!("{i}/{t}"), v),
         })
         .collect()
+}
+
+/// The constraint values `Sim::seedConstants` reads from the SDC (`setConstraintConstPins`): every
+/// `set_logic_*` pin, then every `set_case_analysis` pin, a later command on a pin replacing an
+/// earlier (`Sdc::setLogicValue` / `setCaseAnalysis` are maps). A value of 0 or 1 holds a constant;
+/// `set_logic_dc` (X) holds none but blocks one. Refused: a `rise` / `fall` case value (it limits
+/// the transitions the search takes, which this timer does not model), an object that is not a
+/// port or an instance pin of the database, and a pattern.
+pub fn sdc_constraints(s: &vyges_loom::sdc::Sdc, db: &Db) -> Result<vyges_est::sim::Constraints, String> {
+    use vyges_est::sim::Pin;
+    let mut out = vyges_est::sim::Constraints::default();
+    if s.case_values.is_empty() && s.logic_values.is_empty() {
+        return Ok(out);
+    }
+    let ports: std::collections::HashSet<String> = db.block_get_b_terms().into_iter().collect();
+    let insts: std::collections::HashSet<String> = db.block_get_insts().into_iter().collect();
+    for (cmds, map) in [(&s.logic_values, &mut out.logic), (&s.case_values, &mut out.case)] {
+        for c in cmds {
+            let value = match (c.constant(), c.value.as_str()) {
+                (Some(v), _) => Some(v),
+                (None, "X") => None,
+                (None, v) => return Err(format!("{} {v}: a transition value is not modelled (0 and 1 are)", c.cmd)),
+            };
+            for o in &c.objects {
+                if o.contains(['*', '?']) {
+                    return Err(format!("{} {o}: a pattern is not modelled", c.cmd));
+                }
+                let pin = match c.accessor.as_str() {
+                    "get_ports" if ports.contains(o) => Pin::Port(o.clone()),
+                    "get_pins" => match o.rsplit_once('/') {
+                        Some((i, t)) if insts.contains(i) && !db.net_of(i, t).is_empty() => Pin::ITerm(i.to_string(), t.to_string()),
+                        _ => return Err(format!("{} {o}: not a connected instance pin (not modelled)", c.cmd)),
+                    },
+                    a => return Err(format!("{} [{a} {o}]: not modelled (ports and instance pins are)", c.cmd)),
+                };
+                map.insert(pin, value);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The logic simulation's constant pins under the SDC's constraint values (`Sim::ensureConstantsPropagated`
+/// with `set_case_analysis` / `set_logic_*` seeded — what `Sta::isConstant` answers): the design's
+/// own constants (tie cells, supply nets) without an SDC or with no such command.
+pub fn constant_values_sdc(db: &Db, liberty: &vyges_est::liberty::LibertyClocks, sdc: Option<&vyges_loom::sdc::Sdc>) -> Result<BTreeMap<vyges_est::sim::Pin, bool>, String> {
+    let c = match sdc {
+        Some(s) => sdc_constraints(s, db)?,
+        None => vyges_est::sim::Constraints::default(),
+    };
+    if c.case.is_empty() && c.logic.is_empty() {
+        return constant_values(db, liberty);
+    }
+    vyges_est::sim::constant_pins_constrained(db, liberty, &c).map_err(|e| format!("constant propagation: {e}"))
+}
+
+/// [`constant_values_sdc`] keyed as the timer names pins ([`constants_by_name`]).
+pub fn sim_constants_sdc(db: &Db, liberty: &vyges_est::liberty::LibertyClocks, sdc: Option<&vyges_loom::sdc::Sdc>) -> Result<HashMap<String, bool>, String> {
+    Ok(constants_by_name(constant_values_sdc(db, liberty, sdc)?))
+}
+
+/// The pins the SDC's constraint values make constant beyond the design's own (`with` against
+/// `without`) must stay off every clock network: a constant there prunes the reference's clock
+/// network (`ClkTreeSearchPred` does not search through a constant), which the clock-pin walks
+/// here do not model.
+pub fn constants_off_clock_networks(db: &Db, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], constraints: &vyges_est::sim::Constraints, with: &BTreeMap<vyges_est::sim::Pin, bool>) -> Result<(), String> {
+    use vyges_est::sim::Pin;
+    if clock_sources.is_empty() || constraints.case.is_empty() && constraints.logic.is_empty() {
+        return Ok(());
+    }
+    let without = constant_values(db, liberty)?;
+    // a constraint value of X holds no constant but its pin is still one the constraints name
+    let named: Vec<Pin> = constraints.case.keys().chain(constraints.logic.keys()).cloned().collect();
+    let clock_nets = vyges_est::clk_network::find_clk_nets(db, liberty, clock_sources).map_err(|e| e.to_string())?;
+    for p in with.keys().filter(|p| !without.contains_key(*p)).chain(named.iter()) {
+        let net = match p {
+            Pin::Port(n) => db.bterm_net(n),
+            Pin::ITerm(i, t) => db.net_of(i, t),
+        };
+        if clock_nets.contains(&net) {
+            return Err(format!("set_case_analysis / set_logic_*: {} is constant on a clock network (the pruned clock network is not modelled)", p.path_name()));
+        }
+    }
+    Ok(())
 }
 
 /// [`vyges_sta::load::sdc_env`] over the design's libraries: `set_driving_cell`, `set_load` and

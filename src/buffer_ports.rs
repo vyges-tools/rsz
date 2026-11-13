@@ -150,9 +150,9 @@ pub fn buffer_inputs(design: &mut dyn PortDesign, o: &Options, weakest: &str, ou
         }
         // Rule: an input port on no net is not modelled (the reference reads the net unchecked).
         let net = design.port_net(&port).ok_or_else(|| Stop::refused("RSZ-REFUSED", format!("input port {port} is on no net: not modelled")))?;
-        // `isConstant` on an input port needs case analysis, which is refused at read_sdc, so it
-        // never holds here.
-        if !design.net_dont_touch(&net) && !design.port_is_clock(&port) && !design.net_special(&net) && has_pins(design, &net) {
+        // Rule (`bufferInputs`): dont-touch net, then `isConstant` (a port the SDC's case
+        // analysis or logic value holds), then clock, special, no pins — each skips the port.
+        if !design.net_dont_touch(&net) && !design.port_is_constant(&port) && !design.port_is_clock(&port) && !design.net_special(&net) && has_pins(design, &net) {
             // repair_design resizes it to the target slew.
             if buffer_input(design, &port, &net, cell, o.verbose, out)? {
                 inserted += 1;

@@ -14,7 +14,7 @@ use crate::buffer_ports;
 use crate::preamble::Libs;
 use crate::repair_design::{self, Args, Inputs};
 use crate::trace::Trace;
-use crate::env::{estimate_state_per_clock, master_pins, masters, no_signal_cap, port_caps_at, sdc_env, search_sdc_on, sim_constants};
+use crate::env::{master_pins, masters, no_signal_cap, port_caps_at, sdc_env, search_sdc_on};
 use crate::Stop;
 use crate::odb_design::{clamp_loc_to_core, gr_layer_rc, grt_flutes, grt_stt, net_info, sdc_cap_pins, sdc_port_cap_limits, sizing_limits, CliDesign, GrLive, TimerLog};
 use crate::timing::{user_time_to_sta, Limits};
@@ -342,6 +342,18 @@ pub fn read_text(path: &str) -> Result<String, String> {
 /// on instance pins (`set_pin_capacitance_limit`), the two forms `write_sdc` writes besides the
 /// design's. A cell — named bare, `find_cells_matching` — or any other form is refused, as is a
 /// value that is not a number.
+/// The SDC commands the job reads beyond its first (`read_sdc`'s refusal list): the logic
+/// simulation's constraint values and the clock transitions. Each timing command applies them as
+/// the reference does (the simulation's constants, the ideal clocks' slews); a command that does
+/// not model them refuses where it runs.
+pub const SIM_AND_CLOCK_SLEW: [&str; 5] = ["set_case_analysis", "set_logic_zero", "set_logic_one", "set_logic_dc", "set_clock_transition"];
+
+/// Whether the constraints carry what [`SIM_AND_CLOCK_SLEW`] names: a command whose timer does not
+/// apply them refuses on this.
+pub fn sdc_has_sim_or_clock_slew(s: &vyges_loom::sdc::Sdc) -> bool {
+    !s.case_values.is_empty() || !s.logic_values.is_empty() || !s.clock_transitions.is_empty()
+}
+
 pub fn sdc_cap_objects_modelled(s: &vyges_loom::sdc::Sdc) -> Result<(), String> {
     for (v, o) in &s.max_capacitance_objects {
         if v.is_nan() || !matches!(o.accessor.as_str(), "get_ports" | "get_pins") {
@@ -714,6 +726,9 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 opts.adjustment = routing_adjustment;
                 (opts.layer_rc, opts.via_rc) = grt_layer_rc(&db, &rc);
                 if let Some(s) = sdc.as_ref() {
+                    if sdc_has_sim_or_clock_slew(s) {
+                        return Err("global_route under set_case_analysis / set_logic_* / set_clock_transition: the router's timer does not apply them (not modelled)".into());
+                    }
                     let lib0 = libs.default_library().ok_or("global_route before any liberty library")?;
                     opts.clock_sources = s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect();
                     let ssdc = search_sdc_on(s, &vyges_grt::timer::netlist(&db), lib0.time_scale, propagated || sdc_propagated, false)?;
@@ -757,10 +772,16 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 let unmodelled: Vec<&str> = s
                     .ignored_affecting_timing()
                     .into_iter()
-                    .filter(|c| (*c != "set_max_transition" || s.max_transition_on_objects) && (*c != "set_max_fanout" || s.max_fanout_on_objects) && *c != "set_max_capacitance" && *c != "set_driving_cell" && *c != "set_propagated_clock" && *c != "set_max_delay" && *c != "set_min_delay" && *c != "group_path")
+                    .filter(|c| (*c != "set_max_transition" || s.max_transition_on_objects) && (*c != "set_max_fanout" || s.max_fanout_on_objects) && *c != "set_max_capacitance" && *c != "set_driving_cell" && *c != "set_propagated_clock" && *c != "set_max_delay" && *c != "set_min_delay" && *c != "group_path" && !SIM_AND_CLOCK_SLEW.contains(c))
                     .collect();
                 if !unmodelled.is_empty() {
                     return Err(format!("{path}: {} not modelled", unmodelled.join(", ")));
+                }
+                // `set_case_analysis` / `set_logic_*`: the logic simulation's seeds (`Sta::isConstant`,
+                // read by every command that times or buffers); `set_clock_transition`: the ideal
+                // clocks' slews (`ClkNetwork::idealClkSlew`). The forms not modelled refuse here.
+                if !db.inst_names().is_empty() {
+                    crate::env::sdc_constraints(&s, &db).map_err(|e| format!("{path}: {e}"))?;
                 }
                 sdc_cap_objects_modelled(&s).map_err(|e| format!("{path}: {e}"))?;
                 // `set_propagated_clock` in the file: read by repair_timing's search; the other
@@ -799,9 +820,12 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     return Err("buffer_ports on a hierarchical design: not modelled".into());
                 }
                 let netlist = vyges_grt::timer::netlist(&db);
-                // `Sim`'s constants: a tie cell's output and what it holds (case analysis is refused
-                // at read_sdc, so tie cells are the only source).
-                let constants = sim_constants(&db, &liberty)?;
+                // `Sim`'s constants (`Sta::isConstant`): a tie cell's output and what it holds, and
+                // what the SDC's `set_case_analysis` / `set_logic_*` hold (`seedConstants`) — a port
+                // held constant gets no buffer.
+                let constraints = sdc.as_ref().map(|s| crate::env::sdc_constraints(s, &db)).transpose()?.unwrap_or_default();
+                let constant_values = crate::env::constant_values_sdc(&db, &liberty, sdc.as_ref())?;
+                let constants = crate::env::constants_by_name(constant_values.clone());
                 // selectBufferCell: the user's cell (a buffer), else findBuffers' port buffer.
                 let weakest = match &o.buffer_cell {
                     Some(c) => {
@@ -813,6 +837,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     None => crate::preamble::find_buffers(&libs, &m, &dont_use, true).map_err(|e| e.message().to_string())?.port_buffer,
                 };
                 let clock_sources: Vec<String> = sdc.as_ref().map(|s| s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect()).unwrap_or_default();
+                crate::env::constants_off_clock_networks(&db, &liberty, &clock_sources, &constraints, &constant_values)?;
                 rc.sort_clk_and_signal_layers();
                 // Inside the guard every edit marks its nets invalid — once parasitics exist.
                 let parasitics = match (carried.take(), estimated) {
@@ -821,7 +846,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         let mut est_rc = estimate_rc.clone().expect("estimated");
                         est_rc.sort_clk_and_signal_layers();
                         let caps = port_caps_at(estimate_sdc.as_deref(), sdc.as_ref(), &libs, &netlist)?;
-                        estimate_state_per_clock(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, &crate::env::est_clocks(sdc.as_ref(), estimate_propagated), estimate_alpha, libs.scene_count(), &caps)?
+                        crate::env::estimate_state_per_clock_sdc(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, &crate::env::est_clocks(sdc.as_ref(), estimate_propagated), estimate_alpha, libs.scene_count(), &caps, &constraints)?
                     }
                     (None, false) => vec![HashMap::new(); libs.scene_count()],
                 };
@@ -830,7 +855,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 let core = (db.block_get_core_area_x_min(), db.block_get_core_area_y_min(), db.block_get_core_area_x_max(), db.block_get_core_area_y_max());
                 let core = (core != (0, 0, 0, 0)).then_some(core);
                 let port_caps = port_caps_at(step["sdc"].as_str(), sdc.as_ref(), &libs, &netlist)?;
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), alpha: routing_alpha, estimating, netlist: std::sync::Arc::new(netlist), netlist_gen: 0, inst_pos: None, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins: sdc.as_ref().map(sdc_cap_pins).unwrap_or_default(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr: None, gr_error: None, undoing: false, skips: None, skip_log: false, area: 0.0 };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), constraints: constraints.clone(), alpha: routing_alpha, estimating, netlist: std::sync::Arc::new(netlist), netlist_gen: 0, inst_pos: None, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins: sdc.as_ref().map(sdc_cap_pins).unwrap_or_default(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr: None, gr_error: None, undoing: false, skips: None, skip_log: false, area: 0.0 };
                 let r = buffer_ports::buffer_ports(&mut design, &o, &weakest);
                 let parasitics = std::mem::take(&mut design.parasitics);
                 match r {
@@ -883,8 +908,11 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 }
                 rc.sort_clk_and_signal_layers();
                 // The logic simulation, once: the timer's constants, the estimate's skips and the
-                // repair's held skips all read the design as it is here (nothing edits it between).
-                let constant_values = crate::env::constant_values(&db, &liberty)?;
+                // repair's held skips all read the design as it is here (nothing edits it between) —
+                // under the SDC's `set_case_analysis` / `set_logic_*` (`Sta::isConstant`).
+                let constraints = sdc.as_ref().map(|s| crate::env::sdc_constraints(s, &db)).transpose()?.unwrap_or_default();
+                let constant_values = crate::env::constant_values_sdc(&db, &liberty, sdc.as_ref())?;
+                crate::env::constants_off_clock_networks(&db, &liberty, &clock_sources, &constraints, &constant_values)?;
                 let held = {
                     let timing = vyges_est::placement::Timing { liberty: Some(&liberty), clock_sources: clock_sources.clone(), propagated: false };
                     Some(vyges_est::placement::skips_with_constants(&db, &timing, &constant_values)?)
@@ -912,7 +940,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         let mut est_rc = estimate_rc.clone().expect("estimated");
                         est_rc.sort_clk_and_signal_layers();
                         let caps = port_caps_at(estimate_sdc.as_deref(), sdc.as_ref(), &libs, &netlist)?;
-                        crate::env::estimate_state_held_per_clock(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, &crate::env::est_clocks(sdc.as_ref(), estimate_propagated), estimate_alpha, libs.scene_count(), &caps, held.as_ref())?
+                        crate::env::estimate_state_held_per_clock_sdc(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, &crate::env::est_clocks(sdc.as_ref(), estimate_propagated), estimate_alpha, libs.scene_count(), &caps, held.as_ref(), &constraints)?
                     }
                 };
                 let wire_rc: Vec<crate::buffered_net::WireRc> = (0..libs.scene_count())
@@ -964,7 +992,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     let none = vyges_loom::sdc::Sdc::default();
                     a.search_sdc = Some(search_sdc_on(sdc.as_ref().unwrap_or(&none), &netlist, lib0.time_scale, false, false)?);
                 }
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), alpha: routing_alpha, estimating, netlist: std::sync::Arc::new(netlist), netlist_gen: 0, inst_pos: None, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins: sdc.as_ref().map(sdc_cap_pins).unwrap_or_default(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr, gr_error: None, undoing: false, skips: None, skip_log: false, area: 0.0 };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), constraints: constraints.clone(), alpha: routing_alpha, estimating, netlist: std::sync::Arc::new(netlist), netlist_gen: 0, inst_pos: None, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: false, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins: sdc.as_ref().map(sdc_cap_pins).unwrap_or_default(), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr, gr_error: None, undoing: false, skips: None, skip_log: false, area: 0.0 };
                 if let Some(skips) = held {
                     design.hold_skips(skips)?;
                 }
@@ -1060,11 +1088,12 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 let mut est_rc = estimate_rc.clone().expect("estimated");
                 est_rc.sort_clk_and_signal_layers();
                 let clock_propagated = propagated || sdc_propagated;
+                let constraints = sdc.as_ref().map(|s| crate::env::sdc_constraints(s, &db)).transpose()?.unwrap_or_default();
                 let parasitics = match carried.take() {
                     Some(p) => p,
                     None => {
                         let caps = port_caps_at(estimate_sdc.as_deref(), sdc.as_ref(), &libs, &netlist)?;
-                        estimate_state_per_clock(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, &crate::env::est_clocks(sdc.as_ref(), estimate_propagated), estimate_alpha, libs.scene_count(), &caps)?
+                        crate::env::estimate_state_per_clock_sdc(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, &crate::env::est_clocks(sdc.as_ref(), estimate_propagated), estimate_alpha, libs.scene_count(), &caps, &constraints)?
                     }
                 };
                 let wire_rc: Vec<crate::buffered_net::WireRc> = (0..libs.scene_count())
@@ -1093,7 +1122,9 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         lines.push(json!({ "code": "RSZ-0058", "severity": "info", "message": format!("Using max wire length {:.0}um.", max_wire_length / 1e-6) }));
                     }
                 }
-                let constants = sim_constants(&db, &liberty)?;
+                let constant_values = crate::env::constant_values_sdc(&db, &liberty, sdc.as_ref())?;
+                crate::env::constants_off_clock_networks(&db, &liberty, &clock_sources, &constraints, &constant_values)?;
+                let constants = crate::env::constants_by_name(constant_values);
                 let info = net_info(&db, &netlist)?;
                 let mut env = match &sdc {
                     Some(s) => sdc_env(s, &libs, &netlist)?,
@@ -1122,7 +1153,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     }
                 }
                 let sdc_pins = sdc.as_ref().map(sdc_cap_pins).unwrap_or_default();
-                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), alpha: routing_alpha, estimating, netlist: std::sync::Arc::new(netlist), netlist_gen: 0, inst_pos: None, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins, timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr: None, gr_error: None, undoing: false, skips: None, skip_log: false, area: 0.0 };
+                let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), constraints: constraints.clone(), alpha: routing_alpha, estimating, netlist: std::sync::Arc::new(netlist), netlist_gen: 0, inst_pos: None, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated, journal: Vec::new(), sdc_nets: BTreeSet::new(), sdc_pins, timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr: None, gr_error: None, undoing: false, skips: None, skip_log: false, area: 0.0 };
                 let inputs = Inputs { libs: &libs, masters: &m, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins, sizing_limits: limits_of_block, clock_pattern: Default::default() };
                 let order = |p: &str| ids.get(p).copied().unwrap_or(u64::MAX);
                 let r = repair_design::repair_clk_nets(&inputs, &mut design, &clk_buffers, &clocks, &order, max_wire_length, &mut trace);
@@ -1161,7 +1192,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         let netlist = vyges_grt::timer::netlist(&db);
                         let mpins = master_pins(&db)?;
                         let mut env = sdc_env(s, &libs, &netlist)?;
-                        env.constants = sim_constants(&db, &liberty)?;
+                        env.constants = crate::env::sim_constants_sdc(&db, &liberty, Some(s))?;
                         let g = repair_design::timer_graph(&libs, 0, &netlist, &env, &mpins).map_err(|e| e.message().to_string())?;
                         let info = net_info(&db, &netlist)?;
                         for c in &ssdc.clocks {
@@ -1260,8 +1291,11 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 let time_scale = lib0.time_scale;
                 let s = sdc.as_ref().ok_or("repair_timing without constraints: not modelled")?;
                 let netlist = vyges_grt::timer::netlist(&db);
-                let constants = sim_constants(&db, &liberty)?;
+                let constraints = crate::env::sdc_constraints(s, &db)?;
                 let clock_sources: Vec<String> = s.clocks.iter().filter(|c| !c.is_virtual()).flat_map(|c| c.sources.iter().cloned()).collect();
+                let constant_values = crate::env::constant_values_sdc(&db, &liberty, Some(s))?;
+                crate::env::constants_off_clock_networks(&db, &liberty, &clock_sources, &constraints, &constant_values)?;
+                let constants = crate::env::constants_by_name(constant_values);
                 let parasitics = match carried.take() {
                     Some(p) => p,
                     None if gr_estimated => {
@@ -1291,7 +1325,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         let mut est_rc = estimate_rc.clone().expect("estimated");
                         est_rc.sort_clk_and_signal_layers();
                         let caps = port_caps_at(estimate_sdc.as_deref(), sdc.as_ref(), &libs, &netlist)?;
-                        estimate_state_per_clock(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, &crate::env::est_clocks(sdc.as_ref(), estimate_propagated), estimate_alpha, libs.scene_count(), &caps)?
+                        crate::env::estimate_state_per_clock_sdc(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, &crate::env::est_clocks(sdc.as_ref(), estimate_propagated), estimate_alpha, libs.scene_count(), &caps, &constraints)?
                     }
                 };
                 // `set_timing_derate` (no objects) onto the graph, as the timer's own reader puts
@@ -1317,14 +1351,12 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 let mut g = repair_design::timer_graph(&libs, 0, &netlist, &env, &mpins).map_err(|e| e.message().to_string())?;
                 let clock_propagated = propagated || sdc_propagated;
                 let clocks = crate::timing::clock_pins(&g, &clock_sources);
-                if s.ignored.iter().any(|c| c == "set_clock_transition") {
-                    return Err("set_clock_transition: not modelled".into());
-                }
                 // An ideal clock's network (`ClkNetwork::isIdealClock`, per clock — est 8e440c9's
-                // rule as the search resolves it): its registers read the ideal clock slew, 0.
+                // rule as the search resolves it): its registers read the ideal clock slew
+                // (`idealClkSlew`: its `set_clock_transition`, else 0).
                 let ideal_sources = crate::env::est_clocks(Some(s), clock_propagated).ideal_sources();
                 if !ideal_sources.is_empty() {
-                    g.ideal_clock = crate::timing::clock_pins(&g, &ideal_sources).into_iter().collect();
+                    crate::timing::set_ideal_clock(&mut g, &ideal_sources);
                 }
                 // A diagnostic: the delay calculation's trace at the repair's start
                 // (`VYGES_RSZ_DCALC_TRACE=<file>`: each gate call and load), as the repair_design
@@ -1387,7 +1419,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         let mut gk = repair_design::timer_graph(&libs, k, &netlist, &env, &mpins).map_err(|e| e.message().to_string())?;
                         let ck = crate::timing::clock_pins(&gk, &clock_sources);
                         if !ideal_sources.is_empty() {
-                            gk.ideal_clock = crate::timing::clock_pins(&gk, &ideal_sources).into_iter().collect();
+                            crate::timing::set_ideal_clock(&mut gk, &ideal_sources);
                         }
                         gk.find_delays(par, None)?;
                         let mut sk = vyges_sta::search::Search::in_graph_order(&gk, &ssdc);
@@ -1586,7 +1618,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     let core = (core != (0, 0, 0, 0)).then_some(core);
                     let port_caps = env.port_pin_cap.clone();
                     let sdc_nets: BTreeSet<String> = s.env.iter().filter(|e| e.cmd == "set_load" && e.accessor == "get_nets").flat_map(|e| e.objects.iter().cloned()).collect();
-                    let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), alpha: routing_alpha, estimating, netlist: std::sync::Arc::new(netlist), netlist_gen: 0, inst_pos: None, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated, journal: Vec::new(), sdc_nets, sdc_pins: sdc_cap_pins(s), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr, gr_error: None, undoing: false, skips: None, skip_log: false, area: 0.0 };
+                    let mut design = CliDesign { db: &mut db, rc: &rc, liberty: &liberty, libs: &libs, clock_sources: &clock_sources, constants: constants.clone(), constraints: constraints.clone(), alpha: routing_alpha, estimating, netlist: std::sync::Arc::new(netlist), netlist_gen: 0, inst_pos: None, parasitics, invalid: BTreeSet::new(), info, core, port_caps, propagated: clock_propagated, journal: Vec::new(), sdc_nets, sdc_pins: sdc_cap_pins(s), timer: TimerLog::default(), stale_out_arcs: BTreeMap::new(), gr, gr_error: None, undoing: false, skips: None, skip_log: false, area: 0.0 };
                     if recover {
                         // `Resizer::recoverPower`: `resizePreamble`, then `RecoverPower::recoverPower`.
                         let max_area = match a.max_utilization.as_deref() {
