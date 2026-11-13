@@ -291,6 +291,104 @@ pub fn sdc_constraints(s: &vyges_loom::sdc::Sdc, db: &Db) -> Result<vyges_est::s
     Ok(out)
 }
 
+/// `Sdc::isConstrained` as `remove_buffers` asks it (`canRemoveBuffer`: the buffer's two pins,
+/// the net it would remove, the buffer itself): the instance pins the SDC constrains — a clock
+/// source, an I/O delay's pin or reference pin, a case or logic value, a pin capacitance limit,
+/// a clock latency, uncertainty or propagation on a pin. Anything that would constrain an
+/// instance or a net (`pvt`, derates, exceptions on cells or nets, …) or an exception point on a
+/// pin is refused: those maps are not modelled. Ports and clocks constrain no instance pin.
+pub fn remove_buffers_sdc_pins(s: &vyges_loom::sdc::Sdc, db: &Db) -> Result<std::collections::BTreeSet<String>, String> {
+    use vyges_loom::sdc::{KeptArg, Objects};
+    let ports: std::collections::HashSet<String> = db.block_get_b_terms().into_iter().collect();
+    let clocks: std::collections::HashSet<&str> = s.clocks.iter().map(|c| c.name.as_str()).collect();
+    // Objects naming only ports, clocks or the design.
+    fn port_or_clock(o: &Objects, ports: &std::collections::HashSet<String>, clocks: &std::collections::HashSet<&str>) -> bool {
+        match o.accessor.as_str() {
+            "get_ports" | "all_inputs" | "all_outputs" | "get_clocks" | "all_clocks" | "current_design" => true,
+            _ if !o.items.is_empty() => o.items.iter().all(|i| port_or_clock(i, ports, clocks)),
+            "" | "list" | "concat" => o.names.iter().all(|n| ports.contains(n) || clocks.contains(n.as_str())),
+            _ => false,
+        }
+    }
+    let refuse = |cmd: &str, o: &Objects| Err(format!("remove_buffers: {cmd} on [{} {}]: an SDC constraint on an instance, a net or an exception pin is not modelled", o.accessor, o.names.join(" ")));
+    let mut pins = std::collections::BTreeSet::new();
+    for c in &s.clocks {
+        pins.extend(c.sources.iter().filter(|p| !ports.contains(*p)).cloned());
+    }
+    for d in s.input_delays.iter().chain(&s.output_delays) {
+        if d.accessor == "get_pins" {
+            pins.extend(d.ports.iter().cloned());
+        }
+        pins.extend(d.reference_pin.iter().cloned());
+    }
+    for c in s.case_values.iter().chain(&s.logic_values) {
+        if c.accessor == "get_pins" {
+            pins.extend(c.objects.iter().cloned());
+        }
+    }
+    for (_, o) in &s.max_capacitance_objects {
+        match o.accessor.as_str() {
+            "get_pins" => pins.extend(o.names.iter().cloned()),
+            _ if port_or_clock(o, &ports, &clocks) => {}
+            _ => return refuse("set_max_capacitance", o),
+        }
+    }
+    for e in s.clock_latencies.iter().chain(&s.clock_transitions).chain(&s.env) {
+        match e.accessor.as_str() {
+            "get_pins" => pins.extend(e.objects.iter().cloned()),
+            "get_ports" | "all_inputs" | "all_outputs" | "get_clocks" | "all_clocks" | "current_design" => {}
+            _ if e.objects.iter().all(|n| ports.contains(n) || clocks.contains(n.as_str())) => {}
+            a => return refuse(&e.cmd, &Objects { accessor: a.to_string(), names: e.objects.clone(), ..Default::default() }),
+        }
+    }
+    for u in &s.uncertainties {
+        for o in &u.written {
+            match o.accessor.as_str() {
+                "get_pins" => pins.extend(o.names.iter().cloned()),
+                _ if port_or_clock(o, &ports, &clocks) => {}
+                _ => return refuse("set_clock_uncertainty", o),
+            }
+        }
+    }
+    for o in &s.propagated {
+        match o.accessor.as_str() {
+            "get_pins" => pins.extend(o.names.iter().cloned()),
+            _ if port_or_clock(o, &ports, &clocks) => {}
+            _ => return refuse("set_propagated_clock", o),
+        }
+    }
+    for e in &s.derates {
+        if !e.objects.is_empty() && !matches!(e.accessor.as_str(), "current_design") {
+            return refuse("set_timing_derate", &Objects { accessor: e.accessor.clone(), names: e.objects.clone(), ..Default::default() });
+        }
+    }
+    let exception_objects = s.exceptions.iter().flat_map(|e| e.args.iter()).chain(s.path_delays.iter().flat_map(|p| p.objects.iter())).chain(s.other_exceptions.iter().flat_map(|e| e.args.iter()));
+    for (key, o) in exception_objects {
+        if !port_or_clock(o, &ports, &clocks) {
+            return refuse(key, o);
+        }
+    }
+    for a in s.disabled_timing.iter().chain(&s.senses).chain(&s.disabled_gating_checks) {
+        if !port_or_clock(&a.written, &ports, &clocks) {
+            return refuse(&a.cmd, &a.written);
+        }
+    }
+    for d in &s.driving_cells {
+        if let Some(o) = d.written.iter().find(|o| !port_or_clock(o, &ports, &clocks)) {
+            return refuse("set_driving_cell", o);
+        }
+    }
+    for k in &s.kept {
+        let objects = k.keys.iter().map(|(_, a)| a).chain(&k.args).filter_map(KeptArg::objects);
+        for o in objects {
+            if !port_or_clock(o, &ports, &clocks) {
+                return refuse(&k.cmd, o);
+            }
+        }
+    }
+    Ok(pins)
+}
+
 /// The logic simulation's constant pins under the SDC's constraint values (`Sim::ensureConstantsPropagated`
 /// with `set_case_analysis` / `set_logic_*` seeded — what `Sta::isConstant` answers): the design's
 /// own constants (tie cells, supply nets) without an SDC or with no such command.

@@ -473,6 +473,8 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
     // a later repair starts from it rather than from a fresh estimate.
     let mut carried: Option<Vec<HashMap<String, NetParasitics>>> = None;
     let mut buffered: Vec<buffer_ports::Outcome> = Vec::new();
+    // `remove_buffers`: each run's outcome.
+    let mut removals: Vec<crate::remove_buffers::Outcome> = Vec::new();
     // Each repair_tie_fanout's result. A later repair is refused: the ties' new nets would reach
     // it through the estimator's callbacks, which are not modelled across this command.
     let mut tie_runs: Vec<Value> = Vec::new();
@@ -802,6 +804,37 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         (false, true) => db.net_set_do_not_touch(o, true).map_err(|e| e.to_string())?,
                         _ => return Err(format!("set_dont_touch {o}: not exactly one instance or net (not modelled)")),
                     }
+                }
+            }
+            // `remove_buffers [insts]` (`Resizer::removeBuffers`): no timing, only `initBlock`; the
+            // SDC's `isConstrained` keeps a buffer whose pins it names.
+            "remove_buffers" => {
+                if estimated || gr_estimated {
+                    return Err("remove_buffers after estimate_parasitics: not modelled (the incremental parasitics update)".into());
+                }
+                if !db.block_get_mod_insts().is_empty() {
+                    return Err("remove_buffers on a hierarchical design: not modelled".into());
+                }
+                let all: BTreeSet<String> = db.block_get_insts().into_iter().collect();
+                // `get_cells $args`: each name an instance, in the order given.
+                for a in &args {
+                    if a.contains(['*', '?']) || !all.contains(a) {
+                        return Err(format!("remove_buffers {a}: not exactly one instance (patterns and unknown names are not modelled)"));
+                    }
+                }
+                let pins = match &sdc {
+                    Some(s) => crate::env::remove_buffers_sdc_pins(s, &db)?,
+                    None => BTreeSet::new(),
+                };
+                let m = masters(&db)?;
+                let mut design = crate::odb_design::OdbRemoval::new(&mut db, &libs, &m, pins);
+                let o = crate::remove_buffers::remove_buffers(&mut design, &args)?;
+                for l in &o.lines {
+                    say(&json!(l));
+                }
+                removals.push(o);
+                if let Some(path) = step["write_def"].as_str() {
+                    db.write_def(path).map_err(|e| format!("{path}: {e}"))?;
                 }
             }
             "buffer_ports" if gr_estimated => return Err("buffer_ports on global-route parasitics: not modelled".into()),
@@ -1876,6 +1909,13 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
             }
             r
         }
+        // remove_buffers alone: the instances it asked are what it checked.
+        None if buffered.is_empty() && !removals.is_empty() => {
+            let removed: usize = removals.iter().map(|r| r.removed).sum();
+            let checked: usize = removals.iter().map(|r| r.checked).sum();
+            let status = if removed > 0 { "repaired" } else if checked > 0 { "up_to_date" } else { "vacuous" };
+            json!({ "tool": "vyges-rsz", "status": status, "insts_checked": checked, "removed_buffers": removed })
+        }
         None if buffered.is_empty() => json!({ "tool": "vyges-rsz", "status": "vacuous", "reason": "no repair_design or buffer_ports step" }),
         // buffer_ports alone: the ports it walked are what it checked.
         None => {
@@ -1941,6 +1981,12 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
             report["status"] = json!("up_to_date");
         }
         report["repair_tie_fanout"] = json!(tie_runs);
+    }
+    if !removals.is_empty() {
+        if removals.iter().any(|r| r.removed > 0) && (report["status"] == "up_to_date" || report["status"] == "vacuous") {
+            report["status"] = json!("repaired");
+        }
+        report["remove_buffers"] = removals.iter().map(|r| json!({ "insts_checked": r.checked, "removed": r.removed, "lines": r.lines })).collect();
     }
     if !buffered.is_empty() {
         report["buffer_ports"] = buffered

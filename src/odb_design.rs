@@ -1795,6 +1795,98 @@ pub fn sdc_port_cap_limits(s: &vyges_loom::sdc::Sdc, cap_scale: f32) -> BTreeMap
     out
 }
 
+/// `remove_buffers` on the database: the buffer test per master (the link corner's liberty cell,
+/// a CORE master), the SDC's constrained instance pins ([`crate::env::remove_buffers_sdc_pins`];
+/// an SDC naming an instance or a net is refused before this runs).
+pub struct OdbRemoval<'a> {
+    pub db: &'a mut Db,
+    /// Per master: its buffer ports (input, output), or none when it is not a removable buffer.
+    pub buffers: HashMap<String, Option<(String, String)>>,
+    pub pins: BTreeSet<String>,
+}
+
+impl<'a> OdbRemoval<'a> {
+    pub fn new(db: &'a mut Db, libs: &Libs, masters: &BTreeMap<String, crate::preamble::Master>, pins: BTreeSet<String>) -> Self {
+        let mut buffers = HashMap::new();
+        for (name, m) in masters {
+            let ports = libs.link_cell(name).filter(|c| m.logic_std && c.is_buffer()).and_then(|c| c.buffer_ports()).map(|(i, o)| (i.name.clone(), o.name.clone()));
+            buffers.insert(name.clone(), ports);
+        }
+        OdbRemoval { db, buffers, pins }
+    }
+    fn net(&self, inst: &str, pin: &str) -> Option<String> {
+        Some(self.db.net_of(inst, pin)).filter(|n| !n.is_empty())
+    }
+}
+
+impl crate::remove_buffers::RemovalDesign for OdbRemoval<'_> {
+    fn insts(&self) -> Vec<String> {
+        self.db.block_get_insts()
+    }
+    fn buffer_ports(&self, inst: &str) -> Option<(String, String)> {
+        self.buffers.get(&self.db.inst_master(inst)).cloned().flatten()
+    }
+    fn net_of(&self, inst: &str, pin: &str) -> Option<String> {
+        self.net(inst, pin)
+    }
+    fn inst_dont_touch(&self, inst: &str) -> bool {
+        self.db.inst_is_do_not_touch(inst)
+    }
+    fn inst_fixed(&self, inst: &str) -> bool {
+        self.db.inst_is_fixed(inst)
+    }
+    fn net_dont_touch(&self, net: &str) -> bool {
+        self.db.net_is_do_not_touch(net)
+    }
+    fn net_has_port(&self, net: &str) -> bool {
+        !self.db.net_bterms(net).is_empty()
+    }
+    fn can_merge_net(&self, survivor: &str, removed: &str) -> bool {
+        self.db.net_can_merge(survivor, removed).unwrap_or(false)
+    }
+    fn net_insts(&self, net: &str) -> Vec<String> {
+        self.db.net_iterms(net).into_iter().filter_map(|p| p.rsplit_once('/').map(|(i, _)| i.to_string())).collect()
+    }
+    fn pin_constrained(&self, pin: &str) -> bool {
+        self.pins.contains(pin)
+    }
+    fn inst_constrained(&self, _inst: &str) -> bool {
+        false
+    }
+    fn net_constrained(&self, _net: &str) -> bool {
+        false
+    }
+    fn remove(&mut self, inst: &str, in_pin: &str, out_pin: &str, unprotect: bool) -> Result<(), String> {
+        let e = |x: vyges_opendb::Error| x.to_string();
+        let in_net = self.net(inst, in_pin).expect("removeBuffer checked the input net");
+        let out_net = self.net(inst, out_pin);
+        // `BufferRemovalProtection`: the buffer's and both nets' dont-touch cleared for the edit;
+        // the survivor's restored after (the removed net is gone).
+        let mut restore = false;
+        if unprotect {
+            let keep_output = out_net.as_deref().is_some_and(|o| buffer_removal_keeps_output_net(!self.db.net_bterms(&in_net).is_empty(), !self.db.net_bterms(o).is_empty()));
+            let (survivor, removed) = if keep_output { (out_net.clone().expect("kept"), Some(in_net.clone())) } else { (in_net.clone(), out_net.clone()) };
+            if self.db.inst_is_do_not_touch(inst) {
+                self.db.inst_set_do_not_touch(inst, false).map_err(e)?;
+            }
+            restore = self.db.net_is_do_not_touch(&survivor);
+            if restore {
+                self.db.net_set_do_not_touch(&survivor, false).map_err(e)?;
+            }
+            if let Some(r) = removed.filter(|r| self.db.net_is_do_not_touch(r)) {
+                self.db.net_set_do_not_touch(&r, false).map_err(e)?;
+            }
+        }
+        let survivor = self.db.remove_buffer(inst, in_pin, out_pin).map_err(e)?;
+        if restore {
+            // With no output net the buffer is destroyed and the input net is the survivor.
+            let name = if survivor.is_empty() { in_net } else { survivor };
+            self.db.net_set_do_not_touch(&name, true).map_err(e)?;
+        }
+        Ok(())
+    }
+}
+
 /// `bufferRemovalKeepsOutputNet` on a flat netlist (upstream aa89cb9694, 9ffa16d003): removing
 /// a buffer keeps its output net only when that net has a port and the input net has none.
 pub fn buffer_removal_keeps_output_net(in_net_has_port: bool, out_net_has_port: bool) -> bool {

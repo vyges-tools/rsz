@@ -23,6 +23,7 @@ broken
 USAGE:
   vyges physical rsz repair_design <job.json> [-o FILE]
   vyges physical rsz buffer_ports <job.json> [-o FILE]  (the same job runner; a job may hold either)
+  vyges physical rsz remove_buffers <job.json> [-o FILE]  (the same job runner)
   vyges physical rsz --describe
   vyges physical rsz --help
   vyges physical rsz --version
@@ -34,7 +35,7 @@ JOB FIELDS:
                  read_sdc, set_dont_use, set_layer_rc, set_wire_rc, set_routing_alpha,
                  set_routing_layers -signal LO-HI [-clock LO-HI], global_route,
                  estimate_parasitics -placement | -global_routing, set_propagated_clock,
-                 buffer_ports [options],
+                 buffer_ports [options], remove_buffers [INST...], set_dont_touch OBJ...,
                  repair_design [options], repair_timing [options],
                  clock_buffers CELL..., repair_clock_nets [-max_wire_length L]
                clock_buffers states the resizer's clock buffer list as clock_tree_synthesis
@@ -43,7 +44,11 @@ JOB FIELDS:
                buffering pays, RSZ-0058)
                an estimate_parasitics step may carry \"db\": the database as the estimate saw it,
                when cells were moved between it and the repair
-               a buffer_ports step may carry \"write_def\": the design as it left it, as DEF
+               a buffer_ports or remove_buffers step may carry \"write_def\": the design as it
+               left it, as DEF
+               remove_buffers: every removable buffer in the block's order, or the named
+               instances (dont-touch set aside); refused after an estimate and on a hierarchical
+               design, and when the SDC constrains an instance, a net or an exception pin
                an estimate_parasitics or buffer_ports step may carry \"sdc\": the constraints in
                force when it ran, when a port's set_load comes after it
   trace        write one line per decision, in the order the repair makes them, to this path
@@ -116,6 +121,7 @@ OPTIONS:
   --star                star this tool on GitHub
 
 REPORT:
+  remove_buffers (per step: insts_checked, removed, lines — RSZ-0097 / RSZ-0168 / RSZ-0026),
   buffer_ports (per step: inserted_inputs, inserted_outputs, ports_checked, lines — each with its
   code and severity), status, nets_checked, nets_repaired, inserted_buffers, resized, drivers_skipped, violations
   {slew, capacitance, fanout, length}, summary — the repair's closing lines, each with its code —
@@ -263,7 +269,7 @@ pub fn main() -> ExitCode {
             println!("{label}:\n  {url}");
             return ExitCode::SUCCESS;
         }
-        Some("repair_design") | Some("buffer_ports") if positional.len() == 2 => {}
+        Some("repair_design") | Some("buffer_ports") | Some("remove_buffers") if positional.len() == 2 => {}
         _ => {
             eprint!("{USAGE}");
             return ExitCode::from(2);
