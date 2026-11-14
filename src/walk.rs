@@ -6,7 +6,10 @@
 //! Load pins are carried by NAME: a repeater edits the design, and the pins it creates are not in
 //! the timing graph the walk started from.
 
-use vyges_sta::graph::Graph;
+use std::collections::HashMap;
+
+use vyges_sta::graph::{Graph, NetParasitics};
+use vyges_sta::netlist::{Conn, Net, Netlist};
 use vyges_sta::liberty::{FALL, MAX, RISE};
 
 use crate::buffered_net::{BufferedNet, Ctx, Kind};
@@ -368,10 +371,13 @@ impl Walk<'_, '_> {
     /// `ensureWireParasitic(drvr_pin)` then `loadCap(drvr_pin, tgt_slew_corner_, max_)`.
     fn estimated_load_cap(&self, r: &crate::design::Repeater, st: &mut State<'_>, trace: &mut Trace) -> Result<f32, Stop> {
         st.design.ensure_wire_parasitic(&r.out_net).map_err(|e| Stop::error("RSZ-EST", e))?;
-        let nl = st.design.netlist().clone();
         // `loadCap(drvr_pin, tgt_slew_corner_, max)`: the target-slew corner's timer and parasitics.
+        // 🔑 It reads the driver's net only (its pins' caps, the SDC on its pins, its parasitic), so
+        // the graph is made over that net alone and its own parasitic — not the whole design, which
+        // made every repeater an O(design) graph build.
         let k = self.sizing.tgt_scene;
-        let par = st.design.parasitics(k).clone();
+        let nl = net_alone(st.design.netlist(), &r.out_net).ok_or_else(|| Stop::error("RSZ-INSERT", format!("{}: no such net", r.out_net)))?;
+        let par: HashMap<String, NetParasitics> = st.design.parasitics(k).get(&r.out_net).map(|p| (r.out_net.clone(), p.clone())).into_iter().collect();
         let graph = crate::repair_design::timer_graph(self.sizing.libs, k, &nl, self.sdc, self.master_pins)?;
         let v = graph.vertices.iter().position(|x| x.name == r.output).ok_or_else(|| Stop::error("RSZ-INSERT", format!("{}: not in the timing graph", r.output)))?;
         let (pin_cap, wire_cap, has_pi) = graph.load_cap_parts(v, &par, RISE);
@@ -486,6 +492,34 @@ pub fn buffer_slew_at(libs: &crate::preamble::Libs, cell: &vyges_sta::liberty::C
     slews[0].max(slews[1])
 }
 
+/// The netlist of net `net` alone: the instances and ports on its pins (in the design's order) and
+/// the net, its pins in their order — every pin of those instances still a vertex, unconnected. A
+/// driver's load ([`Graph::load_cap`]) reads nothing past its own net, so it is the same on this
+/// netlist as on the design's. `None`: no such net.
+fn net_alone(nl: &Netlist, net: &str) -> Option<Netlist> {
+    let n = nl.nets.iter().find(|n| n.name == net)?;
+    let mut insts: Vec<usize> = n.pins.iter().filter_map(|c| if let Conn::Inst(i, _) = c { Some(*i) } else { None }).collect();
+    let mut ports: Vec<usize> = n.pins.iter().filter_map(|c| if let Conn::Port(i) = c { Some(*i) } else { None }).collect();
+    insts.sort_unstable();
+    insts.dedup();
+    ports.sort_unstable();
+    ports.dedup();
+    let at = |v: &[usize], i: usize| v.binary_search(&i).expect("a pin of the net");
+    let pins = n
+        .pins
+        .iter()
+        .map(|c| match c {
+            Conn::Inst(i, p) => Conn::Inst(at(&insts, *i), p.clone()),
+            Conn::Port(i) => Conn::Port(at(&ports, *i)),
+        })
+        .collect();
+    Some(Netlist {
+        insts: insts.iter().map(|&i| nl.insts[i].clone()).collect(),
+        ports: ports.iter().map(|&i| nl.ports[i].clone()).collect(),
+        nets: vec![std::sync::Arc::new(Net { name: n.name.clone(), pins })],
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -529,6 +563,37 @@ mod tests {
     // slew is computed at the LOAD'S corner and cached per corner, so the slow corner's best slew
     // neither rejects a fast-corner limit it would fail nor is reused for it; an impossible limit is
     // RSZ-0090 naming the pin and the corner, and no longer says the limit came from SDC.
+    // Rule (GraphDelayCalc::loadCap via Resizer::resizeToTargetSlew): a driver's load is its net's
+    // pins' caps (in the net's order) and its net's parasitic — nothing past its net — so the graph
+    // over the net alone gives the same load, bit for bit, as the design's.
+    #[test]
+    fn a_drivers_load_over_its_net_alone_is_the_designs() {
+        use vyges_sta::netlist::{inst, PortDir};
+        let text = r#"library (t) { time_unit : "1ns" ; capacitive_load_unit (1, ff) ;
+              cell (BUF) { pin (A) { direction : input ; capacitance : 1 ; } pin (Z) { direction : output ; function : "A" ; } }
+              cell (BIG) { pin (A) { direction : input ; capacitance : 7 ; } pin (Z) { direction : output ; function : "A" ; } } }"#;
+        let libs = vec![Library::read(&lparse(text).unwrap()).unwrap()];
+        let net = |name: &str, pins: Vec<Conn>| std::sync::Arc::new(Net { name: name.into(), pins });
+        let pin = |i: usize, p: &str| Conn::Inst(i, p.into());
+        let nl = Netlist {
+            insts: vec![inst("u0", "BIG"), inst("u1", "BUF"), inst("u2", "BIG"), inst("u3", "BUF"), inst("u4", "BIG")],
+            ports: vec![("a".into(), PortDir::Input), ("y".into(), PortDir::Output)],
+            nets: vec![net("na", vec![pin(0, "A"), Conn::Port(0)]), net("n1", vec![pin(1, "Z"), pin(4, "A"), pin(3, "A"), Conn::Port(1)]), net("n2", vec![pin(0, "Z"), pin(2, "A"), pin(1, "A")])],
+        };
+        let alone = net_alone(&nl, "n1").unwrap();
+        let names: Vec<&str> = alone.insts.iter().map(|i| i.0.as_str()).collect();
+        assert_eq!(names, ["u1", "u3", "u4"]);
+        assert_eq!(alone.ports, [("y".to_string(), PortDir::Output)]);
+        assert!(net_alone(&nl, "nx").is_none());
+        let load = |n: &Netlist| {
+            let g = Graph::build(&libs, n).unwrap();
+            let v = g.vertices.iter().position(|x| x.name == "u1/Z").unwrap();
+            g.load_cap(v, &HashMap::new())
+        };
+        assert_eq!(load(&alone).to_bits(), load(&nl).to_bits());
+        assert!((load(&alone) - 8e-15).abs() < 1e-20, "{}", load(&alone));
+    }
+
     #[test]
     fn the_slew_pre_check_is_per_corner() {
         let l = two_corners(1.0, 2.0, &both);
