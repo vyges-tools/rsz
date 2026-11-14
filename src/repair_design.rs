@@ -158,6 +158,7 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
     // The netlist's order held while the repair edits it (no index moves per repeater), then
     // put back in the database's.
     design.hold_netlist_order(true).map_err(|e| Stop::refused("RSZ-ORDER", e))?;
+    crate::stage("rd:hold_order");
     let outcome = repair_design_held(inputs, design, args, trace);
     design.hold_netlist_order(false).map_err(|e| Stop::refused("RSZ-ORDER", e))?;
     outcome
@@ -186,6 +187,7 @@ fn repair_design_held(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args,
         (args.max_wire_length, check.warning.into_iter().collect::<Vec<(&'static str, String)>>(), check.lengths)
     };
     let slew_shape_factor = preamble::compute_slew_shape_factor(lib)?;
+    crate::stage("rd:resizePreamble");
 
     // RepairDesign::repairDesign
     let r_strongest = r_strongest_buffer(inputs, &buffers.cells);
@@ -209,6 +211,7 @@ fn repair_design_held(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args,
     let netlist = design.netlist_shared();
     let (mut graphs, fresh) = timer_preambles(inputs, &netlist)?;
     let level = session_levels(graphs[0].vertices.iter().map(|v| v.name.as_str()), fresh, args.sta_levels.as_ref());
+    crate::stage("rd:preambles_findAllArrivals");
     if args.pre_placement {
         return Err(Stop::refused("RSZ-ABSENT", "the early sizing round (-pre_placement / -buffer_gain) is not modelled".into()));
     }
@@ -261,8 +264,10 @@ fn repair_design_held(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args,
         }
     }
     trace.ran(&["annot"]);
+    crate::stage("rd:forward_pass");
     // Fix violations from outputs to inputs: the drivers, levelized ONCE, from the LAST.
     let drivers: Vec<String> = timing::levelized_drvr_vertices(g0, &level).into_iter().map(|d| g0.vertices[d].name.clone()).collect();
+    crate::stage("rd:levelizedDrvrVertices");
     // The incremental timer from here: the forward pass's timed graphs are its state (delays
     // exist), and every edit from now on is recorded for it.
     let hold = std::env::var_os("VYGES_RSZ_DCALC").is_none();
@@ -310,6 +315,7 @@ fn repair_design_held(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args,
         max_slacks: HashMap::new(),
     };
     trace.ran(&["drv"]);
+    crate::stage("rd:timer_export");
     let mut outcome = Outcome { warnings, max_wire_lengths, drivers: drivers.len(), ..Default::default() };
     // 🔑 **The graphs are HELD across drivers and rebuilt only after an edit.** `repairNet` times
     // its driver with `findDelays(drvr)` — that one driver, from the slews the graph holds — so
@@ -325,7 +331,26 @@ fn repair_design_held(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args,
     let mut held_netlist = held_copy(&*design);
     let mut held_gen = design.netlist_generation();
     let mut held: Option<HeldGraphs<'_>> = None;
+    // A debug-only switch (`VYGES_RSZ_DRIVER_WINDOW=start:count`): repair only that slice of the
+    // drivers, in loop order, then report each driver's time and exit. Off when unset.
+    let window = driver_window(drivers.len());
+    let mut window_times: Vec<(usize, f64, usize)> = Vec::new();
+    let mut window_rss: Option<u64> = None;
+    let mut probed_start = false;
     for i in (0..drivers.len()).rev() {
+        let started = window.map(|_| (std::time::Instant::now(), ctx.edit_log.end()));
+        if let Some((from, to)) = window {
+            let k = drivers.len() - 1 - i;
+            if k < from {
+                continue;
+            }
+            if window_rss.is_none() {
+                window_rss = Some(rss_kb());
+            }
+            if k >= to {
+                break;
+            }
+        }
         crate::tpush!(trace, "drv|{i}|{}", drivers[i]);
         // Changed since the graphs were made: the design's change count when it keeps one (equal
         // counts are equal netlists), else the netlists compared.
@@ -349,8 +374,26 @@ fn repair_design_held(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args,
             // every graph held stands at the log's end now: what came before is let go
             ctx.edit_log.trim(ctx.edit_log.end());
             held = Some((g, index));
+            if !probed_start {
+                probed_start = true;
+                if let Some((g, _)) = held.as_ref() {
+                    probe_pins(g, None, "start");
+                }
+            }
         }
         held = repair_driver(design, &drivers[i], &mut ctx, &mut outcome, trace, held.take())?;
+        if let Some((t, log0)) = started {
+            window_times.push((i, t.elapsed().as_secs_f64() * 1e3, ctx.edit_log.end() - log0));
+        }
+    }
+    crate::stage("rd:driver_loop");
+    if window.is_some() {
+        report_driver_window(&drivers, &window_times, &ctx.edit_log);
+        let before = window_rss.unwrap_or(0);
+        let after = rss_kb();
+        let edits = window_times.iter().filter(|t| t.2 > 0).count().max(1);
+        eprintln!("VYGWIN|rss|before {before} kB|after {after} kB|peak {} kB|retained {} kB|per driver that edited {:.1} kB", peak_rss_kb(), after as i64 - before as i64, (after as f64 - before as f64) / edits as f64);
+        std::process::exit(0);
     }
     // The timers take each edit at the next graph build; the last driver's have none. With the
     // graph-edit trace on, they are applied here so the trace shows every edit the repair made.
@@ -376,11 +419,83 @@ fn repair_design_held(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args,
         held = Some((g, std::sync::Arc::new(HashMap::new())));
     }
     recycle_held(held);
+    crate::stage("rd:final_relevelize");
     if std::env::var_os("VYGES_RSZ_EDIT_STATS").is_some() {
         let l = &ctx.edit_log;
         eprintln!("VYGEDIT|stats|in_place {}|fallback {}|built {}|events {}", l.in_place, l.fallback, l.built, l.end());
     }
     Ok(outcome)
+}
+
+/// A diagnostic (`VYGES_RSZ_PROBE_DRVR=pin[,pin...]:path`): the slews (max, rise/fall, per scene)
+/// on every pin of each listed pin's instance, appended to `path` — for one driver when it is
+/// checked (`check`), or for every listed instance (`start`, once the driver loop's graphs exist).
+fn probe_pins(gs: &[Graph<'_>], driver: Option<&str>, tag: &str) {
+    use std::io::Write;
+    let Some((pins, path)) = std::env::var("VYGES_RSZ_PROBE_DRVR").ok().and_then(|s| s.rsplit_once(':').map(|(a, b)| (a.to_string(), b.to_string()))) else {
+        return;
+    };
+    let listed: Vec<&str> = pins.split(',').filter(|p| driver.is_none_or(|d| d == *p)).collect();
+    if listed.is_empty() {
+        return;
+    }
+    let insts: Vec<&str> = listed.iter().map(|p| p.rsplit_once('/').map_or("", |(i, _)| i)).collect();
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else {
+        return;
+    };
+    for (k, g) in gs.iter().enumerate() {
+        for (v, x) in g.vertices.iter().enumerate() {
+            if x.name.rsplit_once('/').is_some_and(|(i, _)| insts.contains(&i)) {
+                let _ = writeln!(f, "PROBE {tag} {} scene={k} {} drv={} slew_r={:e} slew_f={:e}", driver.unwrap_or("-"), x.name, x.is_driver, g.slew[v][0][vyges_sta::liberty::MAX], g.slew[v][1][vyges_sta::liberty::MAX]);
+            }
+        }
+    }
+}
+
+/// `VYGES_RSZ_DRIVER_WINDOW=start:count`: the half-open slice of loop positions to repair (position
+/// 0 is the first driver the loop takes). None when unset or malformed.
+fn driver_window(drivers: usize) -> Option<(usize, usize)> {
+    let v = std::env::var("VYGES_RSZ_DRIVER_WINDOW").ok()?;
+    let (a, b) = v.split_once(':')?;
+    let start: usize = a.parse().ok()?;
+    let count: usize = b.parse().ok()?;
+    Some((start.min(drivers), start.saturating_add(count).min(drivers)))
+}
+
+/// This process's resident set (`VmRSS`, kB); 0 where `/proc` is absent.
+fn rss_kb() -> u64 {
+    proc_status_kb("VmRSS:")
+}
+
+/// This process's peak resident set (`VmHWM`, kB); 0 where `/proc` is absent.
+fn peak_rss_kb() -> u64 {
+    proc_status_kb("VmHWM:")
+}
+
+fn proc_status_kb(key: &str) -> u64 {
+    let s = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    s.lines().find_map(|l| l.strip_prefix(key)).and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok()).unwrap_or(0)
+}
+
+/// The window's report on stderr: a log2 histogram of the per-driver times, the totals, and the
+/// slowest drivers.
+fn report_driver_window(drivers: &[String], times: &[(usize, f64, usize)], log: &EditLog<'_>) {
+    let total: f64 = times.iter().map(|t| t.1).sum();
+    let events: usize = times.iter().map(|t| t.2).sum();
+    eprintln!("VYGWIN|drivers {}|ms {total:.1}|ms/driver {:.3}|log events {events}|graph calls in_place {} built {} fallback {}", times.len(), total / times.len().max(1) as f64, log.in_place, log.built, log.fallback);
+    let mut hist = [0usize; 24];
+    for t in times {
+        let b = if t.1 < 0.001 { 0 } else { ((t.1 * 1e3).log2().max(0.0) as usize).min(23) };
+        hist[b] += 1;
+    }
+    for (b, n) in hist.iter().enumerate().filter(|(_, n)| **n > 0) {
+        eprintln!("VYGWIN|hist|<{:.3}ms|{n}", f64::from(1u32 << (b + 1)) / 1e3);
+    }
+    let mut slow: Vec<&(usize, f64, usize)> = times.iter().collect();
+    slow.sort_by(|a, b| b.1.total_cmp(&a.1));
+    for t in slow.iter().take(10) {
+        eprintln!("VYGWIN|slow|{}|{}|{:.3}ms|{}", t.0, drivers[t.0], t.1, t.2);
+    }
 }
 
 /// The graphs held across drivers and their pin index. Their clock pins are their own
@@ -589,6 +704,9 @@ fn scene_graph<'n>(inputs: &Inputs<'n>, k: usize, netlist: NetlistRef<'n>) -> Re
 /// forward-pass annotations applied. They hold the netlist (shared), so they outlive the caller's
 /// handle on it — a graph edited in place ([`timer_graphs`]) moves to the next one.
 fn current_graphs<'n>(inputs: &Inputs<'n>, netlist: &Arc<Netlist>, annotated: &[HashMap<String, f32>]) -> Result<Vec<Graph<'n>>, Stop> {
+    // the bits are the vertex's, one set for every scene: made once, shared by the scenes' graphs
+    // (their vertices are the netlist's, in the same order)
+    let mut blocked: Option<Arc<HashMap<usize, [bool; 2]>>> = None;
     (0..inputs.libs.scene_count())
         .map(|k| {
             let mut g = scene_graph(inputs, k, NetlistRef::Shared(netlist.clone()))?;
@@ -600,9 +718,40 @@ fn current_graphs<'n>(inputs: &Inputs<'n>, netlist: &Arc<Netlist>, annotated: &[
             } else {
                 g.vertices.iter().enumerate().filter_map(|(i, v)| annotated[k].get(&v.name).map(|&l| (i, l))).collect()
             };
+            g.slew_blocked = Some(blocked.get_or_insert_with(|| Arc::new(slew_blocked(&g, annotated))).clone());
             Ok(g)
         })
         .collect()
+}
+
+/// `Vertex::slewAnnotated(rf, min_max)` for a graph of any scene: the reference keeps one set of
+/// annotation bits per vertex, and a scene past the first folds onto the min bit
+/// (`Vertex::setSlewAnnotated`: `ap_index > 1` is 0). A load annotated in the first scene keeps
+/// its max slews in every scene; one annotated only in a later scene keeps its min slews in every
+/// scene and its max slew nowhere — its driver's next timing writes over the annotation
+/// ([`vyges_sta::graph::Graph::slew_blocked`]).
+fn slew_blocked(g: &Graph<'_>, annotated: &[HashMap<String, f32>]) -> HashMap<usize, [bool; 2]> {
+    use vyges_sta::liberty::{MAX, MIN};
+    let index = g.index();
+    let mut blocked: HashMap<usize, [bool; 2]> = HashMap::new();
+    for (k, names) in annotated.iter().enumerate() {
+        let mm = if k == 0 { MAX } else { MIN };
+        if index.len() == g.vertices.len() {
+            for name in names.keys() {
+                if let Some(&v) = index.get(name.as_str()) {
+                    blocked.entry(v).or_default()[mm] = true;
+                }
+            }
+        } else {
+            // a name shared by two vertices (a bidirect pin): both, as the annotations take them
+            for (v, x) in g.vertices.iter().enumerate() {
+                if names.contains_key(&x.name) {
+                    blocked.entry(v).or_default()[mm] = true;
+                }
+            }
+        }
+    }
+    blocked
 }
 
 /// The netlist edits the timers have taken, in order — what a graph made earlier replays to catch
@@ -689,7 +838,9 @@ impl<'n> EditLog<'n> {
 /// `VYGES_STA_CHECK_EDIT` checks each edited graph against a fresh build.
 #[allow(clippy::too_many_arguments)]
 fn timer_graphs<'n>(inputs: &Inputs<'n>, design: &mut dyn Design, annotated: &[HashMap<String, f32>], incs: &mut [IncTimer], log: &mut EditLog<'n>, old: Option<Vec<Graph<'n>>>) -> Result<Vec<Graph<'n>>, Stop> {
+    let _p = crate::prof::Span::new(2);
     let mut edits = design.take_timer_edits();
+    crate::prof::items(2, edits.events.len() as u64);
     // moved, not copied: a connect event lists its net's pins, so a copy is O(fanout) per event
     let first = log.end();
     let evented = !edits.events.is_empty();
@@ -733,6 +884,7 @@ fn timer_graphs<'n>(inputs: &Inputs<'n>, design: &mut dyn Design, annotated: &[H
             // by the design's name map when this is its netlist, not a pass over every net
             let slot = if std::ptr::eq(design.netlist(), &**netlist) { design.net_slot(net) } else { netlist.nets.iter().position(|n| &n.name == net) };
             let Some(n) = slot.map(|k| &netlist.nets[k]) else { continue };
+            crate::prof::items(8, n.pins.len() as u64);
             for c in &n.pins {
                 inc.delays_invalid_from(&netlist.pin_name(c));
             }
@@ -1002,6 +1154,9 @@ fn repair_repeater_net(design: &mut dyn Design, in_pin: &str, out_pin: &str, out
     for (k, g) in graphs.iter_mut().enumerate() {
         if let Some(v) = crate::timing::vertex_named(g, in_pin, false) {
             g.slew_annotated.insert(v, 0.0);
+            if let Some(b) = g.slew_blocked.as_mut() {
+                Arc::make_mut(b).entry(v).or_default()[vyges_sta::liberty::MAX] = true;
+            }
             g.find_vertex_delays(v, design.parasitics(k), &index, None).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
         }
     }
@@ -1170,6 +1325,7 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
                         inc.relevelize(g).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
                     }
                     let pars: Vec<&HashMap<String, vyges_sta::graph::NetParasitics>> = (0..incs.len()).map(|k| design.parasitics(k)).collect();
+                    let _p = crate::prof::Span::new(3);
                     vyges_sta::incr::find_vertex_delay_scenes(incs, own, &pars, &name).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
                 }
                 None => find_all_delays(own_graphs.as_mut().expect("just built"), &*design, &name)?,
@@ -1252,8 +1408,14 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
         (Some(incs), _) => {
             let pars: Vec<&HashMap<String, vyges_sta::graph::NetParasitics>> = (0..incs.len()).map(|k| design.parasitics(k)).collect();
             match own_graphs.as_mut() {
-                Some(own) => vyges_sta::incr::find_vertex_delay_scenes(incs, own, &pars, &name),
-                None => vyges_sta::incr::find_vertex_delay_scenes(incs, &mut held_graphs, &pars, &name),
+                Some(own) => {
+                    let _p = crate::prof::Span::new(3);
+                    vyges_sta::incr::find_vertex_delay_scenes(incs, own, &pars, &name)
+                }
+                None => {
+                    let _p = crate::prof::Span::new(3);
+                    vyges_sta::incr::find_vertex_delay_scenes(incs, &mut held_graphs, &pars, &name)
+                }
             }
             .map_err(|e| Stop::refused("RSZ-TIMER", e))?;
         }
@@ -1278,23 +1440,7 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
     // First the driver's slew: resize the driver, and if that does not fix it, derive the load
     // cap that would, which then caps the buffered net.
     let (mut slew1, mut max_slew1, mut slack1, mut corner1) = timing::repair_check_slew(&timing::Scenes::new(gs!()), drvr, &inputs.limits, &gs!()[0].ideal_clock, ctx.args.slew_margin);
-    // A diagnostic: the slews (max, rise/fall, per scene) on every pin of the driver's instance
-    // when it is checked (`VYGES_RSZ_PROBE_DRVR=pin[,pin...]:path`).
-    if let Some((pins, path)) = std::env::var("VYGES_RSZ_PROBE_DRVR").ok().as_deref().and_then(|s| s.rsplit_once(':')).map(|(a, b)| (a.to_string(), b.to_string())) {
-        if pins.split(',').any(|p| p == name) {
-            use std::io::Write;
-            let inst = name.rsplit_once('/').map_or("", |(i, _)| i).to_string();
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                for (k, g) in gs!().iter().enumerate() {
-                    for (v, x) in g.vertices.iter().enumerate() {
-                        if x.name.rsplit_once('/').is_some_and(|(i, _)| i == inst) {
-                            let _ = writeln!(f, "PROBE {name} scene={k} {} drv={} slew_r={:e} slew_f={:e}", x.name, x.is_driver, g.slew[v][0][vyges_sta::liberty::MAX], g.slew[v][1][vyges_sta::liberty::MAX]);
-                        }
-                    }
-                }
-            }
-        }
-    }
+    probe_pins(gs!(), Some(&name), "check");
     crate::tpush!(trace, "dslew|{}|{}|{}", g9(f64::from(slew1.unwrap_or(0.0))), g9(f64::from(max_slew1)), g9(f64::from(slack1)));
     trace.ran(&["rds", "rdsc", "rdsel", "dresize", "dslew2", "slewcap", "slc0", "slc"]);
     if ctx.args.reroute {

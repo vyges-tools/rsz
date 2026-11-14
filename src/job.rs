@@ -533,6 +533,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
         // Whether a resizer command before this one ran `initBlock` (each of these does, early).
         let block_inited = resizer_ran;
         resizer_ran |= matches!(cmd, "repair_design" | "buffer_ports" | "repair_timing" | "repair_tie_fanout" | "repair_clock_nets");
+        crate::stage(&format!("step:{cmd}"));
         match cmd {
             "read_lef" => {
                 let path = args.last().ok_or("read_lef path")?;
@@ -944,8 +945,10 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 // repair's held skips all read the design as it is here (nothing edits it between) —
                 // under the SDC's `set_case_analysis` / `set_logic_*` (`Sta::isConstant`).
                 let constraints = sdc.as_ref().map(|s| crate::env::sdc_constraints(s, &db)).transpose()?.unwrap_or_default();
+                crate::stage("rd:netlist");
                 let constant_values = crate::env::constant_values_sdc(&db, &liberty, sdc.as_ref())?;
                 crate::env::constants_off_clock_networks(&db, &liberty, &clock_sources, &constraints, &constant_values)?;
+                crate::stage("rd:constants");
                 let held = {
                     let timing = vyges_est::placement::Timing { liberty: Some(&liberty), clock_sources: clock_sources.clone(), propagated: false };
                     Some(vyges_est::placement::skips_with_constants(&db, &timing, &constant_values)?)
@@ -976,6 +979,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         crate::env::estimate_state_held_per_clock_sdc(&db, estimate_db.as_deref(), &netlist, &est_rc, &liberty, &clock_sources, &crate::env::est_clocks(sdc.as_ref(), estimate_propagated), estimate_alpha, libs.scene_count(), &caps, held.as_ref(), &constraints)?
                     }
                 };
+                crate::stage("rd:estimate_parasitics");
                 let wire_rc: Vec<crate::buffered_net::WireRc> = (0..libs.scene_count())
                     .map(|k| {
                         let v = rc.resolved(&db.tech_get_name(), k);
@@ -1032,7 +1036,9 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 let inputs = Inputs { libs: &libs, masters: &m, dont_use: &dont_use, limits, clock_sources: &clock_sources, dbu, wire_rc, sdc: env, master_pins: mpins, sizing_limits: limits_of_block, clock_pattern: Default::default() };
                 let area0 = crate::odb_design::design_area(design.db);
                 a.sta_levels = sta_levels.clone();
+                crate::stage("rd:env");
                 let r = repair_design::repair_design(&inputs, &mut design, &a, &mut trace);
+                crate::stage("rd:order_back");
                 // `RepairDesign::printProgress` (not verbose): the header, row 0, the final row and
                 // the closing rule — area growth against the design area when the repair started.
                 // Reported for gpl's reweight (`-vyges_resize_slack`), which prints it.
@@ -1861,9 +1867,11 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
         std::fs::write(path, trace.text()).map_err(|e| format!("{path}: {e}"))?;
     }
     // The design as the repair left it.
+    crate::stage("steps_done");
     if let Some(path) = job["write_def"].as_str() {
         db.write_def(path).map_err(|e| format!("{path}: {e}"))?;
     }
+    crate::stage("write_def");
     // A diagnostic: the database itself (odb ids preserved), to set against the reference's.
     if let Some(path) = job["write_db"].as_str() {
         db.write(path).map_err(|e| format!("{path}: {e}"))?;

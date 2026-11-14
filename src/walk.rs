@@ -335,6 +335,7 @@ impl Walk<'_, '_> {
     /// repeater in `st.last`).
     #[allow(clippy::too_many_arguments)]
     pub fn make_repeater(&self, reason: &str, x: i32, y: i32, buffer_cell: &str, resize: bool, level: usize, load_pins: &mut Vec<String>, load_cap_hint: Option<f32>, st: &mut State<'_>, trace: &mut Trace) -> Result<(f32, f32, f32), Stop> {
+        let _p = crate::prof::Span::new(7);
         let loads: String = load_pins.iter().map(|p| format!("{p},")).collect();
         crate::tpush!(trace, "rep|{level}|{reason}|{x}|{y}|{buffer_cell}|{loads}");
         let r = st.design.insert_repeater(load_pins, buffer_cell, (x, y), reason).map_err(|e| Stop::error("RSZ-INSERT", e))?;

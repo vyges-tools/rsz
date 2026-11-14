@@ -572,6 +572,8 @@ impl CliDesign<'_> {
     /// full read and fails on any difference; `VYGES_RSZ_FULL_REFRESH=1` uses it instead.
     pub fn refresh_touched(&mut self, new_insts: &[String], touched: &BTreeSet<String>) -> Result<(), String> {
         use vyges_sta::netlist::{Conn, Net, Netlist};
+        let _p = crate::prof::Span::new(0);
+        crate::prof::items(0, touched.len() as u64);
         if std::env::var_os("VYGES_RSZ_FULL_REFRESH").is_some() {
             return self.refresh();
         }
@@ -770,7 +772,12 @@ impl CliDesign<'_> {
                 continue;
             }
             let mut pins = Vec::new();
-            for iterm in self.db.net_iterms(net) {
+            let iterms = self.db.net_iterms(net);
+            crate::prof::items(1, iterms.len() as u64);
+            if iterms.len() >= 100 && std::env::var_os("VYGES_RSZ_REFRESH_TRACE").is_some() {
+                eprintln!("VYGREFRESH|{net}|{}|{}", iterms.len(), new_insts.first().map_or("", |s| s.as_str()));
+            }
+            for iterm in iterms {
                 let (inst, term) = iterm.rsplit_once('/').unwrap_or((&iterm, ""));
                 let Some(k) = pos_of(inst) else { return bail("a pin on an instance not listed") };
                 pins.push(Conn::Inst(k, term.to_string()));
@@ -1216,7 +1223,11 @@ impl CliDesign<'_> {
                 _ => bterms.push(l.clone()),
             }
         }
-        let inst = self.db.insert_buffer_before_loads(net, &iterms, &bterms, cell, Some(loc), reason, None, uniquify, loads_on_diff_nets).map_err(|e| e.to_string())?;
+        let inst = {
+            let _p = crate::prof::Span::new(5);
+            crate::prof::items(5, loads.len() as u64);
+            self.db.insert_buffer_before_loads(net, &iterms, &bterms, cell, Some(loc), reason, None, uniquify, loads_on_diff_nets).map_err(|e| e.to_string())?
+        };
         // `insertBufferPostProcess`: `designAreaIncr(area(master))`.
         self.area_incr(master_area(self.db, cell));
         let at = self.clamp_loc_to_core(self.db.inst_location(&inst), cell);
@@ -1269,6 +1280,7 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
     /// in force now) only when invalid or with no pi model — no entry, here: every net with a
     /// network has its pi model once `findAllArrivals` has run, and an edited net is invalid.
     fn ensure_wire_parasitic(&mut self, net: &str) -> Result<(), String> {
+        let _p = crate::prof::Span::new(4);
         // Estimated now and erased from the invalid set, with no delay invalidation.
         self.pull_edits();
         self.timer.est_invalid.remove(net);
@@ -1442,6 +1454,7 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
     /// `Resizer::replaceCell` → `dbInst::swapMaster`; the callback invalidates the net on every
     /// pin of the instance (not a tristate one).
     fn swap_master(&mut self, inst: &str, cell: &str) -> Result<(), String> {
+        let _p = crate::prof::Span::new(6);
         // `Sta::replaceCell`: with equivalent arcs, `replaceEquivCellBefore` swaps the arc sets of
         // the edges leaving the INPUT pins only — an output-to-output edge keeps the cell it was
         // made with (the first one, across further equivalent swaps); otherwise the instance's
@@ -1469,13 +1482,19 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
         // The nets invalidated are the ones the netlist lists with a pin of it: a supply net
         // (special POWER / GROUND) is no timing net.
         let mut nets: Vec<String> = Vec::new();
-        for (_, _, n) in self.db.inst_iterm_info(inst).map_err(|e| e.to_string())? {
-            if !n.is_empty() && !nets.contains(&n) {
-                nets.push(n);
+        let iterms = self.db.inst_iterm_info(inst).map_err(|e| e.to_string())?;
+        for (_, _, n) in &iterms {
+            if !n.is_empty() && !nets.contains(n) {
+                nets.push(n.clone());
             }
         }
-        let touched: BTreeSet<String> = nets.iter().cloned().collect();
-        self.refresh_touched(&[inst.to_string()], &touched)?;
+        // Only the instance is read again (its master): upstream `dbInst::swapMaster` requires the
+        // new master's terminals to match the old one's by name, remaps each terminal's master
+        // index and re-sorts the instance's own terminal list — no terminal is connected or
+        // disconnected, so every net keeps its pins, their order and their ids. Re-reading the
+        // instance's nets was O(their fanout) per resize: a register's whole clock net each time
+        // (jg8s: 21 M of the 28 M pins the driver loop's refreshes read).
+        self.refresh_touched(&[inst.to_string()], &BTreeSet::new())?;
         nets.retain(|n| !(self.db.net_is_special(n) && matches!(self.db.net_get_sig_type(n).as_str(), "POWER" | "GROUND")));
         for n in nets {
             self.invalidate(&n);
@@ -1486,17 +1505,14 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
         // Witness: SizeDownFanout's next round in the same batch reads the driver timed on its
         // pin caps alone.
         // the nets on its pins only (a net with a pin of it is one of them), not every net
+        // read from the instance's own terminals (each listed net has its pin there), not from a
+        // scan of every pin of each net: a register's clock net per resize
         let lib_cell = self.libs.link_cell(cell);
-        let input_nets: Vec<String> = touched
+        let input_nets: BTreeSet<String> = iterms
             .iter()
-            .filter_map(|t| vyges_rsz::design::Design::net_slot(self, t).map(|k| &self.netlist.nets[k]))
-            .filter(|n| {
-                n.pins.iter().any(|c| {
-                    matches!(c, vyges_sta::netlist::Conn::Inst(i, port) if self.netlist.insts[*i].0 == inst
-                        && lib_cell.and_then(|lc| lc.port(port)).is_some_and(|p| matches!(p.direction, vyges_sta::liberty::Direction::Input | vyges_sta::liberty::Direction::Bidirect)))
-                })
-            })
-            .map(|n| n.name.clone())
+            .filter(|(term, _, n)| !n.is_empty() && lib_cell.and_then(|lc| lc.port(term)).is_some_and(|p| matches!(p.direction, vyges_sta::liberty::Direction::Input | vyges_sta::liberty::Direction::Bidirect)))
+            .filter(|(_, _, n)| vyges_rsz::design::Design::net_slot(self, n).is_some())
+            .map(|(_, _, n)| n.clone())
             .collect();
         if self.estimating {
             for n in input_nets {
@@ -2216,6 +2232,53 @@ impl crate::remove_buffers::RemovalDesign for OdbRemoval<'_> {
 /// a buffer keeps its output net only when that net has a port and the input net has none.
 pub fn buffer_removal_keeps_output_net(in_net_has_port: bool, out_net_has_port: bool) -> bool {
     !in_net_has_port && out_net_has_port
+}
+
+#[cfg(test)]
+mod swap_master_tests {
+    use std::path::Path;
+
+    /// Upstream rule (`dbInst::swapMaster` at 4155ac3): a swap between masters whose terminals
+    /// match by name remaps each terminal's master index and re-sorts the instance's terminal
+    /// list; it connects and disconnects nothing. Every net keeps its terminals, in the same
+    /// order, with the same ids — what lets `CliDesign::swap_master` re-read the instance alone.
+    #[test]
+    fn a_swap_leaves_every_net_with_its_pins_in_order_and_their_ids() {
+        let ex = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/long_wire");
+        let dir = std::env::temp_dir().join(format!("vyges-rsz-swap-master-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // b1 drives b2, b3 and b4 (the net a resized driver and a resized load share)
+        let def = "VERSION 5.8 ;\nDIVIDERCHAR \"/\" ;\nBUSBITCHARS \"[]\" ;\nDESIGN fan ;\nUNITS DISTANCE MICRONS 2000 ;\n\
+DIEAREA ( 0 0 ) ( 200000 28000 ) ;\nROW ROW_0 core 0 0 N DO 500 BY 1 STEP 400 0 ;\nCOMPONENTS 4 ;\n\
+    - b1 BUF_X1 + PLACED ( 20000 0 ) N ;\n    - b2 BUF_X1 + PLACED ( 40000 0 ) N ;\n\
+    - b3 BUF_X2 + PLACED ( 60000 0 ) N ;\n    - b4 BUF_X1 + PLACED ( 80000 0 ) N ;\nEND COMPONENTS\n\
+PINS 1 ;\n    - in1 + NET in1 + DIRECTION INPUT + USE SIGNAL\n      + LAYER M1 ( -100 -100 ) ( 100 100 ) + PLACED ( 200 1400 ) N ;\nEND PINS\n\
+NETS 2 ;\n    - in1 ( PIN in1 ) ( b1 A ) + USE SIGNAL ;\n    - n1 ( b1 Z ) ( b2 A ) ( b3 A ) ( b4 A ) + USE SIGNAL ;\nEND NETS\nEND DESIGN\n";
+        std::fs::write(dir.join("d.def"), def).unwrap();
+        let mut db = vyges_opendb::Db::new();
+        db.read_lef(ex.join("cells.lef").to_str().unwrap()).unwrap();
+        db.read_def(dir.join("d.def").to_str().unwrap(), "default").unwrap();
+        let pins = |db: &vyges_opendb::Db| -> Vec<(String, Vec<(String, u32)>)> {
+            db.net_names()
+                .into_iter()
+                .map(|n| {
+                    let ts = db.net_iterms(&n).into_iter().map(|t| {
+                        let (i, p) = t.rsplit_once('/').unwrap();
+                        let id = db.iterm_id(i, p).unwrap();
+                        (t.clone(), id)
+                    });
+                    (n.clone(), ts.collect())
+                })
+                .collect()
+        };
+        let before = pins(&db);
+        assert_eq!(before.iter().find(|(n, _)| n == "n1").map(|(_, p)| p.len()), Some(4));
+        assert!(db.swap_master("b3", "BUF_X4").unwrap());
+        assert!(db.swap_master("b1", "BUF_X4").unwrap());
+        assert_eq!(db.inst_master("b1"), "BUF_X4");
+        assert_eq!(pins(&db), before);
+    }
 }
 
 #[cfg(test)]
