@@ -82,6 +82,19 @@ pub fn net_parasitic(db: &Db, rc: &vyges_est::rc::Rc, n: &vyges_est::placement::
 /// The ports' `set_load -pin_load`, as an SDC holds them (`SdcEnv::port_pin_cap`).
 pub type PortCaps = HashMap<String, [[Option<f32>; 2]; 2]>;
 
+/// The entries of `caps` for the ports among one net's parasitic `nodes`: what that net's
+/// [`NetParasitics::port_pin_caps`] keeps. The delay calculation asks it only for a port node of
+/// the same net (`Graph::reduced`), and a port it does not hold reads 0, as in the whole map; it
+/// stays `Some` even when empty (reduced against the loads in force THEN, not now).
+/// ⛔ Not the whole map per net: on a large design (1.5 M nets, 3 scenes, ~2,000 ports) that clone
+/// grew past 150 GB before repair_design began.
+pub fn net_port_caps(caps: &PortCaps, nodes: &[String]) -> PortCaps {
+    if caps.is_empty() {
+        return PortCaps::new();
+    }
+    nodes.iter().filter_map(|n| caps.get_key_value(n)).map(|(k, v)| (k.clone(), *v)).collect()
+}
+
 /// The port loads in force at a step: from the SDC the step carries (`"sdc"`: the constraints
 /// as the reference held them when it ran), else from the job's SDC.
 pub fn port_caps_at(path: Option<&str>, current: Option<&vyges_loom::sdc::Sdc>, libs: &Libs, nl: &vyges_sta::netlist::Netlist) -> Result<PortCaps, String> {
@@ -162,7 +175,7 @@ fn parasitics_held(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty
         for n in &nets {
             if let Some(mut p) = net_parasitic(db, rc, n, k)? {
                 // Reduced now, against the port loads in force now.
-                p.port_pin_caps = Some(port_caps.clone());
+                p.port_pin_caps = Some(net_port_caps(port_caps, &p.node_names));
                 map.insert(n.net.clone(), p);
             }
         }
@@ -542,5 +555,27 @@ mod est_clocks_tests {
         let all = vyges_loom::sdc::Sdc::parse("create_clock -name a -period 2 [get_ports {a}]\ncreate_clock -name b -period 2 [get_ports {b}]\n").unwrap();
         assert!(est_clocks(Some(&all), true).all_propagated(), "no clock named: the flag covers all");
         assert!(est_clocks(None, true).ideal_sources().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod net_port_caps_tests {
+    use super::{net_port_caps, PortCaps};
+
+    // Rule (`Graph::reduced` reads `port_pin_caps` for a PORT node of the same net, by its name, a
+    // port not held reading 0): a net keeps only its own ports' loads — the same answer as the
+    // whole map for every name it can be asked — and a net with none keeps an empty map, not
+    // `None` (which would read the loads in force now).
+    #[test]
+    fn a_net_keeps_only_its_own_ports_loads() {
+        let load = |c: f32| [[Some(c), Some(c)], [Some(c), Some(c)]];
+        let caps: PortCaps = [("y".to_string(), load(0.5)), ("z".to_string(), load(0.7))].into_iter().collect();
+        let nodes = vec!["u2/Y".to_string(), "y".to_string(), "n1:1".to_string()];
+        let own = net_port_caps(&caps, &nodes);
+        assert_eq!(own.len(), 1);
+        for n in &nodes {
+            assert_eq!(own.get(n), caps.get(n), "{n}: as the whole map answers");
+        }
+        assert!(net_port_caps(&caps, &["u1/Y".to_string()]).is_empty());
     }
 }

@@ -962,7 +962,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                             .iter()
                             .map(|(net, n)| {
                                 let mut p = vyges_grt::timer::timer_network(net, n);
-                                p.port_pin_caps = Some(caps.clone());
+                                p.port_pin_caps = Some(crate::env::net_port_caps(&caps, &p.node_names));
                                 (net.clone(), p)
                             })
                             .collect();
@@ -1340,7 +1340,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                             .iter()
                             .map(|(net, n)| {
                                 let mut p = vyges_grt::timer::timer_network(net, n);
-                                p.port_pin_caps = Some(caps.clone());
+                                p.port_pin_caps = Some(crate::env::net_port_caps(&caps, &p.node_names));
                                 (net.clone(), p)
                             })
                             .collect();

@@ -932,7 +932,7 @@ impl CliDesign<'_> {
         if let Some(n) = vyges_grt::global_route::routed_network(&gr.after, net) {
             gr_trace(&format!("VYGR|est|cap|{net}|{:.9}", n.nodes.iter().map(|(_, c)| f64::from(*c)).sum::<f64>() * 1e12));
             let mut p = vyges_grt::timer::timer_network(net, &n);
-            p.port_pin_caps = Some(self.port_caps.clone());
+            p.port_pin_caps = Some(crate::env::net_port_caps(&self.port_caps, &p.node_names));
             for map in self.parasitics.iter_mut() {
                 map.insert(net.to_string(), p.clone());
             }
@@ -1121,7 +1121,7 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
         for k in 0..self.parasitics.len() {
             match net_parasitic(self.db, self.rc, &e, k)? {
                 Some(mut p) => {
-                    p.port_pin_caps = Some(self.port_caps.clone());
+                    p.port_pin_caps = Some(crate::env::net_port_caps(&self.port_caps, &p.node_names));
                     self.parasitics[k].insert(net.to_string(), p)
                 }
                 None => self.parasitics[k].remove(net),
