@@ -1268,8 +1268,19 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
         self.area_incr(master_area(self.db, cell));
         // `Resizer::replaceCell`: "legalize the position of the instance in case it leaves the die".
         self.gr_legal_cell_pos(inst)?;
-        self.refresh()?;
-        let nets: Vec<String> = self.netlist.nets.iter().filter(|n| n.pins.iter().any(|c| matches!(c, vyges_sta::netlist::Conn::Inst(i, _) if self.netlist.insts[*i].0 == inst))).map(|n| n.name.clone()).collect();
+        // The instance re-read (its master) and the nets on its pins, not the whole design: a
+        // full read per resize was O(design) — and dropped the order the next insertion extends.
+        // The nets invalidated are the ones the netlist lists with a pin of it: a supply net
+        // (special POWER / GROUND) is no timing net.
+        let mut nets: Vec<String> = Vec::new();
+        for (_, _, n) in self.db.inst_iterm_info(inst).map_err(|e| e.to_string())? {
+            if !n.is_empty() && !nets.contains(&n) {
+                nets.push(n);
+            }
+        }
+        let touched: BTreeSet<String> = nets.iter().cloned().collect();
+        self.refresh_touched(&[inst.to_string()], &touched)?;
+        nets.retain(|n| !(self.db.net_is_special(n) && matches!(self.db.net_get_sig_type(n).as_str(), "POWER" | "GROUND")));
         for n in nets {
             self.invalidate(&n);
         }
