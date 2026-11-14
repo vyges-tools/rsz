@@ -30,6 +30,9 @@ pub struct Repeater {
 pub struct TimerEdits {
     pub events: Vec<String>,
     pub updated_nets: Vec<String>,
+    /// The netlist slots these edits replaced or appended when the design held its order
+    /// ([`Design::hold_netlist_order`]); `None`: not kept (a slot may have moved).
+    pub slots: Option<vyges_sta::graph::SlotDelta>,
 }
 
 /// What the repair asks of the design. The command line implements it over the database.
@@ -120,6 +123,22 @@ pub trait Design {
     /// hierarchical pins are no loads) in visit order — through the module nets when the pin has
     /// one, else its flat net's instance terminals in the database's order, then its ports.
     fn visit_connected_pins(&self, pin: &str) -> Vec<String>;
+    /// The slot of net `net` in [`Design::netlist`], `None` when it has none. A design that keeps
+    /// a name map answers without a pass over every net (a pass per call was O(design) per edit).
+    fn net_slot(&self, net: &str) -> Option<usize> {
+        self.netlist().nets.iter().position(|n| n.name == net)
+    }
+    /// The slot of instance `inst` in [`Design::netlist`], as [`Design::net_slot`].
+    fn inst_slot(&self, inst: &str) -> Option<usize> {
+        self.netlist().insts.iter().position(|i| i.0 == inst)
+    }
+    /// `true`: what the edits make from here is appended to [`Design::netlist`] rather than put at
+    /// the database's position (a reused id is mid-order), so no listed index moves while a repair
+    /// runs; `false`: the netlist is put back in the database's order. A design that keeps no
+    /// order does nothing.
+    fn hold_netlist_order(&mut self, _hold: bool) -> Result<(), String> {
+        Ok(())
+    }
     /// Begin recording the edits for the incremental timer.
     fn start_timer_edits(&mut self) -> Result<(), String> {
         Ok(())

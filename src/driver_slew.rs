@@ -30,10 +30,10 @@ pub struct Driver<'a> {
 /// clock-to-Q arc from an ideal clock pin, the ideal clock's slew at max — `idealClkSlew`: its
 /// `set_clock_transition`, else 0); over the limit, the violation is the larger excess.
 #[allow(clippy::too_many_arguments)]
-fn check_driver_arc_slew(g: &Graph<'_>, inst: &str, from: &str, role: Role, arc: &vyges_sta::liberty::Arc, load_cap: f32, limit: f32, clocks: &std::collections::BTreeSet<usize>, violation: &mut f32) {
+fn check_driver_arc_slew(g: &Graph<'_>, inst: &str, from: &str, role: Role, arc: &vyges_sta::liberty::Arc, load_cap: f32, limit: f32, clocks: &std::collections::HashSet<usize>, violation: &mut f32) {
     let Model::Gate(model) = &arc.model else { return };
     let pin = format!("{inst}/{from}");
-    let Some(v) = g.vertices.iter().position(|x| x.name == pin && !x.is_driver) else { return };
+    let Some(v) = crate::timing::vertex_named(g, &pin, false) else { return };
     let in_slew = if role == Role::RegClkToQ && clocks.contains(&v) { crate::timing::ideal_clk_slew(g, v, arc.from_rf, MAX) } else { g.slew[v][arc.from_rf][MAX] };
     let (_, arc_slew) = model.gate_delay(in_slew, load_cap);
     if arc_slew > limit {
@@ -51,7 +51,7 @@ fn check_driver_arc_slew(g: &Graph<'_>, inst: &str, from: &str, role: Role, arc:
 /// (`findSlewLimit(port, corner)`); its arcs and their models are the LINK size's (`timingArcSets()`
 /// on the link cell — not the corner's models); the input slews are the corner's.
 #[allow(clippy::too_many_arguments)]
-pub fn repair_driver_slew(g: &Graph<'_>, corner: usize, d: &Driver<'_>, load_cap: f32, sizing: &Sizing<'_>, limits: &Limits, slew_margin: f64, clocks: &std::collections::BTreeSet<usize>, trace: &mut Trace) -> Result<Option<String>, Stop> {
+pub fn repair_driver_slew(g: &Graph<'_>, corner: usize, d: &Driver<'_>, load_cap: f32, sizing: &Sizing<'_>, limits: &Limits, slew_margin: f64, clocks: &std::collections::HashSet<usize>, trace: &mut Trace) -> Result<Option<String>, Stop> {
     if d.dont_touch || d.fixed || !d.logic_std_cell {
         return Ok(None);
     }

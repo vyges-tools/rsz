@@ -107,9 +107,30 @@ impl HeldSkips {
     }
 }
 
+/// A swap line that leaves the held skips standing: `Sta::replaceEquivCellBefore/After`
+/// invalidate neither the clock network nor the simulator's constants, so a swap between
+/// equivalent cells (`equiv(from, to)`) changes neither. `swap_before|inst|from|to|terms` carries
+/// both masters and decides for the pair; its `swap_after` never drops them on its own.
+fn swap_keeps_skips(ev: &str, equiv: impl Fn(&str, &str) -> bool) -> bool {
+    if ev.starts_with("swap_after|") {
+        return true;
+    }
+    let f: Vec<&str> = ev.splitn(5, '|').collect();
+    matches!(f.as_slice(), ["swap_before", _, from, to, _] if equiv(from, to))
+}
+
 /// An edit-log line (`Db::edit_log_start`'s format) that names one of `nets` in any field.
+///
+/// 🔑 A connect's, a disconnect's and a net destroy's terminal list is not read: it is the pins
+/// of the net the line names already (a port on it is the clock's own source net, held with it),
+/// and reading it per event was O(fanout) — every load moved off a high-fanout net read the rest.
 fn edit_names_any(ev: &str, nets: &std::collections::HashSet<String>) -> bool {
-    ev.split(['|', ',', ';', '=']).any(|t| nets.contains(t))
+    let named = match ev.split_once('|').map(|(kind, _)| kind) {
+        Some("iterm_connect" | "iterm_disconnect" | "bterm_connect" | "bterm_disconnect") => 3,
+        Some("net_destroy") => 2,
+        _ => usize::MAX,
+    };
+    ev.split('|').take(named).flat_map(|f| f.split([',', ';', '='])).any(|t| nets.contains(t))
 }
 
 /// `parasiticsInvalid(db_net)` for each net `IncrementalGRoute::updateRoutes` routed again
@@ -148,10 +169,23 @@ mod rerouted_tests {
 
 #[cfg(test)]
 mod held_skips_tests {
-    use super::edit_names_any;
+    use super::{edit_names_any, swap_keeps_skips};
 
-    /// The held skips are dropped by an edit naming a held net ANYWHERE in the line: as the
-    /// connected net, in a net's terminal list, or inside a swapped instance's `T=net=pins` terms.
+    /// Rule (`Sta::replaceEquivCellBefore/After`: no `clkPinsInvalid`, no `constantsInvalid`): an
+    /// equivalent swap keeps the held clock nets and constant pins even when its pins are on one
+    /// (a register's clock pin); a swap to another function decides as any other line.
+    #[test]
+    fn an_equivalent_swap_keeps_the_held_skips() {
+        let equiv = |a: &str, b: &str| a.starts_with("dff") == b.starts_with("dff");
+        assert!(swap_keeps_skips("swap_before|r1|dff_1|dff_2|CK=clk=clk,r1/CK;Q=q=r1/Q", equiv));
+        assert!(swap_keeps_skips("swap_after|r1|CK=clk=clk,r1/CK;Q=q=r1/Q", equiv));
+        assert!(!swap_keeps_skips("swap_before|r1|dff_1|nand_2|CK=clk=clk,r1/CK", equiv));
+        assert!(!swap_keeps_skips("iterm_connect|u1/A|clk|clk,u1/A", equiv));
+    }
+
+    /// The held skips are dropped by an edit naming a held net: as the connected net, a merged or
+    /// destroyed one, or inside a swapped instance's `T=net=pins` terms. A connect's terminal
+    /// list is the named net's own pins and is not read.
     #[test]
     fn an_edit_naming_a_held_net_in_any_field_drops_the_skips() {
         let nets = ["clk".to_string(), "const0".to_string()].into_iter().collect();
@@ -163,6 +197,9 @@ mod held_skips_tests {
         assert!(!edit_names_any("iterm_connect|rebuffer1/A|n5|u4/Y,rebuffer1/A", &nets));
         // A name that only CONTAINS a held net is not one.
         assert!(!edit_names_any("iterm_connect|u1/A|clk_div|u1/A", &nets));
+        assert!(edit_names_any("net_destroy|clk|u1/A|7", &nets));
+        assert!(!edit_names_any("net_destroy|n9|clk|7", &nets));
+        assert!(!edit_names_any("bterm_connect|p|n5|clk,u2/A", &nets));
     }
 }
 
@@ -296,6 +333,10 @@ pub struct DbOrder {
     inst_ids: Vec<u32>,
     net_ids: Vec<u32>,
     net_slot: HashMap<String, u32>,
+    /// Held order ([`CliDesign::hold_order`]): the instances and nets made since, by id, at the
+    /// positions they were appended to (after every listed one). The listed ranks stay put.
+    appended_insts: HashMap<u32, usize>,
+    appended_nets: HashMap<u32, usize>,
 }
 
 impl DbOrder {
@@ -321,17 +362,43 @@ impl DbOrder {
             net_ids.push(id);
             net_slot.insert(n.name.clone(), id);
         }
-        Some(DbOrder { inst_id, inst_ids, net_ids, net_slot })
+        Some(DbOrder { inst_id, inst_ids, net_ids, net_slot, appended_insts: HashMap::new(), appended_nets: HashMap::new() })
     }
 
     /// A listed instance's position.
     fn inst_pos(&self, name: &str) -> Option<usize> {
-        self.inst_ids.binary_search(self.inst_id.get(name)?).ok()
+        let id = self.inst_id.get(name)?;
+        self.inst_ids.binary_search(id).ok().or_else(|| self.appended_insts.get(id).copied())
     }
 
     /// A listed net's position, by id.
     fn net_pos(&self, id: u32) -> Option<usize> {
-        self.net_ids.binary_search(&id).ok()
+        self.net_ids.binary_search(&id).ok().or_else(|| self.appended_nets.get(&id).copied())
+    }
+
+    /// Whether the netlist is in the database's order (nothing appended out of it).
+    fn in_db_order(&self) -> bool {
+        self.appended_insts.is_empty() && self.appended_nets.is_empty()
+    }
+
+    /// The database's order of a netlist this order describes: each position's id, ascending —
+    /// `(instance positions, net positions)` in that order. The id ranks of the listed ones are
+    /// their positions; an appended one's id is its key.
+    fn db_permutation(&self) -> (Vec<usize>, Vec<usize>) {
+        let by_id = |listed: &[u32], appended: &HashMap<u32, usize>| -> Vec<usize> {
+            let mut all: Vec<(u32, usize)> = listed.iter().enumerate().map(|(k, &id)| (id, k)).chain(appended.iter().map(|(&id, &k)| (id, k))).collect();
+            all.sort_unstable();
+            all.into_iter().map(|(_, k)| k).collect()
+        };
+        (by_id(&self.inst_ids, &self.appended_insts), by_id(&self.net_ids, &self.appended_nets))
+    }
+
+    /// After [`DbOrder::db_permutation`] is applied: every id listed at its rank.
+    fn settle(&mut self) {
+        self.inst_ids.extend(self.appended_insts.drain().map(|(id, _)| id));
+        self.inst_ids.sort_unstable();
+        self.net_ids.extend(self.appended_nets.drain().map(|(id, _)| id));
+        self.net_ids.sort_unstable();
     }
 
     /// A listed net's position, by name.
@@ -355,6 +422,35 @@ fn shifted(at: &[usize], k: usize) -> usize {
     k + at.partition_point(|&p| p <= k)
 }
 
+/// The netlist `nl` permuted (`inst_order[new] = old position`, the same for `net_order`), each
+/// pin's instance index moved with its instance; a net whose indices all stay is shared.
+fn reordered(nl: &vyges_sta::netlist::Netlist, inst_order: &[usize], net_order: &[usize]) -> vyges_sta::netlist::Netlist {
+    use vyges_sta::netlist::{Conn, Net};
+    let mut new_pos = vec![0usize; inst_order.len()];
+    for (j, &k) in inst_order.iter().enumerate() {
+        new_pos[k] = j;
+    }
+    let nets = net_order
+        .iter()
+        .map(|&k| {
+            let n = &nl.nets[k];
+            if n.pins.iter().all(|c| !matches!(c, Conn::Inst(i, _) if new_pos[*i] != *i)) {
+                return n.clone();
+            }
+            let pins = n
+                .pins
+                .iter()
+                .map(|c| match c {
+                    Conn::Inst(i, p) => Conn::Inst(new_pos[*i], p.clone()),
+                    Conn::Port(p) => Conn::Port(*p),
+                })
+                .collect();
+            std::sync::Arc::new(Net { name: n.name.clone(), pins })
+        })
+        .collect();
+    vyges_sta::netlist::Netlist { insts: inst_order.iter().map(|&k| nl.insts[k].clone()).collect(), ports: nl.ports.clone(), nets }
+}
+
 /// [`CliDesign::edited_netlist`] giving up, the reason traced (`VYGES_RSZ_ORDER_TRACE`).
 fn bail<T>(why: &str) -> Option<T> {
     if std::env::var_os("VYGES_RSZ_ORDER_TRACE").is_some() {
@@ -370,6 +466,15 @@ fn bail<T>(why: &str) -> Option<T> {
 #[derive(Default)]
 pub struct TimerLog {
     pub on: bool,
+    /// The netlist's order held while a repair edits it ([`Design::hold_netlist_order`]): what an
+    /// edit makes is appended, not put at its id's rank, so no listed index moves. After a
+    /// deletion every new id is mid-order, and moving every index past it was O(design) per
+    /// repeater here and in every timing graph — the reference's objects have no positions.
+    pub hold_order: bool,
+    /// The netlist slots the edits since the last take replaced or appended (held order), or
+    /// `slots_lost`: a slot may have moved (a full read, an edit out of held order).
+    pub slots: vyges_sta::graph::SlotDelta,
+    pub slots_lost: bool,
     pub events: Vec<String>,
     pub est_invalid: BTreeSet<String>,
     pub updated: Vec<String>,
@@ -411,7 +516,48 @@ impl CliDesign<'_> {
             self.netlist_gen += 1;
         }
         self.netlist = std::sync::Arc::new(nl);
+        self.timer.slots_lost = true;
         self.info = net_info(self.db, &self.netlist)?;
+        Ok(())
+    }
+
+    /// The database order kept for the netlist as it is now (none after a full read until the next
+    /// edit reads it): positions by name without a pass over the netlist. A name it does not
+    /// answer for is looked for by the pass.
+    fn kept_order(&self) -> Option<&DbOrder> {
+        match self.inst_pos.as_ref() {
+            Some((w, ord)) if std::ptr::eq(w.as_ptr(), std::sync::Arc::as_ptr(&self.netlist)) => Some(ord),
+            _ => None,
+        }
+    }
+
+    /// [`Design::hold_netlist_order`]: on, an edit appends what it makes; off, a netlist held out
+    /// of the database's order is put back in it (one permutation, no read of the database).
+    pub fn hold_order(&mut self, hold: bool) -> Result<(), String> {
+        self.timer.hold_order = hold;
+        if hold {
+            return Ok(());
+        }
+        let Some((w, ord)) = self.inst_pos.as_mut() else { return Ok(()) };
+        if ord.in_db_order() {
+            return Ok(());
+        }
+        if !std::sync::Weak::ptr_eq(w, &std::sync::Arc::downgrade(&self.netlist)) {
+            // the netlist was read again since (a full read is in the database's order)
+            self.inst_pos = None;
+            return Ok(());
+        }
+        let (io, no) = ord.db_permutation();
+        ord.settle();
+        self.netlist = std::sync::Arc::new(reordered(&self.netlist, &io, &no));
+        self.timer.slots_lost = true;
+        self.netlist_gen += 1;
+        if let Some((w, _)) = self.inst_pos.as_mut() {
+            *w = std::sync::Arc::downgrade(&self.netlist);
+        }
+        if std::env::var_os("VYGES_RSZ_CHECK_REFRESH").is_some() && vyges_grt::timer::netlist(self.db) != *self.netlist {
+            return Err("hold_order: the settled netlist differs from the full read".into());
+        }
         Ok(())
     }
 
@@ -542,6 +688,7 @@ impl CliDesign<'_> {
             self.netlist_gen += 1;
         }
         self.netlist = std::sync::Arc::new(nl);
+        self.timer.slots_lost = true;
         // ⚠️ O(design): every instance and net id, read once so the next edit is extended in place
         self.inst_pos = DbOrder::read(self.db, &self.netlist).map(|ord| (std::sync::Arc::downgrade(&self.netlist), ord));
         if self.inst_pos.is_none() && std::env::var_os("VYGES_RSZ_ORDER_TRACE").is_some() {
@@ -598,15 +745,20 @@ impl CliDesign<'_> {
             if j > 0 && made[j - 1].0 == *id {
                 return bail("an instance named twice");
             }
+            if ord.appended_insts.contains_key(id) {
+                return bail("a new instance at a listed id");
+            }
             match ord.inst_ids.binary_search(id) {
                 Ok(_) => return bail("a new instance at a listed id"),
+                // held order: after every listed instance, whatever its id
+                Err(_) if self.timer.hold_order => at.push(old.insts.len()),
                 Err(p) => at.push(p),
             }
         }
         let made_pos: HashMap<&str, usize> = made.iter().enumerate().map(|(j, (_, n))| (n.as_str(), at[j] + j)).collect();
         let pos_of = |inst: &str| made_pos.get(inst).copied().or_else(|| ord.inst_pos(inst).map(|k| shifted(&at, k)));
         let port_index: HashMap<&str, usize> = old.ports.iter().enumerate().map(|(i, (n, _))| (n.as_str(), i)).collect();
-        let mut replaced: Vec<(usize, Net)> = Vec::new();
+        let mut replaced: Vec<(usize, u32, Net)> = Vec::new();
         let mut added: Vec<(u32, Net)> = Vec::new();
         for net in touched {
             let Ok(id) = self.db.net_id(net) else { return bail("a touched net gone") };
@@ -630,14 +782,14 @@ impl CliDesign<'_> {
             }
             match slot {
                 Some(_) if pins.is_empty() => return bail("a listed net left pinless"),
-                Some(k) => replaced.push((k, Net { name: net.clone(), pins })),
+                Some(k) => replaced.push((k, id, Net { name: net.clone(), pins })),
                 None if pins.is_empty() => {}
                 None => added.push((id, Net { name: net.clone(), pins })),
             }
         }
         // a listed net whose name was touched but is not at its slot any more was renamed to a
         // name the edit did not name — its slot would keep the stale name
-        let replaced_slots: std::collections::HashSet<usize> = replaced.iter().map(|(k, _)| *k).collect();
+        let replaced_slots: std::collections::HashSet<usize> = replaced.iter().map(|(k, ..)| *k).collect();
         if touched.iter().any(|t| ord.net_slot_pos(t).is_some_and(|k| !replaced_slots.contains(&k))) {
             return bail("a listed net renamed to a name not touched");
         }
@@ -646,7 +798,7 @@ impl CliDesign<'_> {
         let master_changed = remaster.iter().any(|(k, m)| *m != old.insts[*k].1);
         let changed = master_changed || !made.is_empty() || !added.is_empty() || {
             let before: HashMap<&str, &Vec<Conn>> = touched.iter().filter_map(|t| ord.net_slot_pos(t)).map(|k| (old.nets[k].name.as_str(), &old.nets[k].pins)).collect();
-            let after: HashMap<&str, &Vec<Conn>> = replaced.iter().map(|(_, n)| (n.name.as_str(), &n.pins)).collect();
+            let after: HashMap<&str, &Vec<Conn>> = replaced.iter().map(|(_, _, n)| (n.name.as_str(), &n.pins)).collect();
             before != after
         };
         drop(made_pos);
@@ -659,6 +811,17 @@ impl CliDesign<'_> {
             }
             (*shared).clone()
         });
+        // the slots this edit replaces or appends (no slot moves in held order)
+        let held = self.timer.hold_order;
+        if held {
+            let d = &mut self.timer.slots;
+            d.insts.extend(remaster.iter().map(|(k, _)| *k));
+            d.insts.extend((0..made.len()).map(|j| at[j] + j));
+            d.nets.extend(replaced.iter().map(|(k, ..)| *k));
+            d.nets.extend(nl.nets.len()..nl.nets.len() + added.len());
+        } else {
+            self.timer.slots_lost = true;
+        }
         for (k, m) in remaster {
             std::sync::Arc::make_mut(&mut nl.insts[k]).1 = m;
         }
@@ -680,22 +843,32 @@ impl CliDesign<'_> {
                 eprintln!("VYGORDER|mid|{inst}|{k}");
             }
             let master = self.db.inst_master(&inst);
-            ord.inst_ids.insert(k, id);
+            if self.timer.hold_order {
+                ord.appended_insts.insert(id, k);
+            } else {
+                ord.inst_ids.insert(k, id);
+            }
             ord.inst_id.insert(inst.clone(), id);
             nl.insts.insert(k, vyges_sta::netlist::inst(inst, master));
         }
         // every old name out before any new one in: two slots may trade names
-        for (k, _) in &replaced {
+        for (k, ..) in &replaced {
             ord.net_slot.remove(&nl.nets[*k].name);
         }
-        for (k, r) in replaced {
-            ord.net_slot.insert(r.name.clone(), ord.net_ids[k]);
+        for (k, id, r) in replaced {
+            ord.net_slot.insert(r.name.clone(), id);
             nl.nets[k] = r.into();
         }
         added.sort_by_key(|(id, _)| *id);
         for (id, n) in added {
-            let k = ord.net_ids.partition_point(|&x| x < id);
-            ord.net_ids.insert(k, id);
+            let k = if self.timer.hold_order {
+                ord.appended_nets.insert(id, nl.nets.len());
+                nl.nets.len()
+            } else {
+                let k = ord.net_ids.partition_point(|&x| x < id);
+                ord.net_ids.insert(k, id);
+                k
+            };
             ord.net_slot.insert(n.name.clone(), id);
             nl.nets.insert(k, n.into());
         }
@@ -764,7 +937,14 @@ impl CliDesign<'_> {
         if old.is_some() {
             let full = vyges_grt::timer::netlist(self.db);
             let info = net_info(self.db, &full)?;
-            if full != *self.netlist || info != self.info {
+            let ours = match self.inst_pos.as_ref() {
+                Some((_, ord)) if !ord.in_db_order() => {
+                    let (io, no) = ord.db_permutation();
+                    std::sync::Arc::new(reordered(&self.netlist, &io, &no))
+                }
+                _ => self.netlist.clone(),
+            };
+            if full != *ours || info != self.info {
                 return Err(format!("refresh_touched (edited): differs from the full read (netlist {}, info {})", full == *self.netlist, info == self.info));
             }
         }
@@ -796,11 +976,27 @@ impl CliDesign<'_> {
     }
 
     fn drop_skips_if_touched(&mut self, ev: &str) {
+        // `Sta::replaceEquivCellBefore/After` invalidate neither the clock network nor the
+        // simulator's constants: a swap between equivalent cells (same ports, functions and
+        // sequentials) leaves both as they were, whatever nets its pins are on. Its `swap_before`
+        // carries both masters and decides for the pair; a resize of a register (its clock pin on
+        // the clock net) dropped the sets — a whole-design walk per resize.
+        if swap_keeps_skips(ev, |from, to| self.equivalent_cells(from, to)) {
+            return;
+        }
         if self.skips.as_ref().is_some_and(|h| h.touched_by(ev)) {
             if std::env::var_os("VYGES_RSZ_SKIPS_TRACE").is_some() {
                 eprintln!("VYGSKIPS|dropped|{ev}");
             }
             self.skips = None;
+        }
+    }
+
+    /// Masters `sizing::equiv_cells` calls equivalent (undecided or unknown: not).
+    fn equivalent_cells(&self, from: &str, to: &str) -> bool {
+        match (self.libs.link_cell(from), self.libs.link_cell(to)) {
+            (Some(a), Some(b)) => vyges_rsz::sizing::equiv_cells(a, b) == Some(true),
+            _ => false,
         }
     }
 
@@ -1095,7 +1291,7 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
         if !self.estimating || !(self.invalid.contains(net) || !self.parasitics[0].contains_key(net)) {
             return Ok(());
         }
-        let Some(drvr) = self.netlist.nets.iter().find(|n| n.name == net).and_then(|n| {
+        let Some(drvr) = vyges_rsz::design::Design::net_slot(self, net).map(|k| &self.netlist.nets[k]).and_then(|n| {
             n.pins.iter().map(|c| self.netlist.pin_name(c)).find(|p| self.is_driver_pin(p))
         }) else {
             self.invalid.remove(net);
@@ -1250,7 +1446,7 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
         // the edges leaving the INPUT pins only — an output-to-output edge keeps the cell it was
         // made with (the first one, across further equivalent swaps); otherwise the instance's
         // edges are made anew from the new cell.
-        let from = self.netlist.insts.iter().map(|i| &**i).find(|(n, _)| n == inst).map(|(_, c)| c.clone());
+        let from = vyges_rsz::design::Design::inst_slot(self, inst).map(|k| self.netlist.insts[k].1.clone());
         if let Some(from) = from {
             let equiv = matches!((self.libs.link_cell(&from), self.libs.link_cell(cell)), (Some(a), Some(b)) if vyges_sta::incr::equiv_cells_arcs(a, b));
             if equiv {
@@ -1289,11 +1485,11 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
         // net has no parasitic until `updateParasitics` estimates it again (it is invalid).
         // Witness: SizeDownFanout's next round in the same batch reads the driver timed on its
         // pin caps alone.
+        // the nets on its pins only (a net with a pin of it is one of them), not every net
         let lib_cell = self.libs.link_cell(cell);
-        let input_nets: Vec<String> = self
-            .netlist
-            .nets
+        let input_nets: Vec<String> = touched
             .iter()
+            .filter_map(|t| vyges_rsz::design::Design::net_slot(self, t).map(|k| &self.netlist.nets[k]))
             .filter(|n| {
                 n.pins.iter().any(|c| {
                     matches!(c, vyges_sta::netlist::Conn::Inst(i, port) if self.netlist.insts[*i].0 == inst
@@ -1338,13 +1534,40 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
             }
         }
         self.db.edit_log_start().map_err(|e| e.to_string())?;
-        self.timer = TimerLog { on: true, ..TimerLog::default() };
+        self.timer = TimerLog { on: true, hold_order: self.timer.hold_order, ..TimerLog::default() };
         Ok(())
+    }
+
+    fn net_slot(&self, net: &str) -> Option<usize> {
+        let scan = || self.netlist.nets.iter().position(|n| n.name == net);
+        if let Some(ord) = self.kept_order() {
+            let hit = ord.net_slot_pos(net).filter(|&k| self.netlist.nets.get(k).is_some_and(|n| n.name == net));
+            // 🔑 a name the kept map never held is no net of this netlist (the map is made from
+            // its every net and takes each one an edit makes or renames): a supply net on a resized
+            // instance's pins asked for by name was a pass over every net, per resize
+            if hit.is_some() || !ord.net_slot.contains_key(net) {
+                if std::env::var_os("VYGES_RSZ_CHECK_REFRESH").is_some() {
+                    assert_eq!(hit, scan(), "net {net}: the kept name map and the netlist disagree");
+                }
+                return hit;
+            }
+        }
+        scan()
+    }
+
+    fn inst_slot(&self, inst: &str) -> Option<usize> {
+        self.kept_order().and_then(|ord| ord.inst_pos(inst)).filter(|&k| self.netlist.insts.get(k).is_some_and(|i| i.0 == inst)).or_else(|| self.netlist.insts.iter().position(|i| i.0 == inst))
+    }
+
+    fn hold_netlist_order(&mut self, hold: bool) -> Result<(), String> {
+        CliDesign::hold_order(self, hold)
     }
 
     fn take_timer_edits(&mut self) -> vyges_rsz::design::TimerEdits {
         self.pull_edits();
-        vyges_rsz::design::TimerEdits { events: std::mem::take(&mut self.timer.events), updated_nets: std::mem::take(&mut self.timer.updated) }
+        let slots = std::mem::take(&mut self.timer.slots);
+        let slots = (!std::mem::take(&mut self.timer.slots_lost)).then_some(slots);
+        vyges_rsz::design::TimerEdits { events: std::mem::take(&mut self.timer.events), updated_nets: std::mem::take(&mut self.timer.updated), slots }
     }
 
     fn visit_connected_pins(&self, pin: &str) -> Vec<String> {
@@ -1993,6 +2216,67 @@ impl crate::remove_buffers::RemovalDesign for OdbRemoval<'_> {
 /// a buffer keeps its output net only when that net has a port and the input net has none.
 pub fn buffer_removal_keeps_output_net(in_net_has_port: bool, out_net_has_port: bool) -> bool {
     !in_net_has_port && out_net_has_port
+}
+
+#[cfg(test)]
+mod held_order_tests {
+    use super::*;
+    use vyges_sta::netlist::{Conn, Net, Netlist};
+
+    /// Rule (odb `dbTable::create` takes the LAST freed id and `dbBlock` iterates by id): while
+    /// the order is held, instances and nets made are appended; settling puts each at its id's
+    /// rank, so a held netlist reordered by the permutation is the netlist a full read in id
+    /// order gives, its pins' instance indices moved with their instances.
+    #[test]
+    fn a_held_netlist_settled_is_the_full_read_in_id_order() {
+        let order = |appended_insts: &[(u32, usize)], appended_nets: &[(u32, usize)]| DbOrder {
+            inst_id: HashMap::new(),
+            inst_ids: vec![2, 5, 9],
+            net_ids: vec![4, 8],
+            net_slot: HashMap::new(),
+            appended_insts: appended_insts.iter().copied().collect(),
+            appended_nets: appended_nets.iter().copied().collect(),
+        };
+        assert!(order(&[], &[]).in_db_order());
+        // ids 3 and 7 freed earlier and reused: appended at 3 and 4, their ranks are 1 and 3
+        let mut o = order(&[(3, 3), (7, 4)], &[(1, 2)]);
+        assert!(!o.in_db_order());
+        let (insts, nets) = o.db_permutation();
+        assert_eq!(insts, [0, 3, 1, 4, 2]);
+        assert_eq!(nets, [2, 0, 1]);
+        let pin = |i: usize| Conn::Inst(i, "A".into());
+        let held = Netlist {
+            insts: ["u2", "u5", "u9", "b3", "b7"].iter().map(|n| vyges_sta::netlist::inst(*n, "buf")).collect(),
+            ports: vec![],
+            nets: vec![
+                Net { name: "n4".into(), pins: vec![pin(0), pin(3)] }.into(),
+                Net { name: "n8".into(), pins: vec![pin(2)] }.into(),
+                Net { name: "n1".into(), pins: vec![pin(4), pin(1)] }.into(),
+            ],
+        };
+        let settled = reordered(&held, &insts, &nets);
+        let names: Vec<&str> = settled.insts.iter().map(|i| i.0.as_str()).collect();
+        assert_eq!(names, ["u2", "b3", "u5", "b7", "u9"]);
+        let net = |k: usize| (settled.nets[k].name.clone(), settled.nets[k].pins.clone());
+        assert_eq!(net(0), ("n1".into(), vec![pin(3), pin(2)]));
+        assert_eq!(net(1), ("n4".into(), vec![pin(0), pin(1)]));
+        assert_eq!(net(2), ("n8".into(), vec![pin(4)]));
+        o.settle();
+        assert!(o.in_db_order());
+        assert_eq!((o.inst_ids, o.net_ids), (vec![2, 3, 5, 7, 9], vec![1, 4, 8]));
+    }
+
+    /// A net whose instances all keep their positions is the same allocation after the reorder.
+    #[test]
+    fn a_net_whose_instances_stay_is_shared() {
+        let nl = Netlist {
+            insts: vec![vyges_sta::netlist::inst("u1", "buf"), vyges_sta::netlist::inst("u2", "buf")],
+            ports: vec![],
+            nets: vec![Net { name: "a".into(), pins: vec![Conn::Inst(0, "A".into())] }.into()],
+        };
+        let same = reordered(&nl, &[0, 1], &[0]);
+        assert!(std::sync::Arc::ptr_eq(&same.nets[0], &nl.nets[0]));
+    }
 }
 
 #[cfg(test)]

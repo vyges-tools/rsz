@@ -252,12 +252,74 @@ pub fn annotate_load_slews(g: &mut Graph<'_>, items: &[(usize, usize, f32)], par
     Ok(out)
 }
 
+/// A set of vertices a check asks about (the clock pins): the graph's kept `HashSet`, or an
+/// ordered set a caller walked.
+pub trait PinSet {
+    fn has(&self, v: usize) -> bool;
+}
+
+impl PinSet for std::collections::BTreeSet<usize> {
+    fn has(&self, v: usize) -> bool {
+        self.contains(&v)
+    }
+}
+
+impl PinSet for std::collections::HashSet<usize> {
+    fn has(&self, v: usize) -> bool {
+        self.contains(&v)
+    }
+}
+
+/// The pin's driver (`driver`) or load vertex (`Graph::pinDrvrVertex` / `pinLoadVertex`): by the
+/// graph's name index, not a pass over every vertex (that was O(design) per lookup, several per
+/// repeater). A name has one vertex, or two for a bidirect pin (a driver and a load): the indexed
+/// one on the wrong side sends the lookup to the pass.
+///
+/// 🔑 A pin that is not bidirect has ONE vertex, so the indexed one on the wrong side means none
+/// (an arc from an output pin asked for as a load): that answer from the pass was O(design) per
+/// call. A bidirect pin's two are made one after the other (`makePinVertices`); the pass is kept
+/// for one whose two are not adjacent.
+pub fn vertex_named(g: &Graph<'_>, name: &str, driver: bool) -> Option<usize> {
+    let &v = g.index().get(name)?;
+    if g.vertices[v].is_driver == driver {
+        return Some(v);
+    }
+    let side = |w: usize| g.vertices.get(w).is_some_and(|x| x.is_driver == driver && x.name == name);
+    if let Some(w) = [v.wrapping_sub(1), v + 1].into_iter().find(|&w| side(w)) {
+        return Some(w);
+    }
+    if !is_bidirect(g, v) {
+        return None;
+    }
+    g.vertices.iter().position(|x| x.is_driver == driver && x.name == name)
+}
+
+/// Whether vertex `v`'s pin is bidirect (two vertices): a liberty `inout` port or a top `inout`
+/// port. A pin of a cell no library holds is taken as one (the pass decides).
+fn is_bidirect(g: &Graph<'_>, v: usize) -> bool {
+    let x = &g.vertices[v];
+    match &x.conn {
+        vyges_sta::netlist::Conn::Port(i) => g.netlist.ports.get(*i).is_none_or(|p| p.1 == vyges_sta::netlist::PortDir::Inout),
+        vyges_sta::netlist::Conn::Inst(..) => match (x.lib, x.cell.as_deref(), x.port.as_deref()) {
+            (Some(lib), Some(cell), Some(port)) => g.libs.get(lib).and_then(|l| l.cells.get(cell)).and_then(|c| c.port(port)).is_none_or(|p| p.direction == vyges_sta::liberty::Direction::Bidirect),
+            _ => true,
+        },
+    }
+}
+
+/// The pin's first vertex (the lower id of a bidirect pin's two), by the name index.
+pub fn first_vertex_named(g: &Graph<'_>, name: &str) -> Option<usize> {
+    let v = *g.index().get(name)?;
+    let other = vertex_named(g, name, !g.vertices[v].is_driver);
+    Some(other.map_or(v, |w| w.min(v)))
+}
+
 /// The drivers of a load's net (`network_->drivers(pin)`), scene 0's vertices.
 pub fn net_drivers(g: &Graph<'_>, load: usize) -> Vec<usize> {
     let Some(n) = g.vertex_net[load] else { return Vec::new() };
     g.netlist.nets[n].pins.iter().filter_map(|c| {
         let name = g.netlist.pin_name(c);
-        g.vertices.iter().position(|x| x.name == name && x.is_driver)
+        vertex_named(g, &name, true)
     }).collect()
 }
 
@@ -324,10 +386,10 @@ pub fn clock_pins(g: &Graph<'_>, sources: &[String]) -> std::collections::BTreeS
 /// clock's sources, `isLeafPinClock`) other than its own.
 fn clock_pins_from(g: &Graph<'_>, start: &[String], stop: &[String]) -> std::collections::BTreeSet<usize> {
     use vyges_sta::graph::EdgeKind;
-    let source_v: Vec<usize> = start.iter().chain(stop).filter_map(|s| g.vertices.iter().position(|v| &v.name == s)).collect();
+    let source_v: Vec<usize> = start.iter().chain(stop).filter_map(|s| first_vertex_named(g, s)).collect();
     let mut seen: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     let mut queue: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
-    for v in start.iter().filter_map(|s| g.vertices.iter().position(|v| &v.name == s)) {
+    for v in start.iter().filter_map(|s| first_vertex_named(g, s)) {
         if seen.insert(v) {
             queue.push_back(v);
         }
@@ -475,8 +537,8 @@ pub struct SlewCheck {
 /// `slack = limit − slew` (max slew); a smaller slack wins, a fuzzy tie with a LOWER transition
 /// index wins too (so a later scene's rise can replace an earlier scene's fall). `None`: no limit
 /// (no scene).
-pub fn check_slew(sc: &Scenes<'_, '_>, v: usize, limits: &Limits, clocks: &std::collections::BTreeSet<usize>) -> Option<SlewCheck> {
-    if clocks.contains(&v) {
+pub fn check_slew(sc: &Scenes<'_, '_>, v: usize, limits: &Limits, clocks: &impl PinSet) -> Option<SlewCheck> {
+    if clocks.has(v) {
         return None;
     }
     let mut best: Option<SlewCheck> = None;
@@ -509,7 +571,7 @@ fn margined(limit: f32, margin: f64) -> f32 {
 /// `RepairDesign::checkSlew(drvr)`: the timer's check, its limit margined, `slack = limit −
 /// slew`. With no limit: limit and slack INF and the slew NOT written — the caller's
 /// uninitialized local, which this build reads as 0, so it is `None` here.
-pub fn repair_check_slew(sc: &Scenes<'_, '_>, v: usize, limits: &Limits, clocks: &std::collections::BTreeSet<usize>, slew_margin: f64) -> (Option<f32>, f32, f32, Option<usize>) {
+pub fn repair_check_slew(sc: &Scenes<'_, '_>, v: usize, limits: &Limits, clocks: &impl PinSet, slew_margin: f64) -> (Option<f32>, f32, f32, Option<usize>) {
     let (mut slew, mut limit, mut slack, mut scene) = (None, INF, INF, None);
     if let Some(c) = check_slew(sc, v, limits, clocks) {
         let limit1 = margined(c.limit, slew_margin);
@@ -538,7 +600,7 @@ pub struct LoadSlews {
 /// smallest slack sets the slew. Without one (an ideal clock pin, or no limit): when the pin has
 /// a liberty port whose library has a `default_max_transition`, that default becomes the
 /// running limit — and nothing else (the reference computes a slew there and drops it).
-pub fn check_load_slews(sc: &Scenes<'_, '_>, info: &NetInfo, drvr: usize, limits: &Limits, clocks: &std::collections::BTreeSet<usize>, slew_margin: f64) -> LoadSlews {
+pub fn check_load_slews(sc: &Scenes<'_, '_>, info: &NetInfo, drvr: usize, limits: &Limits, clocks: &impl PinSet, slew_margin: f64) -> LoadSlews {
     let g = sc.link();
     let mut out = LoadSlews { slew: None, limit: INF, slack: INF, scene: None };
     for p in connected_pins(g, info, drvr) {
@@ -576,8 +638,8 @@ pub const DEFAULT_MAX_FANOUT: f32 = 50.0;
 /// port counts 1) against the port's `max_fanout` or, for an output, its library's
 /// `default_max_fanout`, the design's limit when tighter. No limit (or an ideal clock pin):
 /// fanout 0, limit and slack INF.
-pub fn sta_check_fanout(g: &Graph<'_>, info: &NetInfo, drvr: usize, limits: &Limits, clocks: &std::collections::BTreeSet<usize>) -> (f32, f32, f32) {
-    let ideal_clock = clocks.contains(&drvr);
+pub fn sta_check_fanout(g: &Graph<'_>, info: &NetInfo, drvr: usize, limits: &Limits, clocks: &impl PinSet) -> (f32, f32, f32) {
+    let ideal_clock = clocks.has(drvr);
     let mut fanout = 0.0f32;
     for p in connected_pins(g, info, drvr) {
         let is_load = !g.vertices[p].is_driver;
@@ -614,9 +676,9 @@ pub fn sta_check_fanout(g: &Graph<'_>, info: &NetInfo, drvr: usize, limits: &Lim
 
 /// `Resizer::checkFanout(drvr, max)`: the timer's check ([`sta_check_fanout`]); with no limit
 /// the backstop applies: the number of load pins (`FindNetDrvrLoads`), against 50.
-pub fn check_fanout(g: &Graph<'_>, info: &NetInfo, drvr: usize, limits: &Limits, clocks: &std::collections::BTreeSet<usize>) -> (f32, f32, f32) {
+pub fn check_fanout(g: &Graph<'_>, info: &NetInfo, drvr: usize, limits: &Limits, clocks: &impl PinSet) -> (f32, f32, f32) {
     let check = sta_check_fanout(g, info, drvr, limits, clocks);
-    if check.1 < INF || clocks.contains(&drvr) {
+    if check.1 < INF || clocks.has(drvr) {
         return check;
     }
     let loads = connected_pins(g, info, drvr).into_iter().filter(|&p| !g.vertices[p].is_driver).count();
@@ -633,9 +695,9 @@ pub fn check_fanout(g: &Graph<'_>, info: &NetInfo, drvr: usize, limits: &Limits,
 /// slack INF, no scene.
 /// Over the scenes in order (each its scene port's limit and its own load cap), rise then fall:
 /// a FUZZILY smaller slack wins, a fuzzy tie with a lower transition index too. Returns the scene.
-pub fn check_capacitance<P: std::borrow::Borrow<std::collections::HashMap<String, vyges_sta::graph::NetParasitics>>>(sc: &Scenes<'_, '_>, drvr: usize, parasitics: &[P], clocks: &std::collections::BTreeSet<usize>, limits: &Limits) -> (f32, f32, f32, bool, Option<usize>) {
+pub fn check_capacitance<P: std::borrow::Borrow<std::collections::HashMap<String, vyges_sta::graph::NetParasitics>>>(sc: &Scenes<'_, '_>, drvr: usize, parasitics: &[P], clocks: &impl PinSet, limits: &Limits) -> (f32, f32, f32, bool, Option<usize>) {
     let mut best: Option<(f32, f32, f32, usize, usize)> = None;
-    if !clocks.contains(&drvr) {
+    if !clocks.has(drvr) {
         for (k, g) in sc.graphs.iter().enumerate() {
             let vk = sc.at(k, drvr);
             let Some(limit) = find_cap_limit(g, vk, limits) else { continue };
@@ -795,6 +857,25 @@ mod tests {
     // Rule (CheckCapacitances::findLimit, Resizer::maxLoad): "default to top (design) limit",
     // then `if (exists1 && (!exists || min_max->compare(limit, limit1)))` takes the other — for
     // max, the smaller; either alone stands.
+    // Rule (OpenSTA `Graph::pinVertices`: a bidirect pin has a driver vertex and a load vertex,
+    // any other pin one): a pin's vertex on either side, looked up by the name index, is the one
+    // a pass over every vertex finds.
+    #[test]
+    fn a_vertex_by_name_is_the_one_the_pass_finds_on_either_side() {
+        let cell = vyges_sta::liberty::Cell { name: "c".into(), ports: vec![port("A", Direction::Input, None), port("P", Direction::Bidirect, None), port("Y", Direction::Output, None)], ..Default::default() };
+        let libs = vec![Library { cells: [("c".to_string(), cell)].into_iter().collect(), ..Default::default() }];
+        let nl = vyges_sta::netlist::Netlist { insts: vec![vyges_sta::netlist::inst("u1", "c")], ports: Vec::new(), nets: Vec::new() };
+        let g = Graph::build(&libs, &nl).unwrap();
+        assert!(g.vertices.iter().filter(|x| x.name == "u1/P").count() == 2, "the bidirect pin has two vertices");
+        for name in ["u1/A", "u1/P", "u1/Y", "u1/Q"] {
+            for driver in [false, true] {
+                let pass = g.vertices.iter().position(|x| x.is_driver == driver && x.name == name);
+                assert_eq!(vertex_named(&g, name, driver), pass, "{name} driver={driver}");
+            }
+            assert_eq!(first_vertex_named(&g, name), g.vertices.iter().position(|x| x.name == name), "{name} first");
+        }
+    }
+
     #[test]
     fn the_tighter_max_limit_wins_and_either_alone_stands() {
         assert_eq!(tighter_max(Some(5.0), Some(3.0)), Some(3.0));

@@ -376,9 +376,11 @@ impl Walk<'_, '_> {
         // the graph is made over that net alone and its own parasitic — not the whole design, which
         // made every repeater an O(design) graph build.
         let k = self.sizing.tgt_scene;
-        let nl = net_alone(st.design.netlist(), &r.out_net).ok_or_else(|| Stop::error("RSZ-INSERT", format!("{}: no such net", r.out_net)))?;
+        let nl = st.design.net_slot(&r.out_net).and_then(|k| net_alone(st.design.netlist(), k)).ok_or_else(|| Stop::error("RSZ-INSERT", format!("{}: no such net", r.out_net)))?;
         let par: HashMap<String, NetParasitics> = st.design.parasitics(k).get(&r.out_net).map(|p| (r.out_net.clone(), p.clone())).into_iter().collect();
-        let graph = crate::repair_design::timer_graph(self.sizing.libs, k, &nl, self.sdc, self.master_pins)?;
+        let sdc = sdc_on_pins(self.sdc, &nl, self.master_pins);
+        let mut graph = Graph::build_with_pins(self.sizing.libs.scene_slice(k), &nl, Some(self.master_pins)).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+        graph.sdc = sdc;
         let v = graph.vertices.iter().position(|x| x.name == r.output).ok_or_else(|| Stop::error("RSZ-INSERT", format!("{}: not in the timing graph", r.output)))?;
         let (pin_cap, wire_cap, has_pi) = graph.load_cap_parts(v, &par, RISE);
         crate::tpush!(trace, "rtsd|{}|pin={}|wire={}|pi={has_pi}", r.output, g(f64::from(pin_cap)), g(f64::from(wire_cap)));
@@ -495,9 +497,39 @@ pub fn buffer_slew_at(libs: &crate::preamble::Libs, cell: &vyges_sta::liberty::C
 /// The netlist of net `net` alone: the instances and ports on its pins (in the design's order) and
 /// the net, its pins in their order — every pin of those instances still a vertex, unconnected. A
 /// driver's load ([`Graph::load_cap`]) reads nothing past its own net, so it is the same on this
-/// netlist as on the design's. `None`: no such net.
-fn net_alone(nl: &Netlist, net: &str) -> Option<Netlist> {
-    let n = nl.nets.iter().find(|n| n.name == net)?;
+/// netlist as on the design's. The net is the one at slot `k` (the design finds it by name:
+/// [`crate::design::Design::net_slot`]). `None`: no such slot.
+/// The SDC environment on the pins a netlist's graph can have: its ports and every pin of its
+/// instances' masters. A graph over one net looks up no other pin, and copying the whole (a
+/// design's constant pins among it) per repeater was O(design).
+fn sdc_on_pins(sdc: &vyges_sta::graph::SdcEnv, nl: &Netlist, master_pins: &HashMap<String, Vec<String>>) -> vyges_sta::graph::SdcEnv {
+    let mut pins: Vec<String> = nl.ports.iter().map(|p| p.0.clone()).collect();
+    for i in &nl.insts {
+        for p in master_pins.get(&i.1).into_iter().flatten() {
+            pins.push(format!("{}/{p}", i.0));
+        }
+    }
+    for n in &nl.nets {
+        pins.extend(n.pins.iter().map(|c| nl.pin_name(c)));
+    }
+    fn on<V: Clone>(m: &HashMap<String, V>, pins: &[String]) -> HashMap<String, V> {
+        pins.iter().filter_map(|p| m.get_key_value(p.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+    vyges_sta::graph::SdcEnv {
+        derates: sdc.derates.clone(),
+        crpr_disabled: sdc.crpr_disabled,
+        net_wire_cap: on(&sdc.net_wire_cap, &pins),
+        port_pin_cap: on(&sdc.port_pin_cap, &pins),
+        input_slew: on(&sdc.input_slew, &pins),
+        input_drive: on(&sdc.input_drive, &pins),
+        constants: on(&sdc.constants, &pins),
+        sim_transitions: on(&sdc.sim_transitions, &pins),
+        clock_slews: sdc.clock_slews.clone(),
+    }
+}
+
+fn net_alone(nl: &Netlist, k: usize) -> Option<Netlist> {
+    let n = nl.nets.get(k)?;
     let mut insts: Vec<usize> = n.pins.iter().filter_map(|c| if let Conn::Inst(i, _) = c { Some(*i) } else { None }).collect();
     let mut ports: Vec<usize> = n.pins.iter().filter_map(|c| if let Conn::Port(i) = c { Some(*i) } else { None }).collect();
     insts.sort_unstable();
@@ -580,11 +612,11 @@ mod tests {
             ports: vec![("a".into(), PortDir::Input), ("y".into(), PortDir::Output)],
             nets: vec![net("na", vec![pin(0, "A"), Conn::Port(0)]), net("n1", vec![pin(1, "Z"), pin(4, "A"), pin(3, "A"), Conn::Port(1)]), net("n2", vec![pin(0, "Z"), pin(2, "A"), pin(1, "A")])],
         };
-        let alone = net_alone(&nl, "n1").unwrap();
+        let alone = net_alone(&nl, 1).unwrap();
         let names: Vec<&str> = alone.insts.iter().map(|i| i.0.as_str()).collect();
         assert_eq!(names, ["u1", "u3", "u4"]);
         assert_eq!(alone.ports, [("y".to_string(), PortDir::Output)]);
-        assert!(net_alone(&nl, "nx").is_none());
+        assert!(net_alone(&nl, 3).is_none());
         let load = |n: &Netlist| {
             let g = Graph::build(&libs, n).unwrap();
             let v = g.vertices.iter().position(|x| x.name == "u1/Z").unwrap();
@@ -592,6 +624,37 @@ mod tests {
         };
         assert_eq!(load(&alone).to_bits(), load(&nl).to_bits());
         assert!((load(&alone) - 8e-15).abs() < 1e-20, "{}", load(&alone));
+    }
+
+    // `loadCap(drvr_pin)` reads the SDC on the net's own pins only: the copy for a graph over the
+    // net alone keeps those (`set_load` by driver pin, a port's load, a constant pin) and no other.
+    #[test]
+    fn the_sdc_over_a_net_alone_is_the_one_on_its_pins() {
+        use vyges_sta::netlist::{inst, PortDir};
+        let net = |name: &str, pins: Vec<Conn>| std::sync::Arc::new(Net { name: name.into(), pins });
+        let pin = |i: usize, p: &str| Conn::Inst(i, p.into());
+        let nl = Netlist {
+            insts: vec![inst("u0", "BUF"), inst("u1", "BUF"), inst("u2", "BUF")],
+            ports: vec![("a".into(), PortDir::Input), ("y".into(), PortDir::Output)],
+            nets: vec![net("na", vec![pin(0, "A"), Conn::Port(0)]), net("n1", vec![pin(1, "Z"), pin(2, "A"), Conn::Port(1)])],
+        };
+        let mut sdc = vyges_sta::graph::SdcEnv::default();
+        for p in ["u1/Z", "u0/Z"] {
+            sdc.net_wire_cap.insert(p.into(), [Some((1e-15, false)), None]);
+        }
+        sdc.port_pin_cap.insert("y".into(), [[Some(2e-15); 2]; 2]);
+        sdc.port_pin_cap.insert("a".into(), [[Some(3e-15); 2]; 2]);
+        // u2/Z is on no net of the netlist, but its master's pin is a vertex of the graph
+        sdc.constants.insert("u2/Z".into(), true);
+        sdc.constants.insert("u0/A".into(), false);
+        let masters: HashMap<String, Vec<String>> = [("BUF".to_string(), vec!["A".to_string(), "Z".to_string()])].into();
+        let alone = net_alone(&nl, 1).unwrap();
+        let on = sdc_on_pins(&sdc, &alone, &masters);
+        assert_eq!(on.net_wire_cap.keys().collect::<Vec<_>>(), ["u1/Z"]);
+        assert_eq!(on.port_pin_cap.keys().collect::<Vec<_>>(), ["y"]);
+        assert_eq!(on.constants.keys().collect::<Vec<_>>(), ["u2/Z"]);
+        // over the whole netlist, every entry is kept
+        assert_eq!(sdc_on_pins(&sdc, &nl, &masters), sdc);
     }
 
     #[test]
