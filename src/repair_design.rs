@@ -218,12 +218,33 @@ pub fn repair_design(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args, 
     let mut annotated: Vec<HashMap<String, f32>> = vec![HashMap::new(); graphs.len()];
     let mut drvr_with_load_slew_viol: HashMap<String, usize> = HashMap::new();
     let driver_index = timing::driver_index(g0);
+    // Each scene's annotations by load, the first for a load as a scan of the list finds it: a
+    // scan per load was O(loads x annotations) — on a large design (millions of loads, tens of
+    // thousands annotated) longer than the whole repair.
+    let by_load: Vec<HashMap<usize, &timing::Annotation>> = per_scene
+        .iter()
+        .map(|anns| {
+            let mut m = HashMap::with_capacity(anns.len());
+            for a in anns {
+                m.entry(a.load).or_insert(a);
+            }
+            m
+        })
+        .collect();
+    let mut net_drivers: HashMap<usize, Vec<usize>> = HashMap::new();
+    let no_drivers: Vec<usize> = Vec::new();
     for &v in &loads {
-        for (k, anns) in per_scene.iter().enumerate() {
-            if let Some(a) = anns.iter().find(|a| a.load == v) {
+        for (k, anns) in by_load.iter().enumerate() {
+            if let Some(a) = anns.get(&v) {
                 crate::tpush!(trace, "annot|{}|{}|{}", g0.vertices[v].name, inputs.libs.scene_name(k), g9(f64::from(a.limit)));
                 annotated[k].insert(g0.vertices[v].name.clone(), a.limit);
-                for d in timing::net_drivers_in(g0, v, &driver_index) {
+                // a net's drivers once per net, not once per annotated load on it (a pass over
+                // every pin of the net each time: quadratic on a high-fanout net)
+                let drivers = match g0.vertex_net[v] {
+                    Some(n) => &*net_drivers.entry(n).or_insert_with(|| timing::net_drivers_in(g0, v, &driver_index)),
+                    None => &no_drivers,
+                };
+                for &d in drivers.iter() {
                     drvr_with_load_slew_viol.insert(g0.vertices[d].name.clone(), k);
                 }
             }
@@ -617,21 +638,27 @@ fn timer_graphs<'n>(inputs: &Inputs<'n>, design: &mut dyn Design, netlist: &Arc<
     log.events.extend(edits.events.iter().cloned());
     // a caller holding none takes the spare
     let old = old.or_else(|| log.spare.take()).filter(|_| std::env::var_os("VYGES_RSZ_GRAPH_REBUILD").is_none());
-    let mut graphs = match old.map(|gs| edit_graphs(inputs, gs, netlist, log)) {
+    // `VYGES_RSZ_EDIT_STATS`: one line per call — how the graphs were brought on, the events
+    // replayed, and the time it took (a rebuild is O(design), an edit in place is not)
+    let started = std::time::Instant::now();
+    let (mut graphs, how) = match old.map(|gs| edit_graphs(inputs, gs, netlist, log)) {
         Some(Ok(gs)) => {
             log.in_place += 1;
-            gs
+            (gs, "in_place")
         }
         Some(Err(gs)) => {
             log.fallback += 1;
             recycle(Some(gs));
-            current_graphs(inputs, netlist, annotated)?
+            (current_graphs(inputs, netlist, annotated)?, "fallback")
         }
         None => {
             log.built += 1;
-            current_graphs(inputs, netlist, annotated)?
+            (current_graphs(inputs, netlist, annotated)?, "built")
         }
     };
+    if std::env::var_os("VYGES_RSZ_EDIT_STATS").is_some() {
+        eprintln!("VYGEDIT|call|{how}|{}|{}|{:.3}ms", edits.events.len(), log.events.len(), started.elapsed().as_secs_f64() * 1e3);
+    }
     let cx = EventCtx { libs: &inputs.libs.libs, ideal_clock_mode: false };
     for (g, inc) in graphs.iter_mut().zip(incs.iter_mut()) {
         g.edit_seq = Some(log.events.len());
