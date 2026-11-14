@@ -44,7 +44,7 @@ pub struct CliDesign<'a> {
     /// ([`Design::netlist_generation`]).
     pub netlist_gen: u64,
     /// The database order of the netlist it was made for (and only that one, by pointer):
-    /// [`CliDesign::refresh_touched`]'s appended path extends it rather than reading every name.
+    /// [`CliDesign::refresh_touched`]'s edited path extends it rather than reading every name.
     pub inst_pos: Option<(std::sync::Weak<vyges_sta::netlist::Netlist>, DbOrder)>,
     /// Per scene.
     pub parasitics: Vec<HashMap<String, NetParasitics>>,
@@ -283,41 +283,84 @@ pub fn gr_trace(line: &str) {
     }
 }
 
-/// What the appended refresh knows of the database's order without reading every name: each
-/// listed instance's position and the highest instance id listed; each listed net's id, ascending
-/// (the block iterates by id), its position, and each listed net name's position.
+/// What the incremental refresh knows of the database's order without reading every name.
+///
+/// The block iterates its instances and nets by id (`dbTable::next`), and a new object takes the
+/// LAST freed id (`dbTable::create` pops the free list `dbTable::destroy` pushes). So after a
+/// deletion — `remove_buffers`, or a database written after one — a new instance or net lands at
+/// its id's rank, in the middle of the order, not at the end. A position is therefore an id's
+/// rank: each listed instance's id by name and the listed instance ids ascending; the listed net
+/// ids ascending and each listed net name's id.
 pub struct DbOrder {
-    pos: HashMap<String, usize>,
-    inst_max: u32,
+    inst_id: HashMap<String, u32>,
+    inst_ids: Vec<u32>,
     net_ids: Vec<u32>,
-    net_pos: HashMap<u32, usize>,
-    net_slot: HashMap<String, usize>,
+    net_slot: HashMap<String, u32>,
 }
 
 impl DbOrder {
     /// Read once per netlist made by a full read: `None` when the listed order is not the id order.
     fn read(db: &vyges_opendb::Db, nl: &vyges_sta::netlist::Netlist) -> Option<DbOrder> {
-        let pos: HashMap<String, usize> = nl.insts.iter().map(|i| &**i).enumerate().map(|(i, (n, _))| (n.clone(), i)).collect();
-        let mut inst_max = 0;
-        for (k, (n, _)) in nl.insts.iter().map(|i| &**i).enumerate() {
+        let mut inst_id = HashMap::with_capacity(nl.insts.len());
+        let mut inst_ids: Vec<u32> = Vec::with_capacity(nl.insts.len());
+        for (n, _) in nl.insts.iter().map(|i| &**i) {
             let id = db.inst_id(n).ok()?;
-            if k > 0 && id <= inst_max {
+            if inst_ids.last().is_some_and(|&last| id <= last) {
                 return None;
             }
-            inst_max = id;
+            inst_ids.push(id);
+            inst_id.insert(n.clone(), id);
         }
-        let mut net_ids = Vec::with_capacity(nl.nets.len());
+        let mut net_ids: Vec<u32> = Vec::with_capacity(nl.nets.len());
+        let mut net_slot = HashMap::with_capacity(nl.nets.len());
         for n in &nl.nets {
             let id = db.net_id(&n.name).ok()?;
             if net_ids.last().is_some_and(|&last| id <= last) {
                 return None;
             }
             net_ids.push(id);
+            net_slot.insert(n.name.clone(), id);
         }
-        let net_pos = net_ids.iter().enumerate().map(|(k, &id)| (id, k)).collect();
-        let net_slot = nl.nets.iter().enumerate().map(|(k, n)| (n.name.clone(), k)).collect();
-        Some(DbOrder { pos, inst_max, net_ids, net_pos, net_slot })
+        Some(DbOrder { inst_id, inst_ids, net_ids, net_slot })
     }
+
+    /// A listed instance's position.
+    fn inst_pos(&self, name: &str) -> Option<usize> {
+        self.inst_ids.binary_search(self.inst_id.get(name)?).ok()
+    }
+
+    /// A listed net's position, by id.
+    fn net_pos(&self, id: u32) -> Option<usize> {
+        self.net_ids.binary_search(&id).ok()
+    }
+
+    /// A listed net's position, by name.
+    fn net_slot_pos(&self, name: &str) -> Option<usize> {
+        self.net_pos(*self.net_slot.get(name)?)
+    }
+}
+
+/// [`CliDesign::edited_netlist`]'s answer: the next netlist, whether it differs from the one it
+/// was made from, and (under `VYGES_RSZ_CHECK_REFRESH`) that one, to check against.
+struct Edited {
+    nl: vyges_sta::netlist::Netlist,
+    changed: bool,
+    old: Option<std::sync::Arc<vyges_sta::netlist::Netlist>>,
+}
+
+/// Where each new instance goes: `at[j]` is the number of listed instances before the `j`-th new
+/// one (the new ones ascending by id); a listed instance at `k` moves up by the number of new ones
+/// at or before it — its new position.
+fn shifted(at: &[usize], k: usize) -> usize {
+    k + at.partition_point(|&p| p <= k)
+}
+
+/// [`CliDesign::edited_netlist`] giving up, the reason traced (`VYGES_RSZ_ORDER_TRACE`).
+fn bail<T>(why: &str) -> Option<T> {
+    if std::env::var_os("VYGES_RSZ_ORDER_TRACE").is_some() {
+        eprintln!("VYGORDER|bail|{why}");
+    }
+    None
 }
 
 /// The incremental timer's side of the edits: the database's callbacks as read, and the
@@ -386,10 +429,14 @@ impl CliDesign<'_> {
         if std::env::var_os("VYGES_RSZ_FULL_REFRESH").is_some() {
             return self.refresh();
         }
-        let old = self.netlist.clone();
-        if let Some(fast) = self.appended_netlist(&old, new_insts, touched) {
-            return self.refresh_finish(old, fast, new_insts, touched);
+        if let Some(fast) = self.edited_netlist(new_insts, touched) {
+            return self.refresh_finish(fast, new_insts, touched);
         }
+        // ⚠️ O(design): every instance and net name read again
+        if std::env::var_os("VYGES_RSZ_ORDER_TRACE").is_some() {
+            eprintln!("VYGORDER|general");
+        }
+        let old = self.netlist.clone();
         let old_master: HashMap<&str, &str> = old.insts.iter().map(|i| &**i).map(|(n, m)| (n.as_str(), m.as_str())).collect();
         let mut nl = Netlist::default();
         let mut inst_index: HashMap<String, usize> = HashMap::new();
@@ -495,6 +542,11 @@ impl CliDesign<'_> {
             self.netlist_gen += 1;
         }
         self.netlist = std::sync::Arc::new(nl);
+        // ⚠️ O(design): every instance and net id, read once so the next edit is extended in place
+        self.inst_pos = DbOrder::read(self.db, &self.netlist).map(|ord| (std::sync::Arc::downgrade(&self.netlist), ord));
+        if self.inst_pos.is_none() && std::env::var_os("VYGES_RSZ_ORDER_TRACE").is_some() {
+            eprintln!("VYGORDER|read|the listed order is not the id order");
+        }
         if check {
             let full = vyges_grt::timer::netlist(self.db);
             let info = net_info(self.db, &full)?;
@@ -505,65 +557,71 @@ impl CliDesign<'_> {
         Ok(())
     }
 
-    /// [`CliDesign::refresh_touched`] when the edit only APPENDED: the database iterates by id and
-    /// an insertion takes a fresh one, so every instance and every untouched net keeps its place.
-    /// Read by id, not by every name ([`DbOrder`]): a new instance must take an id after every
-    /// listed one; a touched net found at a listed id replaces that slot (a rename keeps the id),
-    /// one at a new id after every listed one is appended in id order. Only the edit is read —
-    /// the full read cost every instance and net name per repeater, O(design²) over a repair.
-    /// `None` when the database's order does not bear that out: an id reused or before the last,
-    /// a touched net gone, special or left pinless, a listed net renamed to a name not touched.
-    fn appended_netlist(&mut self, old: &std::sync::Arc<vyges_sta::netlist::Netlist>, new_insts: &[String], touched: &BTreeSet<String>) -> Option<(vyges_sta::netlist::Netlist, bool, bool)> {
-        use vyges_sta::netlist::{Conn, Net, Netlist};
+    /// [`CliDesign::refresh_touched`] when the edit only MADE instances and nets and reconnected
+    /// pins: every listed instance and net keeps its id, so its place in the id order, and only
+    /// the edit is read ([`DbOrder`]) — the full read cost every instance and net name per
+    /// repeater, O(design²) over a repair.
+    ///
+    /// A new instance goes at its id's rank, which after a deletion is in the middle of the order
+    /// (odb reuses the last freed id): the instances after it move up one and every pin naming one
+    /// of them is re-indexed in place — an index pass over the pins, not a re-read by name. A
+    /// touched net found at a listed id replaces that slot (a rename keeps the id); one at a new id
+    /// goes at that id's rank. The netlist is edited in place when nothing else holds it.
+    /// `None` (nothing changed) when the database's order does not bear that out: a new id already
+    /// listed, a touched net gone, special or left pinless, a listed net renamed to a name not
+    /// touched.
+    fn edited_netlist(&mut self, new_insts: &[String], touched: &BTreeSet<String>) -> Option<Edited> {
+        use vyges_sta::netlist::{Conn, Net};
         let mut ord = match self.inst_pos.take() {
-            Some((w, ord)) if std::sync::Weak::ptr_eq(&w, &std::sync::Arc::downgrade(old)) => ord,
-            cached => {
-                // ⚠️ O(design): every instance and net id read again
-                if std::env::var_os("VYGES_RSZ_ORDER_TRACE").is_some() {
-                    eprintln!("VYGORDER|read|{}", if cached.is_some() { "another netlist" } else { "none kept" });
-                }
-                DbOrder::read(self.db, old)?
-            }
+            Some((w, ord)) if std::sync::Weak::ptr_eq(&w, &std::sync::Arc::downgrade(&self.netlist)) => ord,
+            // ⛔ Not read here, from the netlist before the edit: the edit renamed nets (a buffer
+            // at a port swaps two names), so an old name may now find another net's id. The
+            // general path reads the order after its full read, and the next edit extends it.
+            Some(_) => return bail("the order kept is another netlist's"),
+            None => return bail("no order kept"),
         };
-        let mut nl = Netlist { insts: old.insts.clone(), ports: old.ports.clone(), nets: Vec::with_capacity(old.nets.len() + 2) };
+        // The plan: everything read and checked before anything is changed.
+        let old = &*self.netlist;
         // an instance re-read (the general path's `new_insts`) takes its master from the database;
-        // one not listed is new, appended in id order
-        let mut master_changed = false;
+        // one not listed is new
+        let mut remaster = Vec::new();
         let mut made = Vec::new();
         for i in new_insts {
-            if let Some(&k) = ord.pos.get(i) {
-                let m = self.db.inst_master(i);
-                master_changed |= m != nl.insts[k].1;
-                std::sync::Arc::make_mut(&mut nl.insts[k]).1 = m;
-            } else {
-                made.push((self.db.inst_id(i).ok()?, i));
+            match ord.inst_pos(i) {
+                Some(k) => remaster.push((k, self.db.inst_master(i))),
+                None => made.push((self.db.inst_id(i).ok().or_else(|| bail("a new instance not found"))?, i.clone())),
             }
         }
         made.sort();
-        for (id, inst) in made {
-            if id <= ord.inst_max {
-                return None;
+        let mut at = Vec::with_capacity(made.len());
+        for (j, (id, _)) in made.iter().enumerate() {
+            if j > 0 && made[j - 1].0 == *id {
+                return bail("an instance named twice");
             }
-            ord.inst_max = id;
-            ord.pos.insert(inst.clone(), nl.insts.len());
-            nl.insts.push(vyges_sta::netlist::inst(inst.clone(), self.db.inst_master(inst)));
+            match ord.inst_ids.binary_search(id) {
+                Ok(_) => return bail("a new instance at a listed id"),
+                Err(p) => at.push(p),
+            }
         }
-        let port_index: HashMap<&str, usize> = nl.ports.iter().enumerate().map(|(i, (n, _))| (n.as_str(), i)).collect();
-        let mut replaced: HashMap<usize, Net> = HashMap::new();
-        let mut appended: Vec<(u32, Net)> = Vec::new();
+        let made_pos: HashMap<&str, usize> = made.iter().enumerate().map(|(j, (_, n))| (n.as_str(), at[j] + j)).collect();
+        let pos_of = |inst: &str| made_pos.get(inst).copied().or_else(|| ord.inst_pos(inst).map(|k| shifted(&at, k)));
+        let port_index: HashMap<&str, usize> = old.ports.iter().enumerate().map(|(i, (n, _))| (n.as_str(), i)).collect();
+        let mut replaced: Vec<(usize, Net)> = Vec::new();
+        let mut added: Vec<(u32, Net)> = Vec::new();
         for net in touched {
-            let id = self.db.net_id(net).ok()?;
-            let slot = ord.net_pos.get(&id).copied();
+            let Ok(id) = self.db.net_id(net) else { return bail("a touched net gone") };
+            let slot = ord.net_pos(id);
             if self.db.net_is_special(net) {
                 if slot.is_some() {
-                    return None;
+                    return bail("a listed net made special");
                 }
                 continue;
             }
             let mut pins = Vec::new();
             for iterm in self.db.net_iterms(net) {
                 let (inst, term) = iterm.rsplit_once('/').unwrap_or((&iterm, ""));
-                pins.push(Conn::Inst(*ord.pos.get(inst)?, term.to_string()));
+                let Some(k) = pos_of(inst) else { return bail("a pin on an instance not listed") };
+                pins.push(Conn::Inst(k, term.to_string()));
             }
             for bterm in self.db.net_bterms(net) {
                 if let Some(&p) = port_index.get(bterm.as_str()) {
@@ -571,53 +629,87 @@ impl CliDesign<'_> {
                 }
             }
             match slot {
-                Some(_) if pins.is_empty() => return None,
-                Some(k) => {
-                    replaced.insert(k, Net { name: net.clone(), pins });
-                }
+                Some(_) if pins.is_empty() => return bail("a listed net left pinless"),
+                Some(k) => replaced.push((k, Net { name: net.clone(), pins })),
                 None if pins.is_empty() => {}
-                None if ord.net_ids.last().is_none_or(|&last| id > last) => appended.push((id, Net { name: net.clone(), pins })),
-                None => return None,
+                None => added.push((id, Net { name: net.clone(), pins })),
             }
         }
         // a listed net whose name was touched but is not at its slot any more was renamed to a
         // name the edit did not name — its slot would keep the stale name
-        if touched.iter().any(|t| ord.net_slot.get(t).is_some_and(|k| !replaced.contains_key(k))) {
-            return None;
+        let replaced_slots: std::collections::HashSet<usize> = replaced.iter().map(|(k, _)| *k).collect();
+        if touched.iter().any(|t| ord.net_slot_pos(t).is_some_and(|k| !replaced_slots.contains(&k))) {
+            return bail("a listed net renamed to a name not touched");
         }
-        nl.nets.extend(old.nets.iter().cloned());
+        // Changed: a count, a re-read master, a touched net's pins (by name, as listed before and
+        // after; a touched name listed before is at a replaced slot, checked above).
+        let master_changed = remaster.iter().any(|(k, m)| *m != old.insts[*k].1);
+        let changed = master_changed || !made.is_empty() || !added.is_empty() || {
+            let before: HashMap<&str, &Vec<Conn>> = touched.iter().filter_map(|t| ord.net_slot_pos(t)).map(|k| (old.nets[k].name.as_str(), &old.nets[k].pins)).collect();
+            let after: HashMap<&str, &Vec<Conn>> = replaced.iter().map(|(_, n)| (n.name.as_str(), &n.pins)).collect();
+            before != after
+        };
+        drop(made_pos);
+        // The edit, in place unless another holder (a timing graph) keeps the old generation.
+        let kept = std::env::var_os("VYGES_RSZ_CHECK_REFRESH").is_some().then(|| self.netlist.clone());
+        let mut nl = std::sync::Arc::try_unwrap(std::mem::take(&mut self.netlist)).unwrap_or_else(|shared| {
+            // ⚠️ O(design) pointers copied (and every pin re-indexed below copies its net)
+            if std::env::var_os("VYGES_RSZ_ORDER_TRACE").is_some() {
+                eprintln!("VYGORDER|shared|{}", std::sync::Arc::strong_count(&shared));
+            }
+            (*shared).clone()
+        });
+        for (k, m) in remaster {
+            std::sync::Arc::make_mut(&mut nl.insts[k]).1 = m;
+        }
+        if let Some(&first) = at.first().filter(|&&p| p < nl.insts.len()) {
+            for net in &mut nl.nets {
+                if net.pins.iter().any(|c| matches!(c, Conn::Inst(i, _) if *i >= first)) {
+                    for c in &mut std::sync::Arc::make_mut(net).pins {
+                        if let Conn::Inst(i, _) = c {
+                            *i = shifted(&at, *i);
+                        }
+                    }
+                }
+            }
+        }
+        let trace = std::env::var_os("VYGES_RSZ_ORDER_TRACE").is_some();
+        for (j, (id, inst)) in made.into_iter().enumerate() {
+            let k = at[j] + j;
+            if trace && k < nl.insts.len() {
+                eprintln!("VYGORDER|mid|{inst}|{k}");
+            }
+            let master = self.db.inst_master(&inst);
+            ord.inst_ids.insert(k, id);
+            ord.inst_id.insert(inst.clone(), id);
+            nl.insts.insert(k, vyges_sta::netlist::inst(inst, master));
+        }
         // every old name out before any new one in: two slots may trade names
-        for k in replaced.keys() {
-            ord.net_slot.remove(&old.nets[*k].name);
+        for (k, _) in &replaced {
+            ord.net_slot.remove(&nl.nets[*k].name);
         }
         for (k, r) in replaced {
-            ord.net_slot.insert(r.name.clone(), k);
+            ord.net_slot.insert(r.name.clone(), ord.net_ids[k]);
             nl.nets[k] = r.into();
         }
-        appended.sort_by_key(|(id, _)| *id);
-        for (id, n) in appended {
-            ord.net_pos.insert(id, nl.nets.len());
-            ord.net_slot.insert(n.name.clone(), nl.nets.len());
-            ord.net_ids.push(id);
-            nl.nets.push(n.into());
+        added.sort_by_key(|(id, _)| *id);
+        for (id, n) in added {
+            let k = ord.net_ids.partition_point(|&x| x < id);
+            ord.net_ids.insert(k, id);
+            ord.net_slot.insert(n.name.clone(), id);
+            nl.nets.insert(k, n.into());
         }
         self.inst_pos = Some((std::sync::Weak::new(), ord));
-        Some((nl, false, master_changed))
+        Some(Edited { nl, changed, old: kept })
     }
 
-    /// The rest of [`CliDesign::refresh_touched`] on an appended netlist: the per-net and
-    /// per-instance flags, the change test, the generation.
-    fn refresh_finish(&mut self, old: std::sync::Arc<vyges_sta::netlist::Netlist>, (nl, destroyed, master_changed): (vyges_sta::netlist::Netlist, bool, bool), new_insts: &[String], touched: &BTreeSet<String>) -> Result<(), String> {
+    /// The rest of [`CliDesign::refresh_touched`] on an edited netlist: the per-net and
+    /// per-instance flags, the generation.
+    fn refresh_finish(&mut self, Edited { nl, changed, old }: Edited, new_insts: &[String], touched: &BTreeSet<String>) -> Result<(), String> {
         use vyges_sta::netlist::Conn;
-        if destroyed {
-            let live: BTreeSet<String> = self.db.net_names().into_iter().collect();
-            self.info.dont_touch.retain(|n| live.contains(n));
-            self.info.abutment.retain(|n| live.contains(n));
-            self.info.unplaced_sig_type.retain(|n| live.contains(n));
-        }
-        // the touched nets by their slots (the appended path's own map), not by a pass over every net
+        // the touched nets by their slots (the edited path's own map), not by a pass over every net
         let slots: Vec<usize> = match self.inst_pos.as_ref() {
-            Some((_, ord)) => touched.iter().filter_map(|t| ord.net_slot.get(t).copied()).collect(),
+            Some((_, ord)) => touched.iter().filter_map(|t| ord.net_slot_pos(t)).collect(),
             None => nl.nets.iter().enumerate().filter(|(_, n)| touched.contains(&n.name)).map(|(k, _)| k).collect(),
         };
         for net in slots.iter().map(|&k| &nl.nets[k]) {
@@ -657,14 +749,10 @@ impl CliDesign<'_> {
                 self.info.fixed_insts.insert(i.clone());
             }
         }
-        // Changed: a count, a re-read master (the old instances keep theirs), a touched net's pins.
-        let changed = master_changed || nl.insts.len() != old.insts.len() || nl.nets.len() != old.nets.len() || {
-            let pins = |l: &vyges_sta::netlist::Netlist| -> HashMap<String, Vec<Conn>> { l.nets.iter().filter(|n| touched.contains(&n.name)).map(|n| (n.name.clone(), n.pins.clone())).collect() };
-            pins(&old) != pins(&nl)
-        };
-        let check = std::env::var_os("VYGES_RSZ_CHECK_REFRESH").is_some();
-        if check && changed != (nl != *old) {
-            return Err(format!("refresh_touched (appended): change test says {changed}, the netlists say {}", nl != *old));
+        if let Some(old) = &old {
+            if changed != (nl != **old) {
+                return Err(format!("refresh_touched (edited): change test says {changed}, the netlists say {}", nl != **old));
+            }
         }
         if changed {
             self.netlist_gen += 1;
@@ -673,11 +761,11 @@ impl CliDesign<'_> {
         if let Some((w, _)) = self.inst_pos.as_mut() {
             *w = std::sync::Arc::downgrade(&self.netlist);
         }
-        if check {
+        if old.is_some() {
             let full = vyges_grt::timer::netlist(self.db);
             let info = net_info(self.db, &full)?;
             if full != *self.netlist || info != self.info {
-                return Err(format!("refresh_touched (appended): differs from the full read (netlist {}, info {})", full == *self.netlist, info == self.info));
+                return Err(format!("refresh_touched (edited): differs from the full read (netlist {}, info {})", full == *self.netlist, info == self.info));
             }
         }
         Ok(())
@@ -1673,7 +1761,10 @@ impl CliDesign<'_> {
         let out_net = self.db.net_of(inst, &output.name);
         self.invalidate(&in_net);
         self.invalidate(&out_net);
-        self.refresh()
+        // the edit made the buffer and reconnected the pins of its two nets: only those are read
+        // again (a full read per port buffer was O(design) each)
+        let touched: BTreeSet<String> = [in_net, out_net].into_iter().filter(|n| !n.is_empty()).collect();
+        self.refresh_touched(&[inst.to_string()], &touched)
     }
 }
 

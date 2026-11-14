@@ -111,3 +111,77 @@ fn a_constrained_pin_keeps_its_buffer_and_an_instance_constraint_refuses() {
     assert_eq!(code, Some(3), "{r}");
     assert!(r["reason"].as_str().unwrap_or_default().contains("not modelled"), "{r}");
 }
+
+/// `b1` → `drv` → `b2` → `l1` → `out1`, with `in1` also reaching `out2` (another port counts as
+/// a non-buffer load, so `in1` is buffered).
+const REUSE_DEF: &str = "VERSION 5.8 ;
+DIVIDERCHAR \"/\" ;
+BUSBITCHARS \"[]\" ;
+DESIGN reuse ;
+UNITS DISTANCE MICRONS 2000 ;
+DIEAREA ( 0 0 ) ( 200000 28000 ) ;
+ROW ROW_0 core 0 0 N DO 500 BY 1 STEP 400 0 ;
+COMPONENTS 4 ;
+    - b1 BUF_X1 + PLACED ( 20000 0 ) N ;
+    - drv BUF_X1 + PLACED ( 40000 0 ) N ;
+    - b2 BUF_X1 + PLACED ( 60000 0 ) N ;
+    - l1 BUF_X1 + PLACED ( 80000 0 ) N ;
+END COMPONENTS
+PINS 3 ;
+    - in1 + NET in1 + DIRECTION INPUT + USE SIGNAL
+      + LAYER M1 ( -100 -100 ) ( 100 100 ) + PLACED ( 200 1400 ) N ;
+    - out1 + NET out1 + DIRECTION OUTPUT + USE SIGNAL
+      + LAYER M1 ( -100 -100 ) ( 100 100 ) + PLACED ( 199800 1400 ) N ;
+    - out2 + NET in1 + DIRECTION OUTPUT + USE SIGNAL
+      + LAYER M1 ( -100 -100 ) ( 100 100 ) + PLACED ( 199800 9400 ) N ;
+END PINS
+NETS 5 ;
+    - in1 ( PIN in1 ) ( b1 A ) ( PIN out2 ) + USE SIGNAL ;
+    - na ( b1 Z ) ( drv A ) + USE SIGNAL ;
+    - nb ( drv Z ) ( b2 A ) + USE SIGNAL ;
+    - n1 ( b2 Z ) ( l1 A ) + USE SIGNAL ;
+    - out1 ( l1 Z ) ( PIN out1 ) + USE SIGNAL ;
+END NETS
+END DESIGN
+";
+
+/// Rule (odb `dbTable`: the block iterates by id, and `create` takes the LAST id `destroy` freed):
+/// after `remove_buffers b1 b2` frees ids 1 and 3, `buffer_ports` makes `input1` at id 3 and
+/// `output2` at id 1 — FIRST in the block's order, before `drv`, not at the end — and their nets
+/// take freed net ids the same way (the reference at the pin: `output2` 1, `drv` 2, `input1` 3,
+/// `l1` 4, `output3` 5; its DEF and ours identical). The netlist the timer reads must follow
+/// (checked against a full read on every edit, `VYGES_RSZ_CHECK_REFRESH`) by inserting in place:
+/// only the command's first edit reads every name (`VYGORDER|general`, O(design)); a full read
+/// per port buffer took hours on a large block.
+#[test]
+fn a_buffer_made_after_a_removal_takes_the_freed_id_mid_order_without_a_full_read() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("remove_buffers").join("reuse");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(example().join("cells.lef"), dir.join("cells.lef")).unwrap();
+    std::fs::copy(example().join("cells.lib"), dir.join("cells.lib")).unwrap();
+    std::fs::write(dir.join("d.def"), REUSE_DEF).unwrap();
+    let job = r#"{ "write_def": "out.def", "steps": [
+        { "cmd": "read_lef", "args": ["cells.lef"] },
+        { "cmd": "read_def", "args": ["d.def"] },
+        { "cmd": "read_liberty", "args": ["cells.lib"] },
+        { "cmd": "remove_buffers", "args": ["b1", "b2"] },
+        { "cmd": "buffer_ports", "args": [] } ] }"#;
+    std::fs::write(dir.join("job.json"), job).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_vyges-rsz"))
+        .args(["buffer_ports", "job.json", "-o", "report.json"])
+        .env("VYGES_RSZ_CHECK_REFRESH", "1")
+        .env("VYGES_RSZ_ORDER_TRACE", "1")
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    let r = std::fs::read_to_string(dir.join("report.json")).unwrap_or_default();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let trace: Vec<&str> = stderr.lines().filter(|l| l.starts_with("VYGORDER|")).collect();
+    assert_eq!(out.status.code(), Some(0), "{r}\n{stderr}");
+    // the DEF lists components by name: the order is the trace's (checked against the full read)
+    let def = std::fs::read_to_string(dir.join("out.def")).unwrap();
+    assert_eq!(components(&def), ["drv", "input1", "l1", "output2", "output3"], "{def}");
+    assert!(trace.contains(&"VYGORDER|mid|output2|0"), "output2 takes b1's freed id, first: {trace:?}");
+    assert_eq!(trace.iter().filter(|l| **l == "VYGORDER|general").count(), 1, "a full read after the first edit: {trace:?}");
+}
