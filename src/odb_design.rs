@@ -147,6 +147,56 @@ fn absorb_rerouted(invalid: &mut BTreeSet<String>, delays: &mut BTreeSet<String>
 }
 
 #[cfg(test)]
+mod replay_tests {
+    use super::*;
+    use vyges_sta::netlist::Conn;
+
+    fn c(k: usize, t: &str) -> Conn {
+        Conn::Inst(k, t.into())
+    }
+
+    // Rule (odb dbITerm::connect / dbITerm::disconnectDbNet): a net's terminal list is a linked
+    // list; connect puts the terminal at its head, disconnect unlinks it where it is. A buffer
+    // inserted before two of three loads (its input connected to the net, then the loads moved
+    // off) leaves [buf/A, the load not moved], and the new net lists its loads in reverse
+    // connection order ahead of the buffer's output.
+    #[test]
+    fn a_net_list_replayed_from_the_callbacks_as_odb_keeps_it() {
+        let pos = |i: &str| ["drv", "l1", "l2", "l3", "buf"].iter().position(|n| *n == i);
+        let same = |k: usize| k;
+        let old = [c(3, "A"), c(2, "A"), c(1, "A"), c(0, "Y")];
+        let evs = [(true, "buf/A"), (false, "l1/A"), (false, "l3/A")];
+        let (pins, joined) = replay_net_pins(&old, &same, &evs, &pos).expect("replayed");
+        assert_eq!(pins, [c(4, "A"), c(2, "A"), c(0, "Y")]);
+        assert_eq!(joined, [c(4, "A")]);
+        // the new net, empty before: buf/Y, then l1 and l3 each at the head
+        let (pins, joined) = replay_net_pins(&[], &same, &[(true, "buf/Y"), (true, "l1/A"), (true, "l3/A")], &pos).expect("replayed");
+        assert_eq!(pins, [c(3, "A"), c(1, "A"), c(4, "Y")]);
+        assert_eq!(joined, pins);
+        // a terminal reconnected goes to the head, not back to its place
+        let (pins, _) = replay_net_pins(&old, &same, &[(false, "l2/A"), (true, "l2/A")], &pos).expect("replayed");
+        assert_eq!(pins, [c(2, "A"), c(3, "A"), c(1, "A"), c(0, "Y")]);
+        // a pin leaving that was never on the list, an instance not placed, a port: read whole
+        assert!(replay_net_pins(&old, &same, &[(false, "buf/A")], &pos).is_none());
+        assert!(replay_net_pins(&old, &same, &[(true, "nowhere/A")], &pos).is_none());
+        assert!(replay_net_pins(&[c(0, "Y"), Conn::Port(0)], &same, &[], &pos).is_none());
+        // the kept indices move with the instances made before them
+        let (pins, _) = replay_net_pins(&[c(1, "A")], &|k| k + 1, &[], &pos).expect("replayed");
+        assert_eq!(pins, [c(2, "A")]);
+    }
+
+    #[test]
+    fn only_instance_terminal_callbacks_replay() {
+        let evs: Vec<String> = ["iterm_connect|b/A|n1|d/Y", "iterm_disconnect|l/A|n1|d/Y", "bterm_connect|p|n2|p", "net_create|n3", "swap_before|b|x|y|A=n1=d/Y"].iter().map(|s| s.to_string()).collect();
+        let m = replayable_net_events(&evs);
+        assert_eq!(m["n1"], Some(vec![(true, "b/A"), (false, "l/A")]));
+        assert_eq!(m["n2"], None);
+        assert_eq!(m["n3"], None);
+        assert_eq!(m.len(), 3);
+    }
+}
+
+#[cfg(test)]
 mod rerouted_tests {
     use super::*;
 
@@ -413,6 +463,52 @@ struct Edited {
     nl: vyges_sta::netlist::Netlist,
     changed: bool,
     old: Option<std::sync::Arc<vyges_sta::netlist::Netlist>>,
+    /// Per net slot whose pins were replayed from the edit's callbacks, the pins that joined it:
+    /// the only ones that can lack a pin id (every other kept its id when it came).
+    joined: HashMap<usize, Vec<vyges_sta::netlist::Conn>>,
+}
+
+/// One touched net's pins after an edit: the kept list (`old`, its instance indices moved by
+/// `shift`) with the edit's callbacks on that net applied in order as odb applies them to its
+/// per-net terminal list — a connect puts the terminal at the head (`dbITerm::connect`), a
+/// disconnect unlinks it (`dbITerm::disconnectDbNet`). `events`: (connect?, `inst/term`).
+/// With the pins that joined (head first). `None` when a callback does not fit the list (a pin
+/// left that was not on it, an instance not placed): the caller reads the net whole.
+fn replay_net_pins(old: &[vyges_sta::netlist::Conn], shift: &dyn Fn(usize) -> usize, events: &[(bool, &str)], pos_of: &dyn Fn(&str) -> Option<usize>) -> Option<(Vec<vyges_sta::netlist::Conn>, Vec<vyges_sta::netlist::Conn>)> {
+    use vyges_sta::netlist::Conn;
+    // connected since, in connection order (the last is the head); left from the kept list
+    let mut front: Vec<(usize, &str)> = Vec::new();
+    let mut left: std::collections::HashSet<(usize, &str)> = std::collections::HashSet::new();
+    for &(connect, pin) in events {
+        let (inst, term) = pin.rsplit_once('/')?;
+        let k = pos_of(inst)?;
+        if connect {
+            front.push((k, term));
+        } else if let Some(j) = front.iter().rposition(|&(fk, ft)| fk == k && ft == term) {
+            front.remove(j);
+        } else if !left.insert((k, term)) {
+            return None;
+        }
+    }
+    let joined: Vec<Conn> = front.iter().rev().map(|&(k, t)| Conn::Inst(k, t.to_string())).collect();
+    let mut pins = Vec::with_capacity(joined.len() + old.len());
+    pins.extend(joined.iter().cloned());
+    let mut gone = 0;
+    for c in old {
+        match c {
+            Conn::Inst(i, p) => {
+                let k = shift(*i);
+                if !left.is_empty() && left.contains(&(k, p.as_str())) {
+                    gone += 1;
+                } else {
+                    pins.push(Conn::Inst(k, p.clone()));
+                }
+            }
+            Conn::Port(_) => return None,
+        }
+    }
+    // every pin that left was on the kept list
+    (gone == left.len()).then_some((pins, joined))
 }
 
 /// Where each new instance goes: `at[j]` is the number of listed instances before the `j`-th new
@@ -452,6 +548,40 @@ fn reordered(nl: &vyges_sta::netlist::Netlist, inst_order: &[usize], net_order: 
 }
 
 /// [`CliDesign::edited_netlist`] giving up, the reason traced (`VYGES_RSZ_ORDER_TRACE`).
+/// The nets an edit-log line names (its connectivity on them may have changed).
+fn event_nets(ev: &str) -> Vec<&str> {
+    let f: Vec<&str> = ev.split('|').collect();
+    match f.as_slice() {
+        ["iterm_connect" | "iterm_disconnect" | "bterm_connect" | "bterm_disconnect" | "iterm_destroy", _, net, ..] => vec![*net],
+        ["net_create" | "net_destroy", net, ..] => vec![*net],
+        ["net_merge", a, b] => vec![*a, *b],
+        _ => Vec::new(),
+    }
+}
+
+/// Per net, the instance-terminal callbacks on it in order (connect?, `inst/term`), from
+/// `events`; a net any other callback names (a port's, a destroy, a merge, a creation) maps to
+/// `None`: its list is read whole.
+fn replayable_net_events(events: &[String]) -> HashMap<&str, Option<Vec<(bool, &str)>>> {
+    let mut out: HashMap<&str, Option<Vec<(bool, &str)>>> = HashMap::new();
+    for ev in events {
+        let f: Vec<&str> = ev.split('|').collect();
+        match f.as_slice() {
+            [kind @ ("iterm_connect" | "iterm_disconnect"), pin, net, _] => {
+                if let Some(list) = out.entry(*net).or_insert_with(|| Some(Vec::new())) {
+                    list.push((*kind == "iterm_connect", *pin));
+                }
+            }
+            _ => {
+                for net in event_nets(ev) {
+                    out.insert(net, None);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn bail<T>(why: &str) -> Option<T> {
     if std::env::var_os("VYGES_RSZ_ORDER_TRACE").is_some() {
         eprintln!("VYGORDER|bail|{why}");
@@ -478,6 +608,17 @@ pub struct TimerLog {
     pub events: Vec<String>,
     pub est_invalid: BTreeSet<String>,
     pub updated: Vec<String>,
+    /// Copies of the database's callbacks taken since the last netlist refresh: what
+    /// [`CliDesign::refresh_touched`] replays on a touched net's kept pins (odb's own list
+    /// operations: `dbITerm::connect` puts the terminal at the head of the net's list,
+    /// `disconnectDbNet` unlinks it), so a repeater costs its moved pins, not its net.
+    pub since_refresh: Vec<String>,
+    /// Callbacks a refresh took from the database that [`CliDesign::pull_edits`] has not seen.
+    pub raw_pending: Vec<String>,
+    /// The log recorded every callback since the last refresh (on throughout, not restarted).
+    pub replay_ok: bool,
+    /// Nets a callback named that no refresh has read since: read again whole.
+    pub unsure_nets: std::collections::HashSet<String>,
 }
 
 /// What a journal level puts back on undo besides the database (the netlist is read from the
@@ -562,6 +703,13 @@ impl CliDesign<'_> {
 
     /// After an edit: the timer's netlist and the pin order read again from the database.
     pub fn refresh(&mut self) -> Result<(), String> {
+        if self.timer.on || self.skip_log {
+            let raw = self.take_edit_log();
+            self.timer.raw_pending.extend(raw);
+        }
+        self.timer.since_refresh.clear();
+        self.timer.unsure_nets.clear();
+        self.timer.replay_ok = self.timer.on || self.skip_log;
         let nl = vyges_grt::timer::netlist(self.db);
         if nl != *self.netlist {
             self.netlist_gen += 1;
@@ -622,15 +770,27 @@ impl CliDesign<'_> {
     /// touched nets are read as the full read reads them. `VYGES_RSZ_CHECK_REFRESH=1` also runs the
     /// full read and fails on any difference; `VYGES_RSZ_FULL_REFRESH=1` uses it instead.
     pub fn refresh_touched(&mut self, new_insts: &[String], touched: &BTreeSet<String>) -> Result<(), String> {
-        use vyges_sta::netlist::{Conn, Net, Netlist};
         let _p = crate::prof::Span::new(0);
         crate::prof::items(0, touched.len() as u64);
         if std::env::var_os("VYGES_RSZ_FULL_REFRESH").is_some() {
             return self.refresh();
         }
-        if let Some(fast) = self.edited_netlist(new_insts, touched) {
-            return self.refresh_finish(fast, new_insts, touched);
+        // the edit's callbacks, for the replay (the timer still takes them, in order)
+        if self.timer.on || self.skip_log {
+            let raw = self.take_edit_log();
+            self.timer.raw_pending.extend(raw);
         }
+        let r = match self.edited_netlist(new_insts, touched) {
+            Some(fast) => self.refresh_finish(fast, new_insts, touched),
+            None => self.refresh_read(new_insts, touched),
+        };
+        self.refreshed(touched);
+        r
+    }
+
+    /// [`CliDesign::refresh_touched`]'s general path: every instance and net name read again.
+    fn refresh_read(&mut self, new_insts: &[String], touched: &BTreeSet<String>) -> Result<(), String> {
+        use vyges_sta::netlist::{Conn, Net, Netlist};
         // ⚠️ O(design): every instance and net name read again
         if std::env::var_os("VYGES_RSZ_ORDER_TRACE").is_some() {
             eprintln!("VYGORDER|general");
@@ -813,6 +973,12 @@ impl CliDesign<'_> {
         let port_index: HashMap<&str, usize> = old.ports.iter().enumerate().map(|(i, (n, _))| (n.as_str(), i)).collect();
         let mut replaced: Vec<(usize, u32, Net)> = Vec::new();
         let mut added: Vec<(u32, Net)> = Vec::new();
+        // a listed net's pins from the edit's own callbacks when the log saw them all (no journal
+        // undo: its restores are not list operations), else read whole
+        let replaying = self.timer.replay_ok && (self.timer.on || self.skip_log) && self.journal.is_empty() && !self.undoing && std::env::var_os("VYGES_RSZ_NO_REPLAY").is_none();
+        let net_events = if replaying { replayable_net_events(&self.timer.since_refresh) } else { HashMap::new() };
+        let shift = |i: usize| shifted(&at, i);
+        let mut joined: HashMap<usize, Vec<Conn>> = HashMap::new();
         for net in touched {
             let Ok(id) = self.db.net_id(net) else { return bail("a touched net gone") };
             let slot = ord.net_pos(id);
@@ -821,6 +987,23 @@ impl CliDesign<'_> {
                     return bail("a listed net made special");
                 }
                 continue;
+            }
+            let fits = |k: usize| replaying && !self.timer.unsure_nets.contains(net) && old.nets.get(k).is_some_and(|n| &n.name == net);
+            if let Some(k) = slot.filter(|&k| fits(k)) {
+                let none = Vec::new();
+                let evs = match net_events.get(net.as_str()) {
+                    Some(Some(list)) => Some(list),
+                    Some(None) => None,
+                    None => Some(&none),
+                };
+                if let Some((pins, came)) = evs.and_then(|evs| replay_net_pins(&old.nets[k].pins, &shift, evs, &pos_of)) {
+                    if pins.is_empty() {
+                        return bail("a listed net left pinless");
+                    }
+                    joined.insert(k, came);
+                    replaced.push((k, id, Net { name: net.clone(), pins }));
+                    continue;
+                }
             }
             let mut pins = Vec::new();
             let iterms = self.db.net_iterms(net);
@@ -931,20 +1114,22 @@ impl CliDesign<'_> {
             nl.nets.insert(k, n.into());
         }
         self.inst_pos = Some((std::sync::Weak::new(), ord));
-        Some(Edited { nl, changed, old: kept })
+        Some(Edited { nl, changed, old: kept, joined })
     }
 
     /// The rest of [`CliDesign::refresh_touched`] on an edited netlist: the per-net and
     /// per-instance flags, the generation.
-    fn refresh_finish(&mut self, Edited { nl, changed, old }: Edited, new_insts: &[String], touched: &BTreeSet<String>) -> Result<(), String> {
+    fn refresh_finish(&mut self, Edited { nl, changed, old, joined }: Edited, new_insts: &[String], touched: &BTreeSet<String>) -> Result<(), String> {
         use vyges_sta::netlist::Conn;
         // the touched nets by their slots (the edited path's own map), not by a pass over every net
         let slots: Vec<usize> = match self.inst_pos.as_ref() {
             Some((_, ord)) => touched.iter().filter_map(|t| ord.net_slot_pos(t)).collect(),
             None => nl.nets.iter().enumerate().filter(|(_, n)| touched.contains(&n.name)).map(|(k, _)| k).collect(),
         };
-        for net in slots.iter().map(|&k| &nl.nets[k]) {
-            for c in &net.pins {
+        for (k, net) in slots.iter().map(|&k| (k, &nl.nets[k])) {
+            // a replayed net: only the pins that joined it can be new
+            let pins = joined.get(&k).unwrap_or(&net.pins);
+            for c in pins {
                 let name = nl.pin_name(c);
                 // a terminal keeps its id when it moves to another net: only a new one is read
                 if self.info.pin_id.contains_key(&name) {
@@ -1028,6 +1213,7 @@ impl CliDesign<'_> {
         self.skips = Some(HeldSkips { skips, nets });
         if !self.skip_log && !self.timer.on {
             self.db.edit_log_start().map_err(|e| e.to_string())?;
+            self.timer.replay_ok = false;
         }
         self.skip_log = true;
         Ok(())
@@ -1066,7 +1252,9 @@ impl CliDesign<'_> {
         if !self.timer.on && !self.skip_log {
             return;
         }
-        for ev in self.db.edit_log_take() {
+        let mut evs = std::mem::take(&mut self.timer.raw_pending);
+        evs.extend(self.take_edit_log());
+        for ev in evs {
             self.drop_skips_if_touched(&ev);
             if !self.timer.on {
                 continue;
@@ -1131,6 +1319,30 @@ impl CliDesign<'_> {
             }
             self.timer.events.push(ev);
         }
+    }
+
+    /// The database's callbacks since the last take, a copy kept for the next netlist refresh.
+    fn take_edit_log(&mut self) -> Vec<String> {
+        let raw = self.db.edit_log_take();
+        self.timer.since_refresh.extend(raw.iter().cloned());
+        raw
+    }
+
+    /// After a netlist refresh of `touched`: a callback naming a net it did not read leaves that
+    /// net to be read whole next time; the replay holds while the log keeps recording.
+    fn refreshed(&mut self, touched: &BTreeSet<String>) {
+        let since = std::mem::take(&mut self.timer.since_refresh);
+        for ev in &since {
+            for net in event_nets(ev) {
+                if !touched.contains(net) {
+                    self.timer.unsure_nets.insert(net.to_string());
+                }
+            }
+        }
+        for net in touched {
+            self.timer.unsure_nets.remove(net);
+        }
+        self.timer.replay_ok = self.timer.on || self.skip_log;
     }
 
     /// `GRouteDbCbk::inDbPostMoveInst` → `instItermsDirty`: every net on the moved instance's
@@ -1596,7 +1808,9 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
         // Restarting clears the log: the held skips read what it holds first (the timer's own
         // events in it are discarded, as before).
         if self.skip_log {
-            for ev in self.db.edit_log_take() {
+            let mut evs = std::mem::take(&mut self.timer.raw_pending);
+            evs.extend(self.db.edit_log_take());
+            for ev in evs {
                 self.drop_skips_if_touched(&ev);
             }
         }
