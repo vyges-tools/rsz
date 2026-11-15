@@ -15,6 +15,14 @@ use std::process::ExitCode;
 use serde_json::{json, Value};
 use vyges_rsz::job::run;
 
+/// The reference ships a tuned allocator (tcmalloc, linked by its Bazel build), not the system
+/// one; repair_design allocates and frees per decision and frees its whole timer state at the
+/// end, so the allocator is part of what is compared. See Cargo.toml for the pin. Not when this
+/// file is compiled into the library as `cli_main` for the suite: its binaries set their own.
+#[cfg(not(feature = "suite"))]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const USAGE: &str = "\
 vyges physical rsz — electrical repair of a placed design: repeaters along each net's Steiner
 tree, drivers resized, where a wire is too long or a capacitance, fanout or transition limit is

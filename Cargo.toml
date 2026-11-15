@@ -18,7 +18,7 @@ odb = ["dep:vyges-opendb", "vyges-opendb/gen-write"]
 # The command-line engine: the database, the netlist and placement parasitics the timer reads
 # (the timer adapter shared with the router, the estimator, the Steiner-tree builder), the SDC
 # reader, and JSON jobs.
-cli = ["odb", "dep:vyges-grt", "dep:vyges-est", "dep:vyges-stt", "dep:vyges-loom", "vyges-sta/loom", "dep:vyges-dpl", "dep:serde_json", "dep:flate2", "dep:vyges-events"]
+cli = ["odb", "dep:vyges-grt", "dep:vyges-est", "dep:vyges-stt", "dep:vyges-loom", "vyges-sta/loom", "dep:vyges-dpl", "dep:serde_json", "dep:flate2", "dep:vyges-events", "dep:mimalloc", "dep:libmimalloc-sys"]
 
 [dependencies]
 # The timer's library model: cells, ports, arcs and their tables.
@@ -34,6 +34,19 @@ vyges-dpl = { git = "https://github.com/vyges-tools/dpl.git", branch = "main", o
 vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main", default-features = false, optional = true }
 serde_json = { version = "1", optional = true }
 flate2 = { version = "1", optional = true }
+# The engine binary's global allocator (src/main.rs). The reference binary we are scored against
+# links a tuned allocator (its Bazel build sets `malloc = @tcmalloc`); the system allocator is not
+# what it runs on. mimalloc measured fastest and smallest of tcmalloc / jemalloc / mimalloc on a
+# like-for-like trial. Pinned exactly: libmimalloc-sys 0.1.44 bundles mimalloc v2 by default (the
+# major the trial measured; 0.1.45 on default to v3). Library consumers do not link it.
+mimalloc = { version = "=0.1.48", default-features = false, optional = true }
+libmimalloc-sys = { version = "=0.1.44", default-features = false, optional = true }
+
+# On Linux the allocator also REPLACES malloc/free process-wide (`override`), so the C++ database
+# allocates through it too, as the reference's statically linked tcmalloc does for all of its code.
+# Not on macOS, where the system zone allocator is left alone.
+[target.'cfg(target_os = "linux")'.dependencies]
+libmimalloc-sys = { version = "=0.1.44", default-features = false, features = ["override"], optional = true }
 
 [lib]
 name = "vyges_rsz"
@@ -71,3 +84,10 @@ vyges-loom = { path = "../vyges-tools-loom" }
 
 [patch."https://github.com/vyges-tools/layout"]
 vyges-layout = { path = "../vyges-tools-layout" }
+
+# The reference is built optimised with link-time optimisation; whole-program LTO and one codegen
+# unit let the allocator, the timer and the repair inline across crates (fewer instructions executed
+# on a like-for-like trial, decisions unchanged).
+[profile.release]
+lto = "fat"
+codegen-units = 1
