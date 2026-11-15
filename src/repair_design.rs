@@ -373,6 +373,23 @@ fn repair_design_held(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args,
             let index = g[0].pin_index();
             // every graph held stands at the log's end now: what came before is let go
             ctx.edit_log.trim(ctx.edit_log.end());
+            // and each timer's written names, to the oldest place a graph that imports it (this
+            // set, or the spare set) stands at
+            if let Some(incs) = ctx.timer.as_mut() {
+                for (k, inc) in incs.iter_mut().enumerate() {
+                    let spare = ctx.edit_log.spare.as_ref().and_then(|gs| gs.get(k)).map(|sg| inc.written_place(sg));
+                    let here = g.get(k).and_then(|hg| inc.written_place(hg));
+                    // a spare graph that never imported this state imports it whole: it holds no place
+                    let place = match (here, spare) {
+                        (Some(h), Some(Some(s))) => Some(h.min(s)),
+                        (Some(h), Some(None) | None) => Some(h),
+                        _ => None,
+                    };
+                    if let Some(p) = place {
+                        inc.trim_written(p);
+                    }
+                }
+            }
             held = Some((g, index));
             if !probed_start {
                 probed_start = true;
