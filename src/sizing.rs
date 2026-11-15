@@ -169,6 +169,12 @@ pub struct Sizing<'a> {
     pub tgt_scene: usize,
     /// The block's sizing restrictions (`initBlock`).
     pub limits: SizingLimits,
+    /// `swappable_cells_cache_`: `getSwappableCells`' result per source cell. Its inputs
+    /// (dont_use, the classes, the masters, the limits) are borrowed unchanged for this value's
+    /// life, so one `Sizing` is one cache generation — where upstream clears it (initBlock limit
+    /// changes, init, dont_use set/reset, postReadLiberty, the SetAndRestore in report_equiv) a
+    /// new `Sizing` is built. Start it empty (`Default::default()`).
+    pub swappable_cache: std::cell::RefCell<HashMap<String, Vec<String>>>,
 }
 
 /// `sizing_area_limit_` and `sizing_leakage_limit_`'s defaults: one sizing move may not grow a
@@ -229,6 +235,18 @@ impl Sizing<'_> {
     /// the leakage limit alone (the first of equal areas) is kept, at its place in the class order
     /// — upstream 03bdb5beb4d / 43c34061db2: a low-leakage cell keeps one upsizing step.
     pub fn swappable_cells(&self, source: &str) -> Result<Vec<String>, Stop> {
+        // `if (swappable_cells_cache_.contains(source_cell)) return swappable_cells_cache_[source_cell];`
+        if let Some(cells) = self.swappable_cache.borrow().get(source) {
+            return Ok(cells.clone());
+        }
+        let cells = self.find_swappable_cells(source)?;
+        self.swappable_cache.borrow_mut().insert(source.to_string(), cells.clone());
+        Ok(cells)
+    }
+
+    /// `getSwappableCells`' body past the cache lookup (every path stores its result): see
+    /// [`Sizing::swappable_cells`]. A refusal is not stored — upstream has no such path.
+    fn find_swappable_cells(&self, source: &str) -> Result<Vec<String>, Stop> {
         let Some(master) = self.masters.get(source).filter(|m| m.is_core) else { return Ok(Vec::new()) };
         if self.dont_use.contains(source) {
             return Ok(vec![source.to_string()]);
@@ -473,8 +491,14 @@ mod tests {
         let masters: BTreeMap<String, Master> = ["B1", "B2", "B4"].iter().map(|n| (n.to_string(), Master { site: "s".into(), area: 1, width: 1, height: 1, is_core: true, logic_std: true, implant_obs: vec![] })).collect();
         let equiv = make_equiv_cells(&l);
         let (dont_use, loads) = (BTreeSet::new(), BTreeMap::new());
-        let s = Sizing { libs: &l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: SizingLimits::default() };
+        let s = Sizing { libs: &l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: SizingLimits::default(), swappable_cache: Default::default() };
         assert_eq!(s.swappable_cells("B1").unwrap(), vec!["B1".to_string(), "B2".into()], "B4 leaks 4.1x B1");
+        // Rule (getSwappableCells, `swappable_cells_cache_`): the first call stores its result per
+        // source cell and later calls return the stored list without re-filtering the class.
+        assert_eq!(s.swappable_cache.borrow().get("B1"), Some(&vec!["B1".to_string(), "B2".into()]));
+        s.swappable_cache.borrow_mut().insert("B1".into(), vec!["B4".into()]);
+        assert_eq!(s.swappable_cells("B1").unwrap(), vec!["B4".to_string()], "a later call reads the cache");
+        assert_eq!(s.find_swappable_cells("B1").unwrap(), vec!["B1".to_string(), "B2".into()]);
     }
 
     // Rule (getSwappableCells, upstream 03bdb5beb4d / 43c34061db2): when the leakage limit leaves
@@ -502,7 +526,7 @@ mod tests {
             let masters: BTreeMap<String, Master> = names.iter().zip(areas).map(|(n, area)| (n.to_string(), Master { site: "s".into(), area, width: 1, height: 1, is_core: true, logic_std: true, implant_obs: vec![] })).collect();
             let equiv = make_equiv_cells(&l);
             let (dont_use, loads) = (BTreeSet::new(), BTreeMap::new());
-            let s = Sizing { libs: &l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: SizingLimits::default() };
+            let s = Sizing { libs: &l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: SizingLimits::default(), swappable_cache: Default::default() };
             s.swappable_cells("B1").unwrap()
         };
         let v = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -540,7 +564,7 @@ mod tests {
         let masters: BTreeMap<String, Master> = ["BUF_R", "BUF_L", "XBUF_R", "BUF_S"].iter().map(|n| (n.to_string(), Master { site: "s".into(), area: 1, width: 1, height: 1, is_core: true, logic_std: true, implant_obs: vt(n) })).collect();
         let equiv = make_equiv_cells(&l);
         let (dont_use, loads) = (BTreeSet::new(), BTreeMap::new());
-        let s = Sizing { libs: &l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: SizingLimits::default() };
+        let s = Sizing { libs: &l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: SizingLimits::default(), swappable_cache: Default::default() };
         // By leakage alone R(1) L(2) XR(3) S(4): R and XR are not adjacent and both stayed.
         assert_eq!(s.vt_equiv_cells("BUF_L", 3), vec!["BUF_R".to_string(), "BUF_L".into(), "BUF_S".into()], "XBUF_R deduplicated against BUF_R");
         assert!(s.vt_equiv_cells("BUF_L", 1).is_empty(), "one VT category: none");
