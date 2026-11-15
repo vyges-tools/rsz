@@ -354,6 +354,33 @@ pub fn sdc_has_sim_or_clock_slew(s: &vyges_loom::sdc::Sdc) -> bool {
     !s.case_values.is_empty() || !s.logic_values.is_empty() || !s.clock_transitions.is_empty()
 }
 
+/// SDC commands the timer reads that cannot move any value a repair reads, in the form given
+/// (upstream rules at 4155ac3, read in Sdc.tcl, Sdc.cc, Sta.cc and every consumer):
+/// - `set_wire_load_mode`: `Sdc::wireload_mode_` is read by `WriteSdc` alone (no delay
+///   calculator, wire-load selection or search reads it); `Sta::setWireloadMode` only
+///   invalidates delays.
+/// - `set_clock_gating_check` at design level (no objects, hence no -high/-low: error 398) with
+///   every margin 0: `Sdc::clk_gating_check_` is read only by `VisitPathEnds::clockGatingMargin`,
+///   as its last fallback, which returns 0.0 when no margin exists: the same value.
+///   `Sta::setClockGatingCheck` only invalidates arrivals. Any other form (a margin, objects,
+///   -high/-low) changes gated-clock check slacks and stays refused.
+fn sdc_inert_for_repair(s: &vyges_loom::sdc::Sdc, cmd: &str) -> bool {
+    match cmd {
+        "set_wire_load_mode" => true,
+        "set_clock_gating_check" => {
+            let uses: Vec<_> = s.kept.iter().filter(|k| k.cmd == cmd).collect();
+            !uses.is_empty()
+                && uses.iter().all(|k| {
+                    k.args.is_empty()
+                        && !k.has("-high")
+                        && !k.has("-low")
+                        && k.keys.iter().all(|(n, v)| matches!(n.as_str(), "-setup" | "-hold") && v.word().and_then(|w| w.parse::<f64>().ok()) == Some(0.0))
+                })
+        }
+        _ => false,
+    }
+}
+
 pub fn sdc_cap_objects_modelled(s: &vyges_loom::sdc::Sdc) -> Result<(), String> {
     for (v, o) in &s.max_capacitance_objects {
         if v.is_nan() || !matches!(o.accessor.as_str(), "get_ports" | "get_pins") {
@@ -775,7 +802,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 let unmodelled: Vec<&str> = s
                     .ignored_affecting_timing()
                     .into_iter()
-                    .filter(|c| (*c != "set_max_transition" || s.max_transition_on_objects) && (*c != "set_max_fanout" || s.max_fanout_on_objects) && *c != "set_max_capacitance" && *c != "set_driving_cell" && *c != "set_propagated_clock" && *c != "set_max_delay" && *c != "set_min_delay" && *c != "group_path" && !SIM_AND_CLOCK_SLEW.contains(c))
+                    .filter(|c| (*c != "set_max_transition" || s.max_transition_on_objects) && (*c != "set_max_fanout" || s.max_fanout_on_objects) && *c != "set_max_capacitance" && *c != "set_driving_cell" && *c != "set_propagated_clock" && *c != "set_max_delay" && *c != "set_min_delay" && *c != "group_path" && !SIM_AND_CLOCK_SLEW.contains(c) && !sdc_inert_for_repair(&s, c))
                     .collect();
                 if !unmodelled.is_empty() {
                     return Err(format!("{path}: {} not modelled", unmodelled.join(", ")));
@@ -2124,6 +2151,27 @@ fn finds_fast_buffers(seq: &[crate::repair_timing::Move], plan: Option<&crate::r
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upstream rule (`VisitPathEnds::clockGatingMargin` at 4155ac3 returns 0.0 when no margin
+    /// exists; `Sdc::wireload_mode_` is read only by `WriteSdc`): a design-level zero-margin
+    /// `set_clock_gating_check` and any `set_wire_load_mode` cannot move a value the repair reads,
+    /// so read_sdc passes them over; a margin, objects or -high/-low stay refused. Witness: two
+    /// placed blocks whose SDC carries `set_clock_gating_check -rise/-fall -setup 0`
+    /// and `set_wire_load_mode enclosed`: the reference's repair_design DEF is byte-identical with
+    /// and without them, and ours (refused before) now matches it byte for byte.
+    #[test]
+    fn inert_sdc_forms_are_passed_over_and_live_ones_refused() {
+        let inert = |text: &str, cmd: &str| sdc_inert_for_repair(&vyges_loom::sdc::Sdc::parse(text).unwrap(), cmd);
+        let clk = "create_clock -name clk -period 10 [get_ports clk]\n";
+        assert!(inert(&format!("{clk}set_clock_gating_check -rise -setup 0\nset_clock_gating_check -fall -setup 0\n"), "set_clock_gating_check"));
+        assert!(inert(&format!("{clk}set_clock_gating_check -setup 0.0 -hold 0\n"), "set_clock_gating_check"));
+        assert!(inert(&format!("{clk}set_wire_load_mode enclosed\n"), "set_wire_load_mode"));
+        assert!(!inert(&format!("{clk}set_clock_gating_check -setup 0\nset_clock_gating_check -hold 0.1\n"), "set_clock_gating_check"));
+        assert!(!inert(&format!("{clk}set_clock_gating_check -setup 0.2\n"), "set_clock_gating_check"));
+        assert!(!inert(&format!("{clk}set_clock_gating_check -setup 0 [get_clocks clk]\n"), "set_clock_gating_check"));
+        assert!(!inert(&format!("{clk}set_clock_gating_check -high -setup 0 [get_pins g/A]\n"), "set_clock_gating_check"));
+        assert!(!inert(&format!("{clk}set_wire_load_model -name small\n"), "set_wire_load_model"));
+    }
 
     /// Upstream rule (`WriteSdc::writeExceptions` sorts by `ExceptionPathLess`; `ExceptionPath`
     /// ids count up as made): a captured SDC lists group paths by name, so the groups the script
