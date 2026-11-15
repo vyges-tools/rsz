@@ -903,8 +903,9 @@ fn timer_graphs<'n>(inputs: &Inputs<'n>, design: &mut dyn Design, annotated: &[H
             let slot = if std::ptr::eq(design.netlist(), &**netlist) { design.net_slot(net) } else { netlist.nets.iter().position(|n| &n.name == net) };
             let Some(n) = slot.map(|k| &netlist.nets[k]) else { continue };
             crate::prof::items(8, n.pins.len() as u64);
+            let mut buf = String::new();
             for c in &n.pins {
-                inc.delays_invalid_from(&netlist.pin_name(c));
+                inc.delays_invalid_from(netlist.pin_name_into(c, &mut buf));
             }
         }
         inc.import(g);
