@@ -1469,9 +1469,9 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 // to set against the reference's `report_checks -fields {slew}` along a path.
                 if let Ok(path) = std::env::var("VYGES_RSZ_TIMING_DUMP") {
                     let mut out = String::new();
-                    for (v, vx) in g.vertices.iter().enumerate() {
+                    for (v, _) in g.vertices.iter().enumerate() {
                         for p in &search.paths[v] {
-                            out.push_str(&format!("{} mm={} rf={} clk={} edge={:?} states={} arr={:e} req={:e} slew={:e}\n", vx.name, p.tag.mm, p.tag.rf, p.tag.is_clock, p.tag.clk_edge, p.tag.states.0, p.arrival, p.required, g.slew[v][p.tag.rf][p.tag.mm]));
+                            out.push_str(&format!("{} mm={} rf={} clk={} edge={:?} states={} arr={:e} req={:e} slew={:e}\n", g.vname(v), p.tag.mm, p.tag.rf, p.tag.is_clock, p.tag.clk_edge, p.tag.states.0, p.arrival, p.required, g.slew[v][p.tag.rf][p.tag.mm]));
                         }
                     }
                     std::fs::write(&path, out).map_err(|e| format!("{path}: {e}"))?;

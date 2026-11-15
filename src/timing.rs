@@ -58,7 +58,7 @@ fn tighter_max(limit: Option<f32>, limit1: Option<f32>) -> Option<f32> {
 fn find_cap_limit(g: &Graph<'_>, v: usize, limits: &Limits) -> Option<f32> {
     let mut limit = limits.design_max_capacitance;
     if matches!(g.vertices[v].conn, Conn::Port(_)) {
-        limit = tighter_max(limit, limits.port_max_capacitance.get(&g.vertices[v].name).copied());
+        limit = tighter_max(limit, limits.port_max_capacitance.get(&g.vname(v)).copied());
     }
     tighter_max(limit, limit_port_of(g, v).and_then(|(_, p)| p.max_capacitance))
 }
@@ -154,7 +154,7 @@ pub struct Scenes<'s, 'a> {
     pub graphs: &'s [Graph<'a>],
     /// Per scene, its vertices by (name, is driver) — built only for a scene whose vertex order
     /// differs from scene 0's at a vertex asked for.
-    index: Vec<std::cell::OnceCell<std::collections::HashMap<(&'s str, bool), usize>>>,
+    index: Vec<std::cell::OnceCell<std::collections::HashMap<(&'s vyges_sta::netlist::Conn, bool), usize>>>,
 }
 
 impl<'s, 'a> Scenes<'s, 'a> {
@@ -166,11 +166,11 @@ impl<'s, 'a> Scenes<'s, 'a> {
     pub fn at(&self, k: usize, v: usize) -> usize {
         let (g0, g) = (&self.graphs[0], &self.graphs[k]);
         let want = &g0.vertices[v];
-        if g.vertices.get(v).is_some_and(|x| x.is_driver == want.is_driver && x.name == want.name) {
+        if g.vertices.get(v).is_some_and(|x| x.is_driver == want.is_driver && x.conn == want.conn) {
             return v;
         }
-        let index = self.index[k].get_or_init(|| g.vertices.iter().enumerate().map(|(i, x)| ((x.name.as_str(), x.is_driver), i)).collect());
-        index[&(want.name.as_str(), want.is_driver)]
+        let index = self.index[k].get_or_init(|| g.vertices.iter().enumerate().map(|(i, x)| ((&x.conn, x.is_driver), i)).collect());
+        index[&(&want.conn, want.is_driver)]
     }
     pub fn link(&self) -> &Graph<'a> {
         &self.graphs[0]
@@ -191,7 +191,7 @@ fn path_name_cmp(g: &Graph<'_>, a: usize, b: usize) -> Ordering {
     let port = |v: usize| -> &str {
         match &g.vertices[v].conn {
             Conn::Inst(_, p) => p.as_str(),
-            Conn::Port(_) => g.vertices[v].name.as_str(),
+            Conn::Port(i) => g.netlist.ports[*i].0.as_str(),
         }
     };
     let inst = match (instance_of(g, a), instance_of(g, b)) {
@@ -207,7 +207,7 @@ fn path_name_cmp(g: &Graph<'_>, a: usize, b: usize) -> Ordering {
 /// a top-level port), by level, ties by the full path name as a string (`VertexLevelLess`).
 pub fn ordered_load_pin_vertices(g: &Graph<'_>, level: &[i32]) -> Vec<usize> {
     let mut loads: Vec<usize> = (0..g.vertices.len()).filter(|&v| instance_of(g, v).is_some() && !g.vertices[v].is_driver).collect();
-    loads.sort_by(|&a, &b| level[a].cmp(&level[b]).then_with(|| g.vertices[a].name.as_bytes().cmp(g.vertices[b].name.as_bytes())));
+    loads.sort_by(|&a, &b| level[a].cmp(&level[b]).then_with(|| g.vname(a).as_bytes().cmp(g.vname(b).as_bytes())));
     loads
 }
 
@@ -284,14 +284,14 @@ pub fn vertex_named(g: &Graph<'_>, name: &str, driver: bool) -> Option<usize> {
     if g.vertices[v].is_driver == driver {
         return Some(v);
     }
-    let side = |w: usize| g.vertices.get(w).is_some_and(|x| x.is_driver == driver && x.name == name);
+    let side = |w: usize| g.vertices.get(w).is_some_and(|x| x.is_driver == driver) && g.vname(w) == name;
     if let Some(w) = [v.wrapping_sub(1), v + 1].into_iter().find(|&w| side(w)) {
         return Some(w);
     }
     if !is_bidirect(g, v) {
         return None;
     }
-    g.vertices.iter().position(|x| x.is_driver == driver && x.name == name)
+    (0..g.vertices.len()).position(|x| g.vertices[x].is_driver == driver && g.vname(x) == name)
 }
 
 /// Whether vertex `v`'s pin is bidirect (two vertices): a liberty `inout` port or a top `inout`
@@ -300,7 +300,7 @@ fn is_bidirect(g: &Graph<'_>, v: usize) -> bool {
     let x = &g.vertices[v];
     match &x.conn {
         vyges_sta::netlist::Conn::Port(i) => g.netlist.ports.get(*i).is_none_or(|p| p.1 == vyges_sta::netlist::PortDir::Inout),
-        vyges_sta::netlist::Conn::Inst(..) => match (x.lib, x.cell.as_deref(), x.port.as_deref()) {
+        vyges_sta::netlist::Conn::Inst(..) => match (x.lib, x.cell.as_deref(), x.port()) {
             (Some(lib), Some(cell), Some(port)) => g.libs.get(lib).and_then(|l| l.cells.get(cell)).and_then(|c| c.port(port)).is_none_or(|p| p.direction == vyges_sta::liberty::Direction::Bidirect),
             _ => true,
         },
@@ -324,17 +324,17 @@ pub fn net_drivers(g: &Graph<'_>, load: usize) -> Vec<usize> {
 }
 
 /// Each driver vertex by its pin name — the first, as [`net_drivers`]' search finds it.
-pub fn driver_index<'g>(g: &'g Graph<'_>) -> std::collections::HashMap<&'g str, usize> {
+pub fn driver_index(g: &Graph<'_>) -> std::collections::HashMap<String, usize> {
     let mut index = std::collections::HashMap::new();
-    for (i, v) in g.vertices.iter().enumerate().filter(|(_, v)| v.is_driver) {
-        index.entry(v.name.as_str()).or_insert(i);
+    for (i, _) in g.vertices.iter().enumerate().filter(|(_, v)| v.is_driver) {
+        index.entry(g.vname(i)).or_insert(i);
     }
     index
 }
 
 /// [`net_drivers`] through a [`driver_index`]: the same drivers in the same order, without a
 /// search of every vertex for each pin of the net.
-pub fn net_drivers_in(g: &Graph<'_>, load: usize, drivers: &std::collections::HashMap<&str, usize>) -> Vec<usize> {
+pub fn net_drivers_in(g: &Graph<'_>, load: usize, drivers: &std::collections::HashMap<String, usize>) -> Vec<usize> {
     let Some(n) = g.vertex_net[load] else { return Vec::new() };
     g.netlist.nets[n].pins.iter().filter_map(|c| drivers.get(g.netlist.pin_name(c).as_str()).copied()).collect()
 }
@@ -479,7 +479,7 @@ pub fn connected_pins(g: &Graph<'_>, info: &NetInfo, v: usize) -> Vec<usize> {
     if !pins.contains(&v) {
         pins.push(v);
     }
-    pins.sort_by_key(|&p| info.pin_id.get(&g.vertices[p].name).copied().unwrap_or(u64::MAX));
+    pins.sort_by_key(|&p| info.pin_id.get(&g.vname(p)).copied().unwrap_or(u64::MAX));
     pins.dedup();
     pins
 }
@@ -488,7 +488,7 @@ pub fn connected_pins(g: &Graph<'_>, info: &NetInfo, v: usize) -> Vec<usize> {
 fn port_of<'g>(g: &'g Graph<'_>, v: usize) -> Option<(&'g Library, &'g vyges_sta::liberty::Port)> {
     let vx = &g.vertices[v];
     let lib = &g.libs[vx.lib?];
-    let port = lib.cells.get(vx.cell.as_deref()?)?.port(vx.port.as_deref()?)?;
+    let port = lib.cells.get(vx.cell.as_deref()?)?.port(vx.port()?)?;
     Some((lib, port))
 }
 
@@ -504,7 +504,7 @@ pub fn drive_port<'g>(g: &'g Graph<'_>, v: usize) -> Option<(&'g Library, &'g vy
     if !matches!(g.vertices[v].conn, Conn::Port(_)) {
         return None;
     }
-    let d = g.sdc.input_drive.get(&g.vertices[v].name)?;
+    let d = g.sdc.input_drive.get(&g.vname(v))?;
     let lib = g.libs.iter().find(|l| l.cells.contains_key(&d.cell))?;
     Some((lib, lib.cells[&d.cell].port(&d.to_port)?))
 }
@@ -805,7 +805,7 @@ mod tests {
         let nl = two_clock_netlist();
         let mut g = Graph::build(&libs, &nl).unwrap();
         let sources = vec!["ca".to_string(), "cb".to_string()];
-        let v = |g: &Graph<'_>, n: &str| g.vertices.iter().position(|x| x.name == n && !x.is_driver).unwrap();
+        let v = |g: &Graph<'_>, n: &str| (0..g.vertices.len()).position(|x| g.vname(x) == n && !g.vertices[x].is_driver).unwrap();
         // no transition: every pin reads 0
         set_ideal_clock(&mut g, &sources);
         assert!(g.ideal_clock_slew.is_empty());
@@ -849,7 +849,7 @@ mod tests {
         let sc = Scenes::new(&swapped);
         for v in 0..2 {
             let w = sc.at(1, v);
-            assert_eq!((&swapped[1].vertices[w].name, swapped[1].vertices[w].is_driver), (&swapped[0].vertices[v].name, swapped[0].vertices[v].is_driver));
+            assert_eq!((swapped[1].vname(w), swapped[1].vertices[w].is_driver), (swapped[0].vname(v), swapped[0].vertices[v].is_driver));
         }
         assert_ne!(sc.at(1, 0), 0);
     }
@@ -866,13 +866,13 @@ mod tests {
         let libs = vec![Library { cells: [("c".to_string(), cell)].into_iter().collect(), ..Default::default() }];
         let nl = vyges_sta::netlist::Netlist { insts: vec![vyges_sta::netlist::inst("u1", "c")], ports: Vec::new(), nets: Vec::new() };
         let g = Graph::build(&libs, &nl).unwrap();
-        assert!(g.vertices.iter().filter(|x| x.name == "u1/P").count() == 2, "the bidirect pin has two vertices");
+        assert!((0..g.vertices.len()).filter(|&x| g.vname(x) == "u1/P").count() == 2, "the bidirect pin has two vertices");
         for name in ["u1/A", "u1/P", "u1/Y", "u1/Q"] {
             for driver in [false, true] {
-                let pass = g.vertices.iter().position(|x| x.is_driver == driver && x.name == name);
+                let pass = (0..g.vertices.len()).position(|x| g.vertices[x].is_driver == driver && g.vname(x) == name);
                 assert_eq!(vertex_named(&g, name, driver), pass, "{name} driver={driver}");
             }
-            assert_eq!(first_vertex_named(&g, name), g.vertices.iter().position(|x| x.name == name), "{name} first");
+            assert_eq!(first_vertex_named(&g, name), (0..g.vertices.len()).position(|x| g.vname(x) == name), "{name} first");
         }
     }
 
@@ -918,7 +918,7 @@ mod tests {
             ],
         };
         let g = Graph::build(&libs, &netlist).unwrap();
-        let v = |n: &str| g.vertices.iter().position(|x| x.name == n).unwrap();
+        let v = |n: &str| (0..g.vertices.len()).position(|x| g.vname(x) == n).unwrap();
         let limits = |design: Option<f32>, port: &[(&str, f32)]| Limits { design_max_capacitance: design, port_max_capacitance: port.iter().map(|&(p, c)| (p.to_string(), c)).collect(), ..Default::default() };
         assert_eq!(find_cap_limit(&g, v("in"), &limits(None, &[])), None);
         assert_eq!(find_cap_limit(&g, v("in"), &limits(None, &[("in", 2e-12)])), Some(2e-12));

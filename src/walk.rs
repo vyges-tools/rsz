@@ -97,12 +97,12 @@ impl Walk<'_, '_> {
     /// port's input drive (none is modelled: 0).
     fn drive_resistance(&self) -> f32 {
         let vx = &self.graph().vertices[self.drvr];
-        match (vx.cell.as_deref(), vx.port.as_deref()) {
+        match (vx.cell.as_deref(), vx.port()) {
             // The LINK port's (`network_->libertyPort(pin)->driveResistance()`).
             (Some(c), Some(p)) => self.sizing.libs.link_cell(c).map_or(0.0, |cell| cell.drive_resistance(p)),
             // A top-level port: its driving cell's `-pin` port's (the larger over rise / fall and
             // min / max, all one value here); none ⇒ 0.
-            _ => match self.graph().sdc.input_drive.get(&vx.name) {
+            _ => match self.graph().sdc.input_drive.get(&self.graph().vname(self.drvr)) {
                 Some(d) => self.sizing.libs.link_cell(&d.cell).map_or(0.0, |cell| cell.drive_resistance(&d.to_port)),
                 None => 0.0,
             },
@@ -322,7 +322,7 @@ impl Walk<'_, '_> {
     }
 
     fn repair_net_load(&self, bn: &mut BufferedNet, n: usize, pin: usize, level: usize, st: &mut State<'_>, trace: &mut Trace) -> Result<Down, Stop> {
-        let name = self.graph().vertices[pin].name.clone();
+        let name = self.graph().vname(pin);
         self.check_slew_limit(&name, bn.nodes[n].cap, bn.nodes[n].max_load_slew, self.corner, &mut st.pre)?;
         crate::tpush!(trace, "l|{level}|{name}|{}|{}", g(f64::from(bn.nodes[n].cap)), g(f64::from(bn.nodes[n].max_load_slew)));
         Ok((0, vec![name]))
@@ -388,7 +388,7 @@ impl Walk<'_, '_> {
         let sdc = sdc_on_pins(self.sdc, &nl, self.master_pins);
         let mut graph = Graph::build_with_pins(self.sizing.libs.scene_slice(k), &nl, Some(self.master_pins)).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
         graph.sdc = sdc;
-        let v = graph.vertices.iter().position(|x| x.name == r.output).ok_or_else(|| Stop::error("RSZ-INSERT", format!("{}: not in the timing graph", r.output)))?;
+        let v = (0..graph.vertices.len()).position(|x| graph.vname(x) == r.output).ok_or_else(|| Stop::error("RSZ-INSERT", format!("{}: not in the timing graph", r.output)))?;
         let (pin_cap, wire_cap, has_pi) = graph.load_cap_parts(v, &par, RISE);
         crate::tpush!(trace, "rtsd|{}|pin={}|wire={}|pi={has_pi}", r.output, g(f64::from(pin_cap)), g(f64::from(wire_cap)));
         Ok(graph.load_cap(v, &par))
@@ -626,7 +626,7 @@ mod tests {
         assert!(net_alone(&nl, 3).is_none());
         let load = |n: &Netlist| {
             let g = Graph::build(&libs, n).unwrap();
-            let v = g.vertices.iter().position(|x| x.name == "u1/Z").unwrap();
+            let v = (0..g.vertices.len()).position(|x| g.vname(x) == "u1/Z").unwrap();
             g.load_cap(v, &HashMap::new())
         };
         assert_eq!(load(&alone).to_bits(), load(&nl).to_bits());

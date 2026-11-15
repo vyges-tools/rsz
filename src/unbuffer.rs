@@ -171,7 +171,7 @@ impl<'t, 'g> Timer<'t, 'g> {
 /// tie); one scene, that scene's.
 fn slack_all(t: &Timer<'_, '_>, v: usize) -> f32 {
     let Some(m) = t.multi else { return t.search.vertex_slack(v) };
-    let name = &t.g.vertices[v].name;
+    let name = &t.g.vname(v);
     let mut best: Option<f32> = None;
     for (k, search) in m.searches.iter().enumerate() {
         if let Some(&u) = m.indices[k].get(name) {
@@ -194,7 +194,7 @@ fn check_capacitance_all(t: &Timer<'_, '_>, v: usize) -> (f32, f32, f32, bool, O
         }
         Some(m) => {
             let sc = timing::Scenes::new(m.graphs);
-            let Some(&v0) = m.indices[0].get(&t.g.vertices[v].name) else { return (0.0, 0.0, 0.0, false, None) };
+            let Some(&v0) = m.indices[0].get(&t.g.vname(v)) else { return (0.0, 0.0, 0.0, false, None) };
             timing::check_capacitance(&sc, v0, m.parasitics, &m.ideals[0], t.limits)
         }
     }
@@ -262,7 +262,7 @@ pub fn probe(ctx: &Ctx<'_>, t: &Timer<'_, '_>, stages: &[PathStage<'_>], index: 
         cell: cell_name.to_string(),
         in_port: in_port.to_string(),
         out_port: out.name.clone(),
-        prev_pin: t.g.vertices[prev.vertex].name.clone(),
+        prev_pin: t.g.vname(prev.vertex),
         fanout_reject: None,
         cap_reject: None,
         slack_lines: Vec::new(),
@@ -282,7 +282,7 @@ pub fn probe(ctx: &Ctx<'_>, t: &Timer<'_, '_>, stages: &[PathStage<'_>], index: 
         // (`passesCapGuard` sets `slack_scene`), the buffer's ports there (`scenePort`).
         (Some(_), Some(k)) => {
             let tk = t.at_scene(k);
-            let at = |v: usize| tk.index.get(&t.g.vertices[v].name).copied();
+            let at = |v: usize| tk.index.get(&t.g.vname(v)).copied();
             match (at(p.driver), at(p.prev), at(p.driver_input), ctx.libs.scene_cell(k, cell_name)) {
                 (Some(driver), Some(prev_k), Some(driver_input), Some(scene_cell)) => {
                     let pk = SlackParams { driver, prev: prev_k, driver_input, cell: scene_cell, ..p };
@@ -312,7 +312,7 @@ pub fn estimate_removal_gain(ctx: &Ctx<'_>, t: &Timer<'_, '_>, stages: &[PathSta
         Some(_) => t.at_scene(k),
         None => Timer { ..*t },
     };
-    let at = |v: usize| tk.index.get(&t.g.vertices[v].name).copied();
+    let at = |v: usize| tk.index.get(&t.g.vname(v)).copied();
     let (Some(driver), Some(prev_v), Some(driver_input)) = (at(st.vertex), at(prev.vertex), tk.index.get(&format!("{}/{}", r.inst, r.in_port)).copied()) else { return 0.0 };
     let scene_cell = if t.multi.is_some() { ctx.libs.scene_cell(k, &r.cell).unwrap_or(cell) } else { cell };
     let p = SlackParams { driver, driver_rf: st.rf, prev: prev_v, prev_rf: prev.rf, driver_input, inst: &r.inst, cell: scene_cell };
@@ -325,15 +325,15 @@ pub fn estimate_removal_gain(ctx: &Ctx<'_>, t: &Timer<'_, '_>, stages: &[PathSta
     // `maxLoadManhattenDistance(prev driver)` over its out edges, then the buffer's loads seen
     // from the previous driver.
     let g = tk.g;
-    let prev_loc = locate(&g.vertices[prev_v].name);
-    let old_dist = g.out_edges[prev_v].iter().map(|&e| manhattan(prev_loc, locate(&g.vertices[g.edges[e].to].name))).fold(0, i32::max);
+    let prev_loc = locate(&g.vname(prev_v));
+    let old_dist = g.out_edges[prev_v].iter().map(|&e| manhattan(prev_loc, locate(&g.vname(g.edges[e].to)))).fold(0, i32::max);
     let mut new_dist = old_dist;
     for &e in &g.out_edges[driver] {
         let load = g.edges[e].to;
         if load == driver || g.vertices[load].is_driver {
             continue;
         }
-        new_dist = new_dist.max(manhattan(prev_loc, locate(&g.vertices[load].name)));
+        new_dist = new_dist.max(manhattan(prev_loc, locate(&g.vname(load))));
     }
     // `wireSignalResistance` / `wireSignalCapacitance`: the mean of the layers' directions.
     let wire_res = (ctx.wire_rc.h_res + ctx.wire_rc.v_res) / 2.0;
@@ -355,7 +355,7 @@ fn manhattan(a: (i32, i32), b: (i32, i32)) -> i32 {
 /// fanout 0 when there is no limit, so then only the buffer's fanout counts.
 fn passes_fanout_guard(ctx: &Ctx<'_>, t: &Timer<'_, '_>, inst: &str, prev: usize, target_fanout: usize) -> Option<String> {
     let (fanout, limit, _) = timing::sta_check_fanout(t.g, t.info, prev, ctx.limits, t.ideal);
-    let prev_name = &t.g.vertices[prev].name;
+    let prev_name = &t.g.vname(prev);
     match fanout_rejects(fanout, limit, target_fanout) {
         None => None,
         Some(FanoutLimit::Timer(l)) => Some(format!("buffer {} is not removed because of max fanout limit of {} at {prev_name}", network_name(inst, ctx.hierarchy), fmt_float(l))),
@@ -393,7 +393,7 @@ fn passes_cap_guard(ctx: &Ctx<'_>, t: &Timer<'_, '_>, cell: &Cell, cell_name: &s
     let (drvr_cap, in_cap) = match (t.multi, scene) {
         (Some(_), Some(k)) => {
             let tk = t.at_scene(k);
-            let d = tk.index.get(&t.g.vertices[drvr].name).map_or(0.0, |&u| tk.g.load_cap(u, tk.parasitics));
+            let d = tk.index.get(&t.g.vname(drvr)).map_or(0.0, |&u| tk.g.load_cap(u, tk.parasitics));
             (d, ctx.libs.scene_cell(k, cell_name).map_or(0.0, |c| port_capacitance(c, &input.name)))
         }
         _ => (t.g.load_cap(drvr, t.parasitics), port_capacitance(cell, &input.name)),
@@ -402,7 +402,7 @@ fn passes_cap_guard(ctx: &Ctx<'_>, t: &Timer<'_, '_>, cell: &Cell, cell_name: &s
     if new_cap <= max_cap {
         return (None, scene);
     }
-    let line = format!("buffer {} is not removed because of max cap limit of {} at {}", network_name(inst, ctx.hierarchy), fmt_float(max_cap), t.g.vertices[prev].name);
+    let line = format!("buffer {} is not removed because of max cap limit of {} at {}", network_name(inst, ctx.hierarchy), fmt_float(max_cap), t.g.vname(prev));
     (Some(line), scene)
 }
 
@@ -469,11 +469,12 @@ fn compute_new_delays_slews(ctx: &Ctx<'_>, t: &Timer<'_, '_>, p: &SlackParams<'_
     let g = t.g;
     let vx = &g.vertices[p.prev];
     let prev_cell = vertex_cell(g, p.prev)?;
-    let prev_port = vx.port.as_deref()?;
+    let prev_port = vx.port()?;
     let (input, output) = p.cell.buffer_ports()?;
     let buffer_out = *t.index.get(&format!("{}/{}", p.inst, output.name))?;
     // annotateInputSlews(instance(prev_pin)): each input pin's slew, rise and fall.
-    let prev_inst = vx.name.rsplit_once('/').map(|(i, _)| i).unwrap_or("");
+    let prev_name = g.vname(p.prev);
+    let prev_inst = prev_name.rsplit_once('/').map(|(i, _)| i).unwrap_or("");
     let mut annotated: HashMap<&str, [f32; 2]> = HashMap::new();
     if let Some(pins) = vx.cell.as_deref().and_then(|c| ctx.master_pins.get(c)) {
         for pin in pins {
@@ -485,7 +486,7 @@ fn compute_new_delays_slews(ctx: &Ctx<'_>, t: &Timer<'_, '_>, p: &SlackParams<'_
         }
     }
     for (port, s) in &annotated {
-        raw_dump(format!("VYGA|{}|{port}|{},{}\n", vx.name, bits(s[0]), bits(s[1])));
+        raw_dump(format!("VYGA|{}|{port}|{},{}\n", g.vname(p.prev), bits(s[0]), bits(s[1])));
     }
     let in_slew = |from: &str, rf: usize| annotated.get(from).map_or(ctx.tgt_slews[rf], |s| s[rf]);
     let old_load_cap = g.load_cap(p.prev, t.parasitics);
@@ -529,7 +530,7 @@ fn estimated_slack_ok(ctx: &Ctx<'_>, t: &Timer<'_, '_>, p: &SlackParams<'_>, sce
     raw_dump(format!(
         "VYGE|{}|prev={}|prf={}|drf={}|oc={}|nc={}|od={},{}|nd={},{}|os={},{}|ns={},{}|dlc={}|degrad={}|imp={}\n",
         p.inst,
-        g.vertices[p.prev].name,
+        g.vname(p.prev),
         p.prev_rf,
         p.driver_rf,
         bits(old_cap),
@@ -550,7 +551,7 @@ fn estimated_slack_ok(ctx: &Ctx<'_>, t: &Timer<'_, '_>, p: &SlackParams<'_>, sce
     for &(load, estimated) in &load_pin_slew {
         let old_load_slew = [g.slew[load][0][MAX], g.slew[load][1][MAX]];
         let new_load_slew = [estimated, estimated];
-        lines.push(format!("estimated in slew at fanout pin {} is {}, prev drvr out slew={}", g.vertices[load].name, fmt_float(estimated), fmt_float(new_drvr_slew[p.prev_rf])));
+        lines.push(format!("estimated in slew at fanout pin {} is {}, prev drvr out slew={}", g.vname(load), fmt_float(estimated), fmt_float(new_drvr_slew[p.prev_rf])));
         if !estimate_input_slew_impact(ctx, t, load, old_load_slew, new_load_slew, delay_degrad - delay_imp, p.inst, true, &mut lines) {
             return (false, lines);
         }
@@ -609,7 +610,8 @@ fn estimate_input_slew_impact(ctx: &Ctx<'_>, t: &Timer<'_, '_>, load: usize, old
         }
         return true;
     }
-    let load_inst = vx.name.rsplit_once('/').map_or("", |(i, _)| i);
+    let load_name = g.vname(load);
+    let load_inst = load_name.rsplit_once('/').map_or("", |(i, _)| i);
     let Some(cell) = vertex_cell(g, load) else { return true };
     let Some(pins) = vx.cell.as_deref().and_then(|c| ctx.master_pins.get(c)) else { return true };
     for pin in pins {
@@ -650,7 +652,7 @@ fn estimate_input_slew_impact(ctx: &Ctx<'_>, t: &Timer<'_, '_>, load: usize, old
 /// global route as a buffered net. ⚠️ A route that misses a load (RSZ-0074) gives none here.
 fn make_buffered_net(ctx: &Ctx<'_>, t: &Timer<'_, '_>, drvr: usize) -> Option<(BufferedNet, usize)> {
     let net = t.g.vertex_net[drvr]?;
-    let shape = (t.steiner)(&t.g.netlist.nets[net].name, &t.g.vertices[drvr].name)?;
+    let shape = (t.steiner)(&t.g.netlist.nets[net].name, &t.g.vname(drvr))?;
     let bctx = buffered_net::Ctx { graph: t.g, libs: ctx.libs, sdc: ctx.sdc, limits: ctx.limits, dbu: ctx.dbu, rc: ctx.wire_rc };
     buffered_net::make_buffered_net(&bctx, &shape).ok().flatten()
 }
@@ -801,9 +803,9 @@ fn estimate_slews_after_buffer_removal(ctx: &Ctx<'_>, t: &Timer<'_, '_>, p: &Sla
         }
     }
     let mut ordered: Vec<(usize, f32)> = load_pin_slew.into_iter().collect();
-    let id = |v: usize| t.info.pin_id.get(&g.vertices[v].name).copied().unwrap_or(u64::MAX);
+    let id = |v: usize| t.info.pin_id.get(&g.vname(v)).copied().unwrap_or(u64::MAX);
     for &(v, _) in &ordered {
-        raw_dump(format!("VYGO|{}|{}|id={}|addr={:?}\n", p.inst, g.vertices[v].name, id(v), ctx.pin_addr.and_then(|pa| pa.addr(id(v)))));
+        raw_dump(format!("VYGO|{}|{}|id={}|addr={:?}\n", p.inst, g.vname(v), id(v), ctx.pin_addr.and_then(|pa| pa.addr(id(v)))));
     }
     match ctx.pin_addr.filter(|pa| ordered.iter().all(|&(v, _)| pa.addr(id(v)).is_some())) {
         Some(pa) => ordered.sort_by_key(|&(v, _)| pa.addr(id(v))),
@@ -819,7 +821,7 @@ fn estimate_slews_after_buffer_removal(ctx: &Ctx<'_>, t: &Timer<'_, '_>, p: &Sla
 /// pins, and on some designs the reference's own order differs run to run; that changes only which
 /// loads print before the first rejection, never the verdict (every load must pass).
 fn pointer_order(t: &Timer<'_, '_>, v: usize) -> (bool, u64) {
-    pin_table_order(t.info.pin_id.get(&t.g.vertices[v].name).copied().unwrap_or(u64::MAX))
+    pin_table_order(t.info.pin_id.get(&t.g.vname(v)).copied().unwrap_or(u64::MAX))
 }
 
 /// From `NetInfo::pin_id` (an instance pin's ITerm id × 2, a port's BTerm id × 2 + 1): the

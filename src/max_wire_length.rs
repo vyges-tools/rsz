@@ -172,7 +172,7 @@ pub fn cell_wire_delay(ctx: &Ctx<'_>, cell: &str, drvr_port: &str, load_port: &s
         .into();
         let mut g = crate::repair_design::timer_graph(ctx.libs, k, &netlist, &sdc, ctx.master_pins)?;
         g.find_delays(&par, None).map_err(|e| Stop::error("RSZ-MWL", e))?;
-        let v = |n: &str| g.vertices.iter().position(|x| x.name == n);
+        let v = |n: &str| (0..g.vertices.len()).position(|x| g.vname(x) == n);
         let (Some(d), Some(l)) = (v(&drvr_name), v(&load_name)) else { return Err(Stop::error("RSZ-MWL", "scratch pins not in the graph".into())) };
         let wire = g.edges.iter().position(|e| e.from == d && e.to == l && matches!(e.kind, EdgeKind::Wire)).ok_or_else(|| Stop::error("RSZ-MWL", "no wire edge".into()))?;
         let scene_cell = ctx.libs.scene_cell(k, cell).ok_or_else(|| Stop::error("RSZ-MWL", format!("{cell}: not in scene {k}")))?;

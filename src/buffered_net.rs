@@ -177,7 +177,7 @@ impl BufferedNet {
         use vyges_sta::liberty::{FALL, MAX, RISE};
         let mut node = BNode { kind: Kind::Load { pin }, x: at.0, y: at.1, layer: NULL_LAYER, cap: 0.0, fanout: 1.0, max_load_slew: INF };
         let vx = &ctx.graph.vertices[pin];
-        if let (Some(lib), Some(cell), Some(port)) = (vx.lib, vx.cell.as_deref(), vx.port.as_deref()) {
+        if let (Some(lib), Some(cell), Some(port)) = (vx.lib, vx.cell.as_deref(), vx.port()) {
             let scene_lib = &ctx.graph.libs[lib];
             let link_lib = ctx.libs.link_library(cell).unwrap_or(scene_lib);
             if let (Some(p), Some(lp)) = (scene_lib.cells.get(cell).and_then(|c| c.port(port)), link_lib.cells.get(cell).and_then(|c| c.port(port))) {
@@ -185,7 +185,7 @@ impl BufferedNet {
                 node.fanout = lp.fanout_load.or(link_lib.default_fanout_load).unwrap_or(0.0);
                 node.max_load_slew = timing::max_input_slew_at(link_lib, scene_lib, p.direction, p.max_transition, ctx.limits);
             }
-        } else if let Some(c) = ctx.sdc.port_pin_cap.get(&vx.name) {
+        } else if let Some(c) = ctx.sdc.port_pin_cap.get(&ctx.graph.vname(pin)) {
             for rf in [RISE, FALL] {
                 if let Some(pin_cap) = c[rf][MAX] {
                     node.cap = node.cap.max(pin_cap);
@@ -438,7 +438,7 @@ pub fn trace_tree(bn: &BufferedNet, n: usize, level: usize, g: &Graph<'_>, out: 
     use crate::trace::g9;
     let node = &bn.nodes[n];
     let (kind, pin) = match &node.kind {
-        Kind::Load { pin } => ("load", g.vertices[*pin].name.clone()),
+        Kind::Load { pin } => ("load", g.vname(*pin)),
         Kind::Junction { .. } => ("junction", "-".to_string()),
         Kind::Wire { .. } => ("wire", "-".to_string()),
         Kind::Via { .. } => ("via", "-".to_string()),

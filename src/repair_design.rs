@@ -210,7 +210,8 @@ fn repair_design_held(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args,
     // findAllArrivals: the timing graphs (one per scene), levelized, their delays found.
     let netlist = design.netlist_shared();
     let (mut graphs, fresh) = timer_preambles(inputs, &netlist)?;
-    let level = session_levels(graphs[0].vertices.iter().map(|v| v.name.as_str()), fresh, args.sta_levels.as_ref());
+    let level_names: Vec<String> = (0..graphs[0].vertices.len()).map(|v| graphs[0].vname(v)).collect();
+    let level = session_levels(level_names.iter().map(String::as_str), fresh, args.sta_levels.as_ref());
     crate::stage("rd:preambles_findAllArrivals");
     if args.pre_placement {
         return Err(Stop::refused("RSZ-ABSENT", "the early sizing round (-pre_placement / -buffer_gain) is not modelled".into()));
@@ -249,8 +250,8 @@ fn repair_design_held(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args,
     for &v in &loads {
         for (k, anns) in by_load.iter().enumerate() {
             if let Some(a) = anns.get(&v) {
-                crate::tpush!(trace, "annot|{}|{}|{}", g0.vertices[v].name, inputs.libs.scene_name(k), g9(f64::from(a.limit)));
-                annotated[k].insert(g0.vertices[v].name.clone(), a.limit);
+                crate::tpush!(trace, "annot|{}|{}|{}", g0.vname(v), inputs.libs.scene_name(k), g9(f64::from(a.limit)));
+                annotated[k].insert(g0.vname(v), a.limit);
                 // a net's drivers once per net, not once per annotated load on it (a pass over
                 // every pin of the net each time: quadratic on a high-fanout net)
                 let drivers = match g0.vertex_net[v] {
@@ -258,7 +259,7 @@ fn repair_design_held(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args,
                     None => &no_drivers,
                 };
                 for &d in drivers.iter() {
-                    drvr_with_load_slew_viol.insert(g0.vertices[d].name.clone(), k);
+                    drvr_with_load_slew_viol.insert(g0.vname(d), k);
                 }
             }
         }
@@ -266,7 +267,7 @@ fn repair_design_held(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args,
     trace.ran(&["annot"]);
     crate::stage("rd:forward_pass");
     // Fix violations from outputs to inputs: the drivers, levelized ONCE, from the LAST.
-    let drivers: Vec<String> = timing::levelized_drvr_vertices(g0, &level).into_iter().map(|d| g0.vertices[d].name.clone()).collect();
+    let drivers: Vec<String> = timing::levelized_drvr_vertices(g0, &level).into_iter().map(|d| g0.vname(d)).collect();
     crate::stage("rd:levelizedDrvrVertices");
     // The incremental timer from here: the forward pass's timed graphs are its state (delays
     // exist), and every edit from now on is recorded for it.
@@ -462,8 +463,8 @@ fn probe_pins(gs: &[Graph<'_>], driver: Option<&str>, tag: &str) {
     };
     for (k, g) in gs.iter().enumerate() {
         for (v, x) in g.vertices.iter().enumerate() {
-            if x.name.rsplit_once('/').is_some_and(|(i, _)| insts.contains(&i)) {
-                let _ = writeln!(f, "PROBE {tag} {} scene={k} {} drv={} slew_r={:e} slew_f={:e}", driver.unwrap_or("-"), x.name, x.is_driver, g.slew[v][0][vyges_sta::liberty::MAX], g.slew[v][1][vyges_sta::liberty::MAX]);
+            if g.vname(v).rsplit_once('/').is_some_and(|(i, _)| insts.contains(&i)) {
+                let _ = writeln!(f, "PROBE {tag} {} scene={k} {} drv={} slew_r={:e} slew_f={:e}", driver.unwrap_or("-"), g.vname(v), x.is_driver, g.slew[v][0][vyges_sta::liberty::MAX], g.slew[v][1][vyges_sta::liberty::MAX]);
             }
         }
     }
@@ -605,7 +606,7 @@ pub fn repair_clk_nets(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers
         let netlist = design.netlist_shared();
         let graphs = current_graphs(inputs, &netlist, &annotated)?;
         let g0 = &graphs[0];
-        let mut drivers: Vec<String> = timing::clock_pins(g0, sources).into_iter().filter(|&v| g0.vertices[v].is_driver).map(|v| g0.vertices[v].name.clone()).collect();
+        let mut drivers: Vec<String> = timing::clock_pins(g0, sources).into_iter().filter(|&v| g0.vertices[v].is_driver).map(|v| g0.vname(v)).collect();
         drivers.sort_by_key(|p| pin_order(p));
         drop(graphs);
         for name in drivers {
@@ -733,7 +734,7 @@ fn current_graphs<'n>(inputs: &Inputs<'n>, netlist: &Arc<Netlist>, annotated: &[
             g.slew_annotated = if index.len() == g.vertices.len() {
                 annotated[k].iter().filter_map(|(name, &l)| index.get(name).map(|&i| (i, l))).collect()
             } else {
-                g.vertices.iter().enumerate().filter_map(|(i, v)| annotated[k].get(&v.name).map(|&l| (i, l))).collect()
+                (0..g.vertices.len()).filter_map(|i| annotated[k].get(&g.vname(i)).map(|&l| (i, l))).collect()
             };
             g.slew_blocked = Some(blocked.get_or_insert_with(|| Arc::new(slew_blocked(&g, annotated))).clone());
             Ok(g)
@@ -761,8 +762,8 @@ fn slew_blocked(g: &Graph<'_>, annotated: &[HashMap<String, f32>]) -> HashMap<us
             }
         } else {
             // a name shared by two vertices (a bidirect pin): both, as the annotations take them
-            for (v, x) in g.vertices.iter().enumerate() {
-                if names.contains_key(&x.name) {
+            for v in 0..g.vertices.len() {
+                if names.contains_key(&g.vname(v)) {
                     blocked.entry(v).or_default()[mm] = true;
                 }
             }
@@ -998,29 +999,29 @@ fn edited_differs(g: &Graph<'_>, f: &Graph<'_>, inc: &IncTimer) -> Option<String
     if let Some(why) = g.differs_from_build(f) {
         return Some(why);
     }
-    let names = |gr: &Graph<'_>, s: &mut dyn Iterator<Item = usize>| -> BTreeSet<String> { s.map(|v| gr.vertices[v].name.clone()).collect() };
+    let names = |gr: &Graph<'_>, s: &mut dyn Iterator<Item = usize>| -> BTreeSet<String> { s.map(|v| gr.vname(v)).collect() };
     if names(g, &mut g.ideal_clock.iter().copied()) != names(f, &mut f.ideal_clock.iter().copied()) {
         return Some("ideal clock pins".into());
     }
-    let annot = |gr: &Graph<'_>| -> BTreeMap<String, u32> { gr.slew_annotated.iter().map(|(&v, &l)| (gr.vertices[v].name.clone(), l.to_bits())).collect() };
+    let annot = |gr: &Graph<'_>| -> BTreeMap<String, u32> { gr.slew_annotated.iter().map(|(&v, &l)| (gr.vname(v), l.to_bits())).collect() };
     if annot(g) != annot(f) {
         return Some("annotated slews".into());
     }
-    let fix: HashMap<(&str, bool), usize> = f.vertices.iter().enumerate().map(|(i, v)| ((v.name.as_str(), v.is_driver), i)).collect();
+    let fix: HashMap<(String, bool), usize> = f.vertices.iter().enumerate().map(|(i, v)| ((f.vname(i), v.is_driver), i)).collect();
     for (v, x) in g.vertices.iter().enumerate() {
-        let w = fix[&(x.name.as_str(), x.is_driver)];
+        let w = fix[&(g.vname(v), x.is_driver)];
         if g.slew[v] != f.slew[w] {
-            return Some(format!("{}: slew {:?}, a fresh build {:?}", x.name, g.slew[v], f.slew[w]));
+            return Some(format!("{}: slew {:?}, a fresh build {:?}", g.vname(v), g.slew[v], f.slew[w]));
         }
     }
     let pending = |name: &str| inc.invalid_delays.contains(name) || inc.delay_queue.contains(name);
     let delays = |gr: &Graph<'_>| -> BTreeMap<(String, String, String), Vec<[u32; 2]>> {
         (0..gr.vertices.len())
             .flat_map(|v| gr.out_edges[v].iter().copied())
-            .filter(|&e| !pending(&gr.vertices[gr.edges[e].from].name) && !pending(&gr.vertices[gr.edges[e].to].name))
+            .filter(|&e| !pending(&gr.vname(gr.edges[e].from)) && !pending(&gr.vname(gr.edges[e].to)))
             .map(|e| {
                 let ed = &gr.edges[e];
-                ((gr.vertices[ed.from].name.clone(), gr.vertices[ed.to].name.clone(), format!("{:?}", ed.kind)), gr.delay[e].iter().map(|d| [d[0].to_bits(), d[1].to_bits()]).collect())
+                ((gr.vname(ed.from), gr.vname(ed.to), format!("{:?}", ed.kind)), gr.delay[e].iter().map(|d| [d[0].to_bits(), d[1].to_bits()]).collect())
             })
             .collect()
     };
@@ -1275,7 +1276,7 @@ fn make_fanout_repeater(repeater_loads: &mut Vec<String>, repeater_inputs: &mut 
 #[allow(clippy::too_many_arguments)]
 fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, net: &str, check_fanout: bool, corner_w_load_slew_viol: Option<usize>, ctx: &mut NetCtx<'g, '_>, outcome: &mut Outcome, trace: &mut Trace, held_index: Option<&HashMap<String, usize>>) -> Result<Vec<Graph<'g>>, Stop> {
     let inputs = ctx.inputs;
-    let name = graphs[0].vertices[drvr].name.clone();
+    let name = graphs[0].vname(drvr);
     let checks = ctx.checks;
     crate::tpush!(trace, "net|{name}|{}|{}|{check_fanout}|{}|{}", checks.slew, checks.cap, ctx.max_length, checks.resize_drvr);
     trace.ran(&["net", "fo", "fanloads", "dslew", "lslew", "cap"]);
@@ -1492,7 +1493,7 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
             // models at the violation's corner.
             if slack1 < 0.0 {
                 let c1 = corner1.expect("a violation has a scene");
-                if let (Some(cell), Some(port)) = (gs!()[0].vertices[drvr].cell.as_deref(), gs!()[0].vertices[drvr].port.as_deref()) {
+                if let (Some(cell), Some(port)) = (gs!()[0].vertices[drvr].cell.as_deref(), gs!()[0].vertices[drvr].port()) {
                     let link = inputs.libs.link_cell(cell).expect("a link cell");
                     let scene_cell = inputs.libs.scene_cell(c1, cell).expect("a scene cell");
                     max_cap = driver_slew::find_slew_load_cap(link, scene_cell, port, f64::from(max_slew1), ctx.sizing.tgt_slews, trace) as f32;
@@ -1725,9 +1726,9 @@ fn driver_max_slack(design: &dyn Design, graphs: &mut [Graph<'_>], drvr_pin: &st
         let mut search = vyges_sta::search::Search::in_graph_order(g, sdc);
         search.find_arrivals().map_err(|e| Stop::refused("RSZ-TIMER", e))?;
         search.find_requireds().map_err(|e| Stop::refused("RSZ-TIMER", e))?;
-        for (v, vx) in g.vertices.iter().enumerate().filter(|(_, vx)| vx.is_driver) {
+        for (v, _) in g.vertices.iter().enumerate().filter(|(_, vx)| vx.is_driver) {
             let s = search.slack_of(v, vyges_sta::liberty::MAX, None);
-            slacks.entry(vx.name.clone()).and_modify(|m| *m = m.min(s)).or_insert(s);
+            slacks.entry(g.vname(v)).and_modify(|m| *m = m.min(s)).or_insert(s);
         }
     }
     ctx.max_slacks = slacks;
@@ -1760,7 +1761,8 @@ fn set_mid_update_slacks<'n>(inputs: &Inputs<'n>, design: &mut dyn Design, ctx: 
         let mut search = vyges_sta::search::Search::in_graph_order(g, sdc);
         search.find_arrivals().map_err(|e| Stop::refused("RSZ-TIMER", e))?;
         search.find_requireds().map_err(|e| Stop::refused("RSZ-TIMER", e))?;
-        let index: HashMap<&str, usize> = g.vertices.iter().enumerate().map(|(i, v)| (v.name.as_str(), i)).collect();
+        let names: Vec<String> = (0..g.vertices.len()).map(|v| g.vname(v)).collect();
+        let index: HashMap<&str, usize> = names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
         for n in &g.netlist.nets {
             let loads: Vec<usize> = n.pins.iter().filter_map(|c| index.get(g.netlist.pin_name(c).as_str()).copied()).filter(|&v| !g.vertices[v].is_driver).collect();
             let s = search.net_slack(&loads);
@@ -1782,15 +1784,15 @@ fn mid_update_pins_dump(g: &Graph<'_>, search: &vyges_sta::search::Search<'_, '_
     let (Ok(want), Ok(path)) = (std::env::var("VYGES_RSZ_RRT_PINS"), std::env::var("VYGES_RSZ_RRT_TRACE")) else { return };
     let Some(n) = g.netlist.nets.iter().find(|n| n.name == want) else { return };
     let mut pins: Vec<String> = n.pins.iter().map(|c| g.netlist.pin_name(c)).collect();
-    if let Some(d) = pins.iter().find(|p| g.vertices.iter().any(|v| v.is_driver && &v.name == *p)).cloned() {
+    if let Some(d) = pins.iter().find(|p| (0..g.vertices.len()).any(|v| g.vertices[v].is_driver && g.vname(v) == **p)).cloned() {
         if let Some((inst, _)) = d.rsplit_once('/') {
             let prefix = format!("{inst}/");
-            for v in g.vertices.iter().filter(|v| v.name.starts_with(&prefix) && v.name != d) {
-                pins.push(v.name.clone());
+            for (vi, v) in g.vertices.iter().enumerate().filter(|(vi, _)| { let n = g.vname(*vi); n.starts_with(&prefix) && n != d }) {
+                pins.push(g.vname(vi));
                 // ...and the driver of that input's net, one level upstream.
                 if !v.is_driver {
-                    if let Some(up) = g.netlist.nets.iter().find(|m| m.pins.iter().any(|c| g.netlist.pin_name(c) == v.name)) {
-                        pins.extend(up.pins.iter().map(|c| g.netlist.pin_name(c)).filter(|p| g.vertices.iter().any(|x| x.is_driver && &x.name == p)));
+                    if let Some(up) = g.netlist.nets.iter().find(|m| m.pins.iter().any(|c| g.netlist.pin_name(c) == g.vname(vi))) {
+                        pins.extend(up.pins.iter().map(|c| g.netlist.pin_name(c)).filter(|p| (0..g.vertices.len()).any(|x| g.vertices[x].is_driver && g.vname(x) == *p)));
                     }
                 }
             }
@@ -1798,7 +1800,7 @@ fn mid_update_pins_dump(g: &Graph<'_>, search: &vyges_sta::search::Search<'_, '_
     }
     let mut out = String::new();
     for p in pins {
-        let Some(v) = g.vertices.iter().position(|x| x.name == p) else { continue };
+        let Some(v) = (0..g.vertices.len()).position(|x| g.vname(x) == p) else { continue };
         let (mut arr, mut req) = (-timing::INF, timing::INF);
         for path in search.paths[v].iter().filter(|x| x.tag.mm == vyges_sta::liberty::MAX) {
             arr = arr.max(path.arrival);
@@ -1825,9 +1827,9 @@ fn repair_driver_slew(design: &dyn Design, graphs: &[Graph<'_>], corner: usize, 
     let dk = sc.at(corner, drvr);
     let load_cap = g.load_cap(dk, design.parasitics(corner));
     let vx = &g.vertices[dk];
-    crate::tpush!(trace, "rds|{}|{}|{}", vx.name, vx.cell.as_deref().unwrap_or("-"), g9(f64::from(load_cap)));
-    let (Some(cell), Some(port), true) = (vx.cell.as_deref(), vx.port.as_deref(), vx.name.contains('/')) else { return Ok(None) };
-    let inst = inst_of(&vx.name);
+    crate::tpush!(trace, "rds|{}|{}|{}", g.vname(dk), vx.cell.as_deref().unwrap_or("-"), g9(f64::from(load_cap)));
+    let (Some(cell), Some(port), true) = (vx.cell.as_deref(), vx.port(), g.vname(dk).contains('/')) else { return Ok(None) };
+    let inst = inst_of(&g.vname(dk));
     let d = driver_slew::Driver {
         inst: &inst,
         cell,
@@ -1839,7 +1841,7 @@ fn repair_driver_slew(design: &dyn Design, graphs: &[Graph<'_>], corner: usize, 
     // the graph's clock pins, kept by every edit (`edit_graphs`), not walked again: a walk per
     // call was O(design) (`findClkPins`' set is likewise kept by the reference's clock network)
     if std::env::var_os("VYGES_RSZ_CHECK_CLOCKS").is_some() {
-        assert_eq!(g.ideal_clock, timing::clock_pins(g, ctx.inputs.clock_sources).into_iter().collect(), "kept clock pins stale at {}", vx.name);
+        assert_eq!(g.ideal_clock, timing::clock_pins(g, ctx.inputs.clock_sources).into_iter().collect(), "kept clock pins stale at {}", g.vname(dk));
     }
     driver_slew::repair_driver_slew(g, corner, &d, load_cap, ctx.sizing, &ctx.inputs.limits, ctx.args.slew_margin, &g.ideal_clock, trace)
 }
@@ -1848,7 +1850,7 @@ fn repair_driver_slew(design: &dyn Design, graphs: &[Graph<'_>], corner: usize, 
 /// (`makeBufferedNetSteiner`, printed) or the global route (`makeBufferedNetGroute`; none for a
 /// one-terminal net, an error for a route that misses a load).
 fn make_buffered_net(design: &dyn Design, g: &Graph<'_>, drvr: usize, net: &str, corner: usize, ctx: &NetCtx<'_, '_>, trace: &mut Trace) -> Result<Option<(buffered_net::BufferedNet, usize)>, String> {
-    let shape = design.net_shape(net, &g.vertices[drvr].name);
+    let shape = design.net_shape(net, &g.vname(drvr));
     match (builder_of(shape.as_ref()), shape) {
         (Builder::Groute, Some(buffered_net::NetShape::Groute(route))) => {
             let bctx = buffered_net::Ctx { graph: g, libs: ctx.inputs.libs, sdc: &ctx.inputs.sdc, limits: &ctx.inputs.limits, dbu: ctx.inputs.dbu, rc: ctx.inputs.wire_rc[corner] };
@@ -1881,14 +1883,14 @@ fn builder_of(shape: Option<&buffered_net::NetShape>) -> Builder {
 /// `Resizer::makeBufferedNetSteiner(drvr_pin, corner)`: the driver net's Steiner tree, printed,
 /// then the buffered net built from it at the corner (`g` is its timer).
 fn make_buffered_net_steiner(design: &dyn Design, g: &Graph<'_>, drvr: usize, net: &str, corner: usize, ctx: &NetCtx<'_, '_>, trace: &mut Trace) -> Option<(buffered_net::BufferedNet, usize)> {
-    let tree = design.steiner(net, &g.vertices[drvr].name)?;
+    let tree = design.steiner(net, &g.vname(drvr))?;
     steiner_buffered_net(&tree, g, drvr, corner, ctx, trace)
 }
 
 /// A Steiner tree, printed, as a buffered net at the corner (`g` is its timer).
 fn steiner_buffered_net(tree: &buffered_net::Tree, g: &Graph<'_>, drvr: usize, corner: usize, ctx: &NetCtx<'_, '_>, trace: &mut Trace) -> Option<(buffered_net::BufferedNet, usize)> {
     if !trace.off {
-    buffered_net::trace_steiner(tree, &g.vertices[drvr].name, &mut trace.lines);
+    buffered_net::trace_steiner(tree, &g.vname(drvr), &mut trace.lines);
     }
     let bctx = buffered_net::Ctx { graph: g, libs: ctx.inputs.libs, sdc: &ctx.inputs.sdc, limits: &ctx.inputs.limits, dbu: ctx.inputs.dbu, rc: ctx.inputs.wire_rc[corner] };
     buffered_net::make_buffered_net_steiner(&bctx, tree)
@@ -2008,8 +2010,8 @@ mod tests {
         let master_pins: HashMap<String, Vec<String>> = [("dff".to_string(), vec!["D".into(), "CK".into(), "Q".into()])].into();
         let inputs = Inputs { libs: &libs, masters: &masters, dont_use: &dont_use, limits: Limits::default(), clock_sources: &sources, dbu: 1000, wire_rc: vec![WireRc::default()], sdc: SdcEnv::default(), sizing_limits: Default::default(), master_pins, clock_pattern: Default::default() };
         let (graphs, _) = timer_preambles(&inputs, &netlist).unwrap();
-        let ck = graphs[0].vertices.iter().position(|v| v.name == "r/CK").unwrap();
-        let d = graphs[0].vertices.iter().position(|v| v.name == "r/D").unwrap();
+        let ck = (0..graphs[0].vertices.len()).position(|v| graphs[0].vname(v) == "r/CK").unwrap();
+        let d = (0..graphs[0].vertices.len()).position(|v| graphs[0].vname(v) == "r/D").unwrap();
         assert!(graphs[0].ideal_clock.contains(&ck), "the register's clock pin is ideal");
         assert!(!graphs[0].ideal_clock.contains(&d), "a data pin is not");
         let again = current_graphs(&inputs, &Arc::new(netlist.clone()), &[HashMap::new()]).unwrap();

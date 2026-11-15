@@ -399,7 +399,7 @@ impl Reader<'_, '_> {
 
     /// The vertex of pin `name` (a driver or a load, as asked).
     fn vertex_of(&self, name: &str, driver: bool) -> Option<usize> {
-        self.g.vertices.iter().position(|x| x.name == name && x.is_driver == driver)
+        (0..self.g.vertices.len()).position(|x| self.g.vname(x) == name && self.g.vertices[x].is_driver == driver)
     }
 
     /// `GraphDelayCalc::edgeFromSlew`: the ideal clock's slew (`idealClkSlew`: its
@@ -429,7 +429,7 @@ impl Reader<'_, '_> {
         let v = path[index].vertex;
         let vx = &self.g.vertices[v];
         // `network->libertyPort(driver_pin)`: an instance pin of a liberty cell.
-        let (Some(cell_name), Some(out_port)) = (vx.cell.as_deref(), vx.port.as_deref()) else { return Err(FailReason::MissingOutputPort) };
+        let (Some(cell_name), Some(out_port)) = (vx.cell.as_deref(), vx.port()) else { return Err(FailReason::MissingOutputPort) };
         if vx.lib.is_none() {
             return Err(FailReason::MissingOutputPort);
         }
@@ -460,7 +460,7 @@ impl Reader<'_, '_> {
         // `network->findPin(inst, port)` → `pinDrvrVertex`: the pin's one vertex, a bidirect's
         // driver vertex — an output port too (an output-to-output arc, a half adder's CON -> SN,
         // reads the output's own slew).
-        let of_pin = |x: &vyges_sta::graph::Vertex| x.port.as_deref() == Some(set.from.as_str()) && matches!(&x.conn, vyges_sta::netlist::Conn::Inst(j, _) if j == k);
+        let of_pin = |x: &vyges_sta::graph::Vertex| x.port() == Some(set.from.as_str()) && matches!(&x.conn, vyges_sta::netlist::Conn::Inst(j, _) if j == k);
         let pin = self.g.vertices.iter().position(|x| of_pin(x) && x.is_driver).or_else(|| self.g.vertices.iter().position(of_pin));
         let Some(u) = pin else { return 0.0 };
         self.edge_from_slew(u, set.arcs[arc.arc].from_rf, set.role)
@@ -542,7 +542,7 @@ impl Reader<'_, '_> {
             }
         }
         Ok(DelayStageState {
-            driver_pin: self.g.vertices[driver].name.clone(),
+            driver_pin: self.g.vname(driver),
             input_slew,
             load_cap,
             current_model_delay,
@@ -812,7 +812,7 @@ impl Reader<'_, '_> {
                 let Some(driver) = drivers.first() else { continue };
                 let Some(dv) = self.vertex_of(driver, true) else { continue };
                 let dx = &self.g.vertices[dv];
-                let Some((dcell, dport)) = dx.cell.as_deref().zip(dx.port.as_deref()) else { continue };
+                let Some((dcell, dport)) = dx.cell.as_deref().zip(dx.port()) else { continue };
                 let Some(dlink) = self.libs.link_cell(dcell) else { continue };
                 if dlink.port(dport).is_none() {
                     continue;
@@ -930,7 +930,7 @@ pub fn min_max_compare(mm: usize, a: f32, b: f32) -> bool {
 /// the driver's net has a `set_load` (it takes precedence over parasitics), else the net's
 /// reduced pi model.
 fn find_parasitic_pi(g: &Graph<'_>, driver: usize, rf: usize, parasitics: &HashMap<String, NetParasitics>) -> Option<(f32, f32, f32)> {
-    if g.sdc.net_wire_cap.contains_key(&g.vertices[driver].name) {
+    if g.sdc.net_wire_cap.contains_key(&g.vname(driver)) {
         return None;
     }
     g.reduced_pi(driver, rf, MAX, parasitics)
@@ -1298,7 +1298,7 @@ mod tests {
         let pi = vyges_sta::parasitics::PiElmore { c2: 1e-15, rpi: 10.0, c1: 2e-15, elmore: Vec::new() };
         let mut par = HashMap::new();
         par.insert("n1".to_string(), NetParasitics { node_names: vec!["u1/Z".into(), "u2/A".into()], pi: Some(pi), ..Default::default() });
-        let u1z = g.vertices.iter().position(|v| v.name == "u1/Z").unwrap();
+        let u1z = (0..g.vertices.len()).position(|v| g.vname(v) == "u1/Z").unwrap();
         assert_eq!(find_parasitic_pi(&g, u1z, 0, &par), Some((1e-15, 10.0, 2e-15)));
         g.sdc.net_wire_cap.insert("u1/Z".into(), [Some((1e-12, false)); 2]);
         assert_eq!(find_parasitic_pi(&g, u1z, 0, &par), None);

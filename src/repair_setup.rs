@@ -354,8 +354,8 @@ fn effort_delays(g: &Graph<'_>, s: &Search<'_, '_>, drvr: usize) -> Option<(f32,
     for &e in g.in_edges[drvr].iter().rev() {
         let from = g.edges[e].from;
         let fx = &g.vertices[from];
-        let from_output = match (&fx.cell, &fx.port) {
-            (Some(c), Some(p)) => g.libs[fx.lib.unwrap_or(0)].cells.get(c.as_str()).and_then(|c| c.port(p)).is_some_and(|p| matches!(p.direction, vyges_sta::liberty::Direction::Output)),
+        let from_output = match (fx.cell.as_deref(), fx.port()) {
+            (Some(c), Some(p)) => g.libs[fx.lib.unwrap_or(0)].cells.get(c).and_then(|c| c.port(p)).is_some_and(|p| matches!(p.direction, vyges_sta::liberty::Direction::Output)),
             _ => false,
         };
         if from_output {
@@ -428,11 +428,11 @@ fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], timer: &mut Tim
             Some(_) if gs.len() > 1 => return Err(Stop::refused("RSZ-ABSENT", "repair_timing -path_group over several corners: not modelled".into())),
             Some(name) => {
                 let group_ends = ss[0].group_path_ends(crate::path_group::sta_group_name(name), MAX, usize::MAX, -INF, INF);
-                let points: Vec<Point> = group_ends.iter().map(|e| Point { pin: gs[0].vertices[e.vertex].name.clone(), slack: e.slack, wns_slack: e.slack }).collect();
-                let paths: HashMap<String, (usize, usize)> = group_ends.iter().map(|e| (gs[0].vertices[e.vertex].name.clone(), (e.vertex, e.path))).collect();
+                let points: Vec<Point> = group_ends.iter().map(|e| Point { pin: gs[0].vname(e.vertex), slack: e.slack, wns_slack: e.slack }).collect();
+                let paths: HashMap<String, (usize, usize)> = group_ends.iter().map(|e| (gs[0].vname(e.vertex), (e.vertex, e.path))).collect();
                 // `startpointInGroup`: every startpoint when the group starts anywhere (`kAny`).
                 let side = crate::path_group::group_starts_at_input(name);
-                let starts: Vec<Point> = starts.into_iter().filter(|p| side.is_none_or(|from_inputs| gs[0].vertices.iter().position(|x| x.name == p.pin).is_some_and(|v| (gs[0].is_port(v) && gs[0].vertices[v].is_driver) == from_inputs))).collect();
+                let starts: Vec<Point> = starts.into_iter().filter(|p| side.is_none_or(|from_inputs| (0..gs[0].vertices.len()).position(|x| gs[0].vname(x) == p.pin).is_some_and(|v| (gs[0].is_port(v) && gs[0].vertices[v].is_driver) == from_inputs))).collect();
                 (points, starts, paths)
             }
         };
@@ -461,7 +461,7 @@ fn snapshot(ctx: &Ctx<'_>, design: &dyn Design, want: &[String], timer: &mut Tim
             // the earlier scene on a tie; the path is expanded in its own scene.
             let mut best: Option<(usize, usize, f32)> = None;
             for k in 0..gs.len() {
-                let Some(v) = gs[k].vertices.iter().position(|x| x.name == n) else { continue };
+                let Some(v) = (0..gs[k].vertices.len()).position(|x| gs[k].vname(x) == n) else { continue };
                 let worst = ss[k].paths[v].iter().filter(|p| p.tag.mm == MAX).map(|p| p.required - p.arrival).fold(None, |m: Option<f32>, s| match m {
                     Some(m) if !fuzzy::less(s, m) => Some(m),
                     _ => Some(s),
@@ -500,7 +500,7 @@ fn slack_over_scenes(gs: &[Graph<'_>], ss: &[Search<'_, '_>], v: usize, mm: usiz
     let vx = &gs[0].vertices[v];
     let mut slack = INF;
     for (k, (g, s)) in gs.iter().zip(ss).enumerate() {
-        let u = if k == 0 { Some(v) } else { g.vertices.iter().position(|x| x.name == vx.name && x.is_driver == vx.is_driver) };
+        let u = if k == 0 { Some(v) } else { (0..g.vertices.len()).position(|x| g.vname(x) == gs[0].vname(v) && g.vertices[x].is_driver == vx.is_driver) };
         let Some(u) = u else { continue };
         let x = s.slack_of(u, mm, rf);
         if fuzzy::less(x, slack) {
@@ -585,7 +585,7 @@ fn timed_levels<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits:
     let g = &graphs[0];
     // A diagnostic: one pin's slews at every snapshot (`VYGES_RSZ_SNAP_PIN=pin:path`).
     if let Some((pin, path)) = std::env::var("VYGES_RSZ_SNAP_PIN").ok().as_deref().and_then(|s| s.split_once(':')).map(|(a, b)| (a.to_string(), b.to_string())) {
-        if let Some(v) = g.vertices.iter().position(|x| x.name == pin) {
+        if let Some(v) = (0..g.vertices.len()).position(|x| g.vname(x) == pin) {
             use std::io::Write;
             let net = g.vertex_net[v].map(|n| g.netlist.nets[n].name.clone()).unwrap_or_default();
             let has_par = design.parasitics(0).contains_key(&net);
@@ -629,7 +629,7 @@ fn timed_levels<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits:
                 }
                 if m == INF { "INF".to_string() } else { format!("{:.9}", f64::from(m) * 1e15) }
             };
-            s.push_str(&format!("{} {} {}", vx.name, slack(0), slack(1)));
+            s.push_str(&format!("{} {} {}", g.vname(v), slack(0), slack(1)));
             if full {
                 for (rf, slew) in g.slew[v].iter().enumerate() {
                     let arr = search.paths[v].iter().filter(|p| p.tag.mm == MAX && p.tag.rf == rf && !p.tag.is_clock)
@@ -738,7 +738,7 @@ fn expand_path(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTr
     // From the end back to the root.
     let mut chain = vec![(end, p)];
     while let Some(prev) = p.prev {
-        p = *search.paths[prev.vertex].iter().find(|q| q.tag == prev.tag).ok_or_else(|| timer_stop(format!("{}: a path's prev path is not at its vertex", g.vertices[prev.vertex].name)))?;
+        p = *search.paths[prev.vertex].iter().find(|q| q.tag == prev.tag).ok_or_else(|| timer_stop(format!("{}: a path's prev path is not at its vertex", g.vname(prev.vertex))))?;
         chain.push((prev.vertex, p));
     }
     let mut start_from_end = None;
@@ -779,7 +779,7 @@ fn expand_path(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTr
 #[allow(clippy::too_many_arguments)]
 fn restage(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[BTreeSet<usize>], design: &dyn Design, view: &PathView, ideal: &BTreeSet<usize>) -> Result<PathView, String> {
     let (g, search) = (&gs[view.scene], &ss[view.scene]);
-    let find = |pin: &str, is_driver: bool| g.vertices.iter().position(|x| x.name == pin && x.is_driver == is_driver);
+    let find = |pin: &str, is_driver: bool| (0..g.vertices.len()).position(|x| g.vname(x) == pin && g.vertices[x].is_driver == is_driver);
     let chain = refind_chain(&view.chain, find, &search.paths)?;
     let mut out = view_of_chain(ctx, gs, ss, cs, design, view.scene, &chain, view.start, ideal);
     for seg in &view.latch_segments {
@@ -836,8 +836,8 @@ fn view_of_chain(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[B
         all_parasitics = (0..gs.len()).map(|k| design.parasitics(k).clone()).collect();
         &all_parasitics
     };
-    let ideal0: BTreeSet<usize> = if scene == 0 { ideal.clone() } else { ideal.iter().filter_map(|&u| gs[0].vertices.iter().position(|x| x.name == g.vertices[u].name && x.is_driver == g.vertices[u].is_driver)).collect() };
-    let to_scene0 = |u: usize| if scene == 0 { Some(u) } else { gs[0].vertices.iter().position(|x| x.name == g.vertices[u].name && x.is_driver == g.vertices[u].is_driver) };
+    let ideal0: BTreeSet<usize> = if scene == 0 { ideal.clone() } else { ideal.iter().filter_map(|&u| (0..gs[0].vertices.len()).position(|x| gs[0].vname(x) == g.vname(u) && gs[0].vertices[x].is_driver == g.vertices[u].is_driver)).collect() };
+    let to_scene0 = |u: usize| if scene == 0 { Some(u) } else { (0..gs[0].vertices.len()).position(|x| gs[0].vname(x) == g.vname(u) && gs[0].vertices[x].is_driver == g.vertices[u].is_driver) };
     let mut stages = Vec::with_capacity(n);
     for (i, (v, p)) in chain.iter().enumerate() {
         let vx = &g.vertices[*v];
@@ -847,12 +847,12 @@ fn view_of_chain(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[B
         };
         let top_port = vx.lib.is_none();
         let mut st = Stage {
-            pin: vx.name.clone(),
+            pin: g.vname(*v),
             is_driver: vx.is_driver,
             top_port,
             inst: inst_index.map(|k| g.netlist.insts[k].0.clone()),
-            cell: vx.cell.clone(),
-            port: vx.port.clone(),
+            cell: vx.cell.as_deref().map(str::to_string),
+            port: vx.port().map(str::to_string),
             load_delay: None,
             arc_delay: None,
             in_wire_delay: None,
@@ -885,8 +885,8 @@ fn view_of_chain(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[B
                 if !same || ux.is_driver {
                     continue;
                 }
-                let reg_clk = ux.cell.as_deref().and_then(|c| ctx.libs.link_cell(c)).zip(ux.port.as_deref()).is_some_and(|(c, port)| c.arc_sets.iter().any(|a| a.from == port && matches!(a.role, Role::RegClkToQ | Role::LatchEnToQ)));
-                let scan = ux.cell.as_deref().and_then(|c| ctx.libs.link_cell(c)).zip(ux.port.as_deref()).is_some_and(|(c, port)| is_scan_pin(c, port));
+                let reg_clk = ux.cell.as_deref().and_then(|c| ctx.libs.link_cell(c)).zip(ux.port()).is_some_and(|(c, port)| c.arc_sets.iter().any(|a| a.from == port && matches!(a.role, Role::RegClkToQ | Role::LatchEnToQ)));
+                let scan = ux.cell.as_deref().and_then(|c| ctx.libs.link_cell(c)).zip(ux.port()).is_some_and(|(c, port)| is_scan_pin(c, port));
                 let checks = if scan || max_cap_skips_pin(reg_clk, Some(ideal.contains(&u))) {
                     Vec::new()
                 } else {
@@ -899,11 +899,11 @@ fn view_of_chain(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[B
                     })
                     .collect()
                 };
-                st.fanin_caps.push((ux.port.clone().unwrap_or_default(), checks));
+                st.fanin_caps.push((ux.port().map(str::to_string).unwrap_or_default(), checks));
                 // annotateInputSlews: an input pin with a liberty port.
-                let is_input = ux.cell.as_deref().and_then(|c| ctx.libs.link_cell(c)).and_then(|c| c.port(ux.port.as_deref()?)).is_some_and(|p| p.direction == vyges_sta::liberty::Direction::Input);
+                let is_input = ux.cell.as_deref().and_then(|c| ctx.libs.link_cell(c)).and_then(|c| c.port(ux.port()?)).is_some_and(|p| p.direction == vyges_sta::liberty::Direction::Input);
                 if is_input {
-                    st.in_slews.push((ux.port.clone().unwrap_or_default(), [g.slew[u][0][MAX], g.slew[u][1][MAX]]));
+                    st.in_slews.push((ux.port().map(str::to_string).unwrap_or_default(), [g.slew[u][0][MAX], g.slew[u][1][MAX]]));
                 }
             }
         }
@@ -932,11 +932,11 @@ fn view_of_chain(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[B
         for (i, (v, _)) in chain.iter().enumerate() {
             let st = &stages[i];
             if i > 0 && st.is_driver && !st.top_port && buffer_fanout_applicable(st.fanout) {
-                stages[i].rebuffer = Some(probe_rebuffer(ctx, gs, ss, cs, design, &g.vertices[*v].name));
+                stages[i].rebuffer = Some(probe_rebuffer(ctx, gs, ss, cs, design, &g.vname(*v)));
             }
         }
     }
-    let key = |v: usize| (g.vertices[v].name.clone(), g.vertices[v].is_driver);
+    let key = |v: usize| (g.vname(v), g.vertices[v].is_driver);
     let chain = chain.iter().map(|(v, p)| ChainKey { pin: key(*v).0, is_driver: key(*v).1, tag: p.tag, crpr_pin: p.tag.crpr.map(|c| key(c.vertex)) }).collect();
     PathView { stages, start, scene, latch_segments: Vec::new(), chain }
 }
@@ -949,13 +949,13 @@ fn view_of_chain(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], cs: &[B
 /// driver arc is timed in its arrival path's scene.
 fn probe_rebuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], _cs: &[BTreeSet<usize>], design: &dyn Design, drvr_name: &str) -> RebufProbe {
     let g = &gs[0];
-    let Some(drvr) = g.vertices.iter().position(|x| x.name == drvr_name && x.is_driver) else { return RebufProbe::Skip };
+    let Some(drvr) = (0..g.vertices.len()).position(|x| g.vname(x) == drvr_name && g.vertices[x].is_driver) else { return RebufProbe::Skip };
     let vx = &g.vertices[drvr];
     if vx.lib.is_none() {
-        return RebufProbe::Warn(format!("[WARNING RSZ-2020] rebuffering does not support top port as the driver pin: {}", vx.name));
+        return RebufProbe::Warn(format!("[WARNING RSZ-2020] rebuffering does not support top port as the driver pin: {}", g.vname(drvr)));
     }
     let Some(net) = g.vertex_net[drvr] else { return RebufProbe::Skip };
-    let (Some(cell_name), Some(_)) = (vx.cell.as_deref(), vx.port.as_deref()) else { return RebufProbe::Skip };
+    let (Some(cell_name), Some(_)) = (vx.cell.as_deref(), vx.port()) else { return RebufProbe::Skip };
     if !g.libs[vx.lib.expect("an instance pin")].cells.contains_key(cell_name) {
         return RebufProbe::Skip;
     }
@@ -966,8 +966,8 @@ fn probe_rebuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], _cs: &
     }
     let net_name = &g.netlist.nets[net].name;
     let bctx = crate::buffered_net::Ctx { graph: g, libs: ctx.libs, sdc: ctx.env, limits: ctx.limits, dbu: ctx.dbu, rc: ctx.wire_rc };
-    let Some((bn, root)) = design.net_shape(net_name, &vx.name).and_then(|shape| crate::buffered_net::make_buffered_net(&bctx, &shape).ok().flatten()) else {
-        return RebufProbe::Warn(format!("[WARNING RSZ-0075] makeBufferedNet failed for driver {}", vx.name));
+    let Some((bn, root)) = design.net_shape(net_name, &g.vname(drvr)).and_then(|shape| crate::buffered_net::make_buffered_net(&bctx, &shape).ok().flatten()) else {
+        return RebufProbe::Warn(format!("[WARNING RSZ-0075] makeBufferedNet failed for driver {}", g.vname(drvr)));
     };
     match rebuffer_probe_of_net(ctx, gs, ss, design, drvr, &bn, root) {
         Some(p) => RebufProbe::Ready(Box::new(p)),
@@ -982,13 +982,13 @@ fn rebuffer_probe_of_net(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>],
     let g = &gs[0];
     let ideal: BTreeSet<usize> = gs[0].ideal_clock.iter().copied().collect();
     let vx = &g.vertices[drvr];
-    let (cell_name, port) = (vx.cell.as_deref()?, vx.port.as_deref()?);
+    let (cell_name, port) = (vx.cell.as_deref()?, vx.port()?);
     let cell = g.libs[vx.lib?].cells.get(cell_name)?;
     // The buffered net as rebuffer nodes, its loads annotated in visit order.
     let mut nodes: Vec<rebuffer::Node> = Vec::with_capacity(bn.nodes.len());
     for n in &bn.nodes {
         let kind = match n.kind {
-            crate::buffered_net::Kind::Load { pin } => rebuffer::Kind::Load { pin: g.vertices[pin].name.clone() },
+            crate::buffered_net::Kind::Load { pin } => rebuffer::Kind::Load { pin: g.vname(pin) },
             crate::buffered_net::Kind::Junction { r, r2 } => rebuffer::Kind::Junction { r, r2 },
             crate::buffered_net::Kind::Wire { r } => rebuffer::Kind::Wire { r },
             crate::buffered_net::Kind::Via { r, ref_layer } => rebuffer::Kind::Via { r, ref_layer },
@@ -997,7 +997,7 @@ fn rebuffer_probe_of_net(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>],
     }
     let mut arrival_paths: [Option<(usize, vyges_sta::search::Path)>; 2] = [None, None];
     let mut warnings = Vec::new();
-    annotate_load_slacks(gs, ss, bn, root, &vx.name, &mut nodes, &mut arrival_paths, &mut warnings);
+    annotate_load_slacks(gs, ss, bn, root, &g.vname(drvr), &mut nodes, &mut arrival_paths, &mut warnings);
     let mut arcs: [Option<Option<rebuffer::DriverArc>>; 2] = [None, None];
     let mut arc_scenes = [0usize; 2];
     for rf in 0..2 {
@@ -1039,7 +1039,7 @@ fn rebuffer_probe_of_net(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>],
         drvr_resistance: link.drive_resistance(port),
         fanout_limit,
         drvr_pin_max_slew,
-        pin: vx.name.clone(),
+        pin: g.vname(drvr),
         warnings,
     })
 }
@@ -1060,15 +1060,14 @@ enum FullProbe {
 /// buffer and the tree imported behind it. Nodes appended to `nodes`; the root's index.
 #[allow(clippy::too_many_arguments)]
 fn import_buffer_tree(ctx: &Ctx<'_>, g: &Graph<'_>, index: &HashMap<(&str, bool), usize>, design: &dyn Design, removable: &dyn Fn(&str, &str, &str) -> bool, drvr: usize, nodes: &mut Vec<rebuffer::Node>, failed: &mut Option<String>) -> Option<usize> {
-    let vx = &g.vertices[drvr];
     let net = g.vertex_net[drvr]?;
     let net_name = &g.netlist.nets[net].name;
     let bctx = crate::buffered_net::Ctx { graph: g, libs: ctx.libs, sdc: ctx.env, limits: ctx.limits, dbu: ctx.dbu, rc: ctx.wire_rc };
-    let (bn, root) = design.net_shape(net_name, &vx.name).and_then(|shape| crate::buffered_net::make_buffered_net(&bctx, &shape).ok().flatten())?;
+    let (bn, root) = design.net_shape(net_name, &g.vname(drvr)).and_then(|shape| crate::buffered_net::make_buffered_net(&bctx, &shape).ok().flatten())?;
     let base = nodes.len();
     for n in &bn.nodes {
         let kind = match n.kind {
-            crate::buffered_net::Kind::Load { pin } => rebuffer::Kind::Load { pin: g.vertices[pin].name.clone() },
+            crate::buffered_net::Kind::Load { pin } => rebuffer::Kind::Load { pin: g.vname(pin) },
             crate::buffered_net::Kind::Junction { r, r2 } => rebuffer::Kind::Junction { r: r + base, r2: r2 + base },
             crate::buffered_net::Kind::Wire { r } => rebuffer::Kind::Wire { r: r + base },
             crate::buffered_net::Kind::Via { r, ref_layer } => rebuffer::Kind::Via { r: r + base, ref_layer },
@@ -1079,7 +1078,7 @@ fn import_buffer_tree(ctx: &Ctx<'_>, g: &Graph<'_>, index: &HashMap<(&str, bool)
         let rebuffer::Kind::Load { pin } = nodes[k].kind.clone() else { continue };
         let Some(&v) = index.get(&(pin.as_str(), false)) else { continue };
         let lv = &g.vertices[v];
-        let (Some(cell_name), Some(port)) = (lv.cell.as_deref(), lv.port.as_deref()) else { continue };
+        let (Some(cell_name), Some(port)) = (lv.cell.as_deref(), lv.port()) else { continue };
         // `!cell->isBuffer()`: an inverter has buffer ports too, and stays a load
         let Some(cell) = ctx.libs.link_cell(cell_name).filter(|c| c.is_buffer()) else { continue };
         let Some((in_port, out_port)) = cell.buffer_ports() else { continue };
@@ -1146,7 +1145,7 @@ fn annotate_import_slacks(gs: &[Graph<'_>], ss: &[Search<'_, '_>], nodes: &mut [
             let mut req: Option<(usize, usize, vyges_sta::search::Path)> = None;
             let mut min_slack = INF;
             for (k, (g, search)) in gs.iter().zip(ss).enumerate() {
-                let Some(v) = g.vertices.iter().position(|x| x.name == pin && !x.is_driver) else { continue };
+                let Some(v) = (0..g.vertices.len()).position(|x| g.vname(x) == pin && !g.vertices[x].is_driver) else { continue };
                 for p in search.paths[v].iter().filter(|p| p.tag.mm == MAX) {
                     let s = p.required - p.arrival;
                     if fuzzy::less(s, min_slack) {
@@ -1160,7 +1159,7 @@ fn annotate_import_slacks(gs: &[Graph<'_>], ss: &[Search<'_, '_>], nodes: &mut [
                 let (g, search) = (&gs[k], &ss[k]);
                 let mut at = v;
                 while let Some(a) = arrival {
-                    if g.vertices[at].name == drvr && g.vertices[at].is_driver {
+                    if g.vname(at) == drvr && g.vertices[at].is_driver {
                         break;
                     }
                     arrival = a.prev.and_then(|pv| {
@@ -1196,10 +1195,11 @@ fn annotate_import_slacks(gs: &[Graph<'_>], ss: &[Search<'_, '_>], nodes: &mut [
 fn full_probe(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], _cs: &[BTreeSet<usize>], design: &dyn Design, removable: &dyn Fn(&str, &str, &str) -> bool, drvr_name: &str) -> FullProbe {
     let g = &gs[0];
     let ideal: BTreeSet<usize> = gs[0].ideal_clock.iter().copied().collect();
-    let index: HashMap<(&str, bool), usize> = g.vertices.iter().enumerate().map(|(i, v)| ((v.name.as_str(), v.is_driver), i)).collect();
+    let names: Vec<String> = (0..g.vertices.len()).map(|v| g.vname(v)).collect();
+    let index: HashMap<(&str, bool), usize> = g.vertices.iter().enumerate().map(|(i, v)| ((names[i].as_str(), v.is_driver), i)).collect();
     let Some(&drvr) = index.get(&(drvr_name, true)) else { return FullProbe::Skip };
     let vx = &g.vertices[drvr];
-    let (Some(cell_name), Some(port)) = (vx.cell.as_deref(), vx.port.as_deref()) else { return FullProbe::Skip };
+    let (Some(cell_name), Some(port)) = (vx.cell.as_deref(), vx.port()) else { return FullProbe::Skip };
     let Some(cell) = vx.lib.and_then(|l| g.libs[l].cells.get(cell_name)) else { return FullProbe::Skip };
     let link = ctx.libs.link_cell(cell_name).unwrap_or(cell);
     let (_, max_fanout, _) = crate::timing::check_fanout(g, design.net_info(), drvr, ctx.limits, &ideal);
@@ -1220,7 +1220,7 @@ fn full_probe(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], _cs: &[BTr
     import_areas(ctx, &mut nodes, root);
     let mut arrival_paths: [Option<(usize, vyges_sta::search::Path)>; 2] = [None, None];
     let mut warnings = Vec::new();
-    annotate_import_slacks(gs, ss, &mut nodes, root, &vx.name, &mut arrival_paths, &mut warnings);
+    annotate_import_slacks(gs, ss, &mut nodes, root, &g.vname(drvr), &mut arrival_paths, &mut warnings);
     let mut arcs: [Option<Option<rebuffer::DriverArc>>; 2] = [None, None];
     let mut arc_scenes = [0usize; 2];
     for rf in 0..2 {
@@ -1243,7 +1243,7 @@ fn full_probe(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], _cs: &[BTr
     // the timer's slack at the driver: its worst max path over every scene
     let mut sta_slack = INF;
     for (gk, sk) in gs.iter().zip(ss) {
-        let Some(u) = gk.vertices.iter().position(|x| x.name == vx.name && x.is_driver) else { continue };
+        let Some(u) = (0..gk.vertices.len()).position(|x| gk.vname(x) == g.vname(drvr) && gk.vertices[x].is_driver) else { continue };
         for q in sk.paths[u].iter().filter(|q| q.tag.mm == MAX) {
             let x = q.required - q.arrival;
             if fuzzy::less(x, sta_slack) {
@@ -1252,7 +1252,7 @@ fn full_probe(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], _cs: &[BTr
         }
     }
     FullProbe::Ready(
-        Box::new(rebuffer::Probe { nodes, root, arcs, arc_scenes, drvr_port_cap: port_capacitance(link, port).unwrap_or(0.0), drvr_resistance: link.drive_resistance(port), fanout_limit, drvr_pin_max_slew, pin: vx.name.clone(), warnings }),
+        Box::new(rebuffer::Probe { nodes, root, arcs, arc_scenes, drvr_port_cap: port_capacitance(link, port).unwrap_or(0.0), drvr_resistance: link.drive_resistance(port), fanout_limit, drvr_pin_max_slew, pin: g.vname(drvr), warnings }),
         sta_slack,
     )
 }
@@ -1305,18 +1305,17 @@ fn resize_slacks_on(r: &mut Repair<'_, '_>) -> Result<BTreeMap<String, f32>, Sto
     let slacks = timed_all(ctx, r.design.as_design(), &mut r.timer, TimerEdits::default(), |gs, ss, cs| {
         let g = &gs[0];
         // `levelizedDrvrVertices`: on the timer's (incremental) levels
-        let level: Vec<i32> = g.vertices.iter().map(|v| levels.get(&v.name).copied().unwrap_or(0)).collect();
+        let level: Vec<i32> = (0..g.vertices.len()).map(|v| levels.get(&g.vname(v)).copied().unwrap_or(0)).collect();
         let drvrs = crate::timing::levelized_drvr_vertices(g, &level);
         let mut out = BTreeMap::new();
         for &d in drvrs.iter().rev() {
-            let vx = &g.vertices[d];
             let Some(net) = g.vertex_net[d].map(|k| g.netlist.nets[k].name.clone()) else { continue };
-            if ctx.env.constants.contains_key(&vx.name) || special.contains(&net) || cs[0].contains(&d) {
+            if ctx.env.constants.contains_key(&g.vname(d)) || special.contains(&net) || cs[0].contains(&d) {
                 continue;
             }
             let mut slack = INF;
             for (gk, sk) in gs.iter().zip(ss) {
-                let Some(u) = gk.vertices.iter().position(|x| x.name == vx.name && x.is_driver) else { continue };
+                let Some(u) = (0..gk.vertices.len()).position(|x| gk.vname(x) == g.vname(d) && gk.vertices[x].is_driver) else { continue };
                 for q in sk.paths[u].iter().filter(|q| q.tag.mm == MAX) {
                     let x = q.required - q.arrival;
                     if fuzzy::less(x, slack) {
@@ -1358,7 +1357,7 @@ impl Repair<'_, '_> {
         let levels = self.timer.inc[0].levels.clone();
         timed_all(ctx, self.design.as_design(), &mut self.timer, TimerEdits::default(), |gs, _ss, cs| {
             let g = &gs[0];
-            let level: Vec<i32> = g.vertices.iter().map(|v| levels.get(&v.name).copied().unwrap_or(0)).collect();
+            let level: Vec<i32> = (0..g.vertices.len()).map(|v| levels.get(&g.vname(v)).copied().unwrap_or(0)).collect();
             let mut out = Vec::new();
             for d in crate::timing::levelized_drvr_vertices(g, &level) {
                 let vx = &g.vertices[d];
@@ -1366,18 +1365,19 @@ impl Repair<'_, '_> {
                 if info.dont_touch.contains(&net) || info.abutment.contains(&net) || !plain.contains(&net) {
                     continue;
                 }
-                if cs[0].contains(&d) || ctx.clock_sources.contains(&vx.name) || ctx.env.constants.contains_key(&vx.name) {
+                if cs[0].contains(&d) || ctx.clock_sources.contains(&g.vname(d)) || ctx.env.constants.contains_key(&g.vname(d)) {
                     continue;
                 }
-                let (Some(cell_name), Some(port)) = (vx.cell.as_deref(), vx.port.as_deref()) else { continue };
+                let (Some(cell_name), Some(port)) = (vx.cell.as_deref(), vx.port()) else { continue };
                 let Some(cell) = ctx.libs.link_cell(cell_name) else { continue };
                 if cell.port(port).is_some_and(|p| p.is_any_tristate()) {
                     continue;
                 }
-                let Some((inst, _)) = vx.name.rsplit_once('/') else { continue };
+                let name = g.vname(d);
+                let Some((inst, _)) = name.rsplit_once('/') else { continue };
                 let logic = ctx.sizing.masters.get(cell_name).is_some_and(|m| m.logic_std);
                 if !cell.is_buffer() || !logic || is_port_buffer(g, inst) {
-                    out.push(vx.name.clone());
+                    out.push(g.vname(d));
                 }
             }
             Ok(out)
@@ -1564,7 +1564,7 @@ fn fanout_slacks(gs: &[Graph<'_>], scene: usize, drvr: usize, rf: usize, split: 
         let vx = &g.vertices[v];
         let mut s = INF;
         for (gk, sk) in gs.iter().zip(ss) {
-            let Some(u) = gk.vertices.iter().position(|x| x.name == vx.name && x.is_driver == vx.is_driver) else { continue };
+            let Some(u) = (0..gk.vertices.len()).position(|x| gk.vname(x) == g.vname(v) && gk.vertices[x].is_driver == vx.is_driver) else { continue };
             for p in sk.paths[u].iter().filter(|p| p.tag.mm == MAX && rf.is_none_or(|r| p.tag.rf == r)) {
                 let x = p.required - p.arrival;
                 if fuzzy::less(x, s) {
@@ -1580,7 +1580,7 @@ fn fanout_slacks(gs: &[Graph<'_>], scene: usize, drvr: usize, rf: usize, split: 
         .filter(|&&e| !split || matches!(g.edges[e].kind, EdgeKind::Wire))
         .map(|&e| {
             let to = g.edges[e].to;
-            clone::FanoutSlack { pin: g.vertices[to].name.clone(), slack: slack_at(to, Some(rf)) - drvr_slack, top_port: g.vertices[to].lib.is_none() }
+            clone::FanoutSlack { pin: g.vname(to), slack: slack_at(to, Some(rf)) - drvr_slack, top_port: g.vertices[to].lib.is_none() }
         })
         .collect();
     clone::collect_fanout_slacks(fanouts)
@@ -1599,11 +1599,12 @@ fn annotate_load_slacks(gs: &[Graph<'_>], ss: &[Search<'_, '_>], bn: &crate::buf
             annotate_load_slacks(gs, ss, bn, r2, drvr, nodes, arrival_paths, warnings);
         }
         crate::buffered_net::Kind::Load { pin } => {
-            let name = gs[0].vertices[pin].name.as_str();
+            let name = gs[0].vname(pin);
+            let name = name.as_str();
             let mut req: Option<(usize, usize, vyges_sta::search::Path)> = None;
             let mut min_slack = INF;
             for (k, (g, search)) in gs.iter().zip(ss).enumerate() {
-                let Some(v) = g.vertices.iter().position(|x| x.name == name && !x.is_driver) else { continue };
+                let Some(v) = (0..g.vertices.len()).position(|x| g.vname(x) == name && !g.vertices[x].is_driver) else { continue };
                 for p in search.paths[v].iter().filter(|p| p.tag.mm == MAX) {
                     let s = p.required - p.arrival;
                     if fuzzy::less(s, min_slack) {
@@ -1617,7 +1618,7 @@ fn annotate_load_slacks(gs: &[Graph<'_>], ss: &[Search<'_, '_>], bn: &crate::buf
                 let (g, search) = (&gs[k], &ss[k]);
                 let mut at = v;
                 while let Some(a) = arrival {
-                    if g.vertices[at].name == drvr && g.vertices[at].is_driver {
+                    if g.vname(at) == drvr && g.vertices[at].is_driver {
                         break;
                     }
                     arrival = a.prev.and_then(|pv| {
@@ -1671,7 +1672,7 @@ fn probe_unbuffer(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], _cs: &
 /// The unbuffer probe's context and its timer at `scene` (every scene's too, with several).
 fn with_unbuffer_timer<R>(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], design: &dyn Design, scene: usize, ideal: &BTreeSet<usize>, read: impl FnOnce(&unbuffer::Ctx<'_>, &unbuffer::Timer<'_, '_>) -> R) -> R {
     let (g, search) = (&gs[scene], &ss[scene]);
-    let index: HashMap<String, usize> = g.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect();
+    let index: HashMap<String, usize> = (0..g.vertices.len()).map(|i| (g.vname(i), i)).collect();
     let steiner = |net: &str, drvr: &str| design.net_shape(net, drvr);
     // Several corners: every scene's timer, for the reads made over all of them.
     let several = gs.len() > 1;
@@ -1680,7 +1681,7 @@ fn with_unbuffer_timer<R>(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>]
     let ideals: Vec<BTreeSet<usize>> =
         if several { gs.iter().map(|gk| gk.ideal_clock.iter().copied().collect()).collect() } else { Vec::new() };
     let indices: Vec<HashMap<String, usize>> = if several {
-        gs.iter().map(|gk| gk.vertices.iter().enumerate().map(|(i, v)| (v.name.clone(), i)).collect()).collect()
+        gs.iter().map(|gk| (0..gk.vertices.len()).map(|i| (gk.vname(i), i)).collect()).collect()
     } else {
         Vec::new()
     };
@@ -1980,25 +1981,25 @@ fn replacement_preserves_max_cap(libs: &Libs, cell: &str, replacement: &str, fan
 fn clock_tree_pins(g: &Graph<'_>, clocks: &BTreeSet<usize>) -> BTreeSet<String> {
     let port_role = |v: usize, test: &dyn Fn(Role) -> bool| -> bool {
         let vx = &g.vertices[v];
-        let (Some(cell), Some(port)) = (vx.lib.and_then(|l| g.libs.get(l)).and_then(|l| l.cells.get(vx.cell.as_deref()?)), vx.port.as_deref()) else { return false };
+        let (Some(cell), Some(port)) = (vx.lib.and_then(|l| g.libs.get(l)).and_then(|l| l.cells.get(vx.cell.as_deref()?)), vx.port()) else { return false };
         cell.arc_sets.iter().any(|a| a.from == port && test(a.role))
     };
     let is_sink = |v: usize| {
         let vx = &g.vertices[v];
         port_role(v, &|r| matches!(r, Role::RegClkToQ | Role::LatchEnToQ)) || port_role(v, &|r| r.is_timing_check()) || (g.is_port(v) && !vx.is_driver)
     };
-    let clock_pins: BTreeSet<&str> = clocks.iter().map(|&v| g.vertices[v].name.as_str()).collect();
+    let clock_pins: BTreeSet<String> = clocks.iter().map(|&v| g.vname(v)).collect();
     let mut tree: BTreeSet<String> = BTreeSet::new();
     let mut queue: Vec<String> = Vec::new();
     for &v in clocks {
-        if is_sink(v) && tree.insert(g.vertices[v].name.clone()) {
-            queue.push(g.vertices[v].name.clone());
+        if is_sink(v) && tree.insert(g.vname(v)) {
+            queue.push(g.vname(v));
         }
     }
     // `pinVertices`: a pin's vertex and, for a bidirect, its driver vertex.
-    let mut vertices: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (u, ux) in g.vertices.iter().enumerate() {
-        vertices.entry(ux.name.as_str()).or_default().push(u);
+    let mut vertices: HashMap<String, Vec<usize>> = HashMap::new();
+    for (u, _) in g.vertices.iter().enumerate() {
+        vertices.entry(g.vname(u)).or_default().push(u);
     }
     let is_check = |e: usize| matches!(g.edges[e].kind, EdgeKind::Gate { set } if g.arc_set(e, set).role.is_timing_check());
     while let Some(pin) = queue.pop() {
@@ -2007,7 +2008,7 @@ fn clock_tree_pins(g: &Graph<'_>, clocks: &BTreeSet<usize>) -> BTreeSet<String> 
                 if is_check(e) {
                     continue;
                 }
-                let from = &g.vertices[g.edges[e].from].name;
+                let from = &g.vname(g.edges[e].from);
                 if clock_pins.contains(from.as_str()) && tree.insert(from.clone()) {
                     queue.push(from.clone());
                 }
@@ -2489,7 +2490,7 @@ impl HoldRepair<'_, '_> {
             Ok(ends
                 .iter()
                 .map(|p| {
-                    let v = g.vertices.iter().position(|x| x.name == p.pin).expect("an endpoint vertex");
+                    let v = (0..g.vertices.len()).position(|x| g.vname(x) == p.pin).expect("an endpoint vertex");
                     // `isClock(pin) && !vertex->hasChecks()` (upstream 28e3110e528): a clock-network
                     // pin that is no timing check's data pin; a register D pin sampling a clock used
                     // as data is a real hold endpoint.
@@ -2504,7 +2505,7 @@ impl HoldRepair<'_, '_> {
     /// per endpoint, in the group's order (slack, then pin), each with the group's slack.
     fn group_hold_slacks(&mut self, name: &str, slack_max: f32) -> Result<Vec<(String, f32)>, Stop> {
         let name = crate::path_group::sta_group_name(name).to_string();
-        self.query_all(move |gs, ss, _| Ok(ss[0].group_path_ends(&name, MIN, usize::MAX, -INF, slack_max).iter().map(|e| (gs[0].vertices[e.vertex].name.clone(), e.slack)).collect()))
+        self.query_all(move |gs, ss, _| Ok(ss[0].group_path_ends(&name, MIN, usize::MAX, -INF, slack_max).iter().map(|e| (gs[0].vname(e.vertex), e.slack)).collect()))
     }
 
     /// `holdSlack(end)` of each endpoint: `Sta::slack(end, min)`, or under -path_group the
@@ -2545,7 +2546,7 @@ impl HoldRepair<'_, '_> {
             let ends = setup_ends(ctx, gs, ss, cs)?;
             let mut slew = -INF;
             for g in gs {
-                let v = g.vertices.iter().position(|x| x.name == pin).ok_or_else(|| timer_stop(format!("{pin}: not in the timing graph")))?;
+                let v = (0..g.vertices.len()).position(|x| g.vname(x) == pin).ok_or_else(|| timer_stop(format!("{pin}: not in the timing graph")))?;
                 slew = crate::rebuffer::std_max(slew, crate::rebuffer::std_max(g.slew[v][0][MAX], g.slew[v][1][MAX]));
             }
             Ok((worst_slack(&ends).0, slew))
@@ -2686,7 +2687,7 @@ impl HoldRepair<'_, '_> {
         let want_tree = self.clk_tree_pins.is_none();
         let group = self.ctx.path_group.map(|n| crate::path_group::sta_group_name(n).to_string());
         self.query_all(move |gs, ss, cs| {
-            let Some(v0) = gs[0].vertices.iter().position(|x| x.name == end) else { return Ok(None) };
+            let Some(v0) = (0..gs[0].vertices.len()).position(|x| gs[0].vname(x) == end) else { return Ok(None) };
             // Under -path_group `findWorstSlackPath` is the group's worst end there
             // (`worstGroupEnd`, one scene): the endpoint is here for the group's slack, which its
             // worst hold path need not carry.
@@ -2704,7 +2705,7 @@ impl HoldRepair<'_, '_> {
                 // (`vertexWorstSlackPath`, `findWorstSlackPath`'s fallback).
                 Some(None) | None => {
                     for (k, (gk, sk)) in gs.iter().zip(ss).enumerate() {
-                        let Some(u) = gk.vertices.iter().position(|x| x.name == end) else { continue };
+                        let Some(u) = (0..gk.vertices.len()).position(|x| gk.vname(x) == end) else { continue };
                         for p in sk.paths[u].iter().filter(|p| p.tag.mm == MIN) {
                             let slack = p.arrival - p.required;
                             if fuzzy::less(slack, min_slack) {
@@ -2728,14 +2729,14 @@ impl HoldRepair<'_, '_> {
                         _ => {}
                     }
                 }
-                p = *s.paths[prev.vertex].iter().find(|q| q.tag == prev.tag).ok_or_else(|| timer_stop(format!("{}: a path's prev path is not at its vertex", g.vertices[prev.vertex].name)))?;
+                p = *s.paths[prev.vertex].iter().find(|q| q.tag == prev.tag).ok_or_else(|| timer_stop(format!("{}: a path's prev path is not at its vertex", g.vname(prev.vertex))))?;
                 chain.push(prev.vertex);
                 i += 1;
             }
             let n = chain.len();
             let start = n - 1 - start_from_end.unwrap_or(n - 1);
             chain.reverse();
-            let vertices = chain[start..].iter().map(|&u| (g.vertices[u].name.clone(), g.vertices[u].is_driver)).collect();
+            let vertices = chain[start..].iter().map(|&u| (g.vname(u), g.vertices[u].is_driver)).collect();
             let clock: Vec<bool> = chain[start..].iter().map(|u| cs[k].contains(u)).collect();
             let tree = (want_tree && clock.iter().any(|&c| c)).then(|| clock_tree_pins(g, &cs[k]));
             Ok(Some((HoldPath { slack: min_slack, len: n, vertices, clock, tree }, slack_over_scenes(gs, ss, v0, MAX, None))))
@@ -2749,7 +2750,7 @@ impl HoldRepair<'_, '_> {
         let libs = self.ctx.libs;
         self.query_all(move |gs, ss, _| {
             let g = &gs[0];
-            let v = g.vertices.iter().position(|x| x.name == drvr).ok_or_else(|| timer_stop(format!("{drvr}: not in the timing graph")))?;
+            let v = (0..g.vertices.len()).position(|x| g.vname(x) == drvr).ok_or_else(|| timer_stop(format!("{drvr}: not in the timing graph")))?;
             let mut out = Vec::new();
             for &e in &g.out_edges[v] {
                 if g.is_check(e) || matches!(edge_arc_set(g, e).map(|a| a.role), Some(Role::LatchDtoQ)) {
@@ -2765,14 +2766,14 @@ impl HoldRepair<'_, '_> {
                     }
                 }
                 let cell = vx.cell.as_deref().and_then(|c| libs.link_cell(c));
-                let direction = cell.and_then(|c| vx.port.as_deref().and_then(|pn| c.port(pn))).map(|p| p.direction);
+                let direction = cell.and_then(|c| vx.port().and_then(|pn| c.port(pn))).map(|p| p.direction);
                 let input_or_port = port || matches!(direction, Some(vyges_sta::liberty::Direction::Input | vyges_sta::liberty::Direction::Bidirect));
                 let out_port = port && !vx.is_driver;
-                let cap = match (cell, vx.port.as_deref()) {
+                let cap = match (cell, vx.port()) {
                     (Some(c), Some(pn)) => crate::rebuffer::port_cap(c, pn),
                     _ => 0.0,
                 };
-                out.push(HoldFanout { pin: vx.name.clone(), hold_slack: slack_over_scenes(gs, ss, to, MIN, None), slacks, input_or_port, out_port, cap });
+                out.push(HoldFanout { pin: g.vname(to), hold_slack: slack_over_scenes(gs, ss, to, MIN, None), slacks, input_or_port, out_port, cap });
             }
             Ok(out)
         })
@@ -2943,7 +2944,7 @@ impl HoldRepair<'_, '_> {
         // `checkMaxSlewCap`: `checkCapacitance` / `checkSlew` over `scenes()`, in scene 0's vertices.
         self.query_all(move |gs, _, cs| {
             let (g, clocks) = (&gs[0], &cs[0]);
-            let v = g.vertices.iter().position(|x| x.name == drvr).ok_or_else(|| timer_stop(format!("{drvr}: not in the timing graph")))?;
+            let v = (0..g.vertices.len()).position(|x| g.vname(x) == drvr).ok_or_else(|| timer_stop(format!("{drvr}: not in the timing graph")))?;
             let sc = crate::timing::Scenes::new(gs);
             const RATIO: f32 = 0.2;
             let (_, limit, slack, _, corner) = crate::timing::check_capacitance(&sc, v, &parasitics, clocks, ctx.limits);
@@ -2971,7 +2972,7 @@ fn resize_to_target_slew(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, r: &crate:
     let k = ctx.sizing.tgt_scene;
     let par = d.parasitics(k).clone();
     let graph = crate::repair_design::timer_graph(ctx.libs, k, &nl, ctx.env, ctx.master_pins)?;
-    let v = graph.vertices.iter().position(|x| x.name == r.output).ok_or_else(|| Stop::error("RSZ-INSERT", format!("{}: not in the timing graph", r.output)))?;
+    let v = (0..graph.vertices.len()).position(|x| graph.vname(x) == r.output).ok_or_else(|| Stop::error("RSZ-INSERT", format!("{}: not in the timing graph", r.output)))?;
     let load_cap = graph.load_cap(v, &par);
     if load_cap > 0.0 {
         let target = ctx.sizing.find_target_cell(cell, load_cap, false)?;
@@ -3151,16 +3152,16 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
         let edits = r.design.take_timer_edits();
         let text = timed_all(ctx, r.design.as_design(), &mut r.timer, edits, |gs, ss, _| {
             let mut out = String::new();
-            for (v, vx) in gs[0].vertices.iter().enumerate() {
+            for (v, _) in gs[0].vertices.iter().enumerate() {
                 let mut slack = [vyges_sta::search::INF_SLACK; 2];
                 for (k, s) in ss.iter().enumerate() {
-                    let vk = if k == 0 { Some(v) } else { gs[k].vertices.iter().position(|x| x.name == vx.name) };
+                    let vk = if k == 0 { Some(v) } else { (0..gs[k].vertices.len()).position(|x| gs[k].vname(x) == gs[0].vname(v)) };
                     let Some(vk) = vk else { continue };
                     for (rf, sl) in slack.iter_mut().enumerate() {
                         *sl = sl.min(s.slack_of(vk, MAX, Some(rf)));
                     }
                 }
-                out.push_str(&format!("{} {:.6} {:.6}\n", vx.name, f64::from(slack[0]) * 1e15, f64::from(slack[1]) * 1e15));
+                out.push_str(&format!("{} {:.6} {:.6}\n", gs[0].vname(v), f64::from(slack[0]) * 1e15, f64::from(slack[1]) * 1e15));
             }
             Ok(out)
         })?;
@@ -3248,7 +3249,8 @@ impl Repair<'_, '_> {
             let mut out: HashMap<String, f32> = HashMap::new();
             for k in 0..gs.len() {
                 let g = &gs[k];
-                let index: HashMap<&str, usize> = g.vertices.iter().enumerate().map(|(i, v)| (v.name.as_str(), i)).collect();
+                let names: Vec<String> = (0..g.vertices.len()).map(|v| g.vname(v)).collect();
+                let index: HashMap<&str, usize> = names.iter().enumerate().map(|(i, n)| (n.as_str(), i)).collect();
                 for n in &g.netlist.nets {
                     let loads: Vec<usize> = n.pins.iter().filter_map(|c| index.get(g.netlist.pin_name(c).as_str()).copied()).filter(|&v| !g.vertices[v].is_driver).collect();
                     let s = ss[k].net_slack(&loads);
@@ -3789,8 +3791,8 @@ impl Repair<'_, '_> {
             let vx = |v: usize| &g.vertices[v];
             let port_dir = |v: usize| {
                 let x = vx(v);
-                match (&x.cell, &x.port) {
-                    (Some(c), Some(p)) => g.libs[x.lib.unwrap_or(0)].cells.get(c.as_str()).and_then(|c| c.port(p)).map(|p| p.direction),
+                match (x.cell.as_deref(), x.port()) {
+                    (Some(c), Some(p)) => g.libs[x.lib.unwrap_or(0)].cells.get(c).and_then(|c| c.port(p)).map(|p| p.direction),
                     _ => None,
                 }
             };
@@ -3806,11 +3808,11 @@ impl Repair<'_, '_> {
                 ctx.master_pins.get(&inst.1).map_or(Vec::new(), |ports| {
                     ports.iter().filter_map(|p| {
                         let name = g.netlist.pin_name(&vyges_sta::netlist::Conn::Inst(*k, p.clone()));
-                        g.vertices.iter().position(|x| x.name == name && (x.is_driver || !g.vertices.iter().any(|y| y.name == name && y.is_driver)))
+                        (0..g.vertices.len()).position(|x| g.vname(x) == name && (g.vertices[x].is_driver || !(0..g.vertices.len()).any(|y| g.vname(y) == name && g.vertices[y].is_driver)))
                     }).collect()
                 })
             };
-            let Some(pv) = g.vertices.iter().position(|x| x.name == point && (use_starts == x.is_driver || g.vertices.iter().filter(|y| y.name == point).count() == 1)) else {
+            let Some(pv) = (0..g.vertices.len()).position(|x| g.vname(x) == point && (use_starts == g.vertices[x].is_driver || (0..g.vertices.len()).filter(|&y| g.vname(y) == point).count() == 1)) else {
                 return Ok(Vec::new());
             };
             let mut found: Vec<usize> = Vec::new();
@@ -3876,7 +3878,7 @@ impl Repair<'_, '_> {
                     }
                 }
             }
-            Ok(found.into_iter().map(|v| vx(v).name.clone()).collect())
+            Ok(found.into_iter().map(|v| g.vname(v)).collect())
         })?;
         let mut data = self.violator_data(&pins)?;
         crate::order::libcxx_sort_by(&mut data, |a, b| a.1 > b.1 || (a.1 == b.1 && a.2 < b.2) || (a.1 == b.1 && a.2 == b.2 && a.0 < b.0))
@@ -3930,14 +3932,14 @@ impl Repair<'_, '_> {
             let (g, s) = (&gs[0], &ss[0]);
             let mut out = Vec::with_capacity(pins.len());
             for pin in pins {
-                let Some(dv) = g.vertices.iter().position(|x| x.name == *pin && x.is_driver) else { continue };
+                let Some(dv) = (0..g.vertices.len()).position(|x| g.vname(x) == *pin && g.vertices[x].is_driver) else { continue };
                 let load = effort_delays(g, s, dv).map_or(-INF, |(l, _)| l);
                 let mut tns = 0.0f32;
                 for &e in g.out_edges[dv].iter().rev() {
                     let to = g.edges[e].to;
                     let tx = &g.vertices[to];
-                    let output = match (&tx.cell, &tx.port) {
-                        (Some(c), Some(p)) => g.libs[tx.lib.unwrap_or(0)].cells.get(c.as_str()).and_then(|c| c.port(p)).is_some_and(|p| matches!(p.direction, vyges_sta::liberty::Direction::Output)),
+                    let output = match (tx.cell.as_deref(), tx.port()) {
+                        (Some(c), Some(p)) => g.libs[tx.lib.unwrap_or(0)].cells.get(c).and_then(|c| c.port(p)).is_some_and(|p| matches!(p.direction, vyges_sta::liberty::Direction::Output)),
                         // A top-level output port.
                         _ => !tx.is_driver,
                     };
@@ -4131,9 +4133,9 @@ impl Repair<'_, '_> {
             let (g, s) = (&gs[0], &ss[0]);
             let netlist = design.netlist();
             let ids = &design.net_info().pin_id;
-            let mut index: HashMap<&str, Vec<usize>> = HashMap::new();
-            for (v, x) in g.vertices.iter().enumerate() {
-                index.entry(x.name.as_str()).or_default().push(v);
+            let mut index: HashMap<String, Vec<usize>> = HashMap::new();
+            for (v, _) in g.vertices.iter().enumerate() {
+                index.entry(g.vname(v)).or_default().push(v);
             }
             let vertices = |name: &str| index.get(name).map_or(&[][..], |v| v.as_slice());
             // `pinLoadVertex` / `pinDrvrVertex`: a pin's one vertex, or of a bidirect's two the load's
@@ -4141,7 +4143,7 @@ impl Repair<'_, '_> {
             let load_vertex = |name: &str| vertices(name).iter().copied().find(|&v| !g.vertices[v].is_driver).or_else(|| vertices(name).first().copied());
             let drvr_vertex = |name: &str| vertices(name).iter().copied().find(|&v| g.vertices[v].is_driver);
             let wire_fanout = |v: usize| g.out_edges[v].iter().filter(|&&e| matches!(g.edges[e].kind, EdgeKind::Wire)).count();
-            let cell_of = |v: usize| g.vertices[v].cell.clone();
+            let cell_of = |v: usize| g.vertices[v].cell.as_deref().map(str::to_string);
             let mut viol: Vec<(String, f32)> = setup_ends(ctx, gs, ss, cs)?.into_iter().filter(|p| p.slack < 0.0).map(|p| (p.pin, p.slack)).collect();
             crate::order::libcxx_sort_by(&mut viol, |a, b| a.1 < b.1).map_err(|e| Stop::refused("RSZ-ABSENT", format!("the move tracker's endpoint sort over {} endpoints falls back to heap sort: not modelled", e.len)))?;
             let mut top = Vec::with_capacity(viol.len());
@@ -4168,10 +4170,10 @@ impl Repair<'_, '_> {
                     .find(|n| {
                         let x = &g.vertices[n.vertex];
                         let lc = x.cell.as_deref().and_then(|c| ctx.libs.link_cell(c));
-                        lc.is_some_and(|c| (!c.sequentials.is_empty() || c.has_seq_bank) && x.port.as_deref().and_then(|p| c.port(p)).is_some_and(|p| p.direction == vyges_sta::liberty::Direction::Output))
+                        lc.is_some_and(|c| (!c.sequentials.is_empty() || c.has_seq_bank) && x.port().and_then(|p| c.port(p)).is_some_and(|p| p.direction == vyges_sta::liberty::Direction::Output))
                     })
                     .or(expanded.first())
-                    .map(|n| g.vertices[n.vertex].name.clone());
+                    .map(|n| g.vname(n.vertex));
                 // The largest arrival step (from 0: a step must be positive).
                 let mut step: Option<(usize, f32)> = None;
                 let mut worst_delay = 0.0f32;
@@ -4183,7 +4185,7 @@ impl Repair<'_, '_> {
                     }
                 }
                 let worst_pin = step.map(|(i, d)| {
-                    let pin = &g.vertices[expanded[i].vertex].name;
+                    let pin = &g.vname(expanded[i].vertex);
                     let label = match cell_of(expanded[i].vertex) {
                         Some(c) => format!("{pin} ({c})"),
                         None => pin.clone(),
@@ -4197,7 +4199,7 @@ impl Repair<'_, '_> {
                         for (k, pe) in s.endpoint_path_ends(v, 100, 100).iter().enumerate() {
                             let _ = writeln!(f, "next path {} {} {} delay {:.3} slack {:.3}", k + 1, name, if pe.nodes[0].tag.rf == 0 { "^" } else { "v" }, f64::from(pe.arrival()) * 1e9, f64::from(pe.slack) * 1e9);
                             for n in &pe.nodes {
-                                let _ = writeln!(f, "  {} {} {:.3}", g.vertices[n.vertex].name, if n.tag.rf == 0 { "^" } else { "v" }, f64::from(n.arrival) * 1e9);
+                                let _ = writeln!(f, "  {} {} {:.3}", g.vname(n.vertex), if n.tag.rf == 0 { "^" } else { "v" }, f64::from(n.arrival) * 1e9);
                             }
                         }
                     }
@@ -4258,12 +4260,12 @@ impl Repair<'_, '_> {
             let netlist = design.netlist();
             let ids = &design.net_info().pin_id;
             // Each scene's vertices by pin name (a bidirect pin has two).
-            let index: Vec<HashMap<&str, Vec<usize>>> = gs
+            let index: Vec<HashMap<String, Vec<usize>>> = gs
                 .iter()
                 .map(|g| {
-                    let mut m: HashMap<&str, Vec<usize>> = HashMap::new();
-                    for (v, x) in g.vertices.iter().enumerate() {
-                        m.entry(x.name.as_str()).or_default().push(v);
+                    let mut m: HashMap<String, Vec<usize>> = HashMap::new();
+                    for v in 0..g.vertices.len() {
+                        m.entry(g.vname(v)).or_default().push(v);
                     }
                     m
                 })
@@ -5450,8 +5452,8 @@ impl Repair<'_, '_> {
         timed_all(ctx, design, &mut self.timer, edits, |gs, ss, _| {
             let (g, s) = (&gs[0], &ss[0]);
             let par = design.parasitics(0);
-            let Some(dv) = g.vertices.iter().position(|x| x.name == drvr && x.is_driver) else { return Ok(Vec::new()) };
-            let vertex_of = |name: &str, drv: bool| g.vertices.iter().position(|x| x.name == name && x.is_driver == drv).or_else(|| g.vertices.iter().position(|x| x.name == name));
+            let Some(dv) = (0..g.vertices.len()).position(|x| g.vname(x) == drvr && g.vertices[x].is_driver) else { return Ok(Vec::new()) };
+            let vertex_of = |name: &str, drv: bool| (0..g.vertices.len()).position(|x| g.vname(x) == name && g.vertices[x].is_driver == drv).or_else(|| (0..g.vertices.len()).position(|x| g.vname(x) == name));
             let mut out = Vec::new();
             for &e in g.out_edges[dv].iter().rev() {
                 if !matches!(g.edges[e].kind, EdgeKind::Wire) {
@@ -5463,7 +5465,7 @@ impl Repair<'_, '_> {
                     vyges_sta::netlist::Conn::Inst(k, _) => (Some(g.netlist.insts[*k].0.clone()), Some(*k)),
                     vyges_sta::netlist::Conn::Port(_) => (None, None),
                 };
-                let mut load = SdfLoad { pin: x.name.clone(), inst, cell: x.cell.clone(), port: x.port.clone(), slack: s.slack_of(fv, MAX, None), worst_input_slack: INF, worst_output_slack: INF, outputs: Vec::new() };
+                let mut load = SdfLoad { pin: g.vname(fv), inst, cell: x.cell.as_deref().map(str::to_string), port: x.port().map(str::to_string), slack: s.slack_of(fv, MAX, None), worst_input_slack: INF, worst_output_slack: INF, outputs: Vec::new() };
                 if let (Some(k), Some(cell)) = (k, x.cell.as_deref().and_then(|c| ctx.libs.link_cell(c))) {
                     for p in ctx.master_pins.get(&g.netlist.insts[k].1).map_or(&[][..], |v| v.as_slice()) {
                         let Some(port) = cell.port(p) else { continue };
@@ -6176,7 +6178,7 @@ mod tests {
         };
         let g = Graph::build(&libs, &netlist).unwrap();
         let clocks = crate::timing::clock_pins(&g, &["clk".to_string()]);
-        let name = |v: usize| g.vertices[v].name.as_str();
+        let name = |v: usize| g.vname(v);
         assert!(clocks.iter().any(|&v| name(v) == "dbuf/Z") && clocks.iter().any(|&v| name(v) == "r2/D"), "the clock is used as data: dbuf and r2/D are in its network: {:?}", clocks.iter().map(|&v| name(v)).collect::<Vec<_>>());
         let tree = clock_tree_pins(&g, &clocks);
         // i1/B (an enable, off the clock network) is fanin of the tree but not in it; i3 reaches

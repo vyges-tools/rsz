@@ -139,7 +139,7 @@ impl Repair<'_, '_> {
             let mut visited: HashSet<usize> = HashSet::new();
             let mut crit_set: HashSet<String> = HashSet::new();
             for end in ends {
-                let Some(ev) = (0..g.vertices.len()).find(|&x| &g.vertices[x].name == end && s.is_endpoint(x)) else { continue };
+                let Some(ev) = (0..g.vertices.len()).find(|&x| &g.vname(x) == end && s.is_endpoint(x)) else { continue };
                 if !visited.insert(ev) {
                     continue;
                 }
@@ -166,7 +166,7 @@ impl Repair<'_, '_> {
                             // `outputPin(inst)`: the first any-output pin in the instance's pin
                             // iterator order (its master's terminals, as LEF orders them).
                             let out_pin = first_output_port(ctx.master_pins.get(cell).map(Vec::as_slice).unwrap_or_default(), |port| ctx.libs.link_cell(cell).and_then(|c| c.port(port)).map(|p| p.direction))
-                                .and_then(|port| g.vertices.iter().find(|ux| ux.port.as_deref() == Some(port) && matches!(&ux.conn, Conn::Inst(j, _) if j == k)).map(|ux| ux.name.clone()));
+                                .and_then(|port| (0..g.vertices.len()).find(|&u| g.vertices[u].port() == Some(port) && matches!(&g.vertices[u].conn, Conn::Inst(j, _) if j == k)).map(|u| g.vname(u)));
                             if fuzzy::less(inst_slack, margin) && crit_set.insert(inst.clone()) {
                                 endpoint_insts += 1;
                                 let mut fanin_caps = Vec::new();
@@ -174,11 +174,11 @@ impl Repair<'_, '_> {
                                     if ux.is_driver || !matches!(&ux.conn, Conn::Inst(j, _) if j == k) {
                                         continue;
                                     }
-                                    let is_input = ctx.libs.link_cell(cell).and_then(|c| c.port(ux.port.as_deref()?)).is_some_and(|p| p.direction == Direction::Input);
+                                    let is_input = ctx.libs.link_cell(cell).and_then(|c| c.port(ux.port()?)).is_some_and(|p| p.direction == Direction::Input);
                                     // The target has no scene or path (`Target::mode` is null), so no
                                     // register clock pin is skipped (`max_cap_skips_pin(_, None)`);
                                     // a scan pin is.
-                                    let scan = ctx.libs.link_cell(cell).zip(ux.port.as_deref()).is_some_and(|(c, port)| super::is_scan_pin(c, port));
+                                    let scan = ctx.libs.link_cell(cell).zip(ux.port()).is_some_and(|(c, port)| super::is_scan_pin(c, port));
                                     if !is_input || scan {
                                         continue;
                                     }
@@ -189,7 +189,7 @@ impl Repair<'_, '_> {
                                             CapCheck { cap, max_cap, slack, limited }
                                         })
                                         .collect();
-                                    fanin_caps.push((ux.port.clone().unwrap_or_default(), checks));
+                                    fanin_caps.push((ux.port().map(str::to_string).unwrap_or_default(), checks));
                                 }
                                 result.push(CritInst { inst: inst.clone(), cell: cell.clone(), best, out_pin, slack: inst_slack, fanin_caps });
                             }
@@ -376,7 +376,7 @@ mod tests {
         };
         let g = vyges_sta::graph::Graph::build(&libs, &netlist).unwrap();
         let clocks = crate::timing::clock_pins(&g, &["clk".to_string()]);
-        let names = |from_inputs: bool| -> BTreeSet<String> { find_group_fanout(&g, &clocks, Some(from_inputs), &|v| is_reg_clk(&g, v)).into_iter().map(|v| g.vertices[v].name.clone()).collect() };
+        let names = |from_inputs: bool| -> BTreeSet<String> { find_group_fanout(&g, &clocks, Some(from_inputs), &|v| is_reg_clk(&g, v)).into_iter().map(|v| g.vname(v)).collect() };
         let set = |xs: &[&str]| -> BTreeSet<String> { xs.iter().map(|x| x.to_string()).collect() };
         assert_eq!(names(true), set(&["a", "b1/A", "b1/Z", "en", "r1/D", "r3/D"]));
         assert_eq!(names(false), set(&["b2/A", "b2/Z", "q", "r1/Q", "r2/D", "r2/Q", "r3/Q"]));

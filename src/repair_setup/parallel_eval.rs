@@ -859,7 +859,7 @@ fn bottleneck_analyze(gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::searc
     let mut endpoint_nodes = Vec::new();
     let mut queue = Vec::new();
     for (pin, slack) in endpoints {
-        let v = g.vertices.iter().position(|x| x.name == *pin && !x.is_driver).or_else(|| g.vertices.iter().position(|x| x.name == *pin));
+        let v = (0..g.vertices.len()).position(|x| g.vname(x) == *pin && !g.vertices[x].is_driver).or_else(|| (0..g.vertices.len()).position(|x| g.vname(x) == *pin));
         let deficit = slack_margin - slack;
         let Some(v) = v else { continue };
         if deficit <= 0.0 || node_of[v] >= 0 {
@@ -957,7 +957,7 @@ fn bottleneck_analyze(gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::searc
         let sv = (n.startpoint_deficit_sum * n.endpoint_deficit_sum).sqrt();
         max_severity = max_severity.max(sv);
         let x = &g.vertices[n.vertex];
-        severity.insert((x.name.clone(), x.is_driver), sv);
+        severity.insert((g.vname(n.vertex), x.is_driver), sv);
     }
     Ok((severity, max_severity, nodes.len()))
 }
@@ -1702,7 +1702,7 @@ impl Repair<'_, '_> {
             // batch; an endpoint missing from it is above every target slack (INF).
             let group_slacks: Option<HashMap<String, f32>> = ctx.path_group.map(|name| {
                 let slack_max = batch.iter().map(|&k| pool.targets[k].slack).fold(-super::INF, f32::max);
-                ss[0].group_path_ends(crate::path_group::sta_group_name(name), MAX, usize::MAX, -super::INF, slack_max).iter().map(|e| (gs[0].vertices[e.vertex].name.clone(), e.slack)).collect()
+                ss[0].group_path_ends(crate::path_group::sta_group_name(name), MAX, usize::MAX, -super::INF, slack_max).iter().map(|e| (gs[0].vname(e.vertex), e.slack)).collect()
             });
             let mut rows = Vec::with_capacity(batch.len());
             for &k in &batch {
@@ -2088,7 +2088,7 @@ impl Repair<'_, '_> {
                 if ux.is_driver || !matches!(&ux.conn, vyges_sta::netlist::Conn::Inst(k, _) if g.netlist.insts[*k].0 == inst) {
                     continue;
                 }
-                let Some(port) = ux.port.as_deref() else { continue };
+                let Some(port) = ux.port() else { continue };
                 if !current.port(port).is_some_and(|p| matches!(p.direction, vyges_sta::liberty::Direction::Input | vyges_sta::liberty::Direction::Bidirect)) {
                     continue;
                 }
@@ -2699,7 +2699,7 @@ fn pe_guarded_side_pins(c: &Candidate, target: &Target) -> Vec<String> {
 fn pe_load_slack(gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], pin: &str) -> Option<f32> {
     let mut slack: Option<f32> = None;
     for (k, g) in gs.iter().enumerate() {
-        let Some(u) = g.vertices.iter().position(|x| x.name == pin && !x.is_driver) else { continue };
+        let Some(u) = (0..g.vertices.len()).position(|x| g.vname(x) == pin && !g.vertices[x].is_driver) else { continue };
         let v = ss[k].slack_of(u, MAX, None);
         slack = Some(match slack {
             Some(s) if !fuzzy::less(v, s) => s,
@@ -2740,7 +2740,7 @@ fn pe_graph_stage_delay(ctx: &super::Ctx<'_>, gs: &[vyges_sta::graph::Graph<'_>]
     let ref_cell = ctx.libs.scene_cell(arc.scene, &arc.cell)?;
     let ref_set = ref_cell.arc_sets.get(arc.set)?;
     let g = gs.get(arc.scene)?;
-    let driver = g.vertices.iter().position(|x| x.name == stage.driver_pin && x.is_driver)?;
+    let driver = (0..g.vertices.len()).position(|x| g.vname(x) == stage.driver_pin && g.vertices[x].is_driver)?;
     for &e in g.in_edges[driver].iter().rev() {
         let vyges_sta::graph::EdgeKind::Gate { set } = g.edges[e].kind else { continue };
         let cand_set = g.arc_set(e, set);
@@ -2956,7 +2956,7 @@ fn rebuffer_mt_make_tree_plans(target: &Target, plan: &PlanTimer<'_, '_, '_>, cf
     let Some((bn, root)) = target.rebuffer_net.as_ref() else { return Ok(none()) };
     let rctx = plan.ctx.rebuffer.ok_or_else(|| Stop::refused("RSZ-ABSENT", "RebufferMt without characterized buffers".into()))?;
     let g = &plan.gs[0];
-    let Some(drvr) = g.vertices.iter().position(|x| x.name == target.driver_pin && x.is_driver) else { return Ok(none()) };
+    let Some(drvr) = (0..g.vertices.len()).position(|x| g.vname(x) == target.driver_pin && g.vertices[x].is_driver) else { return Ok(none()) };
     let Some(probe) = super::rebuffer_probe_of_net(plan.ctx, plan.gs, plan.ss, plan.design, drvr, bn, *root) else { return Ok(none()) };
     if let Some(w) = probe.warnings.first() {
         return Err(Stop::refused("RSZ-ABSENT", format!("RebufferMt planning warnings are not modelled: {w}")));
@@ -3134,7 +3134,7 @@ fn unbuffer_mt_impact(target: &Target, plan: &PlanTimer<'_, '_, '_>) -> MoveImpa
     let ports = plan.ctx.libs.link_cell(&target.cell).and_then(|c| c.buffer_ports()).map(|(i, o)| (i.name.clone(), o.name.clone()));
     let net_of = |port: &str| {
         let pin = format!("{}/{port}", target.inst);
-        g.vertices.iter().position(|x| x.name == pin).and_then(|v| g.vertex_net[v])
+        (0..g.vertices.len()).position(|x| g.vname(x) == pin).and_then(|v| g.vertex_net[v])
     };
     match ports {
         Some((input, output)) => unbuffer_impact_on(move_candidate_impact(target, plan.names), &g.netlist, &target.inst, net_of(&input), net_of(&output)),
@@ -3813,11 +3813,11 @@ fn rebuffer_mt_prepare_inputs(target: &mut Target, plan: &PlanTimer<'_, '_, '_>,
 /// `Rebuffer::makeBufferedNet` (see [`rebuffer_mt_prepare_inputs`]).
 fn rebuffer_make_buffered_net(plan: &PlanTimer<'_, '_, '_>, drvr_pin: &str) -> Result<Option<(crate::buffered_net::BufferedNet, usize)>, String> {
     let (g, design, ctx) = (&plan.gs[0], plan.design, plan.ctx);
-    let Some(drvr) = g.vertices.iter().position(|x| x.name == drvr_pin && x.is_driver) else { return Ok(None) };
+    let Some(drvr) = (0..g.vertices.len()).position(|x| g.vname(x) == drvr_pin && g.vertices[x].is_driver) else { return Ok(None) };
     let vx = &g.vertices[drvr];
     let Some(lib) = vx.lib else { return Ok(None) };
     let Some(net) = g.vertex_net[drvr] else { return Ok(None) };
-    let (Some(cell), Some(port)) = (vx.cell.as_deref(), vx.port.as_deref()) else { return Ok(None) };
+    let (Some(cell), Some(port)) = (vx.cell.as_deref(), vx.port()) else { return Ok(None) };
     if g.libs[lib].cells.get(cell).is_none_or(|c| c.port(port).is_none()) {
         return Ok(None);
     }
@@ -3825,7 +3825,7 @@ fn rebuffer_make_buffered_net(plan: &PlanTimer<'_, '_, '_>, drvr_pin: &str) -> R
     if top_out {
         return Ok(None);
     }
-    let Some(shape) = design.net_shape(&g.netlist.nets[net].name, &vx.name) else { return Ok(None) };
+    let Some(shape) = design.net_shape(&g.netlist.nets[net].name, &g.vname(drvr)) else { return Ok(None) };
     let bctx = crate::buffered_net::Ctx { graph: g, libs: ctx.libs, sdc: ctx.env, limits: ctx.limits, dbu: ctx.dbu, rc: ctx.wire_rc };
     crate::buffered_net::make_buffered_net(&bctx, &shape)
 }
@@ -3839,13 +3839,13 @@ fn rebuffer_collect_load_timing(target: &Target, plan: &PlanTimer<'_, '_, '_>, c
     let arc = &context.target().arc;
     let Some(out_rf) = plan.ctx.libs.scene_cell(arc.scene, &arc.cell).map(|c| c.arc_sets[arc.set].arcs[arc.arc].to_rf) else { return out };
     let g = &plan.gs[arc.scene];
-    let Some(drvr) = g.vertices.iter().position(|x| x.name == target.driver_pin && x.is_driver) else { return out };
+    let Some(drvr) = (0..g.vertices.len()).position(|x| g.vname(x) == target.driver_pin && g.vertices[x].is_driver) else { return out };
     let weights = crate::delay_estimator::FaninSideLoadOptions { critical_load_pins: crit, off_path_weight: cfg.fanin_side_offpath_weight };
     for &e in &g.out_edges[drvr] {
         if !matches!(g.edges[e].kind, vyges_sta::graph::EdgeKind::Wire) {
             continue;
         }
-        let pin = &g.vertices[g.edges[e].to].name;
+        let pin = &g.vname(g.edges[e].to);
         let slack = pe_slack_over_scenes(plan.gs, plan.ss, pin, false);
         if crate::delay_estimator::delay_inf(slack) {
             continue;
@@ -3867,7 +3867,7 @@ fn size_down_fanout_mt_prepare_inputs(target: &mut Target, plan: &PlanTimer<'_, 
     let scene = target.scene;
     let g = &gs[scene];
     // resolveDriverContext.
-    let Some(drvr) = g.vertices.iter().position(|x| x.name == target.driver_pin && x.is_driver) else { return Ok(()) };
+    let Some(drvr) = (0..g.vertices.len()).position(|x| g.vname(x) == target.driver_pin && g.vertices[x].is_driver) else { return Ok(()) };
     let Some(drvr_cell) = ctx.libs.link_cell(&target.cell) else { return Ok(()) };
     let Some(drvr_port) = target.driver_pin.rsplit_once('/').map(|(_, p)| p).filter(|p| drvr_cell.port(p).is_some()) else { return Ok(()) };
     let drvr_res = drvr_cell.drive_resistance(drvr_port);
@@ -3884,9 +3884,9 @@ fn size_down_fanout_mt_prepare_inputs(target: &mut Target, plan: &PlanTimer<'_, 
                 continue;
             }
         }
-        fanouts.push((v, pe_slack_over_scenes(gs, ss, &g.vertices[v].name, false)));
+        fanouts.push((v, pe_slack_over_scenes(gs, ss, &g.vname(v), false)));
     }
-    crate::order::libcxx_sort_by(&mut fanouts, |a, b| a.1 > b.1 || (a.1 == b.1 && g.vertices[a.0].name < g.vertices[b.0].name))
+    crate::order::libcxx_sort_by(&mut fanouts, |a, b| a.1 > b.1 || (a.1 == b.1 && g.vname(a.0) < g.vname(b.0)))
         .map_err(|e| format!("the size-down fanout sort over {} loads falls back to heap sort: not modelled", e.len))?;
     let mut loads = Vec::new();
     for (v, slack) in fanouts {
@@ -3902,7 +3902,7 @@ fn size_down_fanout_mt_prepare_inputs(target: &mut Target, plan: &PlanTimer<'_, 
 /// driver vertex when `driver`).
 fn pe_slack_over_scenes(gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], pin: &str, driver: bool) -> f32 {
     let g0 = &gs[0];
-    let v = g0.vertices.iter().position(|x| x.name == pin && x.is_driver == driver).or_else(|| g0.vertices.iter().position(|x| x.name == pin));
+    let v = (0..g0.vertices.len()).position(|x| g0.vname(x) == pin && g0.vertices[x].is_driver == driver).or_else(|| (0..g0.vertices.len()).position(|x| g0.vname(x) == pin));
     v.map_or(super::INF, |v| super::slack_over_scenes(gs, ss, v, MAX, None))
 }
 
@@ -3913,7 +3913,7 @@ fn size_down_measure_load(plan: &PlanTimer<'_, '_, '_>, scene: usize, arc_scene:
     let x = &g.vertices[v];
     // resolveLoad: a liberty port on an instance that is neither dont_touch nor fixed, of a
     // logic standard cell, with a port at the scene.
-    let (Some(cell_name), Some(port)) = (x.cell.clone(), x.port.clone()) else { return Ok(None) };
+    let (Some(cell_name), Some(port)) = (x.cell.as_deref().map(str::to_string), x.port().map(str::to_string)) else { return Ok(None) };
     let Some(cell) = ctx.libs.link_cell(&cell_name) else { return Ok(None) };
     let vyges_sta::netlist::Conn::Inst(k, _) = &x.conn else { return Ok(None) };
     let (inst, master) = (&g.netlist.insts[*k].0, &g.netlist.insts[*k].1);
@@ -3981,11 +3981,11 @@ fn size_down_measure_load(plan: &PlanTimer<'_, '_, '_>, scene: usize, arc_scene:
     let mut outputs = Vec::new();
     for p in pins.iter().filter(|p| direction(p) == Some(vyges_sta::liberty::Direction::Output)) {
         let name = pin_of(p);
-        let Some(vo) = g.vertices.iter().position(|y| y.name == name && !y.is_driver).or_else(|| g.vertices.iter().position(|y| y.name == name)) else { continue };
+        let Some(vo) = (0..g.vertices.len()).position(|y| g.vname(y) == name && !g.vertices[y].is_driver).or_else(|| (0..g.vertices.len()).position(|y| g.vname(y) == name)) else { continue };
         let cap = g.load_cap(vo, design.parasitics(scene));
         let mut slew = -super::INF;
         for gk in gs {
-            if let Some(w) = gk.vertices.iter().position(|y| y.name == name && !y.is_driver).or_else(|| gk.vertices.iter().position(|y| y.name == name)) {
+            if let Some(w) = (0..gk.vertices.len()).position(|y| gk.vname(y) == name && !gk.vertices[y].is_driver).or_else(|| (0..gk.vertices.len()).position(|y| gk.vname(y) == name)) {
                 slew = slew.max(gk.slew[w][0][MAX]).max(gk.slew[w][1][MAX]);
             }
         }
@@ -4013,7 +4013,7 @@ fn size_down_measure_load(plan: &PlanTimer<'_, '_, '_>, scene: usize, arc_scene:
     if let (Some(cur), Some(new)) = (cur, new) {
         option.target_load_delta = Some(new - cur);
     }
-    Ok(Some(SizeDownFanoutLoad { inst: inst.clone(), pin: x.name.clone(), port, cell: cell_name, load_slack, delay_budget, input_cap, step_down: option }))
+    Ok(Some(SizeDownFanoutLoad { inst: inst.clone(), pin: g.vname(v), port, cell: cell_name, load_slack, delay_budget, input_cap, step_down: option }))
 }
 
 /// `violatesOutputLimits`: the cell lacks an output's port, or the output's load is over the
@@ -4044,7 +4044,7 @@ fn size_down_violates_output_limits(ctx: &super::Ctx<'_>, scene: usize, outputs:
 fn split_load_mt_prepare_inputs(target: &mut Target, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], design: &dyn super::Design, ctx: &super::Ctx<'_>, crit: &HashSet<String>, cfg: &MtConfig) -> Result<(), String> {
     let scene = target.scene;
     let g = &gs[scene];
-    let Some(drvr) = g.vertices.iter().position(|x| x.name == target.driver_pin && x.is_driver) else { return Ok(()) };
+    let Some(drvr) = (0..g.vertices.len()).position(|x| g.vname(x) == target.driver_pin && g.vertices[x].is_driver) else { return Ok(()) };
     let fanout_slacks = super::fanout_slacks(gs, scene, drvr, target.driver_rf, true, ss);
     if fanout_slacks.is_empty() {
         return Ok(());
@@ -4100,7 +4100,7 @@ fn build_load_split_model(input: &mut SplitLoadInput, g: &vyges_sta::graph::Grap
     let mut pins: Vec<String> = nl.nets[net].pins.iter().map(|c| nl.pin_name(c)).collect();
     pins.sort_by_key(|p| pin_id.get(p).copied().unwrap_or(u64::MAX));
     for pin in &pins {
-        let Some(v) = g.vertices.iter().position(|x| x.name == *pin && !x.is_driver) else { continue };
+        let Some(v) = (0..g.vertices.len()).position(|x| g.vname(x) == *pin && !g.vertices[x].is_driver) else { continue };
         if !pe_is_load(g, v) {
             continue;
         }
@@ -4112,13 +4112,13 @@ fn build_load_split_model(input: &mut SplitLoadInput, g: &vyges_sta::graph::Grap
         }
         moved_box.add(location);
         let vx = &g.vertices[v];
-        if let (Some(cell), Some(port)) = (vx.cell.as_deref(), vx.port.as_deref()) {
+        if let (Some(cell), Some(port)) = (vx.cell.as_deref(), vx.port()) {
             if let Some(c) = ctx.libs.scene_cell(arc_scene, cell).or_else(|| ctx.libs.link_cell(cell)) {
                 input.moved_pin_cap += super::port_capacitance(c, port).unwrap_or(0.0);
             }
         }
         // The moved load keeps its slack as the budget for the new driver's extra delay.
-        let slack = gs[0].vertices.iter().position(|x| x.name == *pin && !x.is_driver).map_or(super::INF, |v0| super::slack_over_scenes(gs, ss, v0, MAX, None));
+        let slack = (0..gs[0].vertices.len()).position(|x| gs[0].vname(x) == *pin && !gs[0].vertices[x].is_driver).map_or(super::INF, |v0| super::slack_over_scenes(gs, ss, v0, MAX, None));
         if crate::delay_estimator::delay_inf(slack) {
             continue;
         }
@@ -4173,7 +4173,7 @@ fn prepare_input_cap_budgets(target: &mut Target, gs: &[vyges_sta::graph::Graph<
         for port in pins {
             let Some(p) = cell.port(port).filter(|p| matches!(p.direction, vyges_sta::liberty::Direction::Input | vyges_sta::liberty::Direction::Bidirect)) else { continue };
             let pin = format!("{}/{port}", target.inst);
-            let Some(u) = g.vertices.iter().position(|x| x.name == pin && !x.is_driver) else { continue };
+            let Some(u) = (0..g.vertices.len()).position(|x| g.vname(x) == pin && !g.vertices[x].is_driver) else { continue };
             if g.vertex_net[u].is_none() {
                 continue;
             }
@@ -4191,7 +4191,7 @@ fn prepare_input_cap_budgets(target: &mut Target, gs: &[vyges_sta::graph::Graph<
 /// `pathInputPort`: the from-port of the arc the target's path takes into the driver, when it is
 /// not an output.
 fn pe_path_input_port(target: &Target, g: &vyges_sta::graph::Graph<'_>, search: &vyges_sta::search::Search<'_, '_>, ctx: &super::Ctx<'_>) -> Option<String> {
-    let find = |pin: &str, is_driver: bool| g.vertices.iter().position(|x| x.name == pin && x.is_driver == is_driver);
+    let find = |pin: &str, is_driver: bool| (0..g.vertices.len()).position(|x| g.vname(x) == pin && g.vertices[x].is_driver == is_driver);
     let chain = super::refind_chain(&target.path, find, &search.paths).ok()?;
     let prev = chain.get(target.path_index)?.1.prev?;
     let port = super::edge_arc_set(g, prev.edge)?.from.clone();
@@ -4214,13 +4214,14 @@ fn swap_pins_mt_prepare_inputs(target: &mut Target, gs: &[vyges_sta::graph::Grap
     if equiv_ports.is_empty() {
         return Ok(());
     }
-    let Some(drvr) = g.vertices.iter().position(|x| x.name == target.driver_pin && x.is_driver) else { return Ok(()) };
+    let Some(drvr) = (0..g.vertices.len()).position(|x| g.vname(x) == target.driver_pin && g.vertices[x].is_driver) else { return Ok(()) };
     let load_cap = g.load_cap(drvr, design.parasitics(scene));
     // annotateInputSlews(drvr, scene): the instance's input pins' timed slews.
     let prefix = format!("{}/", target.inst);
     let mut annotated: HashMap<String, [f32; 2]> = HashMap::new();
     for (u, ux) in g.vertices.iter().enumerate() {
-        let Some(port) = ux.name.strip_prefix(&prefix) else { continue };
+        let name = g.vname(u);
+        let Some(port) = name.strip_prefix(&prefix) else { continue };
         if !ux.is_driver && cell.port(port).is_some_and(crate::swap_pins::is_input) {
             annotated.insert(port.to_string(), [g.slew[u][0][MAX], g.slew[u][1][MAX]]);
         }
@@ -4243,7 +4244,7 @@ fn swap_pins_mt_prepare_inputs(target: &mut Target, gs: &[vyges_sta::graph::Grap
         if side_model {
             let pin = format!("{prefix}{port}");
             // `Sta::slack(pinLoadVertex(pin), max)`: over every scene.
-            if let Some(v0) = gs[0].vertices.iter().position(|x| x.name == pin && !x.is_driver) {
+            if let Some(v0) = (0..gs[0].vertices.len()).position(|x| gs[0].vname(x) == pin && !gs[0].vertices[x].is_driver) {
                 let slack = super::slack_over_scenes(gs, ss, v0, MAX, None);
                 if !crate::delay_estimator::delay_inf(slack) {
                     equivalent.pin = Some(pin);
@@ -4263,7 +4264,7 @@ fn swap_pins_mt_prepare_inputs(target: &mut Target, gs: &[vyges_sta::graph::Grap
 fn unbuffer_mt_prepare_inputs(target: &mut Target, facts: &PlanFacts, gs: &[vyges_sta::graph::Graph<'_>], ss: &[vyges_sta::search::Search<'_, '_>], design: &dyn super::Design, ctx: &super::Ctx<'_>) {
     let scene = target.scene;
     let g = &gs[scene];
-    let find = |pin: &str, is_driver: bool| g.vertices.iter().position(|x| x.name == pin && x.is_driver == is_driver);
+    let find = |pin: &str, is_driver: bool| (0..g.vertices.len()).position(|x| g.vname(x) == pin && g.vertices[x].is_driver == is_driver);
     let Ok(chain) = super::refind_chain(&target.path, find, &ss[scene].paths) else { return };
     let owned: Vec<(Option<String>, Option<String>, Option<String>)> = chain
         .iter()
@@ -4274,7 +4275,7 @@ fn unbuffer_mt_prepare_inputs(target: &mut Target, facts: &PlanFacts, gs: &[vyge
                 vyges_sta::netlist::Conn::Port(_) => None,
             };
             let in_port = p.prev.and_then(|prev| super::edge_arc_set(g, prev.edge)).map(|set| set.from.clone());
-            (inst, vx.cell.clone(), in_port)
+            (inst, vx.cell.as_deref().map(str::to_string), in_port)
         })
         .collect();
     let stages: Vec<crate::unbuffer::PathStage<'_>> = chain
@@ -4406,7 +4407,7 @@ fn pe_prepare_estimator_context(target: &mut Target, gs: &[vyges_sta::graph::Gra
     target.prepare_why = String::new();
     let scene = target.scene;
     let (g, search) = (&gs[scene], &ss[scene]);
-    let find = |pin: &str, is_driver: bool| g.vertices.iter().position(|x| x.name == pin && x.is_driver == is_driver);
+    let find = |pin: &str, is_driver: bool| (0..g.vertices.len()).position(|x| g.vname(x) == pin && g.vertices[x].is_driver == is_driver);
     let pins = |keys: &[super::ChainKey]| -> Option<Vec<PathPin>> {
         let chain = super::refind_chain(keys, find, &search.paths).ok()?;
         Some(chain.iter().map(|(v, p)| PathPin { vertex: *v, in_edge: p.prev.map(|x| (x.edge, x.arc)) }).collect())
@@ -4418,7 +4419,7 @@ fn pe_prepare_estimator_context(target: &mut Target, gs: &[vyges_sta::graph::Gra
     let latch = target.latch_data_path.as_ref().and_then(|(keys, start)| pins(keys).map(|p| (p, *start)));
     let slack = |v: usize, rf: Option<usize>| {
         let vx = &g.vertices[v];
-        let v0 = if scene == 0 { Some(v) } else { gs[0].vertices.iter().position(|x| x.name == vx.name && x.is_driver == vx.is_driver) };
+        let v0 = if scene == 0 { Some(v) } else { (0..gs[0].vertices.len()).position(|x| gs[0].vname(x) == g.vname(v) && gs[0].vertices[x].is_driver == vx.is_driver) };
         v0.map_or(super::INF, |v0| super::slack_over_scenes(gs, ss, v0, vyges_sta::liberty::MAX, rf))
     };
     let reader = Reader { libs: ctx.libs, g, parasitics: design.parasitics(scene), scene, equiv: inputs.equiv, dont_use: inputs.dont_use, slack: &slack, clock_pins: &cs[scene], pin_id: inputs.pin_id, master_pins: ctx.master_pins, mm: vyges_sta::liberty::MAX };

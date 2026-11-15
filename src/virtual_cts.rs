@@ -24,10 +24,10 @@ fn edge_role(g: &Graph<'_>, e: usize) -> Option<Role> {
 /// `pin_id` (pins without one last, by name).
 pub fn register_clk_pins(g: &Graph<'_>, source: &str, pin_id: &HashMap<String, u64>) -> Vec<String> {
     let reg_clk: Vec<bool> = (0..g.vertices.len()).map(|v| g.out_edges[v].iter().any(|&e| matches!(edge_role(g, e), Some(Role::RegClkToQ | Role::LatchEnToQ)))).collect();
-    let inst_of = |v: usize| g.vertices[v].name.rsplit_once('/').map(|(i, _)| i.to_string());
+    let inst_of = |v: usize| g.vname(v).rsplit_once('/').map(|(i, _)| i.to_string());
     let mut regs: BTreeSet<String> = BTreeSet::new();
     let mut visited = vec![false; g.vertices.len()];
-    let mut stack: Vec<usize> = g.vertices.iter().enumerate().filter(|(_, x)| x.name == source).map(|(v, _)| v).collect();
+    let mut stack: Vec<usize> = (0..g.vertices.len()).filter(|&v| g.vname(v) == source).collect();
     while let Some(v) = stack.pop() {
         if visited[v] {
             continue;
@@ -43,7 +43,7 @@ pub fn register_clk_pins(g: &Graph<'_>, source: &str, pin_id: &HashMap<String, u
             }
         }
     }
-    let mut pins: Vec<String> = (0..g.vertices.len()).filter(|&v| reg_clk[v] && inst_of(v).is_some_and(|i| regs.contains(&i))).map(|v| g.vertices[v].name.clone()).collect();
+    let mut pins: Vec<String> = (0..g.vertices.len()).filter(|&v| reg_clk[v] && inst_of(v).is_some_and(|i| regs.contains(&i))).map(|v| g.vname(v)).collect();
     pins.sort_by(|a, b| (pin_id.get(a).copied().unwrap_or(u64::MAX), a).cmp(&(pin_id.get(b).copied().unwrap_or(u64::MAX), b)));
     pins.dedup();
     pins

@@ -164,8 +164,8 @@ fn net_pins(g: &Graph<'_>, v: usize) -> Vec<(String, bool, bool)> {
         .iter()
         .map(|c| {
             let name = g.netlist.pin_name(c);
-            let driver = g.vertices.iter().any(|x| x.name == name && x.is_driver);
-            let load = g.vertices.iter().any(|x| x.name == name && !x.is_driver);
+            let driver = (0..g.vertices.len()).any(|x| g.vname(x) == name && g.vertices[x].is_driver);
+            let load = (0..g.vertices.len()).any(|x| g.vname(x) == name && !g.vertices[x].is_driver);
             (name, driver, load)
         })
         .collect()
@@ -288,7 +288,8 @@ fn prepare_input(t: &Timer<'_, '_, '_>, scene: usize, inst: &str, cell: &str, v:
     if !matches!(g.edges[prev.edge].kind, EdgeKind::Wire) {
         return Some(context);
     }
-    let driver_inst = g.vertices[dv].name.rsplit_once('/').map(|(i, _)| i);
+    let driver_name = g.vname(dv);
+    let driver_inst = driver_name.rsplit_once('/').map(|(i, _)| i);
     if matches!(g.vertices[dv].conn, vyges_sta::netlist::Conn::Inst(..)) && driver_inst == Some(inst) {
         return None;
     }
@@ -370,9 +371,9 @@ fn prepare_setup_hold_check(t: &Timer<'_, '_, '_>, scene: usize, inst: &str, cel
         check_derate,
         baseline_slack,
         setup,
-        data_pin: g.vertices[d_v].name.clone(),
+        data_pin: g.vname(d_v),
         data_rf: data.tag.rf,
-        clock_pin: g.vertices[tgt_v].name.clone(),
+        clock_pin: g.vname(tgt_v),
         clock_rf: clock.tag.rf,
         scene,
     };
@@ -389,7 +390,7 @@ fn prepare_setup_hold_check(t: &Timer<'_, '_, '_>, scene: usize, inst: &str, cel
 /// setup or hold end prepared; the first that cannot be is the failure and ends the visit.
 fn collect_setup_hold_checks(t: &Timer<'_, '_, '_>, inst: &str, cell: &str, pin: &str, candidates: &[String], checks: &mut Vec<PreparedSetupHoldCheck>) -> Result<(), &'static str> {
     for (scene, (g, search)) in t.gs.iter().zip(t.ss).enumerate() {
-        let Some(d_v) = g.vertices.iter().position(|x| x.name == pin && !x.is_driver) else { continue };
+        let Some(d_v) = (0..g.vertices.len()).position(|x| g.vname(x) == pin && !g.vertices[x].is_driver) else { continue };
         for end in search.check_ends(d_v) {
             let EdgeKind::Gate { set } = g.edges[end.edge].kind else { continue };
             if !matches!(g.arc_set(end.edge, set).role, Role::Setup | Role::Hold) {
@@ -467,7 +468,7 @@ impl SequentialTimingEstimator {
         }
         for port in out.data_ports.clone() {
             let pin = format!("{inst}/{port}");
-            if !t.gs.first().is_some_and(|g| g.vertices.iter().any(|x| x.name == pin && !x.is_driver)) {
+            if !t.gs.first().is_some_and(|g| (0..g.vertices.len()).any(|x| g.vname(x) == pin && !g.vertices[x].is_driver)) {
                 out.prepare_failure_reason = "sequential_missing_data_pin";
                 break;
             }

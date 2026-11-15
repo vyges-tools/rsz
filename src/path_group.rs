@@ -62,7 +62,7 @@ fn primary_pins(nl: &Netlist, inputs: bool, clock_sources: &[String]) -> Vec<Str
 /// nothing. `None` for `gated_clock` too (its ends are the timer's own group).
 pub fn make_path_group(g: &Graph<'_>, nl: &Netlist, name: &str, clock_sources: &[String]) -> Option<(PathDelay, String)> {
     let (from_inputs, to_outputs) = group_sides(name)?;
-    let names = |vs: Vec<usize>| -> Vec<String> { vs.into_iter().map(|v| g.vertices[v].name.clone()).collect() };
+    let names = |vs: Vec<usize>| -> Vec<String> { vs.into_iter().map(|v| g.vname(v)).collect() };
     let from = if from_inputs { primary_pins(nl, true, clock_sources) } else { names(vyges_sta::path_group::register_pins(g, false)) };
     let to = if to_outputs { primary_pins(nl, false, clock_sources) } else { names(vyges_sta::path_group::register_pins(g, true)) };
     if from.is_empty() || to.is_empty() {
@@ -91,7 +91,7 @@ pub fn make_path_group(g: &Graph<'_>, nl: &Netlist, name: &str, clock_sources: &
 pub fn group_ends(g: &Graph<'_>, s: &vyges_sta::search::Search<'_, '_>, name: &str) -> Vec<crate::repair_timing::Point> {
     s.group_path_ends(sta_group_name(name), vyges_sta::liberty::MAX, usize::MAX, -vyges_sta::search::INF_SLACK, vyges_sta::search::INF_SLACK)
         .into_iter()
-        .map(|e| crate::repair_timing::Point { pin: g.vertices[e.vertex].name.clone(), slack: e.slack, wns_slack: e.slack })
+        .map(|e| crate::repair_timing::Point { pin: g.vname(e.vertex), slack: e.slack, wns_slack: e.slack })
         .collect()
 }
 

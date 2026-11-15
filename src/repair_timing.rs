@@ -757,7 +757,7 @@ pub fn timing_points(g: &vyges_sta::graph::Graph<'_>, search: &vyges_sta::search
         // `Search::isEndpoint` (a path delay's internal pins included); an end whose fanout the
         // search still walks is refused — a path delay's internal `-to` pin breaks it.
         if search.is_endpoint(v) {
-            ends.push(Point { pin: vx.name.clone(), slack: search.vertex_slack(v), wns_slack: search.wns_slack(v, true) });
+            ends.push(Point { pin: g.vname(v), slack: search.vertex_slack(v), wns_slack: search.wns_slack(v, true) });
         }
         if clocks.contains(&v) || !vx.is_driver {
             continue;
@@ -765,7 +765,7 @@ pub fn timing_points(g: &vyges_sta::graph::Graph<'_>, search: &vyges_sta::search
         let register = vx.cell.as_deref().and_then(|c| libs.link_cell(c)).is_some_and(|c| !c.sequentials.is_empty() || c.has_seq_bank);
         if port || register {
             let slack = search.vertex_slack(v);
-            starts.push(Point { pin: vx.name.clone(), slack, wns_slack: slack });
+            starts.push(Point { pin: g.vname(v), slack, wns_slack: slack });
         }
     }
     Ok((ends, starts))

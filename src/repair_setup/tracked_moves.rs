@@ -37,8 +37,8 @@ fn pin_slack(gs: &[Graph<'_>], ss: &[Search<'_, '_>], name: &str) -> Option<f32>
     let mut s = INF;
     let mut any = false;
     for (k, g) in gs.iter().enumerate() {
-        for (u, x) in g.vertices.iter().enumerate() {
-            if x.name == name {
+        for (u, _) in g.vertices.iter().enumerate() {
+            if g.vname(u) == name {
                 any = true;
                 let v = ss[k].slack_of(u, MAX, None);
                 if fuzzy::less(v, s) {

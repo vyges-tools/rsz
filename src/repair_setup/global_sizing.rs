@@ -135,13 +135,13 @@ impl<'v, 'g> View<'v, 'g> {
             EdgeKind::Gate { set } => set.to_string(),
             EdgeKind::Wire => "w".into(),
         };
-        format!("{}>{}#{set}", self.g.vertices[ed.from].name, self.g.vertices[ed.to].name)
+        format!("{}>{}#{set}", self.g.vname(ed.from), self.g.vname(ed.to))
     }
 
     /// The trace's edge name (`from>to`).
     fn edge_name(&self, e: usize) -> String {
         let ed = &self.g.edges[e];
-        format!("{}>{}", self.g.vertices[ed.from].name, self.g.vertices[ed.to].name)
+        format!("{}>{}", self.g.vname(ed.from), self.g.vname(ed.to))
     }
 
     /// `edgeMaxArcDelay`: over the edge's arcs, `std::max(delay, max)` from 0.
@@ -398,7 +398,7 @@ impl GsEnv<'_> {
     fn allocate(&self, gs: &mut Gs, v: &View<'_, '_>) {
         let edges = v.data_edges();
         gs.lambda = edges.iter().map(|&e| (v.key(e), 0.0)).collect();
-        gs.endpoints = (0..v.g.vertices.len()).filter(|&x| v.s.is_endpoint(x)).map(|x| v.g.vertices[x].name.clone()).collect();
+        gs.endpoints = (0..v.g.vertices.len()).filter(|&x| v.s.is_endpoint(x)).map(|x| v.g.vname(x)).collect();
         gs.mu = vec![0.0; gs.endpoints.len()];
         self.trace(format!("alloc|{}|{}", edges.len(), gs.endpoints.len()));
     }
@@ -408,7 +408,7 @@ impl GsEnv<'_> {
         let mut mu_max_raw = 0.0f32;
         for (k, name) in gs.endpoints.iter().enumerate() {
             // `Sta::slack(endpoint, max)` of the endpoint vertex.
-            let slack = (0..v.g.vertices.len()).find(|&x| &v.g.vertices[x].name == name && v.s.is_endpoint(x)).map_or(vyges_sta::search::INF_SLACK, |x| v.s.slack_of(x, MAX, None));
+            let slack = (0..v.g.vertices.len()).find(|&x| &v.g.vname(x) == name && v.s.is_endpoint(x)).map_or(vyges_sta::search::INF_SLACK, |x| v.s.slack_of(x, MAX, None));
             let gap = cfg.setup_slack_margin - slack;
             let mu = if gap > 0.0 { gap.powf(cfg.mu_exponent) } else { 0.0 };
             gs.mu[k] = mu;
@@ -464,7 +464,8 @@ impl GsEnv<'_> {
     fn project_flow_balance(&self, gs: &mut Gs, v: &View<'_, '_>, cfg: &GlobalSizingConfig) -> Result<(), Stop> {
         let endpoints: HashMap<&str, usize> = gs.endpoints.iter().enumerate().map(|(k, n)| (n.as_str(), k)).collect();
         for x in v.level_sorted(true)? {
-            let name = v.g.vertices[x].name.as_str();
+            let name = v.g.vname(x);
+        let name = name.as_str();
             let ep = if v.s.is_endpoint(x) { endpoints.get(name).copied() } else { None };
             let target = match ep {
                 Some(k) => gs.mu[k],
@@ -637,7 +638,7 @@ impl GsEnv<'_> {
             let slack = v.s.slack_of(x, MAX, None);
             let b = if slack >= SLACK_SENTINEL { SLACK_SENTINEL } else { (slack - cfg.setup_slack_margin).max(0.0) / depth as f32 };
             gs.budget.insert(x, b);
-            self.trace(format!("bud|{}|{}|{}|{}|{}", v.g.vertices[x].name, fwd[x], bwd[x], c_hex(f64::from(slack)), c_hex(f64::from(b))));
+            self.trace(format!("bud|{}|{}|{}|{}|{}", v.g.vname(x), fwd[x], bwd[x], c_hex(f64::from(slack)), c_hex(f64::from(b))));
         }
         Ok(())
     }
@@ -685,7 +686,7 @@ impl GsEnv<'_> {
                     if self.ctx.libs.link_cell(up_cell).is_none() {
                         continue;
                     }
-                    let Some(drv_port) = v.g.vertices[drv_v].port.clone() else { continue };
+                    let Some(drv_port) = v.g.vertices[drv_v].port().map(str::to_string) else { continue };
                     let lambda_u = self.internal_lambda(gs, v, drv_v, up_inst);
                     if lambda_u <= 0.0 {
                         continue;
