@@ -494,6 +494,57 @@ fn nets_left_by_deletion(iterm_nets: impl Iterator<Item = String>, skip: &[&str]
     iterm_nets.filter(|n| !n.is_empty() && !skip.contains(&n.as_str())).collect()
 }
 
+impl<'a> CliDesign<'a> {
+    /// A design over `db` from what every command must supply; every other field starts empty,
+    /// off or zero, with the routing alpha at `set_routing_alpha`'s default (0.3) and the
+    /// estimator on. A caller sets the rest by name with struct-update syntax
+    /// (`CliDesign { constants, ..CliDesign::new(…) }`), so a field added here reaches every
+    /// caller, in this crate or a consumer, at its default instead of breaking the literal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        db: &'a mut Db,
+        rc: &'a vyges_est::rc::Rc,
+        liberty: &'a vyges_est::liberty::LibertyClocks,
+        libs: &'a Libs,
+        clock_sources: &'a [String],
+        netlist: vyges_sta::netlist::Netlist,
+        parasitics: Vec<HashMap<String, NetParasitics>>,
+        info: NetInfo,
+    ) -> Self {
+        CliDesign {
+            db,
+            rc,
+            liberty,
+            libs,
+            clock_sources,
+            constants: HashMap::new(),
+            constraints: vyges_est::sim::Constraints::default(),
+            alpha: 0.3,
+            estimating: true,
+            netlist: std::sync::Arc::new(netlist),
+            netlist_gen: 0,
+            inst_pos: None,
+            parasitics,
+            invalid: BTreeSet::new(),
+            info,
+            core: None,
+            port_caps: PortCaps::new(),
+            propagated: false,
+            journal: Vec::new(),
+            sdc_nets: BTreeSet::new(),
+            sdc_pins: BTreeSet::new(),
+            timer: TimerLog::default(),
+            stale_out_arcs: BTreeMap::new(),
+            gr: None,
+            gr_error: None,
+            undoing: false,
+            skips: None,
+            area: 0.0,
+            skip_log: false,
+        }
+    }
+}
+
 impl CliDesign<'_> {
     /// The nets on an instance's other iterms (its supply pins, when the design connects them):
     /// deleting the instance disconnects each, and `OdbCallBack::inDbITermPostDisconnect`
