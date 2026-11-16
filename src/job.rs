@@ -420,6 +420,10 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
             }
             // Deprecated: it only turns the early sizing round on.
             "-buffer_gain" => {
+                // `parse_key_args`: a key that is the last word is STA-0560.
+                if i + 1 >= args.len() {
+                    return Err("STA-0560: repair_design -buffer_gain missing value.".into());
+                }
                 a.pre_placement = true;
                 i += 1;
             }
@@ -2158,6 +2162,15 @@ mod tests {
     /// Upstream `proc repair_design` reads `-max_wire_length` through `rsz::parse_max_wire_length`,
     /// which calls `sta::check_positive_float`: a value below zero is `sta_error 572`, before any
     /// work. Zero is accepted (it means no limit).
+    /// Upstream `sta::parse_key_args`: a key given as the last word, with no value after it, is
+    /// `sta_error 560` (`$cmd $key missing value.`), before the command runs.
+    #[test]
+    fn repair_design_buffer_gain_as_the_last_word_is_sta_0560() {
+        let p = |v: &[&str]| super::parse_args(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(p(&["-buffer_gain"]).unwrap_err(), "STA-0560: repair_design -buffer_gain missing value.");
+        assert!(p(&["-buffer_gain", "4"]).unwrap().pre_placement);
+    }
+
     #[test]
     fn repair_design_negative_max_wire_length_is_sta_0572() {
         let p = |v: &[&str]| super::parse_args(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());

@@ -272,7 +272,13 @@ impl Args {
                     i += 1;
                 }
                 // Read by the library selection only: accepted with its value.
-                "-libraries" => i += 1,
+                "-libraries" => {
+                    // `parse_key_args`: a key that is the last word is STA-0560.
+                    if i + 1 >= args.len() {
+                        return Err("STA-0560: repair_timing -libraries missing value.".into());
+                    }
+                    i += 1;
+                }
                 "-skip_pin_swap" => a.skip_pin_swap = true,
                 "-skip_gate_cloning" => a.skip_gate_cloning = true,
                 "-skip_size_down" => a.skip_size_down_fanout = true,
@@ -811,6 +817,15 @@ mod tests {
         assert_eq!(p(&["-setup", "-repair_tns", "0"]).unwrap().repair_tns_end_percent, 0.0);
         assert_eq!(p(&["-setup", "-repair_tns", "100"]).unwrap().repair_tns_end_percent, 1.0);
         assert_eq!(p(&["-setup", "-repair_tns", "50"]).unwrap().repair_tns_end_percent, 0.5);
+    }
+
+    /// Upstream `sta::parse_key_args`: a key given as the last word, with no value after it, is
+    /// `sta_error 560` (`$cmd $key missing value.`), before the command runs.
+    #[test]
+    fn libraries_as_the_last_word_is_sta_0560() {
+        let p = |v: &[&str]| Args::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(p(&["-setup", "-libraries"]).unwrap_err(), "STA-0560: repair_timing -libraries missing value.");
+        assert!(p(&["-setup", "-libraries", "lib"]).is_ok());
     }
 
     /// `moveTypeFromString` (upstream 94811999d3): `sizedown` is SizeDownFanout, as `size_down` and
