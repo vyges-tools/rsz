@@ -210,7 +210,9 @@ impl Args {
                     i += 1;
                 }
                 "-repair_tns" => {
-                    let v: f64 = value(i)?.parse().map_err(|_| "repair_timing -repair_tns: not a number".to_string())?;
+                    let v = value(i)?;
+                    // `sta::check_percent`: a double in [0, 100], else STA-0576 (the Tcl's error).
+                    let v: f64 = v.parse().ok().filter(|p: &f64| (0.0..=100.0).contains(p)).ok_or_else(|| format!("STA-0576: -repair_tns '{v}' is not between 0 and 100."))?;
                     a.repair_tns_end_percent = v / 100.0;
                     i += 1;
                 }
@@ -795,6 +797,20 @@ mod tests {
         assert!(p(&["-policies", "A", "-phases", "B"]).unwrap_err().starts_with("RSZ-0222"));
         assert_eq!(p(&["-setup", "-phases", "A", "-phases", "B"]).unwrap().phases.as_deref(), Some("B"));
         assert_eq!(p(&["-setup", "-policy", "A"]).unwrap().phases.as_deref(), Some("A"));
+    }
+
+    /// Upstream `proc repair_timing` passes `-repair_tns` through `sta::check_percent`: a double
+    /// outside [0, 100] is `sta_error 576`, before any work. The bounds themselves are accepted.
+    #[test]
+    fn repair_tns_outside_0_to_100_is_sta_0576() {
+        let p = |v: &[&str]| Args::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        for bad in ["-1", "100.5", "1000"] {
+            let e = p(&["-setup", "-repair_tns", bad]).unwrap_err();
+            assert_eq!(e, format!("STA-0576: -repair_tns '{bad}' is not between 0 and 100."));
+        }
+        assert_eq!(p(&["-setup", "-repair_tns", "0"]).unwrap().repair_tns_end_percent, 0.0);
+        assert_eq!(p(&["-setup", "-repair_tns", "100"]).unwrap().repair_tns_end_percent, 1.0);
+        assert_eq!(p(&["-setup", "-repair_tns", "50"]).unwrap().repair_tns_end_percent, 0.5);
     }
 
     /// `moveTypeFromString` (upstream 94811999d3): `sizedown` is SizeDownFanout, as `size_down` and
