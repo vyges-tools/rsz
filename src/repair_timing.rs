@@ -196,6 +196,9 @@ impl Args {
             placed_nets: false,
         };
         let mut i = 0;
+        // `-phases`, `-policy` and `-policies` are one option under three names; the reference
+        // counts the NAMES given (a name repeated keeps its last value, as every key does).
+        let mut phase_aliases: Vec<&str> = Vec::new();
         while i < args.len() {
             let f = args[i].as_str();
             let value = |i: usize| args.get(i + 1).cloned().ok_or_else(|| format!("repair_timing {f} needs a value"));
@@ -223,6 +226,9 @@ impl Args {
                     i += 1;
                 }
                 "-phases" | "-policy" | "-policies" => {
+                    if !phase_aliases.contains(&f) {
+                        phase_aliases.push(f);
+                    }
                     a.phases = Some(value(i)?);
                     i += 1;
                 }
@@ -292,6 +298,11 @@ impl Args {
                 other => return Err(format!("repair_timing {other}: not modelled")),
             }
             i += 1;
+        }
+        // `proc repair_timing`: more than one of the three names is RSZ-0222, an error, before
+        // any work.
+        if phase_aliases.len() > 1 {
+            return Err("RSZ-0222: specify at most one of -phases / -policy / -policies".into());
         }
         if !a.setup && !a.hold {
             a.setup = true;
@@ -773,6 +784,19 @@ pub fn timing_points(g: &vyges_sta::graph::Graph<'_>, search: &vyges_sta::search
 
 #[cfg(test)]
 mod tests {
+    /// Upstream `proc repair_timing` resolves `-phases` / `-policy` / `-policies` to one value and
+    /// counts how many of the three NAMES were given: more than one is `utl::error RSZ 222`. One
+    /// name repeated is one key whose last value wins (`parse_key_args` sets the array twice).
+    #[test]
+    fn more_than_one_phases_alias_is_rsz_0222() {
+        let p = |v: &[&str]| Args::parse(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let e = p(&["-setup", "-phases", "A", "-policy", "B"]).unwrap_err();
+        assert!(e.starts_with("RSZ-0222"), "{e}");
+        assert!(p(&["-policies", "A", "-phases", "B"]).unwrap_err().starts_with("RSZ-0222"));
+        assert_eq!(p(&["-setup", "-phases", "A", "-phases", "B"]).unwrap().phases.as_deref(), Some("B"));
+        assert_eq!(p(&["-setup", "-policy", "A"]).unwrap().phases.as_deref(), Some("A"));
+    }
+
     /// `moveTypeFromString` (upstream 94811999d3): `sizedown` is SizeDownFanout, as `size_down` and
     /// `size_down_fanout` are.
     #[test]
