@@ -401,8 +401,13 @@ pub fn parse_args(args: &[String]) -> Result<Args, String> {
     while i < args.len() {
         match args[i].as_str() {
             // `sta::distance_ui_sta`: microns times the distance unit's FLOAT scale, in double.
+            // `parse_max_wire_length`: `sta::check_positive_float` first, a double >= 0 else STA-0572.
             "-max_wire_length" => {
-                a.max_wire_length = num(args.get(i + 1), "-max_wire_length")? * f64::from(1e-6f32);
+                let v = num(args.get(i + 1), "-max_wire_length")?;
+                if v.is_nan() || v < 0.0 {
+                    return Err(format!("STA-0572: -max_wire_length '{}' is not a positive float.", args[i + 1]));
+                }
+                a.max_wire_length = v * f64::from(1e-6f32);
                 i += 1;
             }
             "-slew_margin" => {
@@ -2150,6 +2155,18 @@ fn finds_fast_buffers(seq: &[crate::repair_timing::Move], plan: Option<&crate::r
 
 #[cfg(test)]
 mod tests {
+    /// Upstream `proc repair_design` reads `-max_wire_length` through `rsz::parse_max_wire_length`,
+    /// which calls `sta::check_positive_float`: a value below zero is `sta_error 572`, before any
+    /// work. Zero is accepted (it means no limit).
+    #[test]
+    fn repair_design_negative_max_wire_length_is_sta_0572() {
+        let p = |v: &[&str]| super::parse_args(&v.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let e = p(&["-max_wire_length", "-5"]).unwrap_err();
+        assert_eq!(e, "STA-0572: -max_wire_length '-5' is not a positive float.");
+        assert_eq!(p(&["-max_wire_length", "0"]).unwrap().max_wire_length, 0.0);
+        assert!(p(&["-max_wire_length", "800"]).unwrap().max_wire_length > 0.0);
+    }
+
     use super::*;
 
     /// Upstream rule (`VisitPathEnds::clockGatingMargin` at 4155ac3 returns 0.0 when no margin
