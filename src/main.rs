@@ -93,7 +93,7 @@ REPAIR_TIMING:
   status repaired (the design changed), unrepaired (violations, nothing kept), up_to_date or
   error. Clocks (one or several, real or virtual), each ideal or propagated, with their I/O
   delays; latches (time borrowing); VT libraries (VtSwapMove); pins tied to supply nets.
-  -setup and -hold together (or neither): the setup repair, then refused. Phases LEGACY, WNS,
+  -setup and -hold together (or neither): the setup repair, then the hold repair. Phases LEGACY, WNS,
   TNS, ENDPOINT_FANIN, STARTPOINT_FANOUT, LAST_GASP, CRIT_VT_SWAP and REROUTE are modelled (an
   empty list or an unknown first phase is the command's own error), on placement or global-route
   parasitics (the live incremental router; a resistance-aware re-route reads the timer's net

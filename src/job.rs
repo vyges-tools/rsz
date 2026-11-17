@@ -563,7 +563,8 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
     let mut groute: Option<vyges_grt::global_route::RouteResult> = None;
     let mut groute_opts: Option<vyges_grt::global_route::RouteOptions> = None;
     let mut gr_estimated = false;
-    for step in job["steps"].as_array().ok_or("steps")? {
+    let steps = split_repair_timing(job["steps"].as_array().ok_or("steps")?);
+    for step in &steps {
         let cmd = step["cmd"].as_str().ok_or("cmd")?;
         let args: Vec<String> = step["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
         // Whether a resizer command before this one ran `initBlock` (each of these does, early).
@@ -1329,10 +1330,19 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 }
                 let mut a = if fr.is_some() { rt::Args::parse(&["-setup".to_string(), "-sequence".to_string(), "buffer".to_string()])? } else { rt::Args::parse(&args)? };
                 a.sta_levels = sta_levels.clone();
+                // The hold part of a command with both parts: the Tcl's once-per-command lines
+                // were the setup part's; `rsz::repair_hold` takes no phases.
+                let hold_part = is_hold_part(&args);
+                // Its setup part starts the command's trace, which the hold part extends.
+                if let Some(path) = job["timing_trace"].as_str().filter(|_| args.windows(2).any(|w| w[0] == "-vyges_part" && w[1] == "setup")) {
+                    std::fs::write(path, "").map_err(|e| format!("{path}: {e}"))?;
+                }
                 // `-path_group` (`rsz::resolve_path_group`, before anything else of the command):
                 // an unknown name warns and restricts nothing; a group is not modelled yet.
                 let (path_group, path_group_lines) = rt::resolve_path_group(a.path_group.as_deref());
-                timing_runs.prefix = path_group_lines;
+                if !hold_part {
+                    timing_runs.prefix = path_group_lines;
+                }
                 // `-recover_power` dispatches to `rsz::recover_power` in place of setup and hold:
                 // -phases, -sequence and the setup flags never reach it.
                 let recover = a.recover_power;
@@ -1345,7 +1355,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 // `-phases`: LEGACY alone is the default pipeline without LAST_GASP; another policy
                 // after the shared preamble is refused there; an empty list or an unknown first
                 // phase is the reference's error, before any line.
-                let plan = a.phases.as_deref().filter(|_| !recover).map(rt::phase_plan);
+                let plan = a.phases.as_deref().filter(|_| !recover && !hold_part).map(rt::phase_plan);
                 match &plan {
                     Some(rt::PhasePlan::Error { code, line }) if a.setup => {
                         timing_runs.push(json!({ "lines": [line], "endpoints": 0, "violating_endpoints": 0, "resized": 0, "removed": 0, "inserted": 0, "error": code }));
@@ -1728,7 +1738,9 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     }
                     if hold_only {
                         let mut trace_head = Vec::new();
-                        if debug_levels.get(&("RSZ".to_string(), "resizer".to_string())).is_some_and(|&l| l >= 1) {
+                        // `findFastBuffers` returns at once when `buffer_fast_sizes_` is set: the
+                        // hold part's preamble finds the list its setup part's made, and prints none.
+                        if !hold_part && debug_levels.get(&("RSZ".to_string(), "resizer".to_string())).is_some_and(|&l| l >= 1) {
                             // `findFastBuffers`' list (`pre-selected buffers`).
                             let base = crate::rebuffer::Ctx { libs: &libs, sizes: &[], rc: wire_rc, dbu: db_dbu, slew_shape_factor, tgt_slews, time_scale, cap_scale: lib0.cap_scale, cmd: 0, tgt: tgt_scene, layers: gr_layers.clone() };
                             let lowest = libs.link_cell(&buffers.lowest).ok_or("no lowest-drive buffer")?;
@@ -1783,11 +1795,14 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         };
                         if let Some(path) = job["timing_trace"].as_str() {
                             let all: Vec<String> = trace_head.into_iter().chain(o.trace.iter().cloned()).collect();
-                            std::fs::write(path, all.join("\n") + "\n").map_err(|e| format!("{path}: {e}"))?;
+                            // The hold part's trace follows the setup part's: one command, one trace.
+                            let mut text = if hold_part { std::fs::read_to_string(path).unwrap_or_default() } else { String::new() };
+                            text.push_str(&(all.join("\n") + "\n"));
+                            std::fs::write(path, text).map_err(|e| format!("{path}: {e}"))?;
                         }
                         // RSZ-0226: logged before `repair_hold` runs.
-                        // RSZ-3244 (the Tcl's argument check) before it.
-                        let lines: Vec<String> = rt::effort_warning(&a).into_iter().chain(a.skip_crpr.then(|| "[INFO RSZ-0226] CRPR disabled during hold repair.".to_string())).chain(o.lines).collect();
+                        // RSZ-3244 (the Tcl's argument check) before it, once per command.
+                        let lines: Vec<String> = rt::effort_warning(&a).filter(|_| !hold_part).into_iter().chain(a.skip_crpr.then(|| "[INFO RSZ-0226] CRPR disabled during hold repair.".to_string())).chain(o.lines).collect();
                         timing_runs.push(json!({ "hold": true, "lines": lines, "endpoints": ends.len(), "violating_endpoints": o.violating, "inserted": o.inserted, "resized": o.resized, "stopped": o.stopped, "error": o.error }));
                         if let Some(why) = o.stopped {
                             timing_stop = Some(why);
@@ -2157,8 +2172,70 @@ fn finds_fast_buffers(seq: &[crate::repair_timing::Move], plan: Option<&crate::r
     seq.contains(&Move::SizeDownFanout) || matches!(plan, Some(PhasePlan::ParallelEval))
 }
 
+/// `proc repair_timing` with both parts (neither `-setup` nor `-hold`, or both), without
+/// `-recover_power`: after the argument checks it calls `rsz::repair_setup`, then
+/// `rsz::repair_hold` on the design the setup part left — the same two calls, on the same
+/// arguments, as `repair_timing -setup` followed by `repair_timing -hold`. Each such step becomes
+/// its two parts (`-vyges_part setup`, `-vyges_part hold`); the hold part leaves out what the
+/// Tcl prints once per command (RSZ-3244, RSZ-0227). A step whose arguments do not parse stays
+/// whole, so it fails as it did.
+fn split_repair_timing(steps: &[Value]) -> Vec<Value> {
+    let mut out = Vec::with_capacity(steps.len());
+    for step in steps {
+        let args: Vec<String> = step["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
+        let both = step["cmd"].as_str() == Some("repair_timing") && crate::repair_timing::Args::parse(&args).is_ok_and(|a| a.setup && a.hold && !a.recover_power);
+        if !both {
+            out.push(step.clone());
+            continue;
+        }
+        for part in ["setup", "hold"] {
+            let mut s = step.clone();
+            s["args"] = Value::from(args.iter().cloned().chain(["-vyges_part".to_string(), part.to_string()]).collect::<Vec<_>>());
+            out.push(s);
+        }
+    }
+    out
+}
+
+/// Whether a `repair_timing` step is the hold part of a command with both parts.
+fn is_hold_part(args: &[String]) -> bool {
+    args.windows(2).any(|w| w[0] == "-vyges_part" && w[1] == "hold")
+}
+
 #[cfg(test)]
 mod tests {
+    /// Upstream rule (`proc repair_timing`, Resizer.tcl at 4155ac3): with neither `-setup` nor
+    /// `-hold` (or both) and no `-recover_power`, the command runs `rsz::repair_setup` and then
+    /// `rsz::repair_hold` — witnessed: the reference's log and design for `repair_timing` equal
+    /// those of `repair_timing -setup; repair_timing -hold`, byte for byte (repair_hold1.def at a
+    /// 0.08 and a 2 ns period, and with `-skip_crpr -max_iterations 1`). So the job runs the two
+    /// parts in turn; a one-part command, `-recover_power`, another command and arguments that
+    /// do not parse are left as they are.
+    #[test]
+    fn a_repair_timing_with_both_parts_runs_setup_then_hold() {
+        let step = |cmd: &str, args: &[&str]| json!({ "cmd": cmd, "args": args });
+        let parts = super::split_repair_timing(&[step("estimate_parasitics", &["-placement"]), step("repair_timing", &["-skip_crpr"]), step("repair_timing", &["-setup", "-hold"])]);
+        let words: Vec<Vec<&str>> = parts.iter().map(|s| std::iter::once(s["cmd"].as_str().unwrap()).chain(s["args"].as_array().unwrap().iter().map(|a| a.as_str().unwrap())).collect()).collect();
+        assert_eq!(
+            words,
+            [
+                vec!["estimate_parasitics", "-placement"],
+                vec!["repair_timing", "-skip_crpr", "-vyges_part", "setup"],
+                vec!["repair_timing", "-skip_crpr", "-vyges_part", "hold"],
+                vec!["repair_timing", "-setup", "-hold", "-vyges_part", "setup"],
+                vec!["repair_timing", "-setup", "-hold", "-vyges_part", "hold"],
+            ]
+        );
+        for one in [step("repair_timing", &["-setup"]), step("repair_timing", &["-hold"]), step("repair_timing", &["-recover_power", "50"]), step("repair_timing", &["-no_such_flag"]), step("fully_rebuffer", &[])] {
+            assert_eq!(super::split_repair_timing(std::slice::from_ref(&one)), [one]);
+        }
+        let parse = |s: &Value| crate::repair_timing::Args::parse(&s["args"].as_array().unwrap().iter().map(|a| a.as_str().unwrap().to_string()).collect::<Vec<_>>()).unwrap();
+        let (setup, hold) = (parse(&parts[1]), parse(&parts[2]));
+        assert!(setup.setup && !setup.hold && setup.skip_crpr);
+        assert!(!hold.setup && hold.hold && hold.skip_crpr);
+        assert!(!super::is_hold_part(&["-hold".to_string()]) && super::is_hold_part(&["-vyges_part".to_string(), "hold".to_string()]));
+    }
+
     /// Upstream `proc repair_design` reads `-max_wire_length` through `rsz::parse_max_wire_length`,
     /// which calls `sta::check_positive_float`: a value below zero is `sta_error 572`, before any
     /// work. Zero is accepted (it means no limit).

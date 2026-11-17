@@ -199,6 +199,9 @@ impl Args {
         // `-phases`, `-policy` and `-policies` are one option under three names; the reference
         // counts the NAMES given (a name repeated keeps its last value, as every key does).
         let mut phase_aliases: Vec<&str> = Vec::new();
+        // `-vyges_part setup|hold`: one part of a command with both (the job's split, see
+        // `job::split_repair_timing`).
+        let mut part: Option<String> = None;
         while i < args.len() {
             let f = args[i].as_str();
             let value = |i: usize| args.get(i + 1).cloned().ok_or_else(|| format!("repair_timing {f} needs a value"));
@@ -219,6 +222,10 @@ impl Args {
                 // Global placement's repair pass: the fraction as the placer holds it (`percent /
                 // 100.0f`, a float), not the command's double division.
                 "-vyges_placed_nets" => a.placed_nets = true,
+                "-vyges_part" => {
+                    part = Some(value(i)?);
+                    i += 1;
+                }
                 "-vyges_repair_tns_fraction" => {
                     a.repair_tns_end_percent = value(i)?.parse().map_err(|_| "repair_timing -vyges_repair_tns_fraction: not a number".to_string())?;
                     i += 1;
@@ -315,6 +322,12 @@ impl Args {
         if !a.setup && !a.hold {
             a.setup = true;
             a.hold = true;
+        }
+        match part.as_deref() {
+            None => {}
+            Some("setup") => a.hold = false,
+            Some("hold") => a.setup = false,
+            Some(other) => return Err(format!("repair_timing -vyges_part {other}: not setup or hold")),
         }
         Ok(a)
     }
