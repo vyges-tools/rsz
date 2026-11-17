@@ -395,7 +395,7 @@ impl Timer {
         inc.track_netlist(design.netlist());
         // a carried session: its levels stand until an edit relevelizes them
         if let Some(l) = levels {
-            inc.levels = l.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            inc.levels = l.iter().map(|(k, v)| (inc.intern(k), *v)).collect();
         }
         Ok(Timer { inc: vec![inc; scenes], trace_at: 0 })
     }
@@ -540,8 +540,8 @@ impl Levels {
 }
 
 /// A pass's level limit on the timer's levels: `None` for every level, `Some(None)` for no pass.
-fn upto_level(u: &Upto, levels: &HashMap<String, i32>) -> Option<Option<i32>> {
-    let level = |p: &String| levels.get(p).copied().unwrap_or(0);
+fn upto_level(u: &Upto, levels: &HashMap<vyges_sta::incr::Name, i32>) -> Option<Option<i32>> {
+    let level = |p: &String| levels.get(p.as_str()).copied().unwrap_or(0);
     match u {
         Upto::All => Some(None),
         Upto::Skip => None,
@@ -1265,7 +1265,7 @@ fn full_probe(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], _cs: &[BTr
 pub fn fully_rebuffer(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args, user_pin: Option<&str>) -> Result<Outcome, Stop> {
     let mut r = Repair::new(ctx, design, args)?;
     r.fully_rebuffer(user_pin)?;
-    r.out.levels = r.timer.inc[0].levels.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    r.out.levels = r.timer.inc[0].levels.iter().map(|(k, v)| (k.to_string(), *v)).collect();
     Ok(r.out)
 }
 
@@ -1279,7 +1279,7 @@ pub type SlacksAndLevels = (BTreeMap<String, f32>, BTreeMap<String, i32>);
 pub fn resize_slacks(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) -> Result<SlacksAndLevels, Stop> {
     let mut r = Repair::new(ctx, design, args)?;
     let slacks = resize_slacks_on(&mut r)?;
-    Ok((slacks, r.timer.inc[0].levels.iter().map(|(k, v)| (k.clone(), *v)).collect()))
+    Ok((slacks, r.timer.inc[0].levels.iter().map(|(k, v)| (k.to_string(), *v)).collect()))
 }
 
 /// [`fully_rebuffer`], then [`resize_slacks`] on the SAME timer — `Resizer::findResizeSlacks`:
@@ -1289,7 +1289,7 @@ pub fn fully_rebuffer_with_slacks(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, a
     let mut r = Repair::new(ctx, design, args)?;
     r.fully_rebuffer(user_pin)?;
     let slacks = resize_slacks_on(&mut r)?;
-    r.out.levels = r.timer.inc[0].levels.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    r.out.levels = r.timer.inc[0].levels.iter().map(|(k, v)| (k.to_string(), *v)).collect();
     Ok((r.out, slacks))
 }
 
@@ -1305,7 +1305,7 @@ fn resize_slacks_on(r: &mut Repair<'_, '_>) -> Result<BTreeMap<String, f32>, Sto
     let slacks = timed_all(ctx, r.design.as_design(), &mut r.timer, TimerEdits::default(), |gs, ss, cs| {
         let g = &gs[0];
         // `levelizedDrvrVertices`: on the timer's (incremental) levels
-        let level: Vec<i32> = (0..g.vertices.len()).map(|v| levels.get(&g.vname(v)).copied().unwrap_or(0)).collect();
+        let level: Vec<i32> = (0..g.vertices.len()).map(|v| g.with_vname(v, |n| levels.get(n).copied()).unwrap_or(0)).collect();
         let drvrs = crate::timing::levelized_drvr_vertices(g, &level);
         let mut out = BTreeMap::new();
         for &d in drvrs.iter().rev() {
@@ -1357,7 +1357,7 @@ impl Repair<'_, '_> {
         let levels = self.timer.inc[0].levels.clone();
         timed_all(ctx, self.design.as_design(), &mut self.timer, TimerEdits::default(), |gs, _ss, cs| {
             let g = &gs[0];
-            let level: Vec<i32> = (0..g.vertices.len()).map(|v| levels.get(&g.vname(v)).copied().unwrap_or(0)).collect();
+            let level: Vec<i32> = (0..g.vertices.len()).map(|v| g.with_vname(v, |n| levels.get(n).copied()).unwrap_or(0)).collect();
             let mut out = Vec::new();
             for d in crate::timing::levelized_drvr_vertices(g, &level) {
                 let vx = &g.vertices[d];
@@ -3171,7 +3171,7 @@ pub fn repair_setup(ctx: &Ctx<'_>, design: &mut dyn SetupDesign, args: &Args) ->
     r.out.resized = r.committer.committed(Move::SizeUp) + r.committer.committed(Move::SizeDownFanout) + r.committer.committed(Move::SizeUpMatch) + r.committer.committed(Move::VtSwap);
     r.out.removed = r.committer.committed(Move::Unbuffer);
     r.out.inserted = r.committer.committed(Move::Buffer);
-    r.out.levels = r.timer.inc[0].levels.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    r.out.levels = r.timer.inc[0].levels.iter().map(|(k, v)| (k.to_string(), *v)).collect();
     Ok(r.out)
 }
 

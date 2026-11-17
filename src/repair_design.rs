@@ -278,11 +278,15 @@ fn repair_design_held(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args,
         for g in &graphs {
             // scene 0's timer prints the graph-edit trace (`VYGES_STA_GRAPH_TRACE`)
             let mut t = IncTimer::default();
+            // one set of names for every scene's timer: they name the same pins
+            if let Some(first) = incs.first() {
+                t.share_names(first);
+            }
             t.trace_edits = incs.is_empty();
             t.track_netlist(&netlist);
             // a carried session: its levels stand until an edit relevelizes them
             if let Some(l) = &args.sta_levels {
-                t.levels = l.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                t.levels = l.iter().map(|(k, v)| (t.intern(k), *v)).collect();
             }
             t.relevelize(g).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
             t.export(g);
@@ -433,7 +437,7 @@ fn repair_design_held(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args,
         });
         let g = timer_graphs(inputs, design, &annotated, incs, &mut ctx.edit_log, old)?;
         incs[0].relevelize(&g[0]).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
-        outcome.levels = Some(incs[0].levels.iter().map(|(k, v)| (k.clone(), *v)).collect());
+        outcome.levels = Some(incs[0].levels.iter().map(|(k, v)| (k.to_string(), *v)).collect());
         held = Some((g, std::sync::Arc::new(HashMap::new())));
     }
     recycle_held(held);
