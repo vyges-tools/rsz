@@ -789,7 +789,8 @@ struct EditLog<'n> {
     fallback: usize,
     built: usize,
     /// Graphs a caller let go (a net's own graphs once its held ones are handed back, a
-    /// repeater's net's): edited forward from their place in the log for a caller that holds none.
+    /// mid-update search's): edited forward from their place in the log for a caller that holds
+    /// none. A fanout repeater's net is not one: it is repaired on the outer net's graphs.
     spare: Option<Vec<Graph<'n>>>,
     /// Per take of the design's edits, the events' length after it and the netlist slots it
     /// changed (`None`: slots moved or were not kept — the graphs compare the netlists whole).
@@ -1156,19 +1157,31 @@ fn repair_driver_net<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut Net
 /// `repairNet` times its driver with `GraphDelayCalc::findDelays(drvr)` — that ONE driver, from
 /// the input slews the graph holds — and nothing has timed the new repeater's input pin yet: its
 /// slew is the vertex's initial 0 (its driver is timed again only by the outer `repairNet`).
-fn repair_repeater_net(design: &mut dyn Design, in_pin: &str, out_pin: &str, out_net: &str, ctx: &mut NetCtx<'_, '_>, outcome: &mut Outcome, trace: &mut Trace) -> Result<(), Stop> {
+///
+/// 🔑 On the timer it is repaired on the OUTER net's graphs (`graphs`), edited in place by the
+/// repeater's edits and handed back as the inner repair left them. Reference rule (OpenROAD
+/// 4155ac31 `RepairDesign::makeFanoutRepeater` → `repairNet(out_net, …)`): the nested repair
+/// runs on the one `sta::Graph` and `GraphDelayCalc` the outer `repairNet` uses — the instrumented
+/// trace (P3 notes, 2026-11-17 step 0) prints the same graph and delay calculator at both depths
+/// — so there is no second graph. A spare set of graphs built for it held a design-size copy of
+/// every scene graph (14 GB on a 1.6 M instance design) for no decision.
+/// Pinned by `tests/fanout_repeater_graphs.rs`.
+#[allow(clippy::too_many_arguments)]
+fn repair_repeater_net<'g>(design: &mut dyn Design, in_pin: &str, out_pin: &str, out_net: &str, graphs: &mut Vec<Graph<'g>>, ctx: &mut NetCtx<'g, '_>, outcome: &mut Outcome, trace: &mut Trace) -> Result<(), Stop> {
     if let Some(incs) = ctx.timer.as_mut() {
         // On the timer the new input pin has no state: its slew reads 0 until a queue reaches it.
-        let graphs = timer_graphs(ctx.inputs, design, ctx.annotated, incs, &mut ctx.edit_log, None)?;
-        let drvr = crate::timing::vertex_named(&graphs[0], out_pin, true).ok_or_else(|| Stop::error("RSZ-INSERT", format!("{out_pin}: not in the timing graph")))?;
+        debug_assert!(!graphs.is_empty(), "the outer net's graphs");
+        let outer = std::mem::take(graphs);
+        let edited = timer_graphs(ctx.inputs, design, ctx.annotated, incs, &mut ctx.edit_log, Some(outer))?;
+        let drvr = crate::timing::vertex_named(&edited[0], out_pin, true).ok_or_else(|| Stop::error("RSZ-INSERT", format!("{out_pin}: not in the timing graph")))?;
         let mut own = Outcome::default();
         // no index held across the repair: `repairNet` on the timer never reads it, and the graphs
         // are edited in place (an edit takes over their index only when nothing else holds it)
-        let r = repair_net(design, graphs, drvr, out_net, false, None, ctx, &mut own, trace, None);
-        let r = r.map(|g| ctx.edit_log.keep(g));
+        let r = repair_net(design, edited, drvr, out_net, false, None, ctx, &mut own, trace, None);
         outcome.inserted_buffers += own.inserted_buffers;
         outcome.resized += own.resized;
-        return r;
+        *graphs = r?;
+        return Ok(());
     }
     let mut graphs = current_graphs(ctx.inputs, &design.netlist_shared(), ctx.annotated)?;
     // Only the repeater's input is timed ahead of `repairNet`'s `findDelays(drvr)` — to its 0 —
@@ -1199,14 +1212,15 @@ fn repair_repeater_net(design: &mut dyn Design, in_pin: &str, out_pin: &str, out
 /// for its parent; otherwise its sub-regions first (bottom up), then their pins and its own, each
 /// taken from the BACK, into groups of `max_fanout` each buffered as it fills; a remainder of at
 /// least `max_fanout / 2` (int) is buffered too, else it stays the region's pins; the repeaters'
-/// inputs join them.
+/// inputs join them. `graphs` are the outer net's, lent to each repeater's net repair and handed
+/// back edited ([`repair_repeater_net`]).
 #[allow(clippy::too_many_arguments)]
-fn make_region_repeaters(region: &mut fanout::LoadRegion, max_fanout: i32, drvr_pin: &str, link: &Graph<'_>, design: &mut dyn Design, ctx: &mut NetCtx<'_, '_>, outcome: &mut Outcome, trace: &mut Trace) -> Result<(), Stop> {
+fn make_region_repeaters<'g>(region: &mut fanout::LoadRegion, max_fanout: i32, drvr_pin: &str, graphs: &mut Vec<Graph<'g>>, design: &mut dyn Design, ctx: &mut NetCtx<'g, '_>, outcome: &mut Outcome, trace: &mut Trace) -> Result<(), Stop> {
     if region.regions.is_empty() {
         return Ok(());
     }
     for k in 0..region.regions.len() {
-        make_region_repeaters(&mut region.regions[k], max_fanout, drvr_pin, link, design, ctx, outcome, trace)?;
+        make_region_repeaters(&mut region.regions[k], max_fanout, drvr_pin, graphs, design, ctx, outcome, trace)?;
     }
     let mut repeater_inputs: Vec<String> = Vec::new();
     let mut repeater_loads: Vec<String> = Vec::new();
@@ -1215,18 +1229,18 @@ fn make_region_repeaters(region: &mut fanout::LoadRegion, max_fanout: i32, drvr_
         while let Some(p) = region.regions[k].pins.pop() {
             repeater_loads.push(p);
             if full(repeater_loads.len()) {
-                make_fanout_repeater(&mut repeater_loads, &mut repeater_inputs, drvr_pin, link, design, ctx, outcome, trace)?;
+                make_fanout_repeater(&mut repeater_loads, &mut repeater_inputs, drvr_pin, graphs, design, ctx, outcome, trace)?;
             }
         }
     }
     while let Some(p) = region.pins.pop() {
         repeater_loads.push(p);
         if full(repeater_loads.len()) {
-            make_fanout_repeater(&mut repeater_loads, &mut repeater_inputs, drvr_pin, link, design, ctx, outcome, trace)?;
+            make_fanout_repeater(&mut repeater_loads, &mut repeater_inputs, drvr_pin, graphs, design, ctx, outcome, trace)?;
         }
     }
     if !repeater_loads.is_empty() && repeater_loads.len() as i64 >= i64::from(max_fanout / 2) {
-        make_fanout_repeater(&mut repeater_loads, &mut repeater_inputs, drvr_pin, link, design, ctx, outcome, trace)?;
+        make_fanout_repeater(&mut repeater_loads, &mut repeater_inputs, drvr_pin, graphs, design, ctx, outcome, trace)?;
     } else {
         region.pins = repeater_loads;
     }
@@ -1238,14 +1252,15 @@ fn make_region_repeaters(region: &mut fanout::LoadRegion, max_fanout: i32, drvr_
 /// the driver (`findClosedPinLoc`), level 1, reason `fanout`; then its net repaired; its input
 /// joins the repeater inputs.
 #[allow(clippy::too_many_arguments)]
-fn make_fanout_repeater(repeater_loads: &mut Vec<String>, repeater_inputs: &mut Vec<String>, drvr_pin: &str, link: &Graph<'_>, design: &mut dyn Design, ctx: &mut NetCtx<'_, '_>, outcome: &mut Outcome, trace: &mut Trace) -> Result<(), Stop> {
+fn make_fanout_repeater<'g>(repeater_loads: &mut Vec<String>, repeater_inputs: &mut Vec<String>, drvr_pin: &str, graphs: &mut Vec<Graph<'g>>, design: &mut dyn Design, ctx: &mut NetCtx<'g, '_>, outcome: &mut Outcome, trace: &mut Trace) -> Result<(), Stop> {
     let inputs = ctx.inputs;
     let (x, y) = {
         let d: &dyn Design = &*design;
         fanout::find_closed_pin_loc(d.pin_location(drvr_pin), repeater_loads, &|p| d.pin_location(p))
     };
-    // `corner_` is the command scene here (set just before makeRegionRepeaters).
-    let bctx = buffered_net::Ctx { graph: link, libs: inputs.libs, sdc: &inputs.sdc, limits: &inputs.limits, dbu: inputs.dbu, rc: inputs.wire_rc[0] };
+    // `corner_` is the command scene here (set just before makeRegionRepeaters). An unresized
+    // repeater (`resize` false) reads nothing off the graph: the outer graphs stand in.
+    let bctx = buffered_net::Ctx { graph: &graphs[0], libs: inputs.libs, sdc: &inputs.sdc, limits: &inputs.limits, dbu: inputs.dbu, rc: inputs.wire_rc[0] };
     let walk = Walk {
         ctx: &bctx,
         sizing: ctx.sizing,
@@ -1268,7 +1283,7 @@ fn make_fanout_repeater(repeater_loads: &mut Vec<String>, repeater_inputs: &mut 
     outcome.inserted_buffers += st.inserted;
     made?;
     let r = st.last.expect("a repeater was made");
-    repair_repeater_net(design, &r.input, &r.output, &r.out_net, ctx, outcome, trace)?;
+    repair_repeater_net(design, &r.input, &r.output, &r.out_net, graphs, ctx, outcome, trace)?;
     repeater_inputs.push(r.input);
     repeater_loads.clear();
     Ok(())
@@ -1392,12 +1407,20 @@ fn repair_net<'g>(design: &mut dyn Design, graphs: Vec<Graph<'g>>, drvr: usize, 
                 let d: &dyn Design = &*design;
                 fanout::find_load_regions(loads, max_fanout, inputs.dbu, &|p| d.pin_location(p))
             };
-            make_region_repeaters(&mut region, max_fanout, &name, &gs!()[0], design, ctx, outcome, trace)?;
+            // The graphs in hand (the held ones: nothing has taken them yet) are lent to the
+            // region repeaters, whose nets are repaired on them, and come back edited.
+            debug_assert!(own_graphs.is_none(), "the fanout repair is repairNet's first edit");
+            let mut lent = take_current!();
+            make_region_repeaters(&mut region, max_fanout, &name, &mut lent, design, ctx, outcome, trace)?;
             fanout_edited = true;
             // The design changed under the driver: its graphs again.
             own_graphs = Some(match ctx.timer.as_mut() {
-                Some(incs) => timer_graphs(inputs, design, ctx.annotated, incs, &mut ctx.edit_log, Some(take_current!()))?,
-                None => current_graphs(inputs, &design.netlist_shared(), ctx.annotated)?,
+                Some(incs) => timer_graphs(inputs, design, ctx.annotated, incs, &mut ctx.edit_log, Some(lent))?,
+                None => {
+                    // off the timer the repeaters' nets were repaired on graphs of their own
+                    held_graphs = lent;
+                    current_graphs(inputs, &design.netlist_shared(), ctx.annotated)?
+                }
             });
             drvr = crate::timing::vertex_named(&gs!()[0], &name, true).expect("the driver");
             // The reference holds the net OBJECT: a repeater before a port load renames it, so
