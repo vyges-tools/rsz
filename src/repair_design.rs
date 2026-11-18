@@ -278,14 +278,15 @@ fn repair_design_held(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args,
         for g in &graphs {
             // scene 0's timer prints the graph-edit trace (`VYGES_STA_GRAPH_TRACE`)
             let mut t = IncTimer::default();
-            // one set of names for every scene's timer: they name the same pins
+            // as the reference's ONE graph: the first scene's timer keeps the levels, cells and
+            // net drivers and takes each edit; the others follow it, with one set of names
             if let Some(first) = incs.first() {
-                t.share_names(first);
+                t.follow(first);
             }
             t.trace_edits = incs.is_empty();
             t.track_netlist(&netlist);
             // a carried session: its levels stand until an edit relevelizes them
-            if let Some(l) = &args.sta_levels {
+            if let (Some(l), true) = (&args.sta_levels, incs.is_empty()) {
                 t.levels = l.iter().map(|(k, v)| (t.intern(k), *v)).collect();
             }
             t.relevelize(g).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
@@ -907,11 +908,12 @@ fn timer_graphs<'n>(inputs: &Inputs<'n>, design: &mut dyn Design, annotated: &[H
     }
     let cx = EventCtx { libs: &inputs.libs.libs, ideal_clock_mode: false };
     let new_events = log.since(first).expect("the log is trimmed only at a held refresh, never inside a call");
+    // each edit taken ONCE for every scene's timer (the first leads, the others follow)
+    for ev in new_events {
+        vyges_sta::incr::apply_event_scenes(incs, &cx, ev).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+    }
     for (g, inc) in graphs.iter_mut().zip(incs.iter_mut()) {
         g.edit_seq = Some(log.end());
-        for ev in new_events {
-            inc.apply_event(&cx, ev).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
-        }
         for net in &edits.updated_nets {
             // by the design's name map when this is its netlist, not a pass over every net
             let slot = if std::ptr::eq(design.netlist(), &**netlist) { design.net_slot(net) } else { netlist.nets.iter().position(|n| &n.name == net) };
