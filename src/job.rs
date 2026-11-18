@@ -563,9 +563,16 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
     let mut groute: Option<vyges_grt::global_route::RouteResult> = None;
     let mut groute_opts: Option<vyges_grt::global_route::RouteOptions> = None;
     let mut gr_estimated = false;
+    // `Libs::align_scene_order`'s reasons, printed (`VYGES_RSZ_EDIT_STATS`) once the reads are done
+    let mut unaligned: Vec<String> = Vec::new();
     let steps = split_repair_timing(job["steps"].as_array().ok_or("steps")?);
     for step in &steps {
         let cmd = step["cmd"].as_str().ok_or("cmd")?;
+        if cmd != "read_liberty" && std::env::var_os("VYGES_RSZ_EDIT_STATS").is_some() {
+            for why in std::mem::take(&mut unaligned) {
+                eprintln!("VYGEDIT|unaligned|{why}");
+            }
+        }
         let args: Vec<String> = step["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
         // Whether a resizer command before this one ran `initBlock` (each of these does, early).
         let block_inited = resizer_ran;
@@ -619,6 +626,8 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     return Err("read_liberty -corner without define_corners (not modelled)".into());
                 }
                 libs.libs.push(lib);
+                // the reasons a scene stays as read (it is then built on its own), as of the last read
+                unaligned = libs.align_scene_order();
                 post_read_liberty_dont_use(&mut dont_use_state, &libs.libs);
             }
             // `set_dont_use_cmd`: each element of the list through `get_lib_cells` — a cell-name

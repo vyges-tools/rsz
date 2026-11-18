@@ -80,6 +80,60 @@ impl Libs {
     pub fn is_link_cell(&self, lib: usize, name: &str) -> bool {
         self.libs.iter().position(|l| l.cells.contains_key(name)) == Some(lib)
     }
+
+    /// Each scene's libraries put in the order of the link scene's libraries they correspond to,
+    /// ONLY when they are a permutation of whole library files: every one corresponds to exactly
+    /// one link library (the same cells, each with the same pins), and no cell name is in two of
+    /// the scene's libraries. Otherwise the scene is left as read (its graph is then built on its
+    /// own) and the reason is returned.
+    ///
+    /// Rule (`LibertyLibrary::makeSceneMap`): a scene finds its cell for a link cell by NAME among
+    /// its libraries, so with unique names the order its libraries were read in is not observable.
+    /// With a name in two libraries it IS (one definition wins by read order), so that is refused.
+    /// Our scene graphs share the link graph's vertices, which name a cell's library by its
+    /// POSITION ([`vyges_sta::scenes::scene_views`]). Witness: CoralNPU's ASAP7 `bc` corner reads
+    /// SIMPLE before SEQ, `wc` (the link) and `tc` SEQ first.
+    pub fn align_scene_order(&mut self) -> Vec<String> {
+        let mut why = Vec::new();
+        let Some(link) = self.link_scene.filter(|&k| k < self.scene_libs.len()) else { return why };
+        let same = |a: &Library, b: &Library| {
+            a.cells.len() == b.cells.len()
+                && a.cells.iter().all(|(n, c)| b.cells.get(n).is_some_and(|d| c.ports.len() == d.ports.len() && c.ports.iter().all(|p| d.port(&p.name).is_some())))
+        };
+        let n = self.scene_libs[link].len();
+        for k in 0..self.scene_libs.len() {
+            if k == link {
+                continue;
+            }
+            if self.scene_libs[k].len() != n {
+                why.push(format!("scene {k}: {} libraries, the link {n}", self.scene_libs[k].len()));
+                continue;
+            }
+            let at: Option<Vec<usize>> = self.scene_libs[k].iter().map(|l| self.scene_libs[link].iter().position(|x| same(l, x))).collect();
+            let Some(at) = at else {
+                why.push(format!("scene {k}: a library matching no link library (by its cells and their pins)"));
+                continue;
+            };
+            let mut sorted = at.clone();
+            sorted.sort_unstable();
+            if sorted.iter().enumerate().any(|(i, &p)| i != p) {
+                why.push(format!("scene {k}: its libraries are not a permutation of the link's"));
+                continue;
+            }
+            if at.iter().enumerate().all(|(i, &p)| i == p) {
+                continue;
+            }
+            let mut names = std::collections::HashSet::new();
+            if let Some(d) = self.scene_libs[k].iter().flat_map(|l| l.cells.keys()).find(|c| !names.insert(c.as_str())) {
+                why.push(format!("scene {k}: {d} is in two of its libraries (read order observable)"));
+                continue;
+            }
+            let mut libs: Vec<(usize, Library)> = at.into_iter().zip(std::mem::take(&mut self.scene_libs[k])).collect();
+            libs.sort_by_key(|(p, _)| *p);
+            self.scene_libs[k] = libs.into_iter().map(|(_, l)| l).collect();
+        }
+        why
+    }
 }
 
 /// What the preamble reads about a cell's LEF master.
@@ -646,6 +700,43 @@ mod tests {
         let (fast_second, k0) = find_buffer_target_slews(&scenes(2.0, 1.0), &bufs);
         assert_eq!((k0, slow_second), (0, fast_second));
         assert_eq!(find_buffer_target_slews(&scenes(1.0, 1.0), &bufs).1, 0, "an equal later scene does not replace");
+    }
+
+    /// A library holding cells `names`, each a buffer B-like cell of that name.
+    fn named_lib(names: &[&str]) -> Library {
+        let cells: Vec<String> = names.iter().map(|n| buf(n, 1.0, 0.01, "")).collect();
+        library(&cells).libs.remove(0)
+    }
+
+    // Rule (`makeSceneMap`: a scene cell found by name): a scene's libraries are put in the link
+    // scene's order when each matches one link library and names are unique (ASAP7: the FF corner
+    // reads SIMPLE before SEQ); a scene that matches no permutation is left as read.
+    #[test]
+    fn a_scene_read_in_another_order_is_put_in_the_link_order() {
+        let (a, b, c) = (|| named_lib(&["A1", "A2"]), || named_lib(&["S1"]), || named_lib(&["F1"]));
+        let mut libs = Libs {
+            libs: Vec::new(),
+            scenes: vec!["wc".into(), "bc".into(), "odd".into()],
+            scene_libs: vec![vec![a(), b(), c()], vec![b(), a(), c()], vec![c(), named_lib(&["X"]), a()]],
+            link_scene: Some(0),
+        };
+        assert_eq!(libs.align_scene_order().len(), 1, "scene 2 refused, scene 1 aligned");
+        let order = |k: usize| libs.scene_libs[k].iter().map(|l| l.cells.keys().min().unwrap().clone()).collect::<Vec<_>>();
+        assert_eq!(order(1), order(0), "bc in the link order");
+        assert_eq!(order(2), ["F1", "X", "A1"], "no permutation of the link: as read");
+        // a name in two of the scene's libraries: the order is observable, so left as read
+        let mut dup = Libs { scene_libs: vec![vec![a(), named_lib(&["A1"])], vec![named_lib(&["A1"]), a()]], link_scene: Some(0), ..Default::default() };
+        let why = dup.align_scene_order();
+        assert_eq!(dup.scene_libs[1][0].cells.len(), 1, "a duplicate name: as read");
+        assert!(why.iter().any(|w| w.contains("A1 is in two")), "{why:?}");
+        // a partial set and a library whose cells differ by pins: as read, with a reason
+        let mut part = Libs { scene_libs: vec![vec![a(), b()], vec![b()]], link_scene: Some(0), ..Default::default() };
+        assert!(part.align_scene_order().iter().any(|w| w.contains("1 libraries, the link 2")));
+        let mut pins = named_lib(&["S1"]);
+        pins.cells.get_mut("S1").unwrap().ports.pop();
+        let mut odd = Libs { scene_libs: vec![vec![a(), b()], vec![pins, a()]], link_scene: Some(0), ..Default::default() };
+        assert!(odd.align_scene_order().iter().any(|w| w.contains("matching no link library")));
+        assert_eq!(odd.scene_libs[1][1].cells.len(), 2, "as read");
     }
 
     fn masters(names: &[&str]) -> BTreeMap<String, Master> {
