@@ -317,7 +317,7 @@ fn repair_design_held(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args,
         pre: PreCheck::default(),
         checks: NetChecks { slew: true, cap: true, resize_drvr: true },
         timer,
-        edit_log: EditLog::default(),
+        edit_log: EditLog { hold_values: hold && !design.route_slacks_possible() && std::env::var_os("VYGES_RSZ_TIMER_MAPS").is_none(), ..Default::default() },
         max_slacks: HashMap::new(),
     };
     trace.ran(&["drv"]);
@@ -791,6 +791,11 @@ fn current_graphs<'n>(inputs: &Inputs<'n>, netlist: &Arc<Netlist>, annotated: &[
 /// place, made again because an edit could not be (`fallback`), or made new.
 #[derive(Default)]
 struct EditLog<'n> {
+    /// The timers' slews and delays are HELD by the one set of graphs edited in place (the
+    /// reference's delay calculator keeps them in its one graph), not kept again by name
+    /// ([`IncTimer::hold_in`]). Off when a second set may be timed beside it (a resistance-aware
+    /// router's mid-update slacks) or with `VYGES_RSZ_TIMER_MAPS` set.
+    hold_values: bool,
     /// The events from `base` on: those before it every graph still held has replayed
     /// ([`EditLog::trim`]). A place in the log (`Graph::edit_seq`) counts from the first event.
     events: Vec<String>,
@@ -893,7 +898,13 @@ fn timer_graphs<'n>(inputs: &Inputs<'n>, design: &mut dyn Design, annotated: &[H
             log.in_place += 1;
             (gs, "in_place")
         }
-        Some(Err(gs)) => {
+        Some(Err(mut gs)) => {
+            // the values the failed graphs held, back by name before they go
+            for (inc, g) in incs.iter_mut().zip(gs.iter_mut()) {
+                if inc.holds(g) {
+                    inc.release(g).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+                }
+            }
             log.fallback += 1;
             recycle(Some(gs));
             (current_graphs(inputs, netlist, annotated)?, "fallback")
@@ -925,13 +936,25 @@ fn timer_graphs<'n>(inputs: &Inputs<'n>, design: &mut dyn Design, annotated: &[H
             }
         }
         inc.import(g);
+        if log.hold_values {
+            g.hold_failed = true;
+            inc.hold_in(g).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+        }
     }
     if std::env::var_os("VYGES_STA_CHECK_EDIT").is_some() {
         let mut fresh = current_graphs(inputs, netlist, annotated)?;
-        for (k, (g, f)) in graphs.iter().zip(fresh.iter_mut()).enumerate() {
+        for (k, (g, f)) in graphs.iter_mut().zip(fresh.iter_mut()).enumerate() {
+            // held values: lent to the check by name, then held again
+            let held = incs[k].holds(g);
+            if held {
+                incs[k].release(g).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+            }
             incs[k].import(f);
             if let Some(why) = edited_differs(g, f, &incs[k]) {
                 return Err(Stop::refused("RSZ-EDIT", format!("scene {k}, edit {}: {why}", log.end())));
+            }
+            if held {
+                incs[k].hold_in(g).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
             }
         }
     }

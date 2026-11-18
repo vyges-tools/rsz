@@ -97,6 +97,11 @@ pub trait Design {
     fn route_slacks_wanted(&mut self) -> bool {
         false
     }
+    /// Can a route update ever want those slacks in this run (a resistance-aware router)? Then
+    /// a second set of graphs is timed beside the held one (`set_mid_update_slacks`).
+    fn route_slacks_possible(&self) -> bool {
+        false
+    }
     /// Those slacks (`sta_->slack(net, max)` per net), for the next `updateParasitics` only.
     fn set_route_slacks(&mut self, _slacks: std::collections::HashMap<String, f32>) {}
     /// `ensureWireParasitic(drvr_pin, net)` would call `updateRoutes`: global-route parasitics,

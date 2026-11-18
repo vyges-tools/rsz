@@ -1641,6 +1641,10 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
         self.gr.is_some()
     }
 
+    fn route_slacks_possible(&self) -> bool {
+        self.gr.as_ref().is_some_and(|g| g.after.resistance_aware)
+    }
+
     fn route_slacks_wanted(&mut self) -> bool {
         self.pull_edits();
         self.gr.as_ref().is_some_and(|g| g.after.resistance_aware && !g.dirty.is_empty())
