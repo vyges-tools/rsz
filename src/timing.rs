@@ -400,8 +400,9 @@ fn clock_pins_from(g: &Graph<'_>, start: &[String], stop: &[String]) -> std::col
                 EdgeKind::Wire => true,
                 EdgeKind::Gate { set } => {
                     let vx = &g.vertices[g.edges[e].to];
-                    let cell = &g.libs[vx.lib.expect("an instance pin")].cells[vx.cell.as_deref().expect("its cell")];
-                    cell.arc_sets[set].role == vyges_sta::liberty::Role::Combinational
+                    let (lib, name) = (vx.lib.expect("an instance pin"), vx.cell.as_deref().expect("its cell"));
+                    // the scene's set of the edge's key (a scene view's edges carry the link cell's)
+                    g.libs[lib].cells[name].arc_sets[g.scene_set(lib, name, set)].role == vyges_sta::liberty::Role::Combinational
                 }
             };
             let to = g.edges[e].to;

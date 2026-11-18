@@ -722,59 +722,68 @@ fn scene_graph<'n>(inputs: &Inputs<'n>, k: usize, netlist: NetlistRef<'n>) -> Re
     Ok(g)
 }
 
+/// The scene whose libraries are the link's (the first read): the structure every scene shares
+/// is built over its cells ([`scene_graphs`]).
+fn link_scene(inputs: &Inputs<'_>) -> usize {
+    inputs.libs.link_scene.filter(|&k| k < inputs.libs.scene_count()).unwrap_or(0)
+}
+
+/// Every scene's graph as repair_design times it ([`scene_graph`]), as the reference holds them:
+/// ONE structure over the LINK cells, each scene a view of it with its own libraries, arc-set map
+/// and slews and delays ([`vyges_sta::scenes`]). Scenes whose libraries cannot share the link
+/// structure (a cell missing, in another library position, or an arc set not found by key) are
+/// each built on their own, as before (`VYGES_RSZ_EDIT_STATS` says why).
+fn scene_graphs<'n>(inputs: &Inputs<'n>, netlist: NetlistRef<'n>) -> Result<Vec<Graph<'n>>, Stop> {
+    let n = inputs.libs.scene_count();
+    let link_k = link_scene(inputs);
+    let link = scene_graph(inputs, link_k, netlist.clone())?;
+    let slices: Vec<&'n [vyges_sta::liberty::Library]> = (0..n).map(|k| inputs.libs.scene_slice(k)).collect();
+    match vyges_sta::scenes::scene_views(link, link_k, &slices) {
+        Ok(mut views) => {
+            for (k, g) in views.iter_mut().enumerate() {
+                if k != link_k {
+                    g.sdc = inputs.sdc.clone();
+                    timing::set_ideal_clock(g, inputs.clock_sources);
+                }
+            }
+            Ok(views)
+        }
+        Err((link, why)) => {
+            if std::env::var_os("VYGES_RSZ_EDIT_STATS").is_some() {
+                eprintln!("VYGEDIT|unshared|{why}");
+            }
+            let mut link = Some(link);
+            (0..n).map(|k| if k == link_k { Ok(link.take().expect("the link scene once")) } else { scene_graph(inputs, k, netlist.clone()) }).collect()
+        }
+    }
+}
+
 /// The timing graphs (one per scene) over the design as it is NOW, each with its scene's
 /// forward-pass annotations applied. They hold the netlist (shared), so they outlive the caller's
 /// handle on it — a graph edited in place ([`timer_graphs`]) moves to the next one.
 fn current_graphs<'n>(inputs: &Inputs<'n>, netlist: &Arc<Netlist>, annotated: &[HashMap<String, f32>]) -> Result<Vec<Graph<'n>>, Stop> {
+    let mut graphs = scene_graphs(inputs, NetlistRef::Shared(netlist.clone()))?;
     // the bits are the vertex's, one set for every scene: made once, shared by the scenes' graphs
     // (their vertices are the netlist's, in the same order)
-    let mut blocked: Option<Arc<HashMap<usize, [bool; 2]>>> = None;
-    (0..inputs.libs.scene_count())
-        .map(|k| {
-            let mut g = scene_graph(inputs, k, NetlistRef::Shared(netlist.clone()))?;
-            // by the name index (the caller asks for it next anyway), not a scan of every vertex —
-            // unless a name is shared (a bidirect pin's two vertices), where the scan takes both
-            let index = g.index();
-            g.slew_annotated = if index.len() == g.vertices.len() {
-                annotated[k].iter().filter_map(|(name, &l)| index.get(name).map(|&i| (i, l))).collect()
-            } else {
-                (0..g.vertices.len()).filter_map(|i| annotated[k].get(&g.vname(i)).map(|&l| (i, l))).collect()
-            };
-            g.slew_blocked = Some(blocked.get_or_insert_with(|| Arc::new(slew_blocked(&g, annotated))).clone());
-            Ok(g)
-        })
-        .collect()
+    let blocked = vyges_sta::scenes::slew_blocked(&graphs[0], annotated, vyges_sta::scenes::AnnotationScope::PinFold);
+    for (k, g) in graphs.iter_mut().enumerate() {
+        // by the name index (the caller asks for it next anyway), not a scan of every vertex —
+        // unless a name is shared (a bidirect pin's two vertices), where the scan takes both
+        let index = g.index();
+        g.slew_annotated = if index.len() == g.vertices.len() {
+            annotated[k].iter().filter_map(|(name, &l)| index.get(name).map(|&i| (i, l))).collect()
+        } else {
+            (0..g.vertices.len()).filter_map(|i| annotated[k].get(&g.vname(i)).map(|&l| (i, l))).collect()
+        };
+        g.slew_blocked = Some(blocked[k].clone());
+    }
+    Ok(graphs)
 }
 
-/// `Vertex::slewAnnotated(rf, min_max)` for a graph of any scene: the reference keeps one set of
-/// annotation bits per vertex, and a scene past the first folds onto the min bit
-/// (`Vertex::setSlewAnnotated`: `ap_index > 1` is 0). A load annotated in the first scene keeps
-/// its max slews in every scene; one annotated only in a later scene keeps its min slews in every
-/// scene and its max slew nowhere — its driver's next timing writes over the annotation
-/// ([`vyges_sta::graph::Graph::slew_blocked`]).
-fn slew_blocked(g: &Graph<'_>, annotated: &[HashMap<String, f32>]) -> HashMap<usize, [bool; 2]> {
-    use vyges_sta::liberty::{MAX, MIN};
-    let index = g.index();
-    let mut blocked: HashMap<usize, [bool; 2]> = HashMap::new();
-    for (k, names) in annotated.iter().enumerate() {
-        let mm = if k == 0 { MAX } else { MIN };
-        if index.len() == g.vertices.len() {
-            for name in names.keys() {
-                if let Some(&v) = index.get(name.as_str()) {
-                    blocked.entry(v).or_default()[mm] = true;
-                }
-            }
-        } else {
-            // a name shared by two vertices (a bidirect pin): both, as the annotations take them
-            for v in 0..g.vertices.len() {
-                if names.contains_key(&g.vname(v)) {
-                    blocked.entry(v).or_default()[mm] = true;
-                }
-            }
-        }
-    }
-    blocked
-}
+// `Vertex::slewAnnotated(rf, min_max)` for a graph of any scene, the #581 fold
+// (`vyges_sta::scenes::AnnotationScope::PinFold`): one set of bits per vertex; a load annotated in
+// the first scene keeps its max slews in every scene, one annotated only in a later scene keeps
+// its min slews in every scene and its max slew nowhere ([`vyges_sta::graph::Graph::slew_blocked`]).
 
 /// The netlist edits the timers have taken, in order — what a graph made earlier replays to catch
 /// up ([`Graph::edit_seq`]: how far into it the graph is) — and how often graphs were edited in
@@ -927,26 +936,32 @@ fn timer_graphs<'n>(inputs: &Inputs<'n>, design: &mut dyn Design, annotated: &[H
     Ok(graphs)
 }
 
-/// The edits `old` has not seen made on it in place, each graph then on `netlist`, its clock pins
-/// walked again (`ideal_clock`: the existing vertices keep their indices, so its annotations stand).
-/// `Err`: the graphs handed back, unusable — an edit was not made in place.
+/// The edits `old` has not seen made on it in place — ONCE, through the link scene, when the
+/// scenes share one structure ([`vyges_sta::scenes::apply_edits`]) — each graph then on `netlist`,
+/// its clock pins walked again (`ideal_clock`: the existing vertices keep their indices, so its
+/// annotations stand). `Err`: the graphs handed back, unusable — an edit was not made in place.
 fn edit_graphs<'n>(inputs: &Inputs<'n>, mut gs: Vec<Graph<'n>>, netlist: &Arc<Netlist>, log: &EditLog<'_>) -> Result<Vec<Graph<'n>>, Vec<Graph<'n>>> {
-    for g in gs.iter_mut() {
-        let Some(seq) = g.edit_seq.filter(|&s| s <= log.end()) else { return Err(gs) };
-        // behind the trim: its events are gone, so it is built again
-        let Some(events) = log.since(seq) else { return Err(gs) };
-        // the slots the takes since changed, when they kept them: the graph's own netlist patched
-        // there (O(edit)); else the two netlists compared and the design's taken (O(design))
-        let done = match log.slots_since(seq) {
-            Some(slots) => g.apply_edits_held(events, netlist, &slots, Some(&inputs.master_pins)),
-            None => g.apply_edits(events, netlist.clone(), Some(&inputs.master_pins)),
-        };
-        if let Err(why) = done {
-            if std::env::var_os("VYGES_RSZ_EDIT_STATS").is_some() {
-                eprintln!("VYGEDIT|fallback|{why}");
-            }
-            return Err(gs);
+    // every scene stands at one place in the log (they are brought on together)
+    let Some(seq) = gs[0].edit_seq.filter(|&s| s <= log.end()) else { return Err(gs) };
+    if gs.iter().any(|g| g.edit_seq != Some(seq)) {
+        return Err(gs);
+    }
+    // behind the trim: its events are gone, so it is built again
+    let Some(events) = log.since(seq) else { return Err(gs) };
+    // the slots the takes since changed, when they kept them: the graph's own netlist patched
+    // there (O(edit)); else the two netlists compared and the design's taken (O(design))
+    let slots = log.slots_since(seq);
+    let done = vyges_sta::scenes::apply_edits(&mut gs, link_scene(inputs), |g| match &slots {
+        Some(slots) => g.apply_edits_held(events, netlist, slots, Some(&inputs.master_pins)),
+        None => g.apply_edits(events, netlist.clone(), Some(&inputs.master_pins)),
+    });
+    if let Err(why) = done {
+        if std::env::var_os("VYGES_RSZ_EDIT_STATS").is_some() {
+            eprintln!("VYGEDIT|fallback|{why}");
         }
+        return Err(gs);
+    }
+    for g in gs.iter_mut() {
         if clock_touched(g, events) {
             g.ideal_clock = timing::clock_pins(g, inputs.clock_sources).into_iter().collect();
         }
@@ -1943,7 +1958,7 @@ fn timer_preambles<'n>(inputs: &'n Inputs<'_>, netlist: &'n vyges_sta::netlist::
     if let Some(why) = timing::unlevelable(&inputs.libs.libs, netlist) {
         return Err(Stop::refused("RSZ-LEVELS", why));
     }
-    let graphs = (0..inputs.libs.scene_count()).map(|k| scene_graph(inputs, k, NetlistRef::Borrowed(netlist))).collect::<Result<Vec<_>, _>>()?;
+    let graphs = scene_graphs(inputs, NetlistRef::Borrowed(netlist))?;
     let level = graphs[0].levels().map_err(|e| Stop::refused("RSZ-TIMER", e))?;
     Ok((graphs, level))
 }
