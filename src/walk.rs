@@ -587,7 +587,7 @@ mod tests {
             );
             Library::read(&lparse(&text).unwrap()).unwrap()
         };
-        Libs { libs: vec![lib(fast)], scenes: vec!["fast".into(), "slow".into()], scene_libs: vec![vec![lib(fast)], vec![lib(slow)]], link_scene: Some(0) }
+        Libs { libs: vec![lib(fast)], scenes: vec!["fast".into(), "slow".into()], scene_libs: vec![vec![lib(fast)], vec![lib(slow)]], link_scene: Some(0), ..Default::default() }
     }
 
     fn both(r: f32) -> String {

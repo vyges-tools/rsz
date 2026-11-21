@@ -543,6 +543,8 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
     // `notes`: what this engine adds to the reference's output, at info level — a limit that was
     // read but can never act (not a reference message; reported so it is not a silent no-op).
     let mut notes: Vec<Value> = Vec::new();
+    // `sta_warnings`: the timer's own warnings from the preamble (STA-1555 from define_scene).
+    let mut sta_warnings: Vec<Value> = Vec::new();
     // `sta_levels`: the timer's levels a caller carries from an earlier job (its session), given
     // to each timing step (repair_design included) and returned as the last left them; a
     // repair_design that edits the netlist relevelizes them and hands them on.
@@ -576,7 +578,16 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
         let args: Vec<String> = step["args"].as_array().map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect()).unwrap_or_default();
         // Whether a resizer command before this one ran `initBlock` (each of these does, early).
         let block_inited = resizer_ran;
-        resizer_ran |= matches!(cmd, "repair_design" | "buffer_ports" | "repair_timing" | "repair_tie_fanout" | "repair_clock_nets");
+        let resizer_cmd = matches!(cmd, "repair_design" | "buffer_ports" | "repair_timing" | "repair_tie_fanout" | "repair_clock_nets");
+        resizer_ran |= resizer_cmd;
+        // The resizer reads `cmdScene()` as the first scene (as `define_corners` left it):
+        // `define_scene` leaves the LAST scene defined there unless `set_scene` moves it.
+        if resizer_cmd {
+            libs.check_defined_scenes()?;
+            if libs.cmd_scene != 0 {
+                return Err(format!("{cmd}: the command scene is {} (not the first scene): not modelled", libs.scene_name(libs.cmd_scene)));
+            }
+        }
         crate::stage(&format!("step:{cmd}"));
         match cmd {
             "read_lef" => {
@@ -592,6 +603,11 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 db = Db::open(path).map_err(|e| format!("{path}: {e}"))?
             }
             "read_liberty" => {
+                // `Sta::readLiberty` after `define_scene` maps the library into every scene
+                // (`updateLibertyScenes`) without binding it to any: not modelled.
+                if libs.scenes_defined {
+                    return Err("read_liberty after define_scene: not modelled".into());
+                }
                 if args.iter().any(|a| a == "-min" || a == "-max") {
                     return Err("read_liberty -min / -max: min/max libraries are not modelled".into());
                 }
@@ -626,6 +642,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     return Err("read_liberty -corner without define_corners (not modelled)".into());
                 }
                 libs.libs.push(lib);
+                libs.lib_files.push(path.clone());
                 // the reasons a scene stays as read (it is then built on its own), as of the last read
                 unaligned = libs.align_scene_order();
                 post_read_liberty_dont_use(&mut dont_use_state, &libs.libs);
@@ -662,6 +679,32 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 libs.scenes = args.clone();
                 libs.scene_libs = vec![Vec::new(); args.len()];
             }
+            // OpenSTA at the f11b4276 pin: the scenes are defined AFTER the reads, binding read
+            // libraries by name or filename (`Libs::define_scene`).
+            "define_scene" => {
+                let mut name = None;
+                let mut files: Option<Vec<String>> = None;
+                let mut it = args.iter();
+                while let Some(a) = it.next() {
+                    match a.as_str() {
+                        "-liberty" => files = Some(it.next().ok_or("define_scene -liberty needs a value")?.split_whitespace().map(String::from).collect()),
+                        k if k.starts_with('-') => return Err(format!("define_scene {k}: not modelled")),
+                        n if name.is_none() => name = Some(n.to_string()),
+                        n => return Err(format!("define_scene {n}: one scene name expected")),
+                    }
+                }
+                let name = name.ok_or("define_scene needs a name")?;
+                let files = files.ok_or_else(|| format!("define_scene {name} without -liberty: not modelled"))?;
+                if !libs.scene_libs.is_empty() && !libs.scenes_defined {
+                    return Err("define_scene after define_corners: not modelled".into());
+                }
+                for w in libs.define_scene(&name, &files)? {
+                    sta_warnings.push(json!({ "code": "STA-1555", "severity": "warning", "message": w.trim_start_matches("STA-1555 ") }));
+                }
+                rc.define_corners(&libs.scenes);
+                unaligned = libs.align_scene_order();
+            }
+            "set_scene" => libs.set_scene(args.first().ok_or("set_scene needs a name")?)?,
             "set_layer_rc" => rc.set_layer_rc(&mut db, units(&liberty)?, &args)?,
             // The argument checks first: the reference raises them before converting any value.
             "set_wire_rc" => {
@@ -2024,6 +2067,9 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
     }
     if !repair_progress.is_empty() {
         report["repair_design_progress"] = json!(repair_progress);
+    }
+    if !sta_warnings.is_empty() {
+        report["sta_warnings"] = json!(sta_warnings);
     }
     if !notes.is_empty() {
         notes.dedup();

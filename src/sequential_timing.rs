@@ -533,7 +533,7 @@ mod tests {
     /// cannot be scored even for an equal-looking change.
     #[test]
     fn an_unchanged_load_moves_nothing_and_a_changed_one_needs_a_driver() {
-        let libs = Libs { libs: Vec::new(), scenes: vec!["default".into()], scene_libs: Vec::new(), link_scene: None };
+        let libs = Libs { libs: Vec::new(), scenes: vec!["default".into()], scene_libs: Vec::new(), link_scene: None, ..Default::default() };
         let mut ideal = input(3e-12);
         ideal.ideal_clock = true;
         assert_eq!(estimate_input_timing_for_cap(&libs, &ideal, f32::NAN), Some((0.0, 3e-12)));
@@ -553,7 +553,7 @@ mod tests {
     /// with no loss (`sequential_estimate_legal`).
     #[test]
     fn with_no_checks_every_candidate_is_legal_and_failures_name_their_reason() {
-        let libs = Libs { libs: Vec::new(), scenes: vec!["default".into()], scene_libs: Vec::new(), link_scene: None };
+        let libs = Libs { libs: Vec::new(), scenes: vec!["default".into()], scene_libs: Vec::new(), link_scene: None, ..Default::default() };
         let e = estimator(Vec::new());
         assert_eq!(e.estimate(&libs, "B"), SequentialResult { legal: true, weighted_side_slack_loss: 0.0, max_side_slack_loss: 0.0, reason: "sequential_estimate_legal" });
         assert_eq!(e.estimate(&libs, "C"), SequentialResult::reject("sequential_missing_candidate_cell"));
@@ -566,7 +566,7 @@ mod tests {
     /// (`sequential_missing_candidate_model`), even with its inputs unchanged.
     #[test]
     fn a_candidate_without_a_check_model_is_unscorable() {
-        let libs = Libs { libs: Vec::new(), scenes: vec!["default".into()], scene_libs: Vec::new(), link_scene: None };
+        let libs = Libs { libs: Vec::new(), scenes: vec!["default".into()], scene_libs: Vec::new(), link_scene: None, ..Default::default() };
         let mut clock = input(0.0);
         clock.ideal_clock = true;
         let check = PreparedSetupHoldCheck { mm: MAX, data: input(1e-12), clock, clock_check_slew_input: None, candidate_check_models: vec![None, None], related_out_cap: 0.0, baseline_check_margin: 0.0, check_derate: 1.0, baseline_slack: 0.0, setup: true, data_pin: "r/D".into(), data_rf: 0, clock_pin: "r/CK".into(), clock_rf: 0, scene: 0 };

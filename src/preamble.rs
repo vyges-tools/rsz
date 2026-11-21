@@ -29,6 +29,14 @@ pub struct Libs {
     /// With corners: the corner of the first library read (`read_liberty -corner`), the LINK
     /// library's — not always the first corner (`define_corners fast slow` read slow first).
     pub link_scene: Option<usize>,
+    /// Each library's filename as `read_liberty` was given it (parallel to `libs`):
+    /// `define_scene -liberty` names a library by its name or by this filename.
+    pub lib_files: Vec<String>,
+    /// `cmdScene()`: the scene a command with no scene argument works in. `define_scene` makes the
+    /// new scene the command scene; `set_scene` picks one.
+    pub cmd_scene: usize,
+    /// Whether the scenes came from `define_scene` (after the reads) rather than `define_corners`.
+    pub scenes_defined: bool,
 }
 
 impl Libs {
@@ -79,6 +87,62 @@ impl Libs {
     /// `isLinkCell(cell)`: the cell of library `lib` named `name` is the link cell.
     pub fn is_link_cell(&self, lib: usize, name: &str) -> bool {
         self.libs.iter().position(|l| l.cells.contains_key(name)) == Some(lib)
+    }
+
+    /// `define_scene name -liberty files` (OpenSTA at the f11b4276 pin, `Sta::makeScene` and
+    /// `Sta::updateSceneLiberty`). The first defined scene replaces the single `default` scene
+    /// (`scenes_.size() == 1 && findScene("default")` deletes it); each later one is appended. Each
+    /// entry of `files` binds the library of that NAME (`findLiberty`), else the one read under
+    /// that FILENAME (`findLibertyFilename`), else warns STA-1555 and binds nothing. The new scene
+    /// becomes the command scene. Returns the warnings, in order.
+    ///
+    /// Refused, not modelled: a scene name defined twice, a library name two libraries share (the
+    /// name map's winner), and the link (first-read) library bound to no scene.
+    pub fn define_scene(&mut self, name: &str, files: &[String]) -> Result<Vec<String>, String> {
+        if self.scenes.iter().any(|s| s == name) {
+            return Err(format!("define_scene {name}: a scene defined twice is not modelled"));
+        }
+        let mut warnings = Vec::new();
+        let mut bound = Vec::new();
+        for f in files {
+            let by_name: Vec<usize> = (0..self.libs.len()).filter(|&i| self.libs[i].name == *f).collect();
+            if by_name.len() > 1 {
+                return Err(format!("define_scene {name}: library name {f} is shared by {} libraries (not modelled)", by_name.len()));
+            }
+            let at = by_name.first().copied().or_else(|| self.lib_files.iter().position(|x| x == f));
+            match at {
+                Some(i) => bound.push(i),
+                None => warnings.push(format!("STA-1555 liberty name/filename {f} not found.")),
+            }
+        }
+        if !self.scenes_defined {
+            self.scenes.clear();
+            self.scene_libs.clear();
+            self.scenes_defined = true;
+        }
+        self.scenes.push(name.to_string());
+        self.scene_libs.push(bound.iter().map(|&i| self.libs[i].clone()).collect());
+        self.cmd_scene = self.scenes.len() - 1;
+        if !bound.is_empty() && bound.contains(&0) && self.link_scene.is_none() {
+            self.link_scene = Some(self.scenes.len() - 1);
+        }
+        Ok(warnings)
+    }
+
+    /// The scenes are complete (the first command that times): with `define_scene` scenes, the
+    /// link library must be in one of them — its scene is the link scene.
+    pub fn check_defined_scenes(&self) -> Result<(), String> {
+        if self.scenes_defined && self.link_scene.is_none() {
+            return Err("the first liberty library read is bound to no scene: not modelled".into());
+        }
+        Ok(())
+    }
+
+    /// `set_scene name` (`set_cmd_scene`); an unknown name is STA-0578.
+    pub fn set_scene(&mut self, name: &str) -> Result<(), String> {
+        let k = if self.scenes.is_empty() && name == "default" { Some(0) } else { self.scenes.iter().position(|s| s == name) };
+        self.cmd_scene = k.ok_or_else(|| format!("STA-0578 {name} is not the name of a scene."))?;
+        Ok(())
     }
 
     /// Each scene's libraries put in the order of the link scene's libraries they correspond to,
@@ -693,7 +757,7 @@ mod tests {
     // an equal one does not take it.
     #[test]
     fn the_target_slew_corner_is_the_slowest_scene() {
-        let scenes = |a: f32, b: f32| Libs { libs: vec![corner_lib(a), corner_lib(b)], scenes: vec!["c0".into(), "c1".into()], scene_libs: vec![vec![corner_lib(a)], vec![corner_lib(b)]], link_scene: Some(0) };
+        let scenes = |a: f32, b: f32| Libs { libs: vec![corner_lib(a), corner_lib(b)], scenes: vec!["c0".into(), "c1".into()], scene_libs: vec![vec![corner_lib(a)], vec![corner_lib(b)]], link_scene: Some(0), ..Default::default() };
         let bufs = ["B".to_string()];
         let (slow_second, k) = find_buffer_target_slews(&scenes(1.0, 2.0), &bufs);
         assert_eq!(k, 1);
@@ -708,6 +772,38 @@ mod tests {
         library(&cells).libs.remove(0)
     }
 
+    /// Upstream rule (OpenSTA at the f11b4276 pin, `Sta::makeScene` / `updateSceneLiberty` /
+    /// `set_scene`): the first `define_scene` replaces the `default` scene; `-liberty` binds a
+    /// library by NAME, else by the FILENAME it was read under, else warns STA-1555; the new scene
+    /// is the command scene until `set_scene`; an unknown scene is STA-0578. The link scene is the
+    /// first scene holding the first library read (the upstream tests read slow first, then
+    /// define fast, slow: link scene 1).
+    #[test]
+    fn define_scene_binds_read_libraries_by_name_then_filename() {
+        let lib = |name: &str, r: f32| {
+            let mut l = corner_lib(r);
+            l.name = name.into();
+            l
+        };
+        let mut libs = Libs { libs: vec![lib("slow_lib", 2.0), lib("fast_lib", 1.0)], lib_files: vec!["N/slow.lib".into(), "N/fast.lib".into()], ..Default::default() };
+        assert_eq!(libs.scene_name(0), "default");
+        assert_eq!(libs.define_scene("fast", &["N/fast.lib".into()]).unwrap(), Vec::<String>::new(), "by filename");
+        assert_eq!((libs.scenes.clone(), libs.cmd_scene), (vec!["fast".to_string()], 0), "the default scene is gone");
+        let w = libs.define_scene("slow", &["slow_lib".into(), "N/typ.lib".into()]).unwrap();
+        assert_eq!(w, ["STA-1555 liberty name/filename N/typ.lib not found."], "by name; a miss warns");
+        assert_eq!(libs.cmd_scene, 1, "the last defined is the command scene");
+        assert_eq!(libs.link_scene, Some(1), "the first library read is slow's");
+        assert_eq!(libs.scene_slice(0)[0].name, "fast_lib");
+        assert_eq!(libs.scene_slice(1).len(), 1);
+        libs.set_scene("fast").unwrap();
+        assert_eq!(libs.cmd_scene, 0);
+        assert_eq!(libs.set_scene("typ").unwrap_err(), "STA-0578 typ is not the name of a scene.");
+        assert!(libs.define_scene("fast", &[]).is_err(), "defined twice");
+        let mut none = Libs { libs: vec![lib("slow_lib", 2.0), lib("fast_lib", 1.0)], lib_files: vec!["s".into(), "f".into()], ..Default::default() };
+        none.define_scene("fast", &["f".into()]).unwrap();
+        assert!(none.check_defined_scenes().is_err(), "the link library in no scene");
+    }
+
     // Rule (`makeSceneMap`: a scene cell found by name): a scene's libraries are put in the link
     // scene's order when each matches one link library and names are unique (ASAP7: the FF corner
     // reads SIMPLE before SEQ); a scene that matches no permutation is left as read.
@@ -719,6 +815,7 @@ mod tests {
             scenes: vec!["wc".into(), "bc".into(), "odd".into()],
             scene_libs: vec![vec![a(), b(), c()], vec![b(), a(), c()], vec![c(), named_lib(&["X"]), a()]],
             link_scene: Some(0),
+            ..Default::default()
         };
         assert_eq!(libs.align_scene_order().len(), 1, "scene 2 refused, scene 1 aligned");
         let order = |k: usize| libs.scene_libs[k].iter().map(|l| l.cells.keys().min().unwrap().clone()).collect::<Vec<_>>();
