@@ -2104,7 +2104,7 @@ impl Repair<'_, '_> {
                     continue;
                 }
                 let reg_clk = current.arc_sets.iter().any(|a| a.from == port && matches!(a.role, vyges_sta::liberty::Role::RegClkToQ | vyges_sta::liberty::Role::LatchEnToQ));
-                if super::max_cap_skips_pin(reg_clk, Some(ideal.contains(&u))) || super::is_scan_pin(current, port) {
+                if skips_fanin_max_cap(current, port, reg_clk, ideal.contains(&u)) {
                     continue;
                 }
                 let cap_delta = super::input_pin_capacitance(rep, port) - super::input_pin_capacitance(current, port);
@@ -4166,11 +4166,18 @@ impl BoundingBox {
     }
 }
 
+/// `Resizer::skipsFaninMaxCap(pin, mode)`: a register clock pin whose clock is ideal in the
+/// target's mode, or the cell's scan-enable / scan-in pin. Shared by `replacementPreservesMaxCap`
+/// and, since OpenROAD #12153, `inputCapBudgets`, so generation screens as apply checks.
+fn skips_fanin_max_cap(cell: &vyges_sta::liberty::Cell, port: &str, reg_clk: bool, ideal: bool) -> bool {
+    super::max_cap_skips_pin(reg_clk, Some(ideal)) || super::is_scan_pin(cell, port)
+}
+
 /// `prepareInputCapBudgets`: `Resizer::inputCapBudgets(inst)` once per target (the second
 /// cell-swap generator reuses it): per pin of the instance in pin order, an input with a liberty
 /// port on a net — its capacitance (`inputPinCapacitance`) and the least `maxCapIncrease` over the
 /// net's drivers (the capacitance check over every scene; a violating driver allows nothing, one
-/// without a limit allows anything).
+/// without a limit allows anything); a pin [`skips_fanin_max_cap`] exempts gets none.
 fn prepare_input_cap_budgets(target: &mut Target, gs: &[vyges_sta::graph::Graph<'_>], design: &dyn super::Design, ctx: &super::Ctx<'_>) {
     if target.input_cap_budgets.is_some() {
         return;
@@ -4186,6 +4193,12 @@ fn prepare_input_cap_budgets(target: &mut Target, gs: &[vyges_sta::graph::Graph<
             let pin = format!("{}/{port}", target.inst);
             let Some(u) = (0..g.vertices.len()).position(|x| g.vname(x) == pin && !g.vertices[x].is_driver) else { continue };
             if g.vertex_net[u].is_none() {
+                continue;
+            }
+            // `skipsFaninMaxCap(pin, mode)` (OpenROAD #12153): the pins `replacementPreservesMaxCap`
+            // exempts — an ideal register clock pin, a scan-enable / scan-in pin — get no budget.
+            let reg_clk = cell.arc_sets.iter().any(|a| a.from == *port && matches!(a.role, vyges_sta::liberty::Role::RegClkToQ | vyges_sta::liberty::Role::LatchEnToQ));
+            if skips_fanin_max_cap(cell, port, reg_clk, clocks.contains(&u)) {
                 continue;
             }
             let mut budget = InputCapBudget { port: p.name.clone(), current_cap: super::input_pin_capacitance(cell, port), max_cap_increase: f32::INFINITY };
@@ -4610,6 +4623,24 @@ fn pe_reset_run_state(pe: &mut ParallelEval) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rule (`Resizer::skipsFaninMaxCap`, OpenROAD #12153 — now also behind `inputCapBudgets`):
+    /// an ideal register clock pin and the scan-enable / scan-in pins are exempt; a propagated
+    /// clock pin and a data pin are not.
+    #[test]
+    fn the_fanin_max_cap_exempts_ideal_clocks_and_scan_pins() {
+        let text = r#"library (l) { cell (c) {
+            pin (D) { direction : input ; } pin (SI) { direction : input ; } pin (SE) { direction : input ; }
+            pin (Q) { direction : output ; function : "D" ; }
+            test_cell () { pin (D) { direction : input ; } pin (SI) { direction : input ; signal_type : test_scan_in ; }
+              pin (SE) { direction : input ; signal_type : test_scan_enable ; } pin (Q) { direction : output ; signal_type : test_scan_out ; } } } }"#;
+        let lib = vyges_sta::liberty::Library::read(&vyges_sta::liberty_parse::parse(text).unwrap()).unwrap();
+        let c = &lib.cells["c"];
+        assert!(skips_fanin_max_cap(c, "CK", true, true), "ideal register clock");
+        assert!(!skips_fanin_max_cap(c, "CK", true, false), "propagated register clock");
+        assert!(skips_fanin_max_cap(c, "SI", false, false) && skips_fanin_max_cap(c, "SE", false, false));
+        assert!(!skips_fanin_max_cap(c, "D", false, true), "a data pin on an ideal net");
+    }
 
     /// Rule (`SetupParallelEvalPolicy::analyzeBottlenecks`, OpenROAD #12027): one analysis serves
     /// `bottleneck_refresh_batches` batches in the WNS tail and twice as many in the broad phase

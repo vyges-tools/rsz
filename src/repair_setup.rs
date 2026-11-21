@@ -1935,8 +1935,6 @@ fn upsize_cell(sizing: &Sizing<'_>, scene: usize, in_port: &str, in_rf: usize, c
     Ok(best)
 }
 
-/// `Resizer::replacementPreservesMaxCap`: each input pin whose capacitance grows must leave every
-/// driver of its net within its limit (`checkMaxCapOK`: a driver already over it may not grow).
 /// `Rebuffer::loadSlewSatisfactory` for the net's own driver port at the f11b4276 pin (OpenROAD
 /// #12109): `resizer_->driveResistance(pin_)` — the largest arc drive over the driver's searched
 /// fanin edges, else the port's.
@@ -1963,6 +1961,8 @@ pub(crate) fn is_scan_pin(cell: &Cell, port: &str) -> bool {
     first(&[T::Enable, T::EnableInverted]) == Some(port) || first(&[T::Input, T::InputInverted]) == Some(port)
 }
 
+/// `Resizer::replacementPreservesMaxCap`: each input pin whose capacitance grows must leave every
+/// driver of its net within its limit (`checkMaxCapOK`: a driver already over it may not grow).
 fn replacement_preserves_max_cap(libs: &Libs, cell: &str, replacement: &str, fanin_caps: &[(String, Vec<CapCheck>)]) -> bool {
     let (Some(cur), Some(rep)) = (libs.link_cell(cell), libs.link_cell(replacement)) else { return true };
     for (port, checks) in fanin_caps {
