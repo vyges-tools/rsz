@@ -1491,12 +1491,16 @@ impl CliDesign<'_> {
             crate::prof::items(5, loads.len() as u64);
             self.db.insert_buffer_before_loads(net, &iterms, &bterms, cell, Some(loc), reason, None, uniquify, loads_on_diff_nets).map_err(|e| e.to_string())?
         };
-        // `insertBufferPostProcess`: `designAreaIncr(area(master))`.
+        // `insertBufferPostProcess`: a PLACED buffer (odb places one inserted at a location) moved
+        // through `setLocation` and legalized — an UNPLACED one left as it is (OpenROAD #11931) —
+        // then `designAreaIncr(area(master))`.
+        if self.db.inst_is_placed(&inst) {
+            let at = self.clamp_loc_to_core(self.db.inst_location(&inst), cell);
+            self.db.set_inst_location(&inst, at.0, at.1).map_err(|e| e.to_string())?;
+            self.gr_inst_moved(&inst);
+            self.gr_legal_cell_pos(&inst)?;
+        }
         self.area_incr(master_area(self.db, cell));
-        let at = self.clamp_loc_to_core(self.db.inst_location(&inst), cell);
-        self.db.set_inst_location(&inst, at.0, at.1).map_err(|e| e.to_string())?;
-        self.gr_inst_moved(&inst);
-        self.gr_legal_cell_pos(&inst)?;
         let c = self.libs.link_cell(cell).ok_or_else(|| format!("{cell}: no liberty cell"))?;
         let (input, output) = c.buffer_ports().ok_or_else(|| format!("{cell}: not a buffer"))?;
         let in_net = self.db.net_of(&inst, &input.name);
@@ -2268,12 +2272,18 @@ impl CliDesign<'_> {
 
     /// `insertBufferPostProcess` (`setLocation`: clamped to the core, placed), and the odb
     /// callbacks: the nets on the new buffer's input and output marked invalid.
+    ///
+    /// ⛔ At the f11b4276 pin (OpenROAD #11931) only a buffer odb left PLACED is moved and
+    /// legalized: an UNPLACED one (inserted where nothing is placed) keeps its status and
+    /// location; the area still grows.
     pub fn insert_buffer_post_process(&mut self, inst: &str, cell: &str) -> Result<(), String> {
+        if self.db.inst_is_placed(inst) {
+            let at = self.clamp_loc_to_core(self.db.inst_location(inst), cell);
+            self.db.set_inst_location(inst, at.0, at.1).map_err(|e| e.to_string())?;
+            self.gr_inst_moved(inst);
+            self.gr_legal_cell_pos(inst)?;
+        }
         self.area_incr(master_area(self.db, cell));
-        let at = self.clamp_loc_to_core(self.db.inst_location(inst), cell);
-        self.db.set_inst_location(inst, at.0, at.1).map_err(|e| e.to_string())?;
-        self.gr_inst_moved(inst);
-        self.gr_legal_cell_pos(inst)?;
         let c = self.libs.link_cell(cell).ok_or_else(|| format!("{cell}: no liberty cell"))?;
         let (input, output) = c.buffer_ports().ok_or_else(|| format!("{cell}: not a buffer"))?;
         let in_net = self.db.net_of(inst, &input.name);
