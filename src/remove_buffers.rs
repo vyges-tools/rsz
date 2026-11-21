@@ -68,7 +68,13 @@ pub fn remove_buffers(d: &mut dyn RemovalDesign, insts: &[String]) -> Result<Out
         }
     } else {
         out.checked = insts.len();
+        // A repeated name is checked once (OpenROAD #12346: the same instance would otherwise be
+        // checked after it was removed).
+        let mut seen = std::collections::HashSet::new();
         for inst in insts {
+            if !seen.insert(inst) {
+                continue;
+            }
             if remove_buffer_if_possible(d, inst, false, &mut out)? {
                 out.removed += 1;
             } else {
@@ -322,5 +328,18 @@ mod tests {
         t.cell("u2", "n1", "n2");
         t.dont_touch.insert("u2".into());
         assert_eq!(remove_buffers(&mut t, &["b1".into()]).unwrap().removed, 0);
+    }
+
+    /// Rule (`Resizer::removeBuffers`, OpenROAD #12346): a name given twice removes its buffer
+    /// once — no second check of an instance already gone, no warning for it.
+    #[test]
+    fn a_repeated_name_removes_its_buffer_once() {
+        let mut t = Toy::default();
+        t.cell("u0", "in", "n0");
+        t.buf("b1", Some("n0"), Some("n1"));
+        t.cell("u2", "n1", "n2");
+        let o = remove_buffers(&mut t, &["b1".into(), "b1".into()]).unwrap();
+        assert_eq!((t.removed.as_slice(), o.removed), (&["b1".to_string()][..], 1));
+        assert_eq!(o.lines, ["[INFO RSZ-0026] Removed 1 buffers."]);
     }
 }
