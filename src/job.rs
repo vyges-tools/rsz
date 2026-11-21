@@ -1568,8 +1568,8 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 } else {
                     (ends, starts)
                 };
-                // `-hold` alone: `Resizer::repairHold` (its preamble with clock buffers allowed),
-                // over the endpoints' min and max slacks.
+                // `-hold` alone: `Resizer::repairHold` over the endpoints' min and max slacks (its
+                // preamble excludes clock buffers too since OpenROAD #12360).
                 let hold_only = !a.setup;
                 let margin = vyges_sta::sdc::user_to_sta(a.setup_margin, time_scale);
                 // Under a group (`restrictedToPathGroup`): the group's path ends in place of the
@@ -1583,10 +1583,10 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 let violating = rt::collect_violating(group_ends.as_deref().unwrap_or(&ends), margin);
                 let violating_starts = rt::collect_violating(&starts, margin);
                 // `hasVtSwapCells`: more than one VT category among the buffers (`getBufferList` in
-                // the preamble, clock buffers excluded for -setup).
+                // the preamble, clock buffers always excluded since OpenROAD #12360).
                 let vt_category_count = {
                     let du = dont_use_state.clone();
-                    crate::preamble::get_buffer_list(&libs, &m, &du, !hold_only).map_err(|e| format!("{}: {}", e.code(), e.message()))?.sorted_vt.len()
+                    crate::preamble::get_buffer_list(&libs, &m, &du, true).map_err(|e| format!("{}: {}", e.code(), e.message()))?.sorted_vt.len()
                 };
                 let seq = if recover { Vec::new() } else { rt::move_sequence(&a, vt_category_count > 1) };
                 // `GlobalSizingPolicy` and `SetupParallelEvalPolicy` have no preamble (no
@@ -1637,7 +1637,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     let db_hierarchy = db.has_hierarchy();
                     let site_heights: BTreeMap<String, i32> = m.values().map(|mm| mm.site.clone()).filter(|s| !s.is_empty()).map(|s| (s.clone(), db.site_get_height(&s))).collect();
                     let db_dbu = db.tech_get_db_units_per_micron();
-                    let buffers = crate::preamble::find_buffers(&libs, &m, &dont_use, !hold_only).map_err(|e| format!("{}: {}", e.code(), e.message()))?;
+                    let buffers = crate::preamble::find_buffers(&libs, &m, &dont_use, true).map_err(|e| format!("{}: {}", e.code(), e.message()))?;
                     let (tgt_slews, tgt_scene, target_loads) = crate::preamble::find_target_loads(&libs, &buffers.cells, &dont_use);
                     let sizing = crate::sizing::Sizing { libs: &libs, masters: &m, dont_use: &dont_use, equiv: &equiv, target_loads: &target_loads, tgt_slews, tgt_scene, limits: sizing_limits(&db)?, swappable_cache: Default::default(), clock_pattern: Default::default() };
                     let limits = Limits {

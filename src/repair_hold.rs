@@ -104,14 +104,15 @@ fn is_delay_cell(name: &str) -> bool {
     !name.is_empty() && (name.contains("DEL") || name.contains("DLY") || name.contains("dlygate"))
 }
 
-/// `filterHoldBuffers`: `getBufferList` with clock buffers kept, then the first of four ever
+/// `filterHoldBuffers`: `getBufferList` — clock buffers excluded, reserved for the clock network
+/// since OpenROAD #12360 (`repairHold` no longer lifts `exclude_clock_buffers_`) — then the first of four ever
 /// looser matches that keeps any buffer — site, VT and footprint; VT and footprint; footprint;
 /// none. The site is the shortest among the list's (`cells_by_site`, a map keyed by the site
 /// object: a tie on the shortest height is ordered by pointer — refused); the VT the least leaky
 /// category (by average cell leakage); the footprint matches when no footprint in the list is a delay
 /// cell's, else when the buffer's is. Each kept buffer is logged as it is added.
 fn filter_hold_buffers<'l>(ctx: &HoldCtx<'l>, out: &mut HoldOutcome) -> Result<Vec<&'l Cell>, Stop> {
-    let list = get_buffer_list(ctx.libs, ctx.masters, ctx.dont_use, false)?;
+    let list = get_buffer_list(ctx.libs, ctx.masters, ctx.dont_use, true)?;
     let height = |s: &str| ctx.site_heights.get(s).copied().unwrap_or(i32::MAX);
     let best_height = list.by_site.keys().map(|s| height(s)).min().unwrap_or(i32::MAX);
     let shortest: Vec<&String> = list.by_site.keys().filter(|s| height(s) == best_height).collect();
@@ -268,6 +269,33 @@ mod tests {
     /// `groupEndpointSlacks(min, 0.0)` — not the endpoints' own worst hold slack (here `b`, worse,
     /// in another group). Witness: repair_timing_path_group5 row 0, 0.145 at `_863_/D`, while
     /// in2reg's -0.0535 at `_881_/D` is the design's worst.
+    /// Rule (`Resizer::getBufferList` under `repairHold`, OpenROAD #12360): clock buffers are
+    /// reserved for the clock network — the hold buffers are data buffers only (before, hold
+    /// repair lifted the exclusion for libraries without delay cells).
+    #[test]
+    fn hold_repair_buffers_are_data_buffers_only() {
+        let buf = |n: &str, r: f32| {
+            format!(
+                r#"cell ({n}) {{ area : 1 ; cell_leakage_power : 1 ; pin (A) {{ direction : input ; capacitance : 0.001 ; }} pin (Z) {{ direction : output ; function : "A" ;
+                  timing () {{ related_pin : "A" ; timing_sense : positive_unate ; cell_fall (t) {{ values ("0, {r}", "0, {r}") ; }} fall_transition (t) {{ values ("0, {r}", "0, {r}") ; }} }} }} }}"#
+            )
+        };
+        let text = format!(
+            r#"library (l) {{ time_unit : "1ns" ; capacitive_load_unit (1, pf) ;
+              lu_table_template (t) {{ variable_1 : input_net_transition ; variable_2 : total_output_net_capacitance ; index_1 ("0, 1") ; index_2 ("0, 1") ; }}
+              {} {} }}"#,
+            buf("BUF_X1", 2.0),
+            buf("CLKBUF_X1", 1.0)
+        );
+        let libs = Libs { libs: vec![vyges_sta::liberty::Library::read(&vyges_sta::liberty_parse::parse(&text).unwrap()).unwrap()], ..Default::default() };
+        let masters: BTreeMap<String, Master> = ["BUF_X1", "CLKBUF_X1"].iter().map(|n| (n.to_string(), Master { site: "core".into(), area: 1, width: 1, height: 1, is_core: true, logic_std: true, implant_obs: vec![] })).collect();
+        let (debug, dont_use) = (BTreeMap::new(), BTreeSet::new());
+        let sites: BTreeMap<String, i32> = [("core".to_string(), 1)].into_iter().collect();
+        let ctx = HoldCtx { libs: &libs, masters: &masters, site_heights: &sites, dont_use: &dont_use, tgt_slews: [0.0; 2], time_scale: 1e-9, debug: &debug };
+        let names: Vec<String> = filter_hold_buffers(&ctx, &mut HoldOutcome::default()).unwrap().iter().map(|c| c.name.clone()).collect();
+        assert_eq!(names, ["BUF_X1"]);
+    }
+
     #[test]
     fn a_group_progress_row_reports_the_group() {
         let debug = BTreeMap::new();
