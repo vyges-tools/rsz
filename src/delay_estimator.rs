@@ -817,7 +817,9 @@ impl Reader<'_, '_> {
                 if dlink.port(dport).is_none() {
                     continue;
                 }
-                delay_per_cap = dlink.drive_resistance(dport);
+                // `resizer.driveResistance(driver_pin)` (OpenROAD #12109): the searched fanin arcs,
+                // else the port's.
+                delay_per_cap = vyges_sta::search::eval_drive_resistance(self.g, dv).unwrap_or_else(|| dlink.drive_resistance(dport));
                 if delay_per_cap <= 0.0 {
                     continue;
                 }

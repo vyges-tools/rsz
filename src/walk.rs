@@ -93,13 +93,14 @@ impl Walk<'_, '_> {
         (dist * f64::from(self.ctx.dbu) * 1e6) as i32 as i64
     }
 
-    /// `Resizer::driveResistance(drvr_pin)`: an instance pin's port drive resistance; a top-level
-    /// port's input drive (none is modelled: 0).
+    /// `Resizer::driveResistance(drvr_pin)`: an instance pin's — since OpenROAD #12109 the
+    /// largest arc drive over its searched fanin edges ([`vyges_sta::search::eval_drive_resistance`]),
+    /// else its port's drive resistance; a top-level port's input drive (none is modelled: 0).
     fn drive_resistance(&self) -> f32 {
         let vx = &self.graph().vertices[self.drvr];
         match (vx.cell.as_deref(), vx.port()) {
-            // The LINK port's (`network_->libertyPort(pin)->driveResistance()`).
-            (Some(c), Some(p)) => self.sizing.libs.link_cell(c).map_or(0.0, |cell| cell.drive_resistance(p)),
+            // The searched fanin arcs, else the LINK port's (`network_->libertyPort(pin)->driveResistance()`).
+            (Some(c), Some(p)) => vyges_sta::search::eval_drive_resistance(self.graph(), self.drvr).unwrap_or_else(|| self.sizing.libs.link_cell(c).map_or(0.0, |cell| cell.drive_resistance(p))),
             // A top-level port: its driving cell's `-pin` port's (the larger over rise / fall and
             // min / max, all one value here); none ⇒ 0.
             _ => match self.graph().sdc.input_drive.get(&self.graph().vname(self.drvr)) {

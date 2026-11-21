@@ -1036,7 +1036,7 @@ fn rebuffer_probe_of_net(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>],
         arcs,
         arc_scenes,
         drvr_port_cap: port_capacitance(link, port).unwrap_or(0.0),
-        drvr_resistance: link.drive_resistance(port),
+        drvr_resistance: drvr_pin_resistance(g, drvr, link, port),
         fanout_limit,
         drvr_pin_max_slew,
         pin: g.vname(drvr),
@@ -1252,7 +1252,7 @@ fn full_probe(ctx: &Ctx<'_>, gs: &[Graph<'_>], ss: &[Search<'_, '_>], _cs: &[BTr
         }
     }
     FullProbe::Ready(
-        Box::new(rebuffer::Probe { nodes, root, arcs, arc_scenes, drvr_port_cap: port_capacitance(link, port).unwrap_or(0.0), drvr_resistance: link.drive_resistance(port), fanout_limit, drvr_pin_max_slew, pin: g.vname(drvr), warnings }),
+        Box::new(rebuffer::Probe { nodes, root, arcs, arc_scenes, drvr_port_cap: port_capacitance(link, port).unwrap_or(0.0), drvr_resistance: drvr_pin_resistance(g, drvr, link, port), fanout_limit, drvr_pin_max_slew, pin: g.vname(drvr), warnings }),
         sta_slack,
     )
 }
@@ -1937,6 +1937,13 @@ fn upsize_cell(sizing: &Sizing<'_>, scene: usize, in_port: &str, in_rf: usize, c
 
 /// `Resizer::replacementPreservesMaxCap`: each input pin whose capacitance grows must leave every
 /// driver of its net within its limit (`checkMaxCapOK`: a driver already over it may not grow).
+/// `Rebuffer::loadSlewSatisfactory` for the net's own driver port at the f11b4276 pin (OpenROAD
+/// #12109): `resizer_->driveResistance(pin_)` — the largest arc drive over the driver's searched
+/// fanin edges, else the port's.
+fn drvr_pin_resistance(g: &Graph<'_>, drvr: usize, link: &vyges_sta::liberty::Cell, port: &str) -> f32 {
+    vyges_sta::search::eval_drive_resistance(g, drvr).unwrap_or_else(|| link.drive_resistance(port))
+}
+
 /// `Resizer::replacementPreservesMaxCap`'s register-clock skip (upstream 21e78aafd40): a register
 /// clock pin's fanin net is not checked only when the target has a mode (`Target::mode`: its
 /// scene, else its endpoint path's) and the pin's clock is ideal there. `mode_ideal` is `None` for
@@ -5985,6 +5992,41 @@ fn over_max_area(design_area: f64, max_area: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rule (`Rebuffer::loadSlewSatisfactory` / `Resizer::driveResistance(pin_)`, OpenROAD #12109):
+    /// the rebuffered driver's resistance is the largest arc drive over its SEARCHED fanin edges,
+    /// not the liberty port's over every arc: a register's clear arc (7 ns / 2 pF, preset / clear
+    /// arcs disabled by default) does not count, CLK -> Q's (3 ns / 2 pF) does.
+    #[test]
+    fn the_rebuffered_driver_resistance_skips_the_clear_arc() {
+        use vyges_sta::netlist::{Conn, Net, Netlist, PortDir};
+        let text = r#"library (l) { time_unit : "1ns" ; capacitive_load_unit (1, pf) ;
+            lu_table_template (t) { variable_1 : input_net_transition ; variable_2 : total_output_net_capacitance ;
+              index_1 ("0, 1") ; index_2 ("0, 2") ; }
+            cell (dffr) {
+              ff (IQ, IQN) { clocked_on : "CLK"; next_state : "D"; clear : "!RN"; }
+              pin (CLK) { direction : input ; clock : true ; }
+              pin (D) { direction : input ; }
+              pin (RN) { direction : input ; }
+              pin (Q) { direction : output ; function : "IQ" ;
+                timing () { related_pin : "CLK" ; timing_type : rising_edge ;
+                  rise_transition (t) { values ("1, 3", "5, 9") ; } fall_transition (t) { values ("1, 3", "5, 9") ; } }
+                timing () { related_pin : "RN" ; timing_type : clear ; timing_sense : positive_unate ;
+                  fall_transition (t) { values ("1, 7", "5, 9") ; } } } } }"#;
+        let libs = vec![vyges_sta::liberty::Library::read(&vyges_sta::liberty_parse::parse(text).unwrap()).unwrap()];
+        let i = |k: usize, p: &str| Conn::Inst(k, p.into());
+        let net = |n: &str, pins: Vec<Conn>| Net { name: n.into(), pins }.into();
+        let netlist = Netlist {
+            insts: vec![vyges_sta::netlist::inst("f1", "dffr")],
+            ports: vec![("clk".into(), PortDir::Input), ("d".into(), PortDir::Input), ("rn".into(), PortDir::Input), ("q".into(), PortDir::Output)],
+            nets: vec![net("clk", vec![i(0, "CLK"), Conn::Port(0)]), net("d", vec![i(0, "D"), Conn::Port(1)]), net("rn", vec![i(0, "RN"), Conn::Port(2)]), net("q", vec![i(0, "Q"), Conn::Port(3)])],
+        };
+        let g = Graph::build(&libs, &netlist).unwrap();
+        let q = (0..g.vertices.len()).find(|&x| g.vname(x) == "f1/Q").unwrap();
+        let cell = &libs[0].cells["dffr"];
+        assert_eq!(drvr_pin_resistance(&g, q, cell, "Q"), (3.0 * 1e-9f32) / (2.0 * 1e-12f32));
+        assert_eq!(cell.drive_resistance("Q"), (7.0 * 1e-9f32) / (2.0 * 1e-12f32), "the port's, which no longer decides");
+    }
 
     /// `Resizer::overMaxArea`: no limit (0) is never over; at the limit is over
     /// (`fuzzyGreaterEqual`), and so is a hair below it — the comparison is on `float`s within
