@@ -1404,6 +1404,24 @@ impl Repair<'_, '_> {
         }
     }
 
+    /// `fullyRebuffer`'s `propagate_edits` up to its timer passes: nothing without edited loads;
+    /// else `updateParasitics` and the limit of `findDelays(max_level)` / `findArrivals(max_level)`
+    /// — the deepest of the loads, read after the batch is levelized. (With route slacks wanted the
+    /// edits are retimed whole here.) The loads are taken.
+    fn fr_propagate_limit(&mut self, edited_loads: &mut Vec<String>) -> Result<Upto, Stop> {
+        if edited_loads.is_empty() {
+            return Ok(Upto::Skip);
+        }
+        let loads = std::mem::take(edited_loads);
+        if self.design.route_slacks_wanted() {
+            self.retime(&[])?;
+            return Ok(Upto::Skip);
+        }
+        self.design.update_parasitics().map_err(timer_stop)?;
+        self.timer.trace_at = self.out.trace.len();
+        Ok(Upto::MaxOfPins(loads))
+    }
+
     fn fully_rebuffer(&mut self, user_pin: Option<&str>) -> Result<(), Stop> {
         let rctx = self.ctx.rebuffer.ok_or_else(|| Stop::refused("RSZ-ABSENT", "fully_rebuffer without characterized buffers".into()))?;
         let mut pins = self.fully_rebuffer_drivers()?;
@@ -1423,16 +1441,31 @@ impl Repair<'_, '_> {
         // `sta_->findRequireds()`: the whole timer, once, before the drivers
         let edits = self.design.take_timer_edits();
         timed_all(self.ctx, self.design.as_design(), &mut self.timer, edits, |_, _, _| Ok(()))?;
+        // OpenROAD #12128: drivers on one level are not in each other's fanin or fanout, so the
+        // edits are propagated to timing once per level (`timing_level`), from the loads of the
+        // edited trees (`edited_loads`), not after every driver. (The resized-instance refresh is
+        // for `-rebuffer_size_driver`, refused here.)
+        let mut timing_level: Option<i32> = None;
+        let mut edited_loads: Vec<String> = Vec::new();
         for iter in 0..n {
             self.fr_progress(iter, false, false, n - iter, interval, initial_area, removed, inserted);
             let pin = pins[iter as usize].clone();
+            // `if (drvr->level() != timing_level) refresh_timing(drvr)`: the pending edits
+            // propagated (`propagate_edits`), then `search_->findRequireds(drvr->level())` — the
+            // requireds only, down to the driver; on the same level, no timing at all. Its slacks
+            // are read off the paths as they stand (`vertexWorstSlackPath`: no preamble).
+            let level = self.timer.inc[0].levels.get(pin.as_str()).copied().unwrap_or(0);
+            let head = if timing_level != Some(level) {
+                timing_level = Some(level);
+                let upto = self.fr_propagate_limit(&mut edited_loads)?;
+                Levels { delays: upto.clone(), arrivals: upto, requireds: Upto::DownToPin(pin.clone()) }
+            } else {
+                Levels { delays: Upto::Skip, arrivals: Upto::Skip, requireds: Upto::Skip }
+            };
             let edits = self.design.take_timer_edits();
             let ctx = self.ctx;
             let design = &*self.design;
             let removable = |i: &str, a: &str, b: &str| design.can_remove_buffer(i, a, b);
-            // `search_->findRequireds(drvr->level())`: the requireds only, down to the driver; its
-            // slacks are read off the paths as they stand (`vertexWorstSlackPath`: no preamble)
-            let head = Levels { delays: Upto::Skip, arrivals: Upto::Skip, requireds: Upto::DownToPin(pin.clone()) };
             let probe = timed_levels(ctx, design.as_design(), &mut self.timer, edits, &head, |gs, ss, cs| Ok(full_probe(ctx, gs, ss, cs, design.as_design(), &removable, &pin)))?;
             let (limit, max_slew) = match &probe {
                 FullProbe::Skip => continue,
@@ -1499,19 +1532,19 @@ impl Repair<'_, '_> {
                 self.design.remove_buffer(inst, ip, op).map_err(|e| Stop::error("RSZ-0168", e))?;
                 removed += 1;
             }
-            // `updateParasitics`, then `findDelays(max_level)` and `findArrivals(max_level)`: up to
-            // the deepest load of the unbuffered tree, the requireds left for the next driver
-            if self.design.route_slacks_wanted() {
-                self.retime(&[])?;
-            } else {
-                self.design.update_parasitics().map_err(timer_stop)?;
-                let edits = self.design.take_timer_edits();
-                self.timer.trace_at = self.out.trace.len();
-                let loads: Vec<String> = tree_loads.iter().cloned().collect();
-                let after = Levels { delays: Upto::MaxOfPins(loads.clone()), arrivals: Upto::MaxOfPins(loads), requireds: Upto::Skip };
-                timed_levels(self.ctx, self.design.as_design(), &mut self.timer, edits, &after, |_, _, _| Ok(()))?;
+            // `record_loads(unbuffered_tree)` when the tree changed anything: its loads wait for
+            // the next level's (or the end's) propagation.
+            if count > 0 || !old.is_empty() {
+                edited_loads.extend(tree_loads.iter().cloned());
             }
             self.debug("rebuffer", 2, "-------------------------------".into());
+        }
+        // `propagate_edits()` after the last driver.
+        let upto = self.fr_propagate_limit(&mut edited_loads)?;
+        if !matches!(upto, Upto::Skip) {
+            let edits = self.design.take_timer_edits();
+            let after = Levels { delays: upto.clone(), arrivals: upto, requireds: Upto::Skip };
+            timed_levels(self.ctx, self.design.as_design(), &mut self.timer, edits, &after, |_, _, _| Ok(()))?;
         }
         self.fr_progress(n, false, true, 0, interval, initial_area, removed, inserted);
         self.debug("rebuffer", 1, "Time spent".into());
