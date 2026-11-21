@@ -30,46 +30,65 @@ pub fn is_input(p: &Port) -> bool {
     p.direction == Direction::Input
 }
 
-/// `SwapPinsGenerator::equivCellPins(cell, input_port)`: none for a sequential or isolation cell,
-/// or one with a port that is neither input nor output (power and ground pins aside); none with
-/// no output or fewer than two inputs; else, in port order, each other input that every output
-/// with a function is symmetric in together with `input_port`. `Err` when a function names
-/// something other than an input (the reference would read past its truth table).
+/// `equivalentSwapInputs(cell, input_port)` (OpenROAD #12158, one check for every caller): none
+/// for a sequential or isolation cell; none when a port is a bus, an output has no function (an
+/// opaque timing model), or a port is neither input nor output (power and ground pins aside);
+/// none with no output, fewer than two or more than 16 inputs, `input_port` not an input or read
+/// by no output's function (a constant output is trivially symmetric in everything). Else, in
+/// port order, each other input every output function is symmetric in together with
+/// `input_port`. `Err` when a function names something other than an input (the reference would
+/// read past its truth table).
 pub fn equiv_cell_pins(cell: &Cell, input_port: &str) -> Result<Vec<String>, String> {
     if !cell.seqs.is_empty() || cell.has_seq_bank || cell.is_isolation_cell {
         return Ok(Vec::new());
     }
-    let (mut outputs, mut inputs) = (0, 0);
+    // `port->hasMembers()`: the port iterator yields a bus as one port.
+    if !cell.buses.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut inputs: Vec<&str> = Vec::new();
+    let mut functions: Vec<FuncExpr> = Vec::new();
+    let mut has_input_in_function = false;
     for p in &cell.ports {
         if is_output(p) {
-            outputs += 1;
+            let Some(function) = p.function.as_deref() else { return Ok(Vec::new()) };
+            let expr = FuncExpr::parse(function).map_err(|e| format!("{}/{}: {e}", cell.name, p.name))?;
+            has_input_in_function |= reads_port(&expr, input_port);
+            functions.push(expr);
         } else if is_input(p) {
-            inputs += 1;
+            inputs.push(&p.name);
         } else {
             return Ok(Vec::new());
         }
     }
-    if outputs < 1 || inputs < 2 {
+    if functions.is_empty() || inputs.len() < 2 || inputs.len() > 16 || !has_input_in_function || !inputs.contains(&input_port) {
         return Ok(Vec::new());
     }
     let mut ports = Vec::new();
-    for candidate in cell.ports.iter().filter(|p| is_input(p)) {
-        let mut is_equivalent: Option<bool> = None;
-        for out in &cell.ports {
-            let Some(function) = out.function.as_deref() else { continue };
-            if !is_output(out) || input_port == candidate.name {
-                continue;
+    for &candidate in inputs.iter().filter(|&&c| c != input_port) {
+        let mut interchangeable = true;
+        for expr in &functions {
+            if !is_port_equiv(expr, cell, input_port, candidate)? {
+                interchangeable = false;
+                break;
             }
-            let expr = FuncExpr::parse(function).map_err(|e| format!("{}/{}: {e}", cell.name, out.name))?;
-            let r = is_port_equiv(&expr, cell, input_port, &candidate.name)?;
-            is_equivalent = Some(is_equivalent.map_or(r, |e| e && r));
         }
-        if is_equivalent == Some(true) && !ports.contains(&candidate.name) {
-            ports.push(candidate.name.clone());
+        if interchangeable {
+            ports.push(candidate.to_string());
         }
     }
     // Sorted by port id: the cell's port order, which the loop already keeps.
     Ok(ports)
+}
+
+/// `FuncExpr::hasPort(port)`: the expression reads the port.
+fn reads_port(expr: &FuncExpr, port: &str) -> bool {
+    match expr {
+        FuncExpr::Port(n) => n == port,
+        FuncExpr::Not(e) => reads_port(e, port),
+        FuncExpr::And(l, r) | FuncExpr::Or(l, r) | FuncExpr::Xor(l, r) => reads_port(l, port) || reads_port(r, port),
+        FuncExpr::One | FuncExpr::Zero => false,
+    }
 }
 
 /// `isPortEqiv`: the function's truth table over every input is unchanged when ports `a` and `b`
@@ -225,6 +244,28 @@ mod tests {
         assert!(equiv_cell_pins(&aoi, "B").unwrap().is_empty());
         let one_in = cell(r#"pin (A) { direction : input ; } pin (Z) { direction : output ; function : "!A" ; }"#);
         assert!(equiv_cell_pins(&one_in, "A").unwrap().is_empty(), "fewer than two inputs");
+    }
+
+    // Rule (equivalentSwapInputs, OpenROAD #12158): no swap on a cell with an opaque output (no
+    // function) or a constant one the input does not reach, nor for an input no output reads;
+    // a bus port also disables it.
+    #[test]
+    fn no_swap_on_an_opaque_or_constant_output() {
+        let opaque = cell(r#"pin (A) { direction : input ; } pin (B) { direction : input ; }
+            pin (Z) { direction : output ; function : "A*B" ; } pin (Y) { direction : output ; }"#);
+        assert!(equiv_cell_pins(&opaque, "A").unwrap().is_empty(), "Y has no function");
+        let constant = cell(r#"pin (A) { direction : input ; } pin (B) { direction : input ; }
+            pin (Z) { direction : output ; function : "1" ; }"#);
+        assert!(equiv_cell_pins(&constant, "A").unwrap().is_empty(), "A reaches no output");
+        let unread = cell(r#"pin (A) { direction : input ; } pin (B) { direction : input ; } pin (C) { direction : input ; }
+            pin (Z) { direction : output ; function : "B*C" ; }"#);
+        assert!(equiv_cell_pins(&unread, "A").unwrap().is_empty(), "A is read by no output");
+        assert_eq!(equiv_cell_pins(&unread, "B").unwrap(), vec!["C"]);
+        let mut bus = cell(r#"pin (A) { direction : input ; } pin (B) { direction : input ; }
+            pin (Z) { direction : output ; function : "A*B" ; }"#);
+        assert_eq!(equiv_cell_pins(&bus, "A").unwrap(), vec!["B"]);
+        bus.buses.push(("D".into(), vec!["D[0]".into()]));
+        assert!(equiv_cell_pins(&bus, "A").unwrap().is_empty(), "a bus port");
     }
 
     // Rule (findSwapPinCandidate): the swap is the fastest equivalent input strictly faster than
