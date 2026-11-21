@@ -1448,9 +1448,10 @@ impl CliDesign<'_> {
         Ok(had_changes)
     }
 
-    /// `EstimateParasitics::parasiticsInvalid(net)` (the odb callbacks call it).
+    /// `EstimateParasitics::parasiticsInvalid(net)` (the odb callbacks call it): since OpenROAD
+    /// #12350 a supply net is never pending ([`supply_sig_type`]).
     pub fn invalidate(&mut self, net: &str) {
-        if self.estimating && !net.is_empty() {
+        if self.estimating && !net.is_empty() && !supply_sig_type(&self.db.net_get_sig_type(net)) {
             self.invalid.insert(net.to_string());
         }
     }
@@ -2297,6 +2298,12 @@ impl CliDesign<'_> {
     }
 }
 
+/// `dbSigType::isSupply`: POWER or GROUND. A supply net carries no estimated parasitics and every
+/// cell's power pin is on it, so `parasiticsInvalid` leaves it alone (OpenROAD #12350).
+fn supply_sig_type(sig_type: &str) -> bool {
+    matches!(sig_type, "POWER" | "GROUND")
+}
+
 /// `EstimateParasitics::makeSteinerTree(drvr_pin)`, as the resizer's buffered net reads it.
 pub fn steiner_tree(db: &Db, net: &str, drvr_pin: &str, alpha: f32) -> Option<vyges_rsz::buffered_net::Tree> {
     let tree = vyges_est::placement::make_steiner_tree_for_driver(db, net, drvr_pin, alpha, &est_stt).ok()??;
@@ -2628,15 +2635,18 @@ mod tests {
     /// Upstream rule (aa89cb9694, 9ffa16d003): the output net survives a buffer removal only when
     /// it has a port and the input net has none; with ports on both sides the input net survives
     /// (before them a port on the output net alone decided it).
-    /// Upstream rule (`OdbCallBack::inDbITermPostDisconnect` at 4155ac3): every iterm
-    /// disconnect invalidates its net's parasitics, a supply net too, so deleting a buffer leaves
-    /// VDD and VSS pending (`pendingNetCount`) until the next update. Witness: the instrumented
-    /// reference on repair_setup_parallel_eval_path_group had VDD/VSS pending in exactly the 20
-    /// of 268 counts that followed an UnbufferMove.
+    /// Upstream rule (`OdbCallBack::inDbITermPostDisconnect`): every iterm disconnect calls
+    /// `parasiticsInvalid` on its net, a supply net too — at 4155ac3 that left VDD and VSS
+    /// pending (`pendingNetCount`) until the next update (witness: the instrumented reference on
+    /// repair_setup_parallel_eval_path_group, 20 of 268 counts after an UnbufferMove). Since
+    /// OpenROAD #12350 `parasiticsInvalid` skips a supply net: the deletion still names them, the
+    /// estimator keeps none pending.
     #[test]
     fn deleting_an_instance_leaves_its_supply_nets_pending() {
         let nets = ["n1", "VDD", "", "VSS", "n2"].map(String::from);
         assert_eq!(nets_left_by_deletion(nets.into_iter(), &["n1", "n2"]), ["VDD", "VSS"]);
+        assert!(supply_sig_type("POWER") && supply_sig_type("GROUND"));
+        assert!(!supply_sig_type("SIGNAL") && !supply_sig_type("CLOCK") && !supply_sig_type(""));
     }
 
     #[test]
