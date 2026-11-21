@@ -175,6 +175,10 @@ pub struct Sizing<'a> {
     /// changes, init, dont_use set/reset, postReadLiberty, the SetAndRestore in report_equiv) a
     /// new `Sizing` is built. Start it empty (`Default::default()`).
     pub swappable_cache: std::cell::RefCell<HashMap<String, Vec<String>>>,
+    /// The clock buffer pattern `getBufferUse` reads (`set_cts_config -clock_buffer_string /
+    /// -clock_buffer_footprint`); setting it clears the swappable cache upstream, a new `Sizing`
+    /// here.
+    pub clock_pattern: crate::preamble::ClockPattern,
 }
 
 /// `sizing_area_limit_` and `sizing_leakage_limit_`'s defaults: one sizing move may not grow a
@@ -230,7 +234,8 @@ impl Sizing<'_> {
     /// only for itself; a cell with no class for itself; else its class, in class order, without
     /// dont_use or non-link cells, cells with no master, cells whose LEF area or leakage exceeds
     /// the source's by more than the block's limits (4 each by default); a source with a `user_function_class` keeps
-    /// only cells with the same one. (No site/VT keeping or footprint matching: off by default.)
+    /// only cells with the same one; a buffer keeps only buffers of its own use, data or clock
+    /// (OpenROAD #12285). (No site/VT keeping or footprint matching: off by default.)
     /// When no cell larger than the source (LEF area) is left, the smallest larger one excluded by
     /// the leakage limit alone (the first of equal areas) is kept, at its place in the class order
     /// — upstream 03bdb5beb4d / 43c34061db2: a low-leakage cell keeps one upsizing step.
@@ -282,6 +287,10 @@ impl Sizing<'_> {
             }
             // `sizing_keep_vt_`: the same VT index — the same set of IMPLANT layers.
             if self.limits.keep_vt && implant_set(m) != implant_set(master) {
+                continue;
+            }
+            // Data and clock buffers stay disjoint (`getBufferUse`, OpenROAD #12285).
+            if source_cell.is_buffer() && cell.is_buffer() && crate::preamble::is_clock_buffer_with(source_cell, &self.clock_pattern) != crate::preamble::is_clock_buffer_with(cell, &self.clock_pattern) {
                 continue;
             }
             if !source_cell.user_function_class.is_empty() && source_cell.user_function_class != cell.user_function_class {
@@ -491,7 +500,7 @@ mod tests {
         let masters: BTreeMap<String, Master> = ["B1", "B2", "B4"].iter().map(|n| (n.to_string(), Master { site: "s".into(), area: 1, width: 1, height: 1, is_core: true, logic_std: true, implant_obs: vec![] })).collect();
         let equiv = make_equiv_cells(&l);
         let (dont_use, loads) = (BTreeSet::new(), BTreeMap::new());
-        let s = Sizing { libs: &l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: SizingLimits::default(), swappable_cache: Default::default() };
+        let s = Sizing { libs: &l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: SizingLimits::default(), swappable_cache: Default::default(), clock_pattern: Default::default() };
         assert_eq!(s.swappable_cells("B1").unwrap(), vec!["B1".to_string(), "B2".into()], "B4 leaks 4.1x B1");
         // Rule (getSwappableCells, `swappable_cells_cache_`): the first call stores its result per
         // source cell and later calls return the stored list without re-filtering the class.
@@ -499,6 +508,41 @@ mod tests {
         s.swappable_cache.borrow_mut().insert("B1".into(), vec!["B4".into()]);
         assert_eq!(s.swappable_cells("B1").unwrap(), vec!["B4".to_string()], "a later call reads the cache");
         assert_eq!(s.find_swappable_cells("B1").unwrap(), vec!["B1".to_string(), "B2".into()]);
+    }
+
+    // Rule (getSwappableCells, OpenROAD #12285): data and clock buffers stay disjoint — a buffer
+    // keeps only buffers of its own `getBufferUse` (the CLKBUF name test by default, the
+    // session's string / footprint pattern when set).
+    #[test]
+    fn data_and_clock_buffers_do_not_swap_for_each_other() {
+        let buf = |n: &str, r: f32| {
+            format!(
+                r#"cell ({n}) {{ cell_leakage_power : 1 ; pin (A) {{ direction : input ; }} pin (Z) {{ direction : output ; function : "A" ;
+                  timing () {{ related_pin : "A" ; timing_sense : positive_unate ; fall_transition (t) {{ values ("0, {r}", "0, {r}") ; }} }} }} }}"#
+            )
+        };
+        let names = ["BUF_X1", "BUF_X2", "CLKBUF_X1", "CLKBUF_X2"];
+        let l = lib(&format!(
+            r#"library (l) {{ lu_table_template (t) {{ variable_1 : input_net_transition ; variable_2 : total_output_net_capacitance ;
+              index_1 ("0, 1") ; index_2 ("0, 1") ; }} {} {} {} {} }}"#,
+            buf(names[0], 4.0), buf(names[1], 2.0), buf(names[2], 3.0), buf(names[3], 1.5)
+        ));
+        let masters: BTreeMap<String, Master> = names.iter().map(|n| (n.to_string(), Master { site: "s".into(), area: 1, width: 1, height: 1, is_core: true, logic_std: true, implant_obs: vec![] })).collect();
+        let equiv = make_equiv_cells(&l);
+        let (dont_use, loads) = (BTreeSet::new(), BTreeMap::new());
+        let sizing = |pattern: crate::preamble::ClockPattern| Sizing { libs: &l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: SizingLimits::default(), swappable_cache: Default::default(), clock_pattern: pattern };
+        let s = sizing(Default::default());
+        let mut data = s.swappable_cells("BUF_X1").unwrap();
+        data.sort();
+        assert_eq!(data, ["BUF_X1", "BUF_X2"]);
+        let mut clk = s.swappable_cells("CLKBUF_X2").unwrap();
+        clk.sort();
+        assert_eq!(clk, ["CLKBUF_X1", "CLKBUF_X2"]);
+        // A pattern naming only X2 cells as clock buffers splits the class the other way.
+        let s = sizing(crate::preamble::ClockPattern::String("_X2".into()));
+        let mut x1 = s.swappable_cells("BUF_X1").unwrap();
+        x1.sort();
+        assert_eq!(x1, ["BUF_X1", "CLKBUF_X1"]);
     }
 
     // Rule (getSwappableCells, upstream 03bdb5beb4d / 43c34061db2): when the leakage limit leaves
@@ -526,7 +570,7 @@ mod tests {
             let masters: BTreeMap<String, Master> = names.iter().zip(areas).map(|(n, area)| (n.to_string(), Master { site: "s".into(), area, width: 1, height: 1, is_core: true, logic_std: true, implant_obs: vec![] })).collect();
             let equiv = make_equiv_cells(&l);
             let (dont_use, loads) = (BTreeSet::new(), BTreeMap::new());
-            let s = Sizing { libs: &l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: SizingLimits::default(), swappable_cache: Default::default() };
+            let s = Sizing { libs: &l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: SizingLimits::default(), swappable_cache: Default::default(), clock_pattern: Default::default() };
             s.swappable_cells("B1").unwrap()
         };
         let v = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -564,7 +608,7 @@ mod tests {
         let masters: BTreeMap<String, Master> = ["BUF_R", "BUF_L", "XBUF_R", "BUF_S"].iter().map(|n| (n.to_string(), Master { site: "s".into(), area: 1, width: 1, height: 1, is_core: true, logic_std: true, implant_obs: vt(n) })).collect();
         let equiv = make_equiv_cells(&l);
         let (dont_use, loads) = (BTreeSet::new(), BTreeMap::new());
-        let s = Sizing { libs: &l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: SizingLimits::default(), swappable_cache: Default::default() };
+        let s = Sizing { libs: &l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: SizingLimits::default(), swappable_cache: Default::default(), clock_pattern: Default::default() };
         // By leakage alone R(1) L(2) XR(3) S(4): R and XR are not adjacent and both stayed.
         assert_eq!(s.vt_equiv_cells("BUF_L", 3), vec!["BUF_R".to_string(), "BUF_L".into(), "BUF_S".into()], "XBUF_R deduplicated against BUF_R");
         assert!(s.vt_equiv_cells("BUF_L", 1).is_empty(), "one VT category: none");

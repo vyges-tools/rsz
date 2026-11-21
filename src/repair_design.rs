@@ -301,7 +301,7 @@ fn repair_design_held(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args,
     drop(graphs);
     // ⛔ not held into the repair: a second holder makes the design copy its netlist per edit
     drop(netlist);
-    let sizing = Sizing { libs: inputs.libs, masters: inputs.masters, dont_use: inputs.dont_use, equiv: &equiv, target_loads: &target_loads, tgt_slews, tgt_scene, limits: inputs.sizing_limits, swappable_cache: Default::default() };
+    let sizing = Sizing { libs: inputs.libs, masters: inputs.masters, dont_use: inputs.dont_use, equiv: &equiv, target_loads: &target_loads, tgt_slews, tgt_scene, limits: inputs.sizing_limits, swappable_cache: Default::default(), clock_pattern: inputs.clock_pattern.clone() };
     let mut ctx = NetCtx {
         inputs,
         args,
@@ -574,7 +574,7 @@ pub fn repair_clk_nets(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers
     let r_strongest = r_strongest_buffer(inputs, clk_buffers);
     let args = Args { max_wire_length, ..Args::default() };
     let lifted = crate::sizing::SizingLimits { area: None, leakage: None, ..inputs.sizing_limits };
-    let sizing = Sizing { libs: inputs.libs, masters: inputs.masters, dont_use: inputs.dont_use, equiv: &equiv, target_loads: &target_loads, tgt_slews, tgt_scene, limits: lifted, swappable_cache: Default::default() };
+    let sizing = Sizing { libs: inputs.libs, masters: inputs.masters, dont_use: inputs.dont_use, equiv: &equiv, target_loads: &target_loads, tgt_slews, tgt_scene, limits: lifted, swappable_cache: Default::default(), clock_pattern: inputs.clock_pattern.clone() };
     let annotated: Vec<HashMap<String, f32>> = vec![HashMap::new(); inputs.libs.scene_count()];
     let no_viol = HashMap::new();
     let mut ctx = NetCtx {

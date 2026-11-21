@@ -6395,7 +6395,7 @@ mod tests {
         let masters: BTreeMap<String, Master> = l.libs[0].cells.keys().map(|n| (n.clone(), Master { site: "s".into(), area: 1, width: 1, height: 1, is_core: true, logic_std: true, implant_obs: vec![] })).collect();
         let equiv = crate::sizing::make_equiv_cells(l);
         let (dont_use, loads) = (BTreeSet::new(), BTreeMap::new());
-        f(&Sizing { libs: l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: Default::default(), swappable_cache: Default::default() })
+        f(&Sizing { libs: l, masters: &masters, dont_use: &dont_use, equiv: &equiv, target_loads: &loads, tgt_slews: [0.0; 2], tgt_scene: 0, limits: Default::default(), swappable_cache: Default::default(), clock_pattern: Default::default() })
     }
 
     /// An inverter of drive resistance `r` (as [`buf`]); liberty `dont_use` when `du`.

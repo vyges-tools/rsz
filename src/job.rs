@@ -1639,7 +1639,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     let db_dbu = db.tech_get_db_units_per_micron();
                     let buffers = crate::preamble::find_buffers(&libs, &m, &dont_use, !hold_only).map_err(|e| format!("{}: {}", e.code(), e.message()))?;
                     let (tgt_slews, tgt_scene, target_loads) = crate::preamble::find_target_loads(&libs, &buffers.cells, &dont_use);
-                    let sizing = crate::sizing::Sizing { libs: &libs, masters: &m, dont_use: &dont_use, equiv: &equiv, target_loads: &target_loads, tgt_slews, tgt_scene, limits: sizing_limits(&db)?, swappable_cache: Default::default() };
+                    let sizing = crate::sizing::Sizing { libs: &libs, masters: &m, dont_use: &dont_use, equiv: &equiv, target_loads: &target_loads, tgt_slews, tgt_scene, limits: sizing_limits(&db)?, swappable_cache: Default::default(), clock_pattern: Default::default() };
                     let limits = Limits {
                         design_max_transition: s.max_transition.map(|v| user_time_to_sta(v, time_scale)),
                         design_max_fanout: s.max_fanout.map(|v| v as f32),
