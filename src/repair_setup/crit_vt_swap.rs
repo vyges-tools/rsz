@@ -147,7 +147,9 @@ impl Repair<'_, '_> {
                 let fanins = |cur: usize| {
                     // Under a group: logic no group startpoint reaches carries none of its paths.
                     let in_group = |f: usize| !matches!(&group_fanout, Some(r) if !r.contains(&f));
-                    g.in_edges[cur].iter().rev().map(|&e| g.edges[e].from).filter(|&f| !is_reg_clk(f) && in_group(f)).map(|f| (f, s.slack_of(f, MAX, None))).collect::<Vec<_>>()
+                    // A clock gate's clock pin is not a register clock, and is not followed either
+                    // (`sta_->isClock(pin)`, OpenROAD #12261).
+                    g.in_edges[cur].iter().rev().map(|&e| g.edges[e].from).filter(|&f| !is_reg_clk(f) && !cs[0].contains(&f) && in_group(f)).map(|f| (f, s.slack_of(f, MAX, None))).collect::<Vec<_>>()
                 };
                 walk_fanin_cone(ev, s.slack_of(ev, MAX, None), margin, &mut visited, fanins, |cur| {
                     // Under a group an instance counts only through an output (its own delay on
@@ -155,6 +157,12 @@ impl Repair<'_, '_> {
                     let counted = counts_instance(group_fanout.is_some(), g.vertices[cur].is_driver);
                     if let (true, Conn::Inst(k, _)) = (counted, &g.vertices[cur].conn) {
                         let (inst, cell) = (&g.netlist.insts[*k].0, &g.netlist.insts[*k].1);
+                        // A clock gate ends its enable check, but its delay is on the clock of
+                        // every register it gates (`drivesClock`, OpenROAD #12261): never swapped,
+                        // nor marked.
+                        if drives_clock(g, &cs[0], *k) {
+                            return endpoint_insts < MAX_CRIT_INSTANCES_PER_ENDPOINT;
+                        }
                         if let Some(best) = check_and_mark_vt_swappable(ctx, dont_touch, inst, cell, not_swappable) {
                             // `getInstanceSlack`: the least (`std::min`) slack over the output pins.
                             let mut inst_slack = f32::MAX;
@@ -204,13 +212,19 @@ impl Repair<'_, '_> {
     }
 }
 
-/// `Vertex::isRegClk`: the from pin of a clock-to-output arc.
 /// `SetupCritVtSwapPolicy::outputPin`: the first of the instance's pins (`pinIterator`, its
 /// master's terminals in order) whose direction `isAnyOutput` — output, tristate or bidirect.
 fn first_output_port(ports: &[String], direction: impl Fn(&str) -> Option<Direction>) -> Option<&str> {
     ports.iter().map(String::as_str).find(|p| matches!(direction(p), Some(Direction::Output | Direction::Tristate | Direction::Bidirect)))
 }
 
+/// `SetupCritVtSwapPolicy::drivesClock(inst)` (OpenROAD #12261): an output pin of the instance is
+/// in the clock network (`sta_->isClock(pin, cmdMode)`).
+fn drives_clock(g: &vyges_sta::graph::Graph<'_>, clock_network: &BTreeSet<usize>, inst: usize) -> bool {
+    g.vertices.iter().enumerate().any(|(u, ux)| ux.is_driver && matches!(&ux.conn, Conn::Inst(j, _) if *j == inst) && clock_network.contains(&u))
+}
+
+/// `Vertex::isRegClk`: the from pin of a clock-to-output arc.
 fn is_reg_clk(g: &vyges_sta::graph::Graph<'_>, v: usize) -> bool {
     g.out_edges[v].iter().any(|&e| match g.edges[e].kind {
         EdgeKind::Gate { set } => {
@@ -380,6 +394,42 @@ mod tests {
         let set = |xs: &[&str]| -> BTreeSet<String> { xs.iter().map(|x| x.to_string()).collect() };
         assert_eq!(names(true), set(&["a", "b1/A", "b1/Z", "en", "r1/D", "r3/D"]));
         assert_eq!(names(false), set(&["b2/A", "b2/Z", "q", "r1/Q", "r2/D", "r2/Q", "r3/Q"]));
+    }
+
+    /// Rule (`SetupCritVtSwapPolicy::drivesClock` / the fanin walk, OpenROAD #12261): an
+    /// instance with an output in the clock network (a clock gate, a clock buffer) is never a
+    /// critical VT swap, and a clock-network pin is not walked through.
+    #[test]
+    fn a_clock_driver_is_no_critical_vt_swap() {
+        const D: &str = r#"cell_rise (t) { values ("0.01, 0.01", "0.01, 0.01"); } rise_transition (t) { values ("0.01, 0.01", "0.01, 0.01"); }
+          cell_fall (t) { values ("0.01, 0.01", "0.01, 0.01"); } fall_transition (t) { values ("0.01, 0.01", "0.01, 0.01"); }"#;
+        let lib = format!(
+            r#"library (t) {{ time_unit : "1ns"; capacitive_load_unit (1, pf);
+          lu_table_template (t) {{ variable_1 : input_net_transition; variable_2 : total_output_net_capacitance; index_1 ("0, 1"); index_2 ("0, 1"); }}
+          cell (buf) {{ pin (A) {{ direction : input; capacitance : 0.001; }}
+            pin (Z) {{ direction : output; function : "A"; timing () {{ related_pin : "A"; timing_sense : positive_unate; {D} }} }} }}
+          cell (dff) {{ ff (IQ, IQN) {{ clocked_on : "CK"; next_state : "D"; }}
+            pin (D) {{ direction : input; capacitance : 0.001; }} pin (CK) {{ direction : input; clock : true; capacitance : 0.001; }}
+            pin (Q) {{ direction : output; function : "IQ"; timing () {{ related_pin : "CK"; timing_type : rising_edge; {D} }} }} }} }}"#
+        );
+        use vyges_sta::netlist::{inst, Conn, Net, Netlist, PortDir};
+        let libs = vec![vyges_sta::liberty::Library::read(&vyges_sta::liberty_parse::parse(&lib).unwrap()).unwrap()];
+        let i = |k: usize, p: &str| Conn::Inst(k, p.into());
+        let netlist = Netlist {
+            insts: vec![inst("cg", "buf"), inst("db", "buf"), inst("r1", "dff")],
+            ports: vec![("clk".into(), PortDir::Input), ("a".into(), PortDir::Input)],
+            nets: vec![
+                Net { name: "clk".into(), pins: vec![Conn::Port(0), i(0, "A")] }.into(),
+                Net { name: "gclk".into(), pins: vec![i(0, "Z"), i(2, "CK")] }.into(),
+                Net { name: "a".into(), pins: vec![Conn::Port(1), i(1, "A")] }.into(),
+                Net { name: "d".into(), pins: vec![i(1, "Z"), i(2, "D")] }.into(),
+            ],
+        };
+        let g = vyges_sta::graph::Graph::build(&libs, &netlist).unwrap();
+        let clocks = crate::timing::clock_pins(&g, &["clk".to_string()]);
+        assert!(drives_clock(&g, &clocks, 0), "the clock buffer drives the register clock");
+        assert!(!drives_clock(&g, &clocks, 1), "the data buffer");
+        assert!(!drives_clock(&g, &clocks, 2), "a register output is data");
     }
 
     /// Rule (`traverseFaninCone` under -path_group): an instance counts only through an output pin;
