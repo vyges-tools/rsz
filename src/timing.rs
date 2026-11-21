@@ -63,11 +63,16 @@ fn find_cap_limit(g: &Graph<'_>, v: usize, limits: &Limits) -> Option<f32> {
     tighter_max(limit, limit_port_of(g, v).and_then(|(_, p)| p.max_capacitance))
 }
 
-/// `Resizer::maxLoad(cell)`: over the output ports in order, the tighter of the design limit and
-/// the port's own; the first port with either returns it, else 0. With a design limit that is
-/// always the first output port.
+/// `Resizer::outputMaxCap(cell)` (`maxLoad` before OpenROAD #12001): over the output ports in
+/// order, the tighter of the design limit and the port's own (`outputMaxCap(port)`, 0 without
+/// either); the first POSITIVE one returns it, else 0 — a zero limit passes to the next output.
 pub fn max_load(cell: &vyges_sta::liberty::Cell, limits: &Limits) -> f32 {
-    cell.ports.iter().filter(|p| p.direction == vyges_sta::liberty::Direction::Output).find_map(|p| tighter_max(limits.design_max_capacitance, p.max_capacitance)).unwrap_or(0.0)
+    cell.ports
+        .iter()
+        .filter(|p| p.direction == vyges_sta::liberty::Direction::Output)
+        .map(|p| tighter_max(limits.design_max_capacitance, p.max_capacitance).unwrap_or(0.0))
+        .find(|&l| l > 0.0)
+        .unwrap_or(0.0)
 }
 
 /// A netlist the timer here cannot level the way the reference does, named — or `None`.
@@ -886,9 +891,10 @@ mod tests {
         assert_eq!(tighter_max(None, None), None);
     }
 
-    // Rule (Resizer::maxLoad): over the OUTPUT ports in order, the first with a limit — the
-    // design's tightened by the port's — returns it, else 0. With a design limit the first output
-    // port always answers, even when a later one has a tighter limit of its own.
+    // Rule (Resizer::outputMaxCap, OpenROAD #12001): over the OUTPUT ports in order, the first
+    // POSITIVE limit — the design's tightened by the port's — returns it, else 0. With a design
+    // limit the first output port answers, even when a later one has a tighter limit of its own;
+    // a zero limit (the old `exists` test returned it) now falls through to the next output.
     #[test]
     fn max_load_takes_the_first_output_port_with_any_limit() {
         let cell = vyges_sta::liberty::Cell { name: "c".into(), ports: vec![port("A", Direction::Input, Some(1.0)), port("Y", Direction::Output, None), port("Z", Direction::Output, Some(4.0))], ..Default::default() };
@@ -899,6 +905,8 @@ mod tests {
         assert_eq!(max_load(&cell, &design(2.0)), 2.0);
         let bare = vyges_sta::liberty::Cell { name: "b".into(), ports: vec![port("Y", Direction::Output, None)], ..Default::default() };
         assert_eq!(max_load(&bare, &none), 0.0);
+        let zero = vyges_sta::liberty::Cell { name: "z".into(), ports: vec![port("Y", Direction::Output, Some(0.0)), port("Z", Direction::Output, Some(4.0))], ..Default::default() };
+        assert_eq!(max_load(&zero, &none), 4.0, "a zero limit passes to the next output");
     }
 
     // Rule (CheckCapacitances::findLimit): on a top-level port, the design limit tightened by the
