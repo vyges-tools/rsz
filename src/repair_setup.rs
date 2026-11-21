@@ -1879,7 +1879,7 @@ fn port_capacitance_rf(cell: &Cell, port: &str, rf: usize) -> Option<f32> {
 
 /// `upsizeCell`'s cost of a nominal cell: its leakage when positive, else its LEF area when
 /// positive, else its liberty area when positive — one entry per metric, `None` where unavailable.
-fn upsize_costs(sizing: &Sizing<'_>, name: &str) -> [Option<f32>; 3] {
+pub(super) fn upsize_costs(sizing: &Sizing<'_>, name: &str) -> [Option<f32>; 3] {
     let cell = sizing.libs.link_cell(name);
     let leakage = cell.and_then(crate::sizing::cell_leakage).filter(|&l| l > 0.0);
     let lef_area = sizing.masters.get(name).filter(|m| m.area > 0).map(|m| m.area as f32);

@@ -159,6 +159,7 @@ pub struct MtConfig {
     pub side_floor_margin: f32,
     pub dual_rf_eval: bool,
     pub dual_rf_drive_guard: bool,
+    pub vt_swap_mt_score_scale: f32,
     pub size_up_mt_score_scale: f32,
     pub size_up_mt_max_drive_ratio: f32,
     pub rebuffer_mt_score_scale: f32,
@@ -172,6 +173,22 @@ pub struct MtConfig {
     pub parallel_eval: ParallelEvalConfig,
 }
 
+impl MtConfig {
+    /// `OptimizationPolicyConfig::scoreScale(type)` (OpenROAD #12153): a move's weight in the
+    /// shared pool, applied by the policy (`estimateTarget`) to the score its candidate found; 1
+    /// for a move without one.
+    pub fn score_scale(&self, m: Move) -> f32 {
+        match m {
+            Move::VtSwap => self.vt_swap_mt_score_scale,
+            Move::SizeUp => self.size_up_mt_score_scale,
+            Move::Buffer => self.rebuffer_mt_score_scale,
+            Move::SplitLoad => self.split_load_mt_score_scale,
+            Move::SizeDownFanout => self.size_down_fanout_mt_score_scale,
+            Move::Clone | Move::SizeUpMatch | Move::SwapPins | Move::Unbuffer | Move::Reroute | Move::BufferToInverters => 1.0,
+        }
+    }
+}
+
 impl Default for MtConfig {
     /// The shipped values, before `forParallelEval`.
     fn default() -> Self {
@@ -182,6 +199,7 @@ impl Default for MtConfig {
             side_floor_margin: 1.0,
             dual_rf_eval: false,
             dual_rf_drive_guard: true,
+            vt_swap_mt_score_scale: 1.0,
             size_up_mt_score_scale: 0.75,
             size_up_mt_max_drive_ratio: 0.0,
             rebuffer_mt_score_scale: 0.10,
@@ -2526,7 +2544,7 @@ impl Repair<'_, '_> {
             fixed: self.design.net_info().fixed_insts.contains(&target.inst),
             ok_to_buffer_net: self.ok_to_buffer_net(&target.driver_pin),
             logic_std: self.ctx.sizing.masters.get(&target.cell).is_some_and(|m| m.logic_std),
-            vt_swappable: self.ctx.vt_category_count >= 2 && self.ctx.sizing.masters.contains_key(&target.cell) && self.ctx.sizing.vt_equiv_cells(&target.cell, self.ctx.vt_category_count).len() > 1,
+            vt_swappable: self.ctx.vt_category_count >= 2 && self.ctx.sizing.masters.contains_key(&target.cell) && !select_candidate_cells(self.ctx, &target.cell).is_empty(),
             driver_liberty: target.driver_pin.rsplit_once('/').is_some_and(|(_, port)| self.ctx.libs.link_cell(&target.cell).is_some_and(|c| c.port(port).is_some())),
             // UnbufferMtGenerator::isApplicable: the moves that block a serial removal (a resize
             // does not).
@@ -2939,8 +2957,8 @@ fn pe_generate(m: Move, target: &Target, plan: &PlanTimer<'_, '_, '_>, cfg: &MtC
         Move::SwapPins => Ok(swap_pins_mt_generate(target, plan.names)),
         Move::SizeUp => size_up_mt_generate(target, plan.ctx, cfg, plan.names),
         Move::VtSwap => vt_swap_mt_generate(target, plan.ctx, cfg, plan.names),
-        Move::SizeDownFanout => Ok(size_down_fanout_mt_generate(target, plan.ctx.libs, cfg, plan.names)),
-        Move::SplitLoad => Ok(split_load_mt_generate(target, plan.ctx.libs, cfg, plan.names)),
+        Move::SizeDownFanout => Ok(size_down_fanout_mt_generate(target, plan.ctx.libs, plan.names)),
+        Move::SplitLoad => Ok(split_load_mt_generate(target, plan.ctx.libs, plan.names)),
         Move::Buffer => rebuffer_mt_generate(target, plan, cfg, rb),
         _ => Ok(Vec::new()),
     }
@@ -3059,14 +3077,14 @@ fn rebuffer_mt_estimate(libs: &crate::preamble::Libs, context: &EstimatorContext
     let mut side_evals = Vec::new();
     let d = bt::estimate_buffer_tree_with_side_paths(libs, context, p, sides, Some(&mut trace), Some(&mut side_evals));
     rb.push_str(&rebuffer_est_line(&target.driver_pin, &d, &trace, &side_evals));
-    rebuffer_mt_estimate_of(&d, cfg.rebuffer_mt_score_scale, cfg.rebuffer_mt_min_score)
+    rebuffer_mt_estimate_of(&d, cfg.rebuffer_mt_min_score)
 }
 
 /// The score rules of [`rebuffer_mt_estimate`] on a delay estimate.
-fn rebuffer_mt_estimate_of(d: &crate::delay_estimator::DelayEstimate, score_scale: f32, min_score: f32) -> Estimate {
+fn rebuffer_mt_estimate_of(d: &crate::delay_estimator::DelayEstimate, min_score: f32) -> Estimate {
     use crate::delay_estimator::FailReason;
     let raw_score = d.arrival_impr - d.side_loss;
-    let mut e = Estimate { legal: false, score: raw_score * score_scale, raw_gain: None, reason: d.reason.name(), tail_admissible: false, side_loss: (d.side_paths_evaluated > 0).then_some(d.side_loss), sequential_penalty: None, sequential_side_loss: None };
+    let mut e = Estimate { legal: false, score: raw_score, raw_gain: None, reason: d.reason.name(), tail_admissible: false, side_loss: (d.side_paths_evaluated > 0).then_some(d.side_loss), sequential_penalty: None, sequential_side_loss: None };
     if !d.legal {
         if matches!(d.reason, FailReason::EstimateNonImproving | FailReason::SideSlackFloorViolation) {
             e.raw_gain = Some(d.arrival_impr);
@@ -3250,28 +3268,56 @@ fn swap_pins_mt_impact(target: &Target, names: &ImpactNames<'_>, input: &SwapPin
 }
 
 /// `SizeUpMtGenerator::generate`: the size-up options of the target arc's output port, scene
-/// and min/max, each replacement kept when it fits the instance's input cap budgets.
+/// and min/max, each replacement kept when it fits the instance's input cap budgets; the fitting
+/// ones' cost ratios made score divisors ([`relative_cell_costs`], OpenROAD #12153).
 fn size_up_mt_generate(target: &Target, ctx: &super::Ctx<'_>, cfg: &MtConfig, names: &ImpactNames<'_>) -> Result<Vec<Candidate>, Stop> {
     let Some(context) = &target.estimator_context else { return Ok(Vec::new()) };
-    let replacements = build_size_up_options(ctx, cfg, &context.target().arc)?;
+    let options = build_size_up_options(ctx, cfg, &context.target().arc)?;
     let budgets = target.input_cap_budgets.as_deref().unwrap_or(&[]);
+    let fitting: Vec<(String, f32)> = options.into_iter().filter(|(r, _)| replacement_fits_input_cap_budgets(ctx, budgets, r)).collect();
+    let divisors = relative_cell_costs(&fitting.iter().map(|&(_, r)| r).collect::<Vec<_>>());
     let mut candidates = Vec::new();
-    for replacement in replacements {
-        if !replacement_fits_input_cap_budgets(ctx, budgets, &replacement) {
-            continue;
-        }
-        let estimate = size_up_mt_estimate(ctx.libs, target, &replacement, cfg.size_up_mt_score_scale)?;
+    for ((replacement, _), divisor) in fitting.into_iter().zip(divisors) {
+        let estimate = size_up_mt_estimate(ctx.libs, target, &replacement, divisor)?;
         candidates.push(Candidate { kind: Move::SizeUp, estimate, impact: cell_swap_impact(target, names, &target.inst), desc: replacement, tree: None, rebuffer_side_pins: Vec::new() });
     }
     Ok(candidates)
+}
+
+/// `relativeCellCosts(cost_ratios)` (OpenROAD #12153): each option's score divisor
+/// `max(1, r / r_min)`, `r_min` the smallest new/old cost ratio above 1 — the cheapest costlier
+/// option keeps its full score, a costlier one pays only its extra cost; every divisor is 1 when
+/// no option costs more.
+fn relative_cell_costs(cost_ratios: &[f32]) -> Vec<f32> {
+    let mut reference = 0.0f32;
+    for &ratio in cost_ratios {
+        if ratio > 1.0 && (reference == 0.0 || ratio < reference) {
+            reference = ratio;
+        }
+    }
+    cost_ratios.iter().map(|&ratio| if reference > 0.0 { 1.0f32.max(ratio / reference) } else { 1.0 }).collect()
+}
+
+/// `SizeUpMtCandidate::costScaled` / `VtSwapMtCandidate::costScaled`: a POSITIVE score divided by
+/// the option's cost divisor; any other score as it is (dividing a negative one would rank a
+/// costlier move higher).
+fn cost_scaled(score: f32, cost_divisor: f32) -> f32 {
+    if score > 0.0 { score / cost_divisor } else { score }
+}
+
+/// `MoveGenerator::cellCostRatio(from_costs, to)`: new/old on the first of leakage, LEF area and
+/// liberty area both cells have ([`super::upsize_costs`]); none when they share no metric.
+fn cell_cost_ratio(from: &[Option<f32>; 3], to: &[Option<f32>; 3]) -> Option<f32> {
+    from.iter().zip(to).find_map(|(old, new)| Some((*new)? / (*old)?))
 }
 
 /// `SizeUpMtGenerator::buildSizeUpOptions`: the swappable cells of the arc's cell, each other than
 /// it, with a master, of the same VT class (`cellVTType`, so VT changes stay VtSwap's), with the
 /// output port at the scene, passing the dual-RF drive guard (when on), and whose drive
 /// resistance is at most the current one and, when the ratio limit is on (a positive
-/// `size_up_mt_max_drive_ratio` and drive), at least the current over the ratio.
-fn build_size_up_options(ctx: &super::Ctx<'_>, cfg: &MtConfig, arc: &crate::delay_estimator::SelectedArc) -> Result<Vec<String>, Stop> {
+/// `size_up_mt_max_drive_ratio` and drive), at least the current over the ratio — and, since
+/// OpenROAD #12153, with a cost ratio to it ([`cell_cost_ratio`]), kept alongside.
+fn build_size_up_options(ctx: &super::Ctx<'_>, cfg: &MtConfig, arc: &crate::delay_estimator::SelectedArc) -> Result<Vec<(String, f32)>, Stop> {
     let mut replacements = Vec::new();
     let Some((_, drvr_port)) = crate::delay_estimator::arc_ports(ctx.libs, arc) else { return Ok(replacements) };
     let cell = &arc.cell;
@@ -3285,6 +3331,7 @@ fn build_size_up_options(ctx: &super::Ctx<'_>, cfg: &MtConfig, arc: &crate::dela
     let limit_ratio = max_ratio > 0.0 && drive_r > 0.0;
     let min_drive_r = if limit_ratio { drive_r / max_ratio } else { 0.0 };
     let current_master = ctx.sizing.masters.get(cell.as_str());
+    let cell_costs = super::upsize_costs(ctx.sizing, cell);
     for name in &swappable {
         if name == cell {
             continue;
@@ -3299,7 +3346,8 @@ fn build_size_up_options(ctx: &super::Ctx<'_>, cfg: &MtConfig, arc: &crate::dela
         }
         let swappable_drive_r = corner.drive_resistance(&drvr_port);
         if swappable_drive_r <= drive_r && (!limit_ratio || swappable_drive_r >= min_drive_r) {
-            replacements.push(name.clone());
+            let Some(ratio) = cell_cost_ratio(&cell_costs, &super::upsize_costs(ctx.sizing, name)) else { continue };
+            replacements.push((name.clone(), ratio));
         }
     }
     Ok(replacements)
@@ -3329,66 +3377,68 @@ fn cell_fits_input_cap_budgets(cell: &vyges_sta::liberty::Cell, budgets: &[Input
 
 /// `MoveCandidate::cellSwapImpact`: complete, the instance written (its pins' nets only enter
 /// the timing cone, which the trace does not print).
-/// `SizeUpMtCandidate::estimate`: the window estimate of the replacement, scored by the gain
-/// times the score scale. Not legal: the score kept, the raw gain only for a non-improving
-/// estimate, tail-admissible for the opposite-transition reject with a positive score. Legal: the
-/// cell swap's side costs.
-fn size_up_mt_estimate(libs: &crate::preamble::Libs, target: &Target, replacement: &str, score_scale: f32) -> Result<Estimate, Stop> {
+/// `SizeUpMtCandidate::estimate`: the window estimate of the replacement, scored by the gain (the
+/// move weight is the policy's). Not legal: the score cost-scaled, the raw gain only for a
+/// non-improving estimate, tail-admissible for the opposite-transition reject with a positive
+/// gain. Legal: the cell swap's side costs, then cost-scaled ([`cost_scaled`]).
+fn size_up_mt_estimate(libs: &crate::preamble::Libs, target: &Target, replacement: &str, cost_divisor: f32) -> Result<Estimate, Stop> {
     let Some(context) = &target.estimator_context else { return Err(Stop::refused("RSZ-ABSENT", "SizeUpMt estimate without an estimator context".into())) };
     let d = crate::delay_estimator::estimate(libs, context, replacement);
     // `chargeCellSwapSideCosts` asks the sequential estimator only for a legal estimate.
     let seq = target.sequential_estimator.as_ref().filter(|_| d.legal).map(|s| s.estimate(libs, replacement));
-    size_up_mt_estimate_of(target, &d, seq, score_scale)
+    size_up_mt_estimate_of(target, &d, seq, cost_divisor)
 }
 
 /// [`size_up_mt_estimate`] from the window estimate.
-fn size_up_mt_estimate_of(target: &Target, d: &crate::delay_estimator::DelayEstimate, seq: Option<SequentialResult>, score_scale: f32) -> Result<Estimate, Stop> {
+fn size_up_mt_estimate_of(target: &Target, d: &crate::delay_estimator::DelayEstimate, seq: Option<SequentialResult>, cost_divisor: f32) -> Result<Estimate, Stop> {
     use crate::delay_estimator::FailReason;
-    let score = d.arrival_impr * score_scale;
+    let score = d.arrival_impr;
     if !d.legal {
-        return Ok(Estimate { legal: false, score, raw_gain: (d.reason == FailReason::EstimateNonImproving).then_some(d.arrival_impr), reason: d.reason.name(), tail_admissible: d.reason == FailReason::DualRfNonImproving && score > 0.0, side_loss: None, sequential_penalty: None, sequential_side_loss: None });
+        return Ok(Estimate { legal: false, score: cost_scaled(score, cost_divisor), raw_gain: (d.reason == FailReason::EstimateNonImproving).then_some(d.arrival_impr), reason: d.reason.name(), tail_admissible: d.reason == FailReason::DualRfNonImproving && score > 0.0, side_loss: None, sequential_penalty: None, sequential_side_loss: None });
     }
     let mut e = Estimate { legal: d.legal, score, raw_gain: Some(d.arrival_impr), reason: d.reason.name(), tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None };
-    charge_cell_swap_side_costs(target, d, seq, score_scale, &mut e)?;
+    charge_cell_swap_side_costs(target, d, seq, &mut e)?;
+    e.score = cost_scaled(e.score, cost_divisor);
     Ok(e)
 }
 
 /// `VtSwapMtCandidate::estimate`: the window estimate of the VT cell. Not legal: a non-improving
-/// estimate keeps its gain as score and raw gain, any other reject scores 0 with none. Legal:
-/// scored by the gain, then the cell swap's side costs at score scale 1.
-fn vt_swap_mt_estimate(libs: &crate::preamble::Libs, target: &Target, cell: &str) -> Result<Estimate, Stop> {
+/// estimate keeps its gain as raw gain and, cost-scaled, as score; any other reject scores 0 with
+/// none. Legal: scored by the gain less the cell swap's side costs, cost-scaled ([`cost_scaled`]).
+fn vt_swap_mt_estimate(libs: &crate::preamble::Libs, target: &Target, cell: &str, cost_divisor: f32) -> Result<Estimate, Stop> {
     let Some(context) = &target.estimator_context else { return Err(Stop::refused("RSZ-ABSENT", "VtSwapMt estimate without an estimator context".into())) };
     let d = crate::delay_estimator::estimate(libs, context, cell);
     let seq = target.sequential_estimator.as_ref().filter(|_| d.legal).map(|s| s.estimate(libs, cell));
-    vt_swap_mt_estimate_of(target, &d, seq)
+    vt_swap_mt_estimate_of(target, &d, seq, cost_divisor)
 }
 
 /// [`vt_swap_mt_estimate`] from the window estimate.
-fn vt_swap_mt_estimate_of(target: &Target, d: &crate::delay_estimator::DelayEstimate, seq: Option<SequentialResult>) -> Result<Estimate, Stop> {
+fn vt_swap_mt_estimate_of(target: &Target, d: &crate::delay_estimator::DelayEstimate, seq: Option<SequentialResult>, cost_divisor: f32) -> Result<Estimate, Stop> {
     use crate::delay_estimator::FailReason;
     if !d.legal {
         let raw = (d.reason == FailReason::EstimateNonImproving).then_some(d.arrival_impr);
-        return Ok(Estimate { legal: false, score: raw.unwrap_or(0.0), raw_gain: raw, reason: d.reason.name(), tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None });
+        return Ok(Estimate { legal: false, score: raw.map_or(0.0, |s| cost_scaled(s, cost_divisor)), raw_gain: raw, reason: d.reason.name(), tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None });
     }
     let mut e = Estimate { legal: true, score: d.arrival_impr, raw_gain: Some(d.arrival_impr), reason: "estimate_legal", tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None };
-    charge_cell_swap_side_costs(target, d, seq, 1.0, &mut e)?;
+    charge_cell_swap_side_costs(target, d, seq, &mut e)?;
+    e.score = cost_scaled(e.score, cost_divisor);
     Ok(e)
 }
 
 /// `MoveCandidate::chargeCellSwapSideCosts`: with a sequential timing estimator on the target
 /// (`seq`, its estimate of the replacement) its weighted loss comes off first — the penalty and
-/// the max loss recorded, the score the gain left times the scale; an illegal side, or a gain left
+/// the max loss recorded, the score the gain left; an illegal side, or a gain left
 /// at or below zero, rejects (the side's reason, else `sequential_non_improving`), tail-admissible
 /// for a legal side with a positive own gain. Then, when the estimate charged side paths, their
 /// loss likewise (`side_loss_non_improving`).
-fn charge_cell_swap_side_costs(target: &Target, d: &crate::delay_estimator::DelayEstimate, seq: Option<SequentialResult>, score_scale: f32, e: &mut Estimate) -> Result<(), Stop> {
+fn charge_cell_swap_side_costs(target: &Target, d: &crate::delay_estimator::DelayEstimate, seq: Option<SequentialResult>, e: &mut Estimate) -> Result<(), Stop> {
     debug_assert_eq!(seq.is_some(), target.sequential_estimator.is_some(), "the caller estimates the side exactly when the target has an estimator");
     let mut adjusted_gain = d.arrival_impr;
     if let Some(side) = seq {
         e.sequential_penalty = Some(side.weighted_side_slack_loss);
         e.sequential_side_loss = Some(side.max_side_slack_loss);
         adjusted_gain -= side.weighted_side_slack_loss;
-        e.score = adjusted_gain * score_scale;
+        e.score = adjusted_gain;
         if !side.legal || adjusted_gain <= 0.0 {
             e.legal = false;
             e.reason = if side.legal { "sequential_non_improving" } else { side.reason };
@@ -3399,7 +3449,7 @@ fn charge_cell_swap_side_costs(target: &Target, d: &crate::delay_estimator::Dela
     if d.side_paths_evaluated > 0 {
         e.side_loss = Some(d.side_loss);
         adjusted_gain -= d.side_loss;
-        e.score = adjusted_gain * score_scale;
+        e.score = adjusted_gain;
         if adjusted_gain <= 0.0 {
             e.legal = false;
             e.reason = "side_loss_non_improving";
@@ -3418,8 +3468,8 @@ fn vt_swap_mt_generate(target: &Target, ctx: &super::Ctx<'_>, cfg: &MtConfig, na
     let budgets = target.input_cap_budgets.as_deref().unwrap_or(&[]);
     let output = crate::delay_estimator::arc_ports(ctx.libs, arc).map(|(_, o)| o);
     let current_scene = ctx.libs.scene_cell(arc.scene, &arc.cell);
-    let mut candidates = Vec::new();
-    for cell in select_candidate_cells(ctx, &target.cell) {
+    let mut fitting: Vec<(String, f32)> = Vec::new();
+    for (cell, ratio) in select_candidate_cells(ctx, &target.cell) {
         if cfg.dual_rf_drive_guard {
             if let (Some(out), Some(current)) = (&output, current_scene) {
                 if let Some(candidate) = ctx.libs.scene_cell(arc.scene, &cell).filter(|c| c.port(out).is_some()) {
@@ -3432,20 +3482,34 @@ fn vt_swap_mt_generate(target: &Target, ctx: &super::Ctx<'_>, cfg: &MtConfig, na
         if !replacement_fits_input_cap_budgets(ctx, budgets, &cell) {
             continue;
         }
-        let estimate = vt_swap_mt_estimate(ctx.libs, target, &cell)?;
+        fitting.push((cell, ratio));
+    }
+    // The cheapest faster VT keeps its full score; a jump over more VTs pays only its extra cost.
+    let divisors = relative_cell_costs(&fitting.iter().map(|&(_, r)| r).collect::<Vec<_>>());
+    let mut candidates = Vec::new();
+    for ((cell, _), divisor) in fitting.into_iter().zip(divisors) {
+        let estimate = vt_swap_mt_estimate(ctx.libs, target, &cell, divisor)?;
         candidates.push(Candidate { kind: Move::VtSwap, estimate, impact: cell_swap_impact(target, names, &target.inst), desc: cell, tree: None, rebuffer_side_pins: Vec::new() });
     }
     Ok(candidates)
 }
 
-/// `VtSwapMtGenerator::selectCandidateCells`: the VT-equivalent cells but the current one.
-fn select_candidate_cells(ctx: &super::Ctx<'_>, current: &str) -> Vec<String> {
-    ctx.sizing.vt_equiv_cells(current, ctx.vt_category_count).into_iter().filter(|c| c != current).collect()
+/// `VtSwapMtGenerator::isApplicable`'s candidate cache: the VT-equivalent cells but the current
+/// one, each with its cost ratio to it ([`cell_cost_ratio`]); a cell sharing no cost metric is
+/// not a candidate (OpenROAD #12153). The move applies when any is left.
+fn select_candidate_cells(ctx: &super::Ctx<'_>, current: &str) -> Vec<(String, f32)> {
+    let current_costs = super::upsize_costs(ctx.sizing, current);
+    ctx.sizing
+        .vt_equiv_cells(current, ctx.vt_category_count)
+        .into_iter()
+        .filter(|c| c != current)
+        .filter_map(|c| cell_cost_ratio(&current_costs, &super::upsize_costs(ctx.sizing, &c)).map(|r| (c, r)))
+        .collect()
 }
 
 /// `SizeDownFanoutMtGenerator::generate`: per prepared load, its one drive step down when it keeps
 /// the output limits, fits the load's delay budget and has a target load change.
-fn size_down_fanout_mt_generate(target: &Target, libs: &crate::preamble::Libs, cfg: &MtConfig, names: &ImpactNames<'_>) -> Vec<Candidate> {
+fn size_down_fanout_mt_generate(target: &Target, libs: &crate::preamble::Libs, names: &ImpactNames<'_>) -> Vec<Candidate> {
     let Some(context) = &target.estimator_context else { return Vec::new() };
     let mut candidates = Vec::new();
     for load in &target.size_down_fanout_loads {
@@ -3454,7 +3518,7 @@ fn size_down_fanout_mt_generate(target: &Target, libs: &crate::preamble::Libs, c
         let d = crate::delay_estimator::estimate_load_change(libs, context, delta);
         candidates.push(Candidate {
             kind: Move::SizeDownFanout,
-            estimate: size_down_fanout_mt_estimate_of(&d, cfg.size_down_fanout_mt_score_scale),
+            estimate: size_down_fanout_mt_estimate_of(&d),
             desc: format!("{}/{}", load.pin, if step_down.cell.is_empty() { "-" } else { &step_down.cell }),
             impact: size_down_fanout_mt_impact(target, names, &load.inst),
             tree: None, rebuffer_side_pins: Vec::new(),
@@ -3490,18 +3554,18 @@ fn fits_delay_budget(delay_budget: f32, worst_delay_change: f32) -> bool {
 /// `SizeDownFanoutMtCandidate::estimate`: the window estimate of the load change on the target
 /// net, legal as it says; the raw gain when legal or non-improving; scored by the gain times the
 /// score scale. No side costs.
-fn size_down_fanout_mt_estimate_of(d: &crate::delay_estimator::DelayEstimate, score_scale: f32) -> Estimate {
+fn size_down_fanout_mt_estimate_of(d: &crate::delay_estimator::DelayEstimate) -> Estimate {
     let raw = (d.legal || d.reason == crate::delay_estimator::FailReason::EstimateNonImproving).then_some(d.arrival_impr);
-    Estimate { legal: d.legal, score: d.arrival_impr * score_scale, raw_gain: raw, reason: d.reason.name(), tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None }
+    Estimate { legal: d.legal, score: d.arrival_impr, raw_gain: raw, reason: d.reason.name(), tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None }
 }
 
 /// `SplitLoadMtGenerator::generate`: one split when `prepareInputs` left an input.
-fn split_load_mt_generate(target: &Target, libs: &crate::preamble::Libs, cfg: &MtConfig, names: &ImpactNames<'_>) -> Vec<Candidate> {
+fn split_load_mt_generate(target: &Target, libs: &crate::preamble::Libs, names: &ImpactNames<'_>) -> Vec<Candidate> {
     let (Some(input), Some(context)) = (&target.split_load_input, &target.estimator_context) else { return Vec::new() };
     let dash = |c: &str| if c.is_empty() { "-".to_string() } else { c.to_string() };
     vec![Candidate {
         kind: Move::SplitLoad,
-        estimate: split_load_mt_estimate(libs, context, input, cfg.split_load_mt_score_scale),
+        estimate: split_load_mt_estimate(libs, context, input),
         desc: format!("{}/{}", dash(&input.buffer_cell), dash(&input.resized_cell)),
         impact: split_load_mt_impact(target, names, input),
         tree: None, rebuffer_side_pins: Vec::new(),
@@ -3515,27 +3579,27 @@ fn split_load_mt_generate(target: &Target, libs: &crate::preamble::Libs, cfg: &M
 /// `missing_buffer_timing_arc`), and pay that delay as side loads (`chargeMovedLoads`); the gain
 /// less the side loss, scaled, is the score; a gain left at or below zero is
 /// `side_loss_non_improving`, tail-admissible for a positive own gain.
-fn split_load_mt_estimate(libs: &crate::preamble::Libs, context: &crate::delay_estimator::EstimatorContext, input: &SplitLoadInput, score_scale: f32) -> Estimate {
+fn split_load_mt_estimate(libs: &crate::preamble::Libs, context: &crate::delay_estimator::EstimatorContext, input: &SplitLoadInput) -> Estimate {
     use crate::delay_estimator::{self as de, FailReason};
     let stage = context.target();
     let mut d = de::estimate_load_change(libs, context, input.target_load_delta);
     let none = Estimate { legal: false, score: 0.0, raw_gain: None, reason: "", tail_admissible: false, side_loss: None, sequential_penalty: None, sequential_side_loss: None };
     if !d.legal {
-        return Estimate { score: d.arrival_impr * score_scale, raw_gain: (d.reason == FailReason::EstimateNonImproving).then_some(d.arrival_impr), reason: d.reason.name(), ..none };
+        return Estimate { score: d.arrival_impr, raw_gain: (d.reason == FailReason::EstimateNonImproving).then_some(d.arrival_impr), reason: d.reason.name(), ..none };
     }
     let driver_delay = de::find_arc_delay(libs, &stage.arc, stage.input_slew, de::load_after_change(stage.load_cap, input.target_load_delta), &stage.arc.cell);
     let buffer_delay = de::find_buffer_delay(libs, context, &input.resized_cell, stage.current_slew, input.moved_pin_cap + input.moved_wire_cap);
     let (Some(driver_delay), Some(buffer_delay)) = (driver_delay, buffer_delay) else { return Estimate { reason: FailReason::MissingBufferTimingArc.name(), ..none } };
     let moved_delta = driver_delay - stage.current_model_delay + buffer_delay;
     de::charge_moved_loads(context, &input.moved_loads, moved_delta, &mut d);
-    split_load_mt_score(&d, score_scale)
+    split_load_mt_score(&d)
 }
 
 /// The end of [`split_load_mt_estimate`]: legal when the estimate is and the gain less the side
 /// loss is above zero; scored by that times the scale.
-fn split_load_mt_score(d: &crate::delay_estimator::DelayEstimate, score_scale: f32) -> Estimate {
+fn split_load_mt_score(d: &crate::delay_estimator::DelayEstimate) -> Estimate {
     let gain = d.arrival_impr - d.side_loss;
-    let mut e = Estimate { legal: d.legal && gain > 0.0, score: gain * score_scale, raw_gain: Some(d.arrival_impr), reason: d.reason.name(), tail_admissible: false, side_loss: Some(d.side_loss), sequential_penalty: None, sequential_side_loss: None };
+    let mut e = Estimate { legal: d.legal && gain > 0.0, score: gain, raw_gain: Some(d.arrival_impr), reason: d.reason.name(), tail_admissible: false, side_loss: Some(d.side_loss), sequential_penalty: None, sequential_side_loss: None };
     if d.legal && gain <= 0.0 {
         e.reason = "side_loss_non_improving";
         e.tail_admissible = d.arrival_impr > 0.0;
@@ -3571,7 +3635,7 @@ fn pe_estimate_targets(pe: &mut ParallelEval, targets: &[Target], generated: Vec
     let mut trace = String::new();
     let mut evaluations = Vec::with_capacity(generated.len());
     for (target, mut candidates) in targets.iter().zip(generated) {
-        let best = estimate_target(&mut candidates, permissive);
+        let best = estimate_target(&mut candidates, permissive, &pe.config);
         for (index, c) in candidates.iter().enumerate() {
             trace.push_str(&pe_cand_line(pe.batch_index, &target.driver_pin, index, c));
         }
@@ -3699,12 +3763,14 @@ fn pe_wns_tail_active(pe: &ParallelEval) -> bool {
     pe.tail.active
 }
 
-/// `estimateTarget`: while the WNS tail is active (`permissive`), a candidate not legal but
-/// tail-admissible becomes legal (`wns_tail_permissive`); the best is the first legal candidate
-/// whose score is strictly greater than the best so far.
-fn estimate_target(candidates: &mut [Candidate], permissive: bool) -> Option<usize> {
+/// `estimateTarget`: each candidate's score times its move's weight ([`MtConfig::score_scale`],
+/// applied here since OpenROAD #12153); while the WNS tail is active (`permissive`), a candidate
+/// not legal but tail-admissible becomes legal (`wns_tail_permissive`); the best is the first
+/// legal candidate whose score is strictly greater than the best so far.
+fn estimate_target(candidates: &mut [Candidate], permissive: bool, cfg: &MtConfig) -> Option<usize> {
     let mut best: Option<(usize, f32)> = None;
     for (k, c) in candidates.iter_mut().enumerate() {
+        c.estimate.score *= cfg.score_scale(c.kind);
         if permissive && !c.estimate.legal && c.estimate.tail_admissible {
             c.estimate.legal = true;
             c.estimate.reason = "wns_tail_permissive";
@@ -5069,20 +5135,50 @@ mod tests {
 
     // estimateTarget: while the WNS tail is active (permissive), a candidate not legal but
     // tail-admissible becomes legal (wns_tail_permissive), else it stays rejected; the best is the
-    // first legal candidate with a strictly greater score.
+    // first legal candidate with a strictly greater score. Scores are first weighted by the move
+    // (scoreScale, OpenROAD #12153): here all weights are 1, below the shipped SizeUp 0.75.
     #[test]
     fn estimate_target_keeps_the_first_of_equal_scores_and_admits_the_tail() {
+        let unit = MtConfig { size_up_mt_score_scale: 1.0, ..MtConfig::default() };
         let c = |kind: Move, legal: bool, tail: bool, score: f32| Candidate { kind, estimate: Estimate { legal, score, raw_gain: None, reason: "x", tail_admissible: tail, side_loss: None, sequential_penalty: None, sequential_side_loss: None }, desc: String::new(), impact: MoveImpact::default(), tree: None, rebuffer_side_pins: Vec::new() };
         let mut cs = vec![c(Move::Unbuffer, false, false, 9.0), c(Move::SizeUp, true, false, 2.0), c(Move::SwapPins, true, false, 2.0), c(Move::VtSwap, false, true, 3.0)];
         let mut strict = cs.clone();
-        assert_eq!(estimate_target(&mut strict, false), Some(1));
+        assert_eq!(estimate_target(&mut strict, false, &unit), Some(1));
         assert_eq!((strict[3].estimate.legal, strict[3].estimate.reason), (false, "x"));
-        assert_eq!(estimate_target(&mut cs, true), Some(3));
+        assert_eq!(estimate_target(&mut cs, true, &unit), Some(3));
         assert_eq!((cs[3].estimate.legal, cs[3].estimate.reason), (true, "wns_tail_permissive"));
         assert_eq!((cs[0].estimate.legal, cs[0].estimate.reason), (false, "x"));
         cs.truncate(3);
-        assert_eq!(estimate_target(&mut cs, true), Some(1));
-        assert_eq!(estimate_target(&mut cs[..1], true), None);
+        assert_eq!(estimate_target(&mut cs, true, &unit), Some(1));
+        assert_eq!(estimate_target(&mut cs[..1], true, &unit), None);
+        // The shipped weights: SizeUp's 2.0 becomes 1.5, below SwapPins' unweighted 2.0.
+        let mut shipped = vec![c(Move::SizeUp, true, false, 2.0), c(Move::SwapPins, true, false, 2.0)];
+        assert_eq!(estimate_target(&mut shipped, false, &MtConfig::default()), Some(1));
+        assert_eq!(shipped[0].estimate.score, 1.5);
+    }
+
+    /// Rule (`OptimizationPolicyConfig::scoreScale`, OpenROAD #12153): VtSwapMt, SizeUpMt,
+    /// RebufferMt, SplitLoadMt and SizeDownFanoutMt carry their weights; every other move 1.
+    #[test]
+    fn each_move_carries_its_weight_and_the_rest_one() {
+        let c = MtConfig::default();
+        let w: Vec<f32> = [Move::VtSwap, Move::SizeUp, Move::Buffer, Move::SplitLoad, Move::SizeDownFanout, Move::Clone, Move::SwapPins, Move::Unbuffer].into_iter().map(|m| c.score_scale(m)).collect();
+        assert_eq!(w, [1.0, 0.75, 0.10, 0.50, 0.75, 1.0, 1.0, 1.0]);
+    }
+
+    /// Rule (`relativeCellCosts`, OpenROAD #12153): the reference is the smallest ratio above 1;
+    /// each divisor is max(1, r / reference), so the cheapest costlier option keeps its score; with
+    /// no ratio above 1 every divisor is 1.
+    #[test]
+    fn the_cheapest_costlier_option_keeps_its_full_score() {
+        assert_eq!(relative_cell_costs(&[0.5, 2.0, 4.0, 1.0, 3.0]), [1.0, 1.0, 2.0, 1.0, 1.5]);
+        assert_eq!(relative_cell_costs(&[0.5, 1.0]), [1.0, 1.0]);
+        assert_eq!(relative_cell_costs(&[]), Vec::<f32>::new());
+        // costScaled: only a positive score pays.
+        assert_eq!((cost_scaled(3.0, 1.5), cost_scaled(-3.0, 1.5), cost_scaled(0.0, 2.0)), (2.0, -3.0, 0.0));
+        // cellCostRatio: the first metric both cells have, never mixing units.
+        assert_eq!(cell_cost_ratio(&[Some(2.0), Some(10.0), None], &[None, Some(30.0), Some(1.0)]), Some(3.0));
+        assert_eq!(cell_cost_ratio(&[Some(2.0), None, None], &[None, Some(30.0), Some(1.0)]), None);
     }
 
 
@@ -5143,29 +5239,31 @@ mod tests {
         crate::delay_estimator::DelayEstimate { legal, candidate_delay: 0.0, arrival_impr, side_paths_evaluated, side_loss, reason }
     }
 
-    // SizeUpMtCandidate::estimate: score = gain * scale. Not legal: the score kept, raw gain only
-    // for estimate_non_improving, tail-admissible only for dual_rf_non_improving with a positive
-    // score, no side loss. Legal: chargeCellSwapSideCosts — with side paths, side_loss is the
-    // window's, score = (gain - loss) * scale, and a gain left at or below zero is
-    // side_loss_non_improving, tail-admissible when the own gain is positive.
+    // SizeUpMtCandidate::estimate (OpenROAD #12153: the weight is the policy's, the candidate
+    // divides a POSITIVE score by its cost divisor, here 2): score = gain. Not legal: the score
+    // cost-scaled, raw gain only for estimate_non_improving, tail-admissible only for
+    // dual_rf_non_improving with a positive gain, no side loss. Legal: chargeCellSwapSideCosts —
+    // with side paths, side_loss is the window's, score = gain - loss, and a gain left at or below
+    // zero is side_loss_non_improving, tail-admissible when the own gain is positive; then the
+    // cost scaling.
     #[test]
     fn size_up_mt_scores_the_scaled_gain_less_the_side_loss() {
         use crate::delay_estimator::FailReason as F;
         let t = with_context(target_at(0));
-        let e = size_up_mt_estimate_of(&t, &delay_estimate(false, -2.0, F::EstimateNonImproving, 0, 0.0), None, 0.5).unwrap();
-        assert_eq!((e.legal, e.score, e.raw_gain, e.reason, e.tail_admissible, e.side_loss), (false, -1.0, Some(-2.0), "estimate_non_improving", false, None));
-        let e = size_up_mt_estimate_of(&t, &delay_estimate(false, 2.0, F::SideSlackFloorViolation, 1, 0.5), None, 0.5).unwrap();
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(false, -2.0, F::EstimateNonImproving, 0, 0.0), None, 2.0).unwrap();
+        assert_eq!((e.legal, e.score, e.raw_gain, e.reason, e.tail_admissible, e.side_loss), (false, -2.0, Some(-2.0), "estimate_non_improving", false, None));
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(false, 2.0, F::SideSlackFloorViolation, 1, 0.5), None, 2.0).unwrap();
         assert_eq!((e.legal, e.score, e.raw_gain, e.reason, e.tail_admissible, e.side_loss), (false, 1.0, None, "side_slack_floor_violation", false, None));
-        let e = size_up_mt_estimate_of(&t, &delay_estimate(false, 2.0, F::DualRfNonImproving, 1, 0.5), None, 0.5).unwrap();
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(false, 2.0, F::DualRfNonImproving, 1, 0.5), None, 2.0).unwrap();
         assert_eq!((e.reason, e.tail_admissible), ("dual_rf_non_improving", true));
-        let e = size_up_mt_estimate_of(&t, &delay_estimate(false, -2.0, F::DualRfNonImproving, 1, 0.5), None, 0.5).unwrap();
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(false, -2.0, F::DualRfNonImproving, 1, 0.5), None, 2.0).unwrap();
         assert!(!e.tail_admissible);
-        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 0, 0.0), None, 0.5).unwrap();
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 0, 0.0), None, 2.0).unwrap();
         assert_eq!((e.legal, e.score, e.raw_gain, e.reason, e.side_loss), (true, 1.0, Some(2.0), "estimate_legal", None));
-        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 2, 0.5), None, 0.5).unwrap();
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 2, 0.5), None, 2.0).unwrap();
         assert_eq!((e.legal, e.score, e.side_loss), (true, 0.75, Some(0.5)));
-        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 2, 3.0), None, 0.5).unwrap();
-        assert_eq!((e.legal, e.score, e.reason, e.tail_admissible, e.side_loss), (false, -0.5, "side_loss_non_improving", true, Some(3.0)));
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 2, 3.0), None, 2.0).unwrap();
+        assert_eq!((e.legal, e.score, e.reason, e.tail_admissible, e.side_loss), (false, -1.0, "side_loss_non_improving", true, Some(3.0)));
     }
 
     // VtSwapMtCandidate::estimate (makeRejectedEstimate): a non-improving estimate keeps its gain as
@@ -5175,12 +5273,17 @@ mod tests {
     fn vt_swap_mt_keeps_the_gain_only_of_a_non_improving_reject() {
         use crate::delay_estimator::FailReason as F;
         let t = with_context(target_at(0));
-        let e = vt_swap_mt_estimate_of(&t, &delay_estimate(false, -2.0, F::EstimateNonImproving, 0, 0.0), None).unwrap();
+        let e = vt_swap_mt_estimate_of(&t, &delay_estimate(false, -2.0, F::EstimateNonImproving, 0, 0.0), None, 1.0).unwrap();
         assert_eq!((e.legal, e.score, e.raw_gain, e.reason), (false, -2.0, Some(-2.0), "estimate_non_improving"));
-        let e = vt_swap_mt_estimate_of(&t, &delay_estimate(false, 2.0, F::DualRfNonImproving, 1, 0.5), None).unwrap();
+        let e = vt_swap_mt_estimate_of(&t, &delay_estimate(false, 2.0, F::DualRfNonImproving, 1, 0.5), None, 1.0).unwrap();
         assert_eq!((e.legal, e.score, e.raw_gain, e.reason, e.tail_admissible), (false, 0.0, None, "dual_rf_non_improving", false));
-        let e = vt_swap_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 1, 0.5), None).unwrap();
+        let e = vt_swap_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 1, 0.5), None, 1.0).unwrap();
         assert_eq!((e.legal, e.score, e.raw_gain, e.side_loss), (true, 1.5, Some(2.0), Some(0.5)));
+        // A costlier VT (OpenROAD #12153): the positive scores pay the divisor, the raw gain not.
+        let e = vt_swap_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 1, 0.5), None, 1.5).unwrap();
+        assert_eq!((e.score, e.raw_gain), (1.0, Some(2.0)));
+        let e = vt_swap_mt_estimate_of(&t, &delay_estimate(false, 3.0, F::EstimateNonImproving, 0, 0.0), None, 1.5).unwrap();
+        assert_eq!((e.score, e.raw_gain), (2.0, Some(3.0)));
     }
 
     // Rules (MoveCandidate::chargeCellSwapSideCosts with a sequential timing estimator): its
@@ -5194,13 +5297,13 @@ mod tests {
         let mut t = with_context(target_at(0));
         t.sequential_estimator = Some(crate::sequential_timing::SequentialTimingEstimator { candidates: Vec::new(), checks: Vec::new(), prepare_failure_reason: "", data_ports: Vec::new() });
         let side = |legal: bool, w: f32, m: f32, reason: &'static str| Some(SequentialResult { legal, weighted_side_slack_loss: w, max_side_slack_loss: m, reason });
-        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 0, 0.0), side(false, 0.5, 1.0, "sequential_setup_violation"), 0.5).unwrap();
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 0, 0.0), side(false, 0.5, 1.0, "sequential_setup_violation"), 2.0).unwrap();
         assert_eq!((e.legal, e.score, e.reason, e.tail_admissible, e.sequential_penalty, e.sequential_side_loss), (false, 0.75, "sequential_setup_violation", false, Some(0.5), Some(1.0)));
-        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 0, 0.0), side(true, 2.0, 2.0, "sequential_estimate_legal"), 0.5).unwrap();
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 0, 0.0), side(true, 2.0, 2.0, "sequential_estimate_legal"), 2.0).unwrap();
         assert_eq!((e.legal, e.score, e.reason, e.tail_admissible), (false, 0.0, "sequential_non_improving", true));
-        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 1, 2.5), side(true, 0.0, 0.0, "sequential_estimate_legal"), 0.5).unwrap();
-        assert_eq!((e.legal, e.score, e.reason, e.tail_admissible, e.side_loss, e.sequential_penalty), (false, -0.25, "side_loss_non_improving", true, Some(2.5), Some(0.0)));
-        let e = vt_swap_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 0, 0.0), side(true, 0.5, 0.5, "sequential_estimate_legal")).unwrap();
+        let e = size_up_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 1, 2.5), side(true, 0.0, 0.0, "sequential_estimate_legal"), 2.0).unwrap();
+        assert_eq!((e.legal, e.score, e.reason, e.tail_admissible, e.side_loss, e.sequential_penalty), (false, -0.5, "side_loss_non_improving", true, Some(2.5), Some(0.0)));
+        let e = vt_swap_mt_estimate_of(&t, &delay_estimate(true, 2.0, F::EstimateLegal, 0, 0.0), side(true, 0.5, 0.5, "sequential_estimate_legal"), 1.0).unwrap();
         assert_eq!((e.legal, e.score, e.reason, e.sequential_penalty), (true, 1.5, "estimate_legal", Some(0.5)));
     }
 
@@ -5232,17 +5335,18 @@ mod tests {
         assert!(!fits_delay_budget(-1.0, 0.5));
     }
 
-    // SizeDownFanoutMtCandidate::estimate: legal as the load-change estimate says, score = gain *
-    // scale, raw gain when legal or non-improving only, no side terms.
+    // SizeDownFanoutMtCandidate::estimate: legal as the load-change estimate says, score = gain
+    // (the weight is the policy's since OpenROAD #12153), raw gain when legal or non-improving
+    // only, no side terms.
     #[test]
     fn size_down_fanout_mt_scores_the_scaled_load_change_gain() {
         use crate::delay_estimator::FailReason as F;
-        let e = size_down_fanout_mt_estimate_of(&delay_estimate(true, 2.0, F::EstimateLegal, 1, 0.5), 0.75);
-        assert_eq!((e.legal, e.score, e.raw_gain, e.reason, e.side_loss, e.tail_admissible), (true, 1.5, Some(2.0), "estimate_legal", None, false));
-        let e = size_down_fanout_mt_estimate_of(&delay_estimate(false, -2.0, F::EstimateNonImproving, 0, 0.0), 0.75);
-        assert_eq!((e.legal, e.score, e.raw_gain), (false, -1.5, Some(-2.0)));
-        let e = size_down_fanout_mt_estimate_of(&delay_estimate(false, 2.0, F::SideSlackFloorViolation, 1, 0.5), 0.75);
-        assert_eq!((e.legal, e.score, e.raw_gain, e.reason), (false, 1.5, None, "side_slack_floor_violation"));
+        let e = size_down_fanout_mt_estimate_of(&delay_estimate(true, 2.0, F::EstimateLegal, 1, 0.5));
+        assert_eq!((e.legal, e.score, e.raw_gain, e.reason, e.side_loss, e.tail_admissible), (true, 2.0, Some(2.0), "estimate_legal", None, false));
+        let e = size_down_fanout_mt_estimate_of(&delay_estimate(false, -2.0, F::EstimateNonImproving, 0, 0.0));
+        assert_eq!((e.legal, e.score, e.raw_gain), (false, -2.0, Some(-2.0)));
+        let e = size_down_fanout_mt_estimate_of(&delay_estimate(false, 2.0, F::SideSlackFloorViolation, 1, 0.5));
+        assert_eq!((e.legal, e.score, e.raw_gain, e.reason), (false, 2.0, None, "side_slack_floor_violation"));
     }
 
     // SizeDownFanoutMtGenerator::generate: a load's step down is kept unless it violates the
@@ -5262,17 +5366,17 @@ mod tests {
 
 
     // SplitLoadMtCandidate::estimate, its end: gain = own gain - side loss; legal when the estimate
-    // is and gain > 0; score = gain * scale; raw gain and side loss always; a legal estimate whose
+    // is and gain > 0; score = gain (weighted by the policy since OpenROAD #12153); raw gain and side loss always; a legal estimate whose
     // gain is at or below zero is side_loss_non_improving, tail-admissible for a positive own gain.
     #[test]
     fn split_load_mt_scores_the_gain_less_the_moved_loads_loss() {
         use crate::delay_estimator::FailReason as F;
-        let e = split_load_mt_score(&delay_estimate(true, 2.0, F::EstimateLegal, 2, 0.5), 0.5);
-        assert_eq!((e.legal, e.score, e.raw_gain, e.side_loss, e.reason, e.tail_admissible), (true, 0.75, Some(2.0), Some(0.5), "estimate_legal", false));
-        let e = split_load_mt_score(&delay_estimate(true, 2.0, F::EstimateLegal, 2, 3.0), 0.5);
-        assert_eq!((e.legal, e.score, e.reason, e.tail_admissible), (false, -0.5, "side_loss_non_improving", true));
+        let e = split_load_mt_score(&delay_estimate(true, 2.0, F::EstimateLegal, 2, 0.5));
+        assert_eq!((e.legal, e.score, e.raw_gain, e.side_loss, e.reason, e.tail_admissible), (true, 1.5, Some(2.0), Some(0.5), "estimate_legal", false));
+        let e = split_load_mt_score(&delay_estimate(true, 2.0, F::EstimateLegal, 2, 3.0));
+        assert_eq!((e.legal, e.score, e.reason, e.tail_admissible), (false, -1.0, "side_loss_non_improving", true));
         // A floor reject from the moved loads stays as it is.
-        let e = split_load_mt_score(&delay_estimate(false, 2.0, F::SideSlackFloorViolation, 2, 0.5), 0.5);
+        let e = split_load_mt_score(&delay_estimate(false, 2.0, F::SideSlackFloorViolation, 2, 0.5));
         assert_eq!((e.legal, e.reason, e.tail_admissible, e.side_loss), (false, "side_slack_floor_violation", false, Some(0.5)));
     }
 
@@ -5457,22 +5561,23 @@ mod tests {
     }
 
 
-    // RebufferMtCandidate::estimate: raw score = gain - side loss, score = raw * scale. A reject
+    // RebufferMtCandidate::estimate: raw score = gain - side loss = score (the weight is the
+    // policy's since OpenROAD #12153). A reject
     // keeps its gain only for estimate_non_improving / side_slack_floor_violation; a legal
     // estimate at raw <= 0 is side_loss_non_improving, under min_score is min_score — both
     // tail-admissible for a positive own gain. side_loss only when side paths were evaluated.
     #[test]
     fn rebuffer_mt_scores_the_gain_less_the_side_loss() {
         use crate::delay_estimator::FailReason as F;
-        let e = rebuffer_mt_estimate_of(&delay_estimate(true, 20e-12, F::EstimateLegal, 1, 4e-12), 0.5, 5e-12);
-        assert_eq!((e.legal, e.score, e.raw_gain, e.side_loss, e.reason), (true, (20e-12f32 - 4e-12) * 0.5, Some(20e-12), Some(4e-12), "estimate_legal"));
-        let e = rebuffer_mt_estimate_of(&delay_estimate(true, 6e-12, F::EstimateLegal, 0, 0.0), 0.5, 7e-12);
+        let e = rebuffer_mt_estimate_of(&delay_estimate(true, 20e-12, F::EstimateLegal, 1, 4e-12), 5e-12);
+        assert_eq!((e.legal, e.score, e.raw_gain, e.side_loss, e.reason), (true, 20e-12f32 - 4e-12, Some(20e-12), Some(4e-12), "estimate_legal"));
+        let e = rebuffer_mt_estimate_of(&delay_estimate(true, 6e-12, F::EstimateLegal, 0, 0.0), 7e-12);
         assert_eq!((e.legal, e.reason, e.tail_admissible, e.side_loss), (false, "min_score", true, None));
-        let e = rebuffer_mt_estimate_of(&delay_estimate(true, 2e-12, F::EstimateLegal, 1, 3e-12), 0.5, 0.0);
+        let e = rebuffer_mt_estimate_of(&delay_estimate(true, 2e-12, F::EstimateLegal, 1, 3e-12), 0.0);
         assert_eq!((e.legal, e.reason, e.tail_admissible), (false, "side_loss_non_improving", true));
-        let e = rebuffer_mt_estimate_of(&delay_estimate(false, 2e-12, F::SideSlackFloorViolation, 1, 1e-12), 0.5, 0.0);
+        let e = rebuffer_mt_estimate_of(&delay_estimate(false, 2e-12, F::SideSlackFloorViolation, 1, 1e-12), 0.0);
         assert_eq!((e.legal, e.raw_gain, e.reason, e.tail_admissible), (false, Some(2e-12), "side_slack_floor_violation", false));
-        let e = rebuffer_mt_estimate_of(&delay_estimate(false, 0.0, F::InvalidBufferInsertion, 0, 0.0), 0.5, 0.0);
+        let e = rebuffer_mt_estimate_of(&delay_estimate(false, 0.0, F::InvalidBufferInsertion, 0, 0.0), 0.0);
         assert_eq!((e.legal, e.raw_gain, e.reason), (false, None, "invalid_buffer_insertion"));
     }
 
