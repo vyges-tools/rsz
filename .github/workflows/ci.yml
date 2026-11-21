@@ -36,14 +36,17 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: vyges-tools/opendb
+          ref: repin-f11b4276  # repin branch; back to the default at the merge
           path: vyges-tools-opendb
       - uses: actions/checkout@v7
         with:
           repository: vyges-tools/opendb-lib
+          ref: repin-f11b4276  # repin branch; back to the default at the merge
           path: vyges-tools-opendb-lib
       - uses: actions/checkout@v7
         with:
           repository: vyges-tools/sta
+          ref: repin-f11b4276  # repin branch; back to the default at the merge
           path: vyges-tools-sta
       - uses: actions/checkout@v7
         with:
@@ -52,6 +55,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: vyges-tools/est
+          ref: repin-f11b4276  # repin branch; back to the default at the merge
           path: vyges-tools-est
       - uses: actions/checkout@v7
         with:
@@ -60,6 +64,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: vyges-tools/loom
+          ref: repin-f11b4276  # repin branch; back to the default at the merge
           path: vyges-tools-loom
       - uses: actions/checkout@v7
         with:
@@ -90,14 +95,17 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: vyges-tools/opendb
+          ref: repin-f11b4276  # repin branch; back to the default at the merge
           path: vyges-tools-opendb
       - uses: actions/checkout@v7
         with:
           repository: vyges-tools/opendb-lib
+          ref: repin-f11b4276  # repin branch; back to the default at the merge
           path: vyges-tools-opendb-lib
       - uses: actions/checkout@v7
         with:
           repository: vyges-tools/sta
+          ref: repin-f11b4276  # repin branch; back to the default at the merge
           path: vyges-tools-sta
       - uses: actions/checkout@v7
         with:
@@ -106,6 +114,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: vyges-tools/est
+          ref: repin-f11b4276  # repin branch; back to the default at the merge
           path: vyges-tools-est
       - uses: actions/checkout@v7
         with:
@@ -114,6 +123,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           repository: vyges-tools/loom
+          ref: repin-f11b4276  # repin branch; back to the default at the merge
           path: vyges-tools-loom
       - uses: actions/checkout@v7
         with:
