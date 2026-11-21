@@ -788,6 +788,18 @@ pub struct Bottlenecks {
     pub max_severity: f32,
 }
 
+impl Bottlenecks {
+    /// `analyzeBottlenecks`' refresh test, the age counted first: a change of phase (into or out
+    /// of the WNS tail) is always stale; otherwise the analysis serves `refresh_batches` batches in
+    /// the tail and TWICE as many before it (OpenROAD #12027).
+    pub fn stale(&mut self, tail_active: bool, refresh_batches: i32) -> bool {
+        let refresh = refresh_batches * if tail_active { 1 } else { 2 };
+        let tail_changed = tail_active != self.in_tail;
+        self.age = self.age.saturating_add(1);
+        tail_changed || self.age >= refresh
+    }
+}
+
 impl Default for Bottlenecks {
     fn default() -> Self {
         Bottlenecks { age: i32::MAX, in_tail: false, severity: HashMap::new(), max_severity: 0.0 }
@@ -1515,17 +1527,16 @@ impl Repair<'_, '_> {
 
     /// `analyzeBottlenecks(scope)`: only while saved batches stall WNS (`weightsPriority`; a
     /// pause makes the next analysis start fresh); one analysis serves
-    /// `bottleneck_refresh_batches` batches, and entering the tail makes a fresh one. The cone is
-    /// cut at `bottleneck_max_endpoints` of the batch's target endpoints.
+    /// `bottleneck_refresh_batches` batches in the tail and twice as many before it
+    /// ([`Bottlenecks::stale`]), and entering the tail makes a fresh one. The cone is cut at
+    /// `bottleneck_max_endpoints` of the batch's target endpoints.
     fn pe_analyze_bottlenecks(&mut self, pe: &mut ParallelEval, scope: &BatchScope) -> Result<(), Stop> {
         let priority = pe.config.parallel_eval.priority;
         if !pe.stall.weights_priority(&pe.config.parallel_eval) {
             pe.bottleneck.age = i32::MAX;
             return Ok(());
         }
-        let tail_changed = pe.tail.active != pe.bottleneck.in_tail;
-        pe.bottleneck.age = pe.bottleneck.age.saturating_add(1);
-        if !tail_changed && pe.bottleneck.age < priority.bottleneck_refresh_batches {
+        if !pe.bottleneck.stale(pe.tail.active, priority.bottleneck_refresh_batches) {
             return Ok(());
         }
         pe.bottleneck.age = 0;
@@ -4599,6 +4610,17 @@ fn pe_reset_run_state(pe: &mut ParallelEval) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rule (`SetupParallelEvalPolicy::analyzeBottlenecks`, OpenROAD #12027): one analysis serves
+    /// `bottleneck_refresh_batches` batches in the WNS tail and twice as many in the broad phase
+    /// before it; the first batch after entering the tail refreshes it whatever its age.
+    #[test]
+    fn a_bottleneck_analysis_lasts_twice_as_long_before_the_tail() {
+        let run = |b: &mut Bottlenecks, tail: bool, n: usize| (0..n).map(|_| { let s = b.stale(tail, 4); if s { b.age = 0; b.in_tail = tail; } s }).collect::<Vec<_>>();
+        let mut b = Bottlenecks { age: 0, in_tail: false, ..Default::default() };
+        assert_eq!(run(&mut b, false, 8), [false, false, false, false, false, false, false, true]);
+        assert_eq!(run(&mut b, true, 5), [true, false, false, false, true], "entering the tail refreshes; then every 4");
+    }
     use vyges_sta::sdc::{Clock, Sdc};
 
     fn clock(name: &str, period: f32, source: &str) -> Clock {

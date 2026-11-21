@@ -14,8 +14,9 @@ use crate::rebuffer::{LoadPath, PathStage, StageKind, TreePlan, WireRcStage};
 /// `kElmoreSlewFactor`.
 const ELMORE_SLEW_FACTOR: f32 = 1.39;
 /// The model's calibration (`kBufferTree*`): a buffer stage's effective load as a share of its
-/// lumped downstream cap on the target path, on a side path, and for a direct load.
-const TARGET_EFFECTIVE_LOAD_CAP_FACTOR: f32 = 0.65;
+/// lumped downstream cap on the target path, on a side path, and for a direct load. The target-path
+/// factor is 0.675 at the f11b4276 pin (OpenROAD #12027; 0.65 before).
+const TARGET_EFFECTIVE_LOAD_CAP_FACTOR: f32 = 0.675;
 const SIDE_EFFECTIVE_LOAD_CAP_FACTOR: f32 = 0.875;
 const DIRECT_LOAD_CAP_FACTOR: f32 = 0.60;
 /// `kLoadRatioSlewFloorExponent`.
@@ -325,4 +326,16 @@ pub fn estimate_buffer_tree_with_side_paths(libs: &Libs, context: &EstimatorCont
         }
     }
     estimate
+}
+
+#[cfg(test)]
+mod calibration_tests {
+    /// Rule (`DelayEstimatorBufferTree.cc` `kBufferTree*`, OpenROAD #12027): the target-path
+    /// effective-load factor was refit to 0.675 (0.65 before); the side-path (0.875) and
+    /// direct-load (0.60) factors kept the original fit. ⚠️ A constant witness only: no unit test
+    /// here builds a tree plan whose estimate the factor moves.
+    #[test]
+    fn the_target_path_load_factor_is_the_refit_one() {
+        assert_eq!((super::TARGET_EFFECTIVE_LOAD_CAP_FACTOR, super::SIDE_EFFECTIVE_LOAD_CAP_FACTOR, super::DIRECT_LOAD_CAP_FACTOR), (0.675, 0.875, 0.60));
+    }
 }
