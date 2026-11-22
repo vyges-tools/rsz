@@ -1206,9 +1206,10 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 let dont_use = dont_use_state.clone();
                 let m = masters(&db)?;
                 let lib0 = libs.default_library().ok_or("repair_clock_nets before any liberty library")?;
-                if lib0.time_scale != 1e-9f32 {
-                    return Err("a library time unit other than 1ns: user-unit conversion is not modelled".into());
-                }
+                // Any library time unit: the limits below are converted from user units with the
+                // default library's scale, and repairClkNets repairs wire length only. Witnessed on
+                // a cts regression with its libraries rescaled to 1ps: the reference's repair is
+                // byte-identical to the 1ns run, and ours matches it.
                 let limits = Limits {
                     design_max_transition: sdc.as_ref().and_then(|s| s.max_transition).map(|v| user_time_to_sta(v, lib0.time_scale)),
                     design_max_fanout: sdc.as_ref().and_then(|s| s.max_fanout).map(|v| v as f32),
