@@ -508,7 +508,8 @@ fn vertex_slew(g: &Graph<'_>, v: usize) -> f32 {
     g.slew[v][0][MAX].max(g.slew[v][1][MAX])
 }
 
-/// `Resizer::estimatedSlackOK`. Returns the verdict and the `remove_buffer` debug lines it
+/// `Resizer::estimatedUnbufferSlackOK` (named so since 8f67915cba, which also hands its two delay
+/// terms to the parallel move's gain estimate). Returns the verdict and the `remove_buffer` debug lines it
 /// printed, in order. `scene`: the capacitance guard's (none refuses).
 fn estimated_slack_ok(ctx: &Ctx<'_>, t: &Timer<'_, '_>, p: &SlackParams<'_>, scene: Option<usize>) -> (bool, Vec<String>) {
     let mut lines = Vec::new();
@@ -521,12 +522,12 @@ fn estimated_slack_ok(ctx: &Ctx<'_>, t: &Timer<'_, '_>, p: &SlackParams<'_>, sce
         lines.push(format!("buffer {} is not removed because of max cap violation", network_name(p.inst, ctx.hierarchy)));
         return (false, lines);
     }
-    let delay_degrad = new_delay[p.prev_rf] - old_delay[p.prev_rf];
+    let upstream_delay_delta = new_delay[p.prev_rf] - old_delay[p.prev_rf];
     // bufferDelay(cell, driver transition, loadCap(driver)): at the target slews.
     let (_, output) = p.cell.buffer_ports().expect("a buffer");
     let tgt = |_: &str, rf: usize| ctx.tgt_slews[rf];
     let scene_cell = vertex_cell(g, p.driver).unwrap_or(p.cell);
-    let delay_imp = gate_delays(scene_cell, &output.name, g.load_cap(p.driver, t.parasitics), &tgt).0[p.driver_rf];
+    let buffer_delay_saved = gate_delays(scene_cell, &output.name, g.load_cap(p.driver, t.parasitics), &tgt).0[p.driver_rf];
     raw_dump(format!(
         "VYGE|{}|prev={}|prf={}|drf={}|oc={}|nc={}|od={},{}|nd={},{}|os={},{}|ns={},{}|dlc={}|degrad={}|imp={}\n",
         p.inst,
@@ -544,15 +545,15 @@ fn estimated_slack_ok(ctx: &Ctx<'_>, t: &Timer<'_, '_>, p: &SlackParams<'_>, sce
         bits(new_drvr_slew[0]),
         bits(new_drvr_slew[1]),
         bits(g.load_cap(p.driver, t.parasitics)),
-        bits(delay_degrad),
-        bits(delay_imp)
+        bits(upstream_delay_delta),
+        bits(buffer_delay_saved)
     ));
     let Some(load_pin_slew) = estimate_slews_after_buffer_removal(ctx, t, p, new_drvr_slew[p.prev_rf]) else { return (false, lines) };
     for &(load, estimated) in &load_pin_slew {
         let old_load_slew = [g.slew[load][0][MAX], g.slew[load][1][MAX]];
         let new_load_slew = [estimated, estimated];
         lines.push(format!("estimated in slew at fanout pin {} is {}, prev drvr out slew={}", g.vname(load), fmt_float(estimated), fmt_float(new_drvr_slew[p.prev_rf])));
-        if !estimate_input_slew_impact(ctx, t, load, old_load_slew, new_load_slew, delay_degrad - delay_imp, p.inst, true, &mut lines) {
+        if !estimate_input_slew_impact(ctx, t, load, old_load_slew, new_load_slew, upstream_delay_delta - buffer_delay_saved, p.inst, true, &mut lines) {
             return (false, lines);
         }
     }
@@ -567,27 +568,33 @@ fn estimated_slack_ok(ctx: &Ctx<'_>, t: &Timer<'_, '_>, p: &SlackParams<'_>, sce
             continue;
         }
         let old_slack = slack_all(t, side);
-        let new_slack = old_slack - delay_degrad - ctx.margin;
+        let new_slack = old_slack - upstream_delay_delta - ctx.margin;
         if new_slack < 0.0 {
             let slack_degrad = old_slack - new_slack;
             if old_slack >= 0.0 || (old_slack < 0.0 && slack_degrad > SLACK_DEGRAD_RATIO_LIMIT * old_slack.abs()) {
-                lines.push(format!(
-                    "buffer {} is not removed because side input pin {name} will have a violating slack of {}: old slack={}, slack margin={}, delay_degrad={}",
-                    network_name(p.inst, ctx.hierarchy),
-                    fmt_float(new_slack),
-                    fmt_float(old_slack),
-                    fmt_float(ctx.margin),
-                    fmt_float(delay_degrad)
-                ));
+                lines.push(side_pin_violation_line(&network_name(p.inst, ctx.hierarchy), &name, new_slack, old_slack, ctx.margin, upstream_delay_delta));
                 return (false, lines);
             }
         }
-        if !estimate_input_slew_impact(ctx, t, side, old_drvr_slew, new_drvr_slew, delay_degrad, p.inst, false, &mut lines) {
+        if !estimate_input_slew_impact(ctx, t, side, old_drvr_slew, new_drvr_slew, upstream_delay_delta, p.inst, false, &mut lines) {
             return (false, lines);
         }
     }
     lines.push(format!("buffer {} can be removed because direct fanouts and side fanouts can absorb delay/slew degradation", network_name(p.inst, ctx.hierarchy)));
     (true, lines)
+}
+
+/// The `remove_buffer` line for a side input pin the removal would leave violating. The last
+/// field is the upstream driver's delay change, `upstream_delay_delta` since 8f67915cba (it was
+/// `delay_degrad`; the value is the same).
+fn side_pin_violation_line(inst: &str, pin: &str, new_slack: f32, old_slack: f32, margin: f32, upstream_delay_delta: f32) -> String {
+    format!(
+        "buffer {inst} is not removed because side input pin {pin} will have a violating slack of {}: old slack={}, slack margin={}, upstream_delay_delta={}",
+        fmt_float(new_slack),
+        fmt_float(old_slack),
+        fmt_float(margin),
+        fmt_float(upstream_delay_delta)
+    )
 }
 
 /// `Resizer::estimateInputSlewImpact(instance(pin), …)`: each output pin of the load's instance,
@@ -852,6 +859,15 @@ mod tests {
     // Rule (passesFanoutGuard): with a timer limit (0 < limit < INF) the fanout plus the buffer's
     // loads less its input must stay within it; with none the timer reports fanout 0 and only the
     // buffer's loads count, against 10.
+    // Rule (OpenROAD 8f67915cba, `estimatedUnbufferSlackOK`): a side input pin the removal leaves
+    // violating is reported with the upstream driver's delay change as `upstream_delay_delta=`,
+    // the field the reference prints since that commit (`delay_degrad=` before, same value).
+    #[test]
+    fn a_violating_side_pin_names_the_upstream_delay_delta() {
+        let l = side_pin_violation_line("inst4", "inst3_neighbor0/A1", -8.430916e-10, -7.603216e-10, 0.0, 8.2769985e-11);
+        assert_eq!(l, "buffer inst4 is not removed because side input pin inst3_neighbor0/A1 will have a violating slack of -8.430916e-10: old slack=-7.603216e-10, slack margin=0, upstream_delay_delta=8.2769985e-11");
+    }
+
     #[test]
     fn the_fanout_guard_reads_the_timer_limit_else_ten() {
         assert_eq!(fanout_rejects(3.0, 5.0, 3), None, "3 + 3 - 1 = 5 fits 5");
