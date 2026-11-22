@@ -572,7 +572,7 @@ fn estimated_slack_ok(ctx: &Ctx<'_>, t: &Timer<'_, '_>, p: &SlackParams<'_>, sce
         if new_slack < 0.0 {
             let slack_degrad = old_slack - new_slack;
             if old_slack >= 0.0 || (old_slack < 0.0 && slack_degrad > SLACK_DEGRAD_RATIO_LIMIT * old_slack.abs()) {
-                lines.push(side_pin_violation_line(&network_name(p.inst, ctx.hierarchy), &name, new_slack, old_slack, ctx.margin, upstream_delay_delta));
+                lines.push(side_pin_violation_line(network_name(p.inst, ctx.hierarchy), &name, new_slack, old_slack, ctx.margin, upstream_delay_delta));
                 return (false, lines);
             }
         }
