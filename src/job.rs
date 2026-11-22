@@ -1362,6 +1362,14 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     }
                 }
                 let error = (!any).then(|| json!({ "code": "RSZ-0089", "message": "Could not find a resistance value for any corner. Cannot evaluate max wire length for buffer. Check over your `set_wire_rc` configuration" }));
+                // Not the reference's (it times what it is given): the constraints every later
+                // reweight searches, read now, so a form the search does not model refuses at
+                // the placer's first timing-driven pass, not at its first reweight.
+                if error.is_none() {
+                    if let Some(s) = sdc.as_ref() {
+                        search_constraints_modelled(s, &db, &libs, propagated || sdc_propagated, &virtual_latencies)?;
+                    }
+                }
                 slack_preamble = Some(json!({ "warnings": warnings, "error": error }));
             }
             "repair_timing" | "fully_rebuffer" | "resize_slacks" => {
@@ -1505,9 +1513,10 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 } else {
                     g.find_delays(&parasitics[0], None)?;
                 }
-                // A hold-only repair applies the clock uncertainties (the search reads them into the
-                // hold and the setup checks); a setup part with setup uncertainty is refused there.
-                let mut ssdc = search_sdc_on(s, &netlist, time_scale, clock_propagated, a.hold && !a.setup)?;
+                // The repair searches the constraints the timer reports on (one `Sta` per run):
+                // the mode's reading — both clock uncertainties, clock groups, false, multicycle
+                // and group paths in creation order (`vyges_sta::scenes::mode_search_sdc`).
+                let mut ssdc = vyges_sta::scenes::mode_search_sdc(s, &netlist, time_scale, clock_propagated)?;
                 crate::env::add_virtual_latencies(&mut ssdc, &virtual_latencies)?;
                 // The groups earlier commands made stay in the constraints (`makeGroupPath` on the
                 // command SDC), after the file's own.
@@ -2116,6 +2125,30 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
 
 /// The progress table's header and row 0 under a path group (`printProgress` with
 /// `restrictedToPathGroup`: `getWns`, `getTns`, `getWorstPin` over the group's ends).
+/// What `repair_timing`'s search refuses in the constraints, without timing anything: the
+/// constants' reading, the derates, the mode's search constraints
+/// ([`vyges_sta::scenes::mode_search_sdc`]) and the search's own check on the link scene's graph.
+/// The same calls, in the same order, as the timing arm makes them; a fail-fast for callers that
+/// time much later (global placement's reweights).
+fn search_constraints_modelled(s: &vyges_loom::sdc::Sdc, db: &Db, libs: &Libs, clock_propagated: bool, virtual_latencies: &[(String, String, f32)]) -> Result<(), String> {
+    let lib0 = libs.default_library().ok_or("repair_timing before any liberty library")?;
+    let netlist = vyges_grt::timer::netlist(db);
+    crate::env::sdc_constraints(s, db)?;
+    // the derates onto the graph, the rest read without them (as the timing arm reads them)
+    let derates = vyges_sta::load::timing_derates(&s.derates)?;
+    let mut underated = s.clone();
+    underated.derates.clear();
+    (underated.late_derate, underated.early_derate) = (None, None);
+    let s = &underated;
+    let mut ssdc = vyges_sta::scenes::mode_search_sdc(s, &netlist, lib0.time_scale, clock_propagated)?;
+    crate::env::add_virtual_latencies(&mut ssdc, virtual_latencies)?;
+    let mut env = sdc_env(s, libs, &netlist)?;
+    env.derates = derates;
+    let mpins = master_pins(db)?;
+    let g = repair_design::timer_graph(libs, 0, &netlist, &env, &mpins).map_err(|e| e.message().to_string())?;
+    vyges_sta::search::Search::in_graph_order(&g, &ssdc).constraints_modelled()
+}
+
 fn group_row0(violating: &[crate::repair_timing::Point], group_ends: &[crate::repair_timing::Point], time_scale: f32) -> Vec<String> {
     use crate::repair_timing as rt;
     let (wns, en_tns, worst) = crate::path_group::group_row(violating, group_ends);
