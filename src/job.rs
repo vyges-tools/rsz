@@ -858,6 +858,13 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 if let Some(q) = s.unevaluated_queries.first() {
                     return Err(format!("{path}: {q}: object query not evaluated, not modelled"));
                 }
+                // `Sdc::setClockLatency(clk)` removes an earlier `set_propagated_clock` on the clock
+                // (the later command wins): after the run propagated the clocks, the file's network
+                // latency would make a clock ideal again. The search reads the run's propagation as
+                // coming after the file (`vyges_sta::scenes::mode_search_sdc`), so this order is refused.
+                if propagated && s.clock_latencies.iter().any(|l| !l.flags.iter().any(|f| f == "-source")) {
+                    return Err(format!("{path}: set_clock_latency read after set_propagated_clock (the latency makes the clock ideal again): not modelled"));
+                }
                 // set_max_transition / set_max_fanout / set_max_capacitance on the design are
                 // modelled (the limits); on any other object they are not. `group_path`: read by
                 // repair_timing's search (`search_sdc_on`), which refuses what it does not model.
