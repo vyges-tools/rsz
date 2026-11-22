@@ -92,18 +92,46 @@ pub struct CliDesign<'a> {
 /// What `estimate_net` skips — the clock network and the constant pins — computed once and held:
 /// each is a whole-design walk, and a repair estimates one net per edit. An edit can change them
 /// only through a net already in them — a buffer inserted on a non-constant, non-clock net is itself
-/// neither, a resize keeps the function — so the held sets are dropped when an edit names one of
-/// `nets` (the clock nets and every constant pin's net), and on any journal undo.
+/// neither, a resize keeps the function — so the held sets are dropped when an edit names a
+/// constant pin's net (`nets`), and on any journal undo.
+///
+/// 🔑 An edit naming only a CLOCK net keeps the constants: every resizer edit keeps each pin's
+/// logic value (a buffer, a resize, a clone), and a non-constant net's new pins hold none, so only
+/// the clock network is walked again (`clock_stale`), at the next estimate. Rule (OpenSTA: a
+/// netlist edit invalidates `ClkNetwork`, rebuilt from the clock sources by `findClkPins`; `Sim`
+/// re-evaluates only instances whose inputs changed value). A clock repair edits clock nets only,
+/// and dropping the constants each time was a whole-design logic simulation per inserted buffer.
 pub struct HeldSkips {
     pub skips: vyges_est::placement::Skips,
+    /// The nets of the held constant pins.
     pub nets: std::collections::HashSet<String>,
+    /// The held clock nets.
+    pub clock_nets: std::collections::HashSet<String>,
+    /// An edit named a clock net since the clock network was walked.
+    pub clock_stale: bool,
+}
+
+/// What an edit-log line does to the held skips.
+#[derive(Debug, PartialEq, Eq)]
+enum SkipsTouch {
+    None,
+    /// It names a clock net and no constant pin's net: the clock network is walked again.
+    ClockNetwork,
+    /// It names a constant pin's net: both are computed again.
+    Constants,
 }
 
 impl HeldSkips {
     /// An edit-log line naming a held net in any field (`|`, `,`, `;`, `=` separate them): an
     /// instance or pin name that equals a net name only costs a needless recompute.
-    fn touched_by(&self, ev: &str) -> bool {
-        edit_names_any(ev, &self.nets)
+    fn touched_by(&self, ev: &str) -> SkipsTouch {
+        if edit_names_any(ev, &self.nets) {
+            SkipsTouch::Constants
+        } else if edit_names_any(ev, &self.clock_nets) {
+            SkipsTouch::ClockNetwork
+        } else {
+            SkipsTouch::None
+        }
     }
 }
 
@@ -250,6 +278,21 @@ mod held_skips_tests {
         assert!(edit_names_any("net_destroy|clk|u1/A|7", &nets));
         assert!(!edit_names_any("net_destroy|n9|clk|7", &nets));
         assert!(!edit_names_any("bterm_connect|p|n5|clk,u2/A", &nets));
+    }
+
+    /// Rule (OpenSTA: `ClkNetwork` rebuilt from the clock sources after a netlist edit; `Sim`
+    /// re-evaluates only instances whose inputs changed): an edit on a clock net walks the clock
+    /// network again and keeps the constants; one on a constant pin's net computes both again,
+    /// even when that net is a clock net too.
+    #[test]
+    fn a_clock_net_edit_keeps_the_constants_a_constant_net_edit_drops_both() {
+        use super::{HeldSkips, SkipsTouch};
+        let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect();
+        let h = HeldSkips { skips: Default::default(), nets: set(&["const0", "gclk"]), clock_nets: set(&["clk", "gclk"]), clock_stale: false };
+        assert_eq!(h.touched_by("iterm_connect|wire1/A|clk|clkbuf/Y"), SkipsTouch::ClockNetwork);
+        assert_eq!(h.touched_by("iterm_connect|u1/A|const0|u1/A"), SkipsTouch::Constants);
+        assert_eq!(h.touched_by("iterm_disconnect|u2/A|gclk|u2/A"), SkipsTouch::Constants, "a clock net holding a constant");
+        assert_eq!(h.touched_by("iterm_connect|u3/A|n5|u3/A"), SkipsTouch::None);
     }
 }
 
@@ -1208,9 +1251,9 @@ impl CliDesign<'_> {
     /// Holds the estimator's clock nets and constant pins of the design as it is now, with the nets
     /// an edit must name to drop them, and starts the edit log they are checked against.
     pub fn hold_skips(&mut self, skips: vyges_est::placement::Skips) -> Result<(), String> {
-        let mut nets: std::collections::HashSet<String> = skips.clock_nets().iter().cloned().collect();
-        nets.extend(skips.constant_pins().iter().map(|p| self.net_of_load(p)).filter(|n| !n.is_empty()));
-        self.skips = Some(HeldSkips { skips, nets });
+        let clock_nets = skips.clock_nets().iter().cloned().collect();
+        let nets = skips.constant_pins().iter().map(|p| self.net_of_load(p)).filter(|n| !n.is_empty()).collect();
+        self.skips = Some(HeldSkips { skips, nets, clock_nets, clock_stale: false });
         if !self.skip_log && !self.timer.on {
             self.db.edit_log_start().map_err(|e| e.to_string())?;
             self.timer.replay_ok = false;
@@ -1228,11 +1271,22 @@ impl CliDesign<'_> {
         if swap_keeps_skips(ev, |from, to| self.equivalent_cells(from, to)) {
             return;
         }
-        if self.skips.as_ref().is_some_and(|h| h.touched_by(ev)) {
-            if std::env::var_os("VYGES_RSZ_SKIPS_TRACE").is_some() {
-                eprintln!("VYGSKIPS|dropped|{ev}");
+        let trace = std::env::var_os("VYGES_RSZ_SKIPS_TRACE").is_some();
+        let Some(h) = self.skips.as_mut() else { return };
+        match h.touched_by(ev) {
+            SkipsTouch::None => {}
+            SkipsTouch::ClockNetwork => {
+                if trace && !h.clock_stale {
+                    eprintln!("VYGSKIPS|clock-stale|{ev}");
+                }
+                h.clock_stale = true;
             }
-            self.skips = None;
+            SkipsTouch::Constants => {
+                if trace {
+                    eprintln!("VYGSKIPS|dropped|{ev}");
+                }
+                self.skips = None;
+            }
         }
     }
 
@@ -1578,19 +1632,32 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
             return Ok(());
         };
         let timing = vyges_est::placement::Timing { liberty: Some(self.liberty), clock_sources: self.clock_sources.to_vec(), propagated: self.propagated };
+        let trace = std::env::var_os("VYGES_RSZ_SKIPS_TRACE").is_some();
         if self.skips.is_none() {
-            if std::env::var_os("VYGES_RSZ_SKIPS_TRACE").is_some() {
-                eprintln!("VYGSKIPS|computed|{net}");
-            }
+            let t0 = std::time::Instant::now();
             let skips = self.fresh_skips(&timing)?;
             self.hold_skips(skips)?;
+            if trace {
+                eprintln!("VYGSKIPS|computed|{net}|{}ms", t0.elapsed().as_millis());
+            }
+        } else if self.skips.as_ref().is_some_and(|h| h.clock_stale) {
+            // The constants kept, the clock network walked again (see [`HeldSkips`]).
+            let t0 = std::time::Instant::now();
+            let h = self.skips.take().expect("held");
+            let skips = h.skips.with_clock_network_now(self.db, &timing)?;
+            let clock_nets = skips.clock_nets().iter().cloned().collect();
+            self.skips = Some(HeldSkips { skips, nets: h.nets, clock_nets, clock_stale: false });
+            if trace {
+                eprintln!("VYGSKIPS|clock-walk|{net}|{}ms", t0.elapsed().as_millis());
+            }
         }
         let skips = &self.skips.as_ref().expect("computed above").skips;
         // A check: the held sets against a fresh walk of the design as it is now.
         if std::env::var_os("VYGES_RSZ_CHECK_SKIPS").is_some() {
             let fresh = self.fresh_skips(&timing)?;
-            if fresh.clock_nets() != skips.clock_nets() || fresh.constant_pins() != skips.constant_pins() {
-                return Err(format!("held skips (estimating {net}): differ from a fresh walk (clock nets {}, constant pins {})", fresh.clock_nets() == skips.clock_nets(), fresh.constant_pins() == skips.constant_pins()));
+            let same = (fresh.clock_nets() == skips.clock_nets(), fresh.ideal_clock_nets() == skips.ideal_clock_nets(), fresh.constant_pins() == skips.constant_pins());
+            if same != (true, true, true) {
+                return Err(format!("held skips (estimating {net}): differ from a fresh walk (clock nets {}, ideal clock nets {}, constant pins {})", same.0, same.1, same.2));
             }
         }
         let e = vyges_est::placement::estimate_net_with_skips(self.db, &timing, skips, net, &drvr, self.alpha, &est_stt)?;
