@@ -426,14 +426,24 @@ pub fn sim_constants_sdc(db: &Db, liberty: &vyges_est::liberty::LibertyClocks, s
 /// network (`ClkTreeSearchPred` does not search through a constant), which the clock-pin walks
 /// here do not model.
 pub fn constants_off_clock_networks(db: &Db, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], constraints: &vyges_est::sim::Constraints, with: &BTreeMap<vyges_est::sim::Pin, bool>) -> Result<(), String> {
-    use vyges_est::sim::Pin;
     if clock_sources.is_empty() || constraints.case.is_empty() && constraints.logic.is_empty() {
         return Ok(());
     }
     let without = constant_values(db, liberty)?;
+    let clock_nets = vyges_est::clk_network::find_clk_nets(db, liberty, clock_sources).map_err(|e| e.to_string())?;
+    constants_off_clock_networks_given(db, &clock_nets, constraints, with, &without)
+}
+
+/// [`constants_off_clock_networks`] from what the caller already holds for the design as it is
+/// now: its clock nets (`find_clk_nets` from the clock sources) and both simulations — `with` the
+/// constraint values, `without` them. Neither the simulation nor the clock walk is run again.
+pub fn constants_off_clock_networks_given(db: &Db, clock_nets: &std::collections::BTreeSet<String>, constraints: &vyges_est::sim::Constraints, with: &BTreeMap<vyges_est::sim::Pin, bool>, without: &BTreeMap<vyges_est::sim::Pin, bool>) -> Result<(), String> {
+    use vyges_est::sim::Pin;
+    if constraints.case.is_empty() && constraints.logic.is_empty() {
+        return Ok(());
+    }
     // a constraint value of X holds no constant but its pin is still one the constraints name
     let named: Vec<Pin> = constraints.case.keys().chain(constraints.logic.keys()).cloned().collect();
-    let clock_nets = vyges_est::clk_network::find_clk_nets(db, liberty, clock_sources).map_err(|e| e.to_string())?;
     for p in with.keys().filter(|p| !without.contains_key(*p)).chain(named.iter()) {
         let net = match p {
             Pin::Port(n) => db.bterm_net(n),
