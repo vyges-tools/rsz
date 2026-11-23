@@ -373,30 +373,7 @@ fn repair_design_held(inputs: &Inputs<'_>, design: &mut dyn Design, args: &Args,
             });
             held_netlist = held_copy(&*design);
             held_gen = design.netlist_generation();
-            // The graphs over the edited design, holding the timer's state: nothing is re-timed
-            // between drivers (the reference times only what each driver's repair asks for).
-            let g = timer_graphs(inputs, design, &annotated, ctx.timer.as_mut().expect("held graphs run on the timer"), &mut ctx.edit_log, old)?;
-            let index = g[0].pin_index();
-            // every graph held stands at the log's end now: what came before is let go
-            ctx.edit_log.trim(ctx.edit_log.end());
-            // and each timer's written names, to the oldest place a graph that imports it (this
-            // set, or the spare set) stands at
-            if let Some(incs) = ctx.timer.as_mut() {
-                for (k, inc) in incs.iter_mut().enumerate() {
-                    let spare = ctx.edit_log.spare.as_ref().and_then(|gs| gs.get(k)).map(|sg| inc.written_place(sg));
-                    let here = g.get(k).and_then(|hg| inc.written_place(hg));
-                    // a spare graph that never imported this state imports it whole: it holds no place
-                    let place = match (here, spare) {
-                        (Some(h), Some(Some(s))) => Some(h.min(s)),
-                        (Some(h), Some(None) | None) => Some(h),
-                        _ => None,
-                    };
-                    if let Some(p) = place {
-                        inc.trim_written(p);
-                    }
-                }
-            }
-            held = Some((g, index));
+            held = Some(timer_held(inputs, design, &annotated, &mut ctx, old)?);
             if !probed_start {
                 probed_start = true;
                 if let Some((g, _)) = held.as_ref() {
@@ -596,24 +573,66 @@ pub fn repair_clk_nets(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers
         max_slacks: HashMap::new(),
     };
     let mut outcome = Outcome::default();
-    // 🔑 `sta_->findDelays()` once, then `repairNet`'s `findDelays(drvr)` per clock driver: the
-    // graphs are HELD across drivers, timed whole when made, and made again only after an edit
-    // (as `repair_design` holds them). Rebuilding and re-timing the design for each driver gave
-    // the same answer at O(N) a driver: minutes for a few hundred clock nets.
+    // 🔑 `sta_->findDelays()` once, then `repairNet`'s `findDelays(drvr)` per clock driver, on the
+    // INCREMENTAL timer `repairDesign` runs on: the graphs are timed whole once, held across
+    // drivers, and after an edit brought on by the edit (in place, the timer's state imported) —
+    // not built and re-timed whole. Reference rule (OpenROAD `RepairDesign::repairClkNets` →
+    // `repairNet` on the one `sta::Graph`, whose `GraphDelayCalc` takes each edit through the
+    // network callbacks). Re-timing every scene's whole graph per inserted buffer was minutes per
+    // edit on a large design.
     // ⚠️ `VYGES_RSZ_DCALC` (the delay-calculation dump) keeps the whole re-timing per driver.
     let hold = std::env::var_os("VYGES_RSZ_DCALC").is_none();
-    let mut held_netlist = design.netlist_shared();
-    let mut held_gen = design.netlist_generation();
+    if hold {
+        let netlist = design.netlist_shared();
+        let mut graphs = current_graphs(inputs, &netlist, &annotated)?;
+        find_all_delays(&mut graphs, &*design, "repair_clk_nets")?;
+        design.start_timer_edits().map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+        let mut incs: Vec<IncTimer> = Vec::with_capacity(graphs.len());
+        for g in &graphs {
+            // as `repairDesign`: the first scene's timer keeps the levels, cells and net
+            // drivers and takes each edit; the others follow it
+            let mut t = IncTimer::default();
+            if let Some(first) = incs.first() {
+                t.follow(first);
+            }
+            t.trace_edits = incs.is_empty();
+            t.track_netlist(&netlist);
+            t.relevelize(g).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+            t.export(g);
+            t.delays_exist = true;
+            incs.push(t);
+        }
+        drop(graphs);
+        drop(netlist);
+        ctx.timer = Some(incs);
+        ctx.edit_log.hold_values = !design.route_slacks_possible() && std::env::var_os("VYGES_RSZ_TIMER_MAPS").is_none();
+    }
     let mut held: Option<HeldGraphs<'_>> = None;
     // Each clock's network pins are taken BEFORE its repair ("make a copy in case the set of pins
     // is updated"); a later clock sees the buffers an earlier one inserted.
     for sources in clocks {
-        let netlist = design.netlist_shared();
-        let graphs = current_graphs(inputs, &netlist, &annotated)?;
-        let g0 = &graphs[0];
-        let mut drivers: Vec<String> = timing::clock_pins(g0, sources).into_iter().filter(|&v| g0.vertices[v].is_driver).map(|v| g0.vname(v)).collect();
+        let mut drivers: Vec<String> = if hold {
+            let old = held.take().map(|(g, index)| {
+                drop(index);
+                g
+            });
+            let h = timer_held(inputs, design, &annotated, &mut ctx, old)?;
+            let g0 = &h.0[0];
+            let d = timing::clock_pins(g0, sources).into_iter().filter(|&v| g0.vertices[v].is_driver).map(|v| g0.vname(v)).collect();
+            held = Some(h);
+            d
+        } else {
+            let netlist = design.netlist_shared();
+            let graphs = current_graphs(inputs, &netlist, &annotated)?;
+            let g0 = &graphs[0];
+            timing::clock_pins(g0, sources).into_iter().filter(|&v| g0.vertices[v].is_driver).map(|v| g0.vname(v)).collect()
+        };
         drivers.sort_by_key(|p| pin_order(p));
-        drop(graphs);
+        // ⛔ the netlist itself is held only by a design that keeps no change count: a second
+        // holder makes the design copy its netlist for every edit (as `repairDesign`)
+        let held_copy = |d: &dyn Design| if d.netlist_generation().is_none() { Some(d.netlist_shared()) } else { None };
+        let mut held_gen = design.netlist_generation();
+        let mut held_netlist = held_copy(&*design);
         for name in drivers {
             if !hold {
                 let netlist = design.netlist_shared();
@@ -626,31 +645,43 @@ pub fn repair_clk_nets(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers
                 repair_net(design, graphs, drvr, &net, false, None, &mut ctx, &mut outcome, trace, None)?;
                 continue;
             }
-            let stale = match (held_gen, design.netlist_generation()) {
-                (Some(a), Some(b)) => a != b,
-                _ => *design.netlist() != *held_netlist,
+            let stale = match (held_gen, design.netlist_generation(), &held_netlist) {
+                (Some(a), Some(b), _) => a != b,
+                (_, _, Some(h)) => *design.netlist() != **h,
+                _ => true,
             };
             if held.is_none() || stale {
-                recycle_held(held.take());
-                held_netlist = design.netlist_shared();
+                let old = held.take().map(|(g, index)| {
+                    drop(index);
+                    g
+                });
+                held = Some(timer_held(inputs, design, &annotated, &mut ctx, old)?);
                 held_gen = design.netlist_generation();
-                let mut g = current_graphs(inputs, &held_netlist, &annotated)?;
-                find_all_delays(&mut g, &*design, &name)?;
-                let index = g[0].pin_index();
-                held = Some((g, index));
+                held_netlist = held_copy(&*design);
             }
             let (graphs, index) = held.take().expect("held graphs");
             let g0 = &graphs[0];
-            let found = crate::timing::vertex_named(g0, &name, true).and_then(|d| g0.vertex_net[d].map(|n| (d, n)));
+            // by the held index while it stands for these graphs (their vertex count is its build's)
+            let by_index = (index.len() == g0.vertices.len()).then(|| index.get(&name).copied().filter(|&d| g0.vertices[d].is_driver)).flatten();
+            let found = by_index.or_else(|| crate::timing::vertex_named(g0, &name, true)).and_then(|d| g0.vertex_net[d].map(|n| (d, n)));
             let Some((drvr, n)) = found else {
                 held = Some((graphs, index));
                 continue;
             };
-            let net = held_netlist.nets[n].name.clone();
+            let net = g0.netlist.nets[n].name.clone();
             outcome.nets_checked += 1;
-            let graphs = repair_net(design, graphs, drvr, &net, false, None, &mut ctx, &mut outcome, trace, Some(&index))?;
+            // on the timer `repairNet` never reads the held index, and the graphs are edited in
+            // place: holding it across the repair would make every edit copy the whole index
+            drop(index);
+            let graphs = repair_net(design, graphs, drvr, &net, false, None, &mut ctx, &mut outcome, trace, None)?;
+            let index = graphs[0].pin_index();
             held = Some((graphs, index));
         }
+    }
+    recycle_held(held);
+    if std::env::var_os("VYGES_RSZ_EDIT_STATS").is_some() {
+        let l = &ctx.edit_log;
+        eprintln!("VYGEDIT|stats|in_place {}|fallback {}|built {}|events {}", l.in_place, l.fallback, l.built, l.end());
     }
     Ok(outcome)
 }
@@ -1133,6 +1164,34 @@ fn repair_driver<'g>(design: &mut dyn Design, drvr_name: &str, ctx: &mut NetCtx<
             Ok(None)
         }
     }
+}
+
+/// The graphs over the edited design, holding the timer's state — nothing is re-timed between
+/// drivers (the reference times only what each driver's repair asks for) — with their pin index;
+/// the edit log and each timer's written names trimmed to where the graphs held now stand.
+fn timer_held<'g>(inputs: &Inputs<'g>, design: &mut dyn Design, annotated: &[HashMap<String, f32>], ctx: &mut NetCtx<'g, '_>, old: Option<Vec<Graph<'g>>>) -> Result<HeldGraphs<'g>, Stop> {
+    let g = timer_graphs(inputs, design, annotated, ctx.timer.as_mut().expect("held graphs run on the timer"), &mut ctx.edit_log, old)?;
+    let index = g[0].pin_index();
+    // every graph held stands at the log's end now: what came before is let go
+    ctx.edit_log.trim(ctx.edit_log.end());
+    // and each timer's written names, to the oldest place a graph that imports it (this set, or
+    // the spare set) stands at
+    if let Some(incs) = ctx.timer.as_mut() {
+        for (k, inc) in incs.iter_mut().enumerate() {
+            let spare = ctx.edit_log.spare.as_ref().and_then(|gs| gs.get(k)).map(|sg| inc.written_place(sg));
+            let here = g.get(k).and_then(|hg| inc.written_place(hg));
+            // a spare graph that never imported this state imports it whole: it holds no place
+            let place = match (here, spare) {
+                (Some(h), Some(Some(s))) => Some(h.min(s)),
+                (Some(h), Some(None) | None) => Some(h),
+                _ => None,
+            };
+            if let Some(p) = place {
+                inc.trim_written(p);
+            }
+        }
+    }
+    Ok((g, index))
 }
 
 /// The held graphs' pin index, lent by value.
