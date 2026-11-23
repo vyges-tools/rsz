@@ -517,6 +517,32 @@ fn timed_all<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits: Ti
     timed_levels(ctx, design, timer, edits, &Levels::ALL, read)
 }
 
+/// The incremental timers brought up to date with the design's STRUCTURE only (`edits` replayed,
+/// `ensureLevelized`), no delay, arrival or required pass: `read` gets the scenes' graphs, their
+/// clock pins and the levels. The edits' invalidations stay pending for the next timed update.
+fn levelized<R>(ctx: &Ctx<'_>, design: &dyn Design, timer: &mut Timer, edits: TimerEdits, read: impl FnOnce(&[Graph<'_>], &[BTreeSet<usize>], &HashMap<vyges_sta::incr::Name, i32>) -> Result<R, Stop>) -> Result<R, Stop> {
+    let netlist = design.netlist();
+    let mut graphs = Vec::with_capacity(timer.inc.len());
+    let mut all_clocks = Vec::with_capacity(timer.inc.len());
+    for k in 0..timer.inc.len() {
+        let mut gk = crate::repair_design::timer_graph(ctx.libs, k, netlist, ctx.env, ctx.master_pins)?;
+        let ck = crate::timing::clock_pins(&gk, ctx.clock_sources);
+        if ctx.ideal_clock {
+            crate::timing::set_ideal_clock(&mut gk, ctx.ideal_sources);
+        }
+        if let Some(stale) = design.stale_out_arcs() {
+            gk.set_stale_out_arcs(stale);
+        }
+        inc_prepare(ctx, design, &mut gk, &mut timer.inc[k], &edits)?;
+        graphs.push(gk);
+        all_clocks.push(ck);
+    }
+    for (inc, gk) in timer.inc.iter_mut().zip(&graphs) {
+        inc.relevelize(gk).map_err(timer_stop)?;
+    }
+    read(&graphs, &all_clocks, &timer.inc[0].levels)
+}
+
 /// How far one timer pass goes (`findDelays(level)`, `findArrivals(level)`, `findRequireds(level)`):
 /// every level, none, the deepest level of some pins, or down to one pin's level.
 #[derive(Debug, Clone)]
@@ -1087,7 +1113,9 @@ fn import_buffer_tree(ctx: &Ctx<'_>, g: &Graph<'_>, index: &HashMap<(&str, bool)
         }
         let Some((inst, _)) = pin.rsplit_once('/') else { continue };
         let vyges_sta::netlist::Conn::Inst(inst_index, _) = lv.conn.clone() else { continue };
-        if !ctx.sizing.masters.get(cell_name).is_some_and(|m| m.logic_std) || is_port_buffer(g, inst_index) || !removable(inst, &in_port.name, &out_port.name) {
+        // the buffer's own nets: its input's and its output's (a buffer has no other signal pin)
+        let own = [g.vertex_net[v], index.get(&(format!("{inst}/{}", out_port.name).as_str(), true)).and_then(|&o| g.vertex_net[o])];
+        if !ctx.sizing.masters.get(cell_name).is_some_and(|m| m.logic_std) || is_port_buffer_on(&g.netlist, inst_index, own.iter().flatten().copied()) || !removable(inst, &in_port.name, &out_port.name) {
             continue;
         }
         let out_pin = format!("{inst}/{}", out_port.name);
@@ -1125,11 +1153,27 @@ fn import_areas(ctx: &Ctx<'_>, nodes: &mut [rebuffer::Node], n: usize) -> f32 {
 /// instance pin and a port. The instance is the netlist's index (from the caller's vertex): the
 /// check compares indices, not pin names — by name it formatted every pin of the design per call,
 /// and a name prefix also took in a hierarchical child (`u1/x/A` for `u1`), which upstream's
-/// `dbInst::getITerms` never does.
-fn is_port_buffer(g: &Graph<'_>, inst: usize) -> bool {
-    is_port_buffer_in(&g.netlist, inst)
+/// `dbInst::getITerms` never does. Here over the given nets: the buffer's own, from the caller's
+/// graph (one walk of a whole netlist per call was O(design) per rebuffered load).
+fn is_port_buffer_on(nl: &vyges_sta::netlist::Netlist, inst: usize, nets: impl Iterator<Item = usize>) -> bool {
+    use vyges_sta::netlist::Conn;
+    nets.into_iter().any(|k| {
+        let (mut insts, mut on, mut ports) = (0, false, false);
+        for c in &nl.nets[k].pins {
+            match c {
+                Conn::Inst(i, _) => {
+                    insts += 1;
+                    on |= *i == inst;
+                }
+                Conn::Port(_) => ports = true,
+            }
+        }
+        on && insts == 1 && ports
+    })
 }
 
+/// [`is_port_buffer_on`] over every net of the netlist: the oracle the tests hold the fast forms to.
+#[cfg(test)]
 fn is_port_buffer_in(nl: &vyges_sta::netlist::Netlist, inst: usize) -> bool {
     use vyges_sta::netlist::Conn;
     nl.nets.iter().any(|n| {
@@ -1145,6 +1189,29 @@ fn is_port_buffer_in(nl: &vyges_sta::netlist::Netlist, inst: usize) -> bool {
         }
         on && insts == 1 && ports
     })
+}
+
+/// [`is_port_buffer_in`] for every instance at once, in one walk of the nets: an instance is a
+/// port buffer when it is the ONLY instance pin on a net that has a port.
+fn port_buffers(nl: &vyges_sta::netlist::Netlist) -> Vec<bool> {
+    use vyges_sta::netlist::Conn;
+    let mut out = vec![false; nl.insts.len()];
+    for n in &nl.nets {
+        let (mut only, mut insts, mut ports) = (None, 0, false);
+        for c in &n.pins {
+            match c {
+                Conn::Inst(i, _) => {
+                    insts += 1;
+                    only = Some(*i);
+                }
+                Conn::Port(_) => ports = true,
+            }
+        }
+        if let (Some(i), 1, true) = (only, insts, ports) {
+            out[i] = true;
+        }
+    }
+    out
 }
 
 /// `annotateLoadSlacks` over an imported tree's loads (below its buffers too), each walked back
@@ -1368,12 +1435,12 @@ impl Repair<'_, '_> {
         let info = self.design.net_info().clone();
         let edits = self.design.take_timer_edits();
         let ctx = self.ctx;
-        // `levelizedDrvrVertices` after `ensureLevelized`: on the timer's (incremental) levels
-        timed_all(ctx, self.design.as_design(), &mut self.timer, edits, |_, _, _| Ok(()))?;
-        let levels = self.timer.inc[0].levels.clone();
-        timed_all(ctx, self.design.as_design(), &mut self.timer, TimerEdits::default(), |gs, _ss, cs| {
+        // `ensureLevelized()` then `levelizedDrvrVertices()`: the drivers are listed on the levels
+        // alone. No timing pass here; `fully_rebuffer`'s `findRequireds()` is the first.
+        levelized(ctx, self.design.as_design(), &mut self.timer, edits, |gs, cs, levels| {
             let g = &gs[0];
             let level: Vec<i32> = (0..g.vertices.len()).map(|v| g.with_vname(v, |n| levels.get(n).copied()).unwrap_or(0)).collect();
+            let port_buffer = port_buffers(&g.netlist);
             let mut out = Vec::new();
             for d in crate::timing::levelized_drvr_vertices(g, &level) {
                 let vx = &g.vertices[d];
@@ -1391,7 +1458,7 @@ impl Repair<'_, '_> {
                 }
                 let vyges_sta::netlist::Conn::Inst(inst_index, _) = vx.conn.clone() else { continue };
                 let logic = ctx.sizing.masters.get(cell_name).is_some_and(|m| m.logic_std);
-                if !cell.is_buffer() || !logic || is_port_buffer(g, inst_index) {
+                if !cell.is_buffer() || !logic || port_buffer[inst_index] {
                     out.push(g.vname(d));
                 }
             }
@@ -6049,19 +6116,30 @@ mod tests {
         use vyges_sta::netlist::{inst, Conn, Net, Netlist, PortDir};
         let pin = |i: usize, p: &str| Conn::Inst(i, p.into());
         let nl = Netlist {
-            insts: vec![inst("b", "BUF"), inst("b/x", "BUF"), inst("c", "BUF"), inst("d", "BUF")],
+            insts: vec![inst("b", "BUF"), inst("b/x", "BUF"), inst("c", "BUF"), inst("d", "BUF"), inst("e", "BUF")],
             ports: vec![("p".into(), PortDir::Input), ("q".into(), PortDir::Output)],
             nets: vec![
                 Net { name: "n0".into(), pins: vec![pin(1, "A"), Conn::Port(0)] }.into(),
                 Net { name: "n1".into(), pins: vec![pin(1, "Z"), pin(0, "A")] }.into(),
                 Net { name: "n2".into(), pins: vec![pin(0, "Z"), pin(2, "A")] }.into(),
                 Net { name: "n3".into(), pins: vec![pin(2, "Z"), pin(3, "A"), Conn::Port(1)] }.into(),
+                // e alone on a net with NO port (a dangling output): one instance pin is not enough
+                Net { name: "n4".into(), pins: vec![pin(4, "Z")] }.into(),
             ],
         };
         assert!(is_port_buffer_in(&nl, 1), "b/x alone with port p");
         assert!(!is_port_buffer_in(&nl, 0), "b's nets each have two instance pins; b/x's port net is not b's");
         assert!(!is_port_buffer_in(&nl, 2), "c's port net also has d");
         assert!(!is_port_buffer_in(&nl, 3));
+        assert!(!is_port_buffer_in(&nl, 4), "e's lone net has no port");
+        // the one-walk table says the same for every instance
+        let table = port_buffers(&nl);
+        for (i, &fast) in table.iter().enumerate() {
+            assert_eq!(fast, is_port_buffer_in(&nl, i), "instance {i}");
+            // and so does the walk over the instance's own nets alone
+            let own = (0..nl.nets.len()).filter(|&k| nl.nets[k].pins.iter().any(|c| matches!(c, Conn::Inst(j, _) if *j == i)));
+            assert_eq!(is_port_buffer_on(&nl, i, own), is_port_buffer_in(&nl, i), "instance {i}, own nets");
+        }
     }
 
     /// Rule (`Rebuffer::loadSlewSatisfactory` / `Resizer::driveResistance(pin_)`, OpenROAD #12109):
