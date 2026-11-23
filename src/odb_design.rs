@@ -111,6 +111,16 @@ pub struct HeldSkips {
     pub clock_stale: bool,
 }
 
+/// Does an estimate walk a stale clock network again? Only when some clock is ideal: the walk
+/// feeds nothing but the ideal-clock skip ([`vyges_est::placement::Skips::ideal_clock_nets`]),
+/// empty when every clock is propagated, so the walk waits (stays stale) until one would read it.
+/// Rule (OpenROAD `EstimateParasitics::isSkipPin`: `isClock(pin)` is asked only when
+/// `hasIdealClocks()`; with every clock propagated it would only rebuild the clock network, which
+/// `repair_clock_nets` invalidates with every repeater it inserts).
+fn clock_walk_needed(clock_stale: bool, propagated: bool) -> bool {
+    clock_stale && !propagated
+}
+
 /// What an edit-log line does to the held skips.
 #[derive(Debug, PartialEq, Eq)]
 enum SkipsTouch {
@@ -293,6 +303,20 @@ mod held_skips_tests {
         assert_eq!(h.touched_by("iterm_connect|u1/A|const0|u1/A"), SkipsTouch::Constants);
         assert_eq!(h.touched_by("iterm_disconnect|u2/A|gclk|u2/A"), SkipsTouch::Constants, "a clock net holding a constant");
         assert_eq!(h.touched_by("iterm_connect|u3/A|n5|u3/A"), SkipsTouch::None);
+    }
+
+    /// Rule (OpenROAD `EstimateParasitics::isSkipPin`: `ideal_clocks = hasIdealClocks()`, and
+    /// `isClock(pin)` is asked only when it holds — "asking whether the pin is a clock would then
+    /// only rebuild the clock network, which repair_clock_nets invalidates with every repeater it
+    /// inserts"): with every clock propagated a stale clock network is not walked again for an
+    /// estimate; with an ideal clock it is, before the next estimate reads it.
+    #[test]
+    fn a_stale_clock_network_is_walked_again_only_for_ideal_clocks() {
+        use super::clock_walk_needed;
+        assert!(!clock_walk_needed(true, true), "every clock propagated: the walk waits");
+        assert!(clock_walk_needed(true, false), "an ideal clock: walked before the estimate");
+        assert!(!clock_walk_needed(false, false), "not stale: nothing to walk");
+        assert!(!clock_walk_needed(false, true));
     }
 }
 
@@ -1640,8 +1664,9 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
             if trace {
                 eprintln!("VYGSKIPS|computed|{net}|{}ms", t0.elapsed().as_millis());
             }
-        } else if self.skips.as_ref().is_some_and(|h| h.clock_stale) {
-            // The constants kept, the clock network walked again (see [`HeldSkips`]).
+        } else if self.skips.as_ref().is_some_and(|h| clock_walk_needed(h.clock_stale, self.propagated)) {
+            // The constants kept, the clock network walked again (see [`HeldSkips`]); with every
+            // clock propagated it stays stale ([`clock_walk_needed`]).
             let t0 = std::time::Instant::now();
             let h = self.skips.take().expect("held");
             let skips = h.skips.with_clock_network_now(self.db, &timing)?;
@@ -1655,7 +1680,9 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
         // A check: the held sets against a fresh walk of the design as it is now.
         if std::env::var_os("VYGES_RSZ_CHECK_SKIPS").is_some() {
             let fresh = self.fresh_skips(&timing)?;
-            let same = (fresh.clock_nets() == skips.clock_nets(), fresh.ideal_clock_nets() == skips.ideal_clock_nets(), fresh.constant_pins() == skips.constant_pins());
+            // a stale clock walk left standing (every clock propagated) is not compared: nothing reads it
+            let stale = self.skips.as_ref().is_some_and(|h| h.clock_stale);
+            let same = (stale || fresh.clock_nets() == skips.clock_nets(), fresh.ideal_clock_nets() == skips.ideal_clock_nets(), fresh.constant_pins() == skips.constant_pins());
             if same != (true, true, true) {
                 return Err(format!("held skips (estimating {net}): differ from a fresh walk (clock nets {}, ideal clock nets {}, constant pins {})", same.0, same.1, same.2));
             }

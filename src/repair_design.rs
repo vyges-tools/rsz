@@ -541,6 +541,23 @@ impl Outcome {
 /// and fanout checks off and no driver resize. A special net (not in the timer) is passed over.
 #[allow(clippy::too_many_arguments)]
 pub fn repair_clk_nets(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers: &[String], clocks: &[Vec<String>], pin_order: &dyn Fn(&str) -> u64, max_wire_length: f64, trace: &mut Trace) -> Result<Outcome, Stop> {
+    repair_clk_nets_then(inputs, design, clk_buffers, clocks, pin_order, max_wire_length, trace, None)
+}
+
+/// What a caller reads from the repair's own first-scene timing graph once the repair is done:
+/// the graph brought up to the repair's last edit, its parasitics updated and its delays found
+/// ([`repair_clk_nets_then`]).
+pub type AfterRepair<'c> = &'c mut dyn FnMut(&Graph<'_>) -> Result<(), String>;
+
+/// [`repair_clk_nets`], then `after` on the repair's first-scene graph as the next timing query
+/// sees it — the reference's next reader (the latency balancer's `ensureClkArrivals`) times the
+/// one `Sta` the repair just updated. 🔑 Rule (OpenROAD: the repair loop's
+/// `IncrementalParasiticsGuard` ends with `updateParasitics()`, every net the repair left invalid
+/// estimated; then `Sta::searchPreamble` → `findDelays()` is INCREMENTAL on that graph — the
+/// delays the edits invalidated, not a new graph timed whole). Not run when the repair held no
+/// graphs (`VYGES_RSZ_DCALC`, no clock): the caller times afresh.
+#[allow(clippy::too_many_arguments)]
+pub fn repair_clk_nets_then(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers: &[String], clocks: &[Vec<String>], pin_order: &dyn Fn(&str) -> u64, max_wire_length: f64, trace: &mut Trace, after: Option<AfterRepair<'_>>) -> Result<Outcome, Stop> {
     // Resizer::resizePreamble
     let lib = inputs.libs.default_library().ok_or_else(|| Stop::error("RSZ-LIB", "no liberty library read".into()))?;
     let equiv = sizing::make_equiv_cells(inputs.libs);
@@ -582,13 +599,23 @@ pub fn repair_clk_nets(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers
     // edit on a large design.
     // ⚠️ `VYGES_RSZ_DCALC` (the delay-calculation dump) keeps the whole re-timing per driver.
     let hold = std::env::var_os("VYGES_RSZ_DCALC").is_none();
+    let mut held: Option<HeldGraphs<'_>> = None;
     if hold {
+        ctx.edit_log.hold_values = !design.route_slacks_possible() && std::env::var_os("VYGES_RSZ_TIMER_MAPS").is_none();
         let netlist = design.netlist_shared();
         let mut graphs = current_graphs(inputs, &netlist, &annotated)?;
+        crate::stage("rcn_graphs");
         find_all_delays(&mut graphs, &*design, "repair_clk_nets")?;
+        crate::stage("rcn_find_delays");
         design.start_timer_edits().map_err(|e| Stop::refused("RSZ-TIMER", e))?;
         let mut incs: Vec<IncTimer> = Vec::with_capacity(graphs.len());
-        for g in &graphs {
+        // 🔑 The graphs just timed whole ARE the timer's graphs: each holds its scene's values as
+        // timed and is handed to the first clock's repair as the held set (edited in place from
+        // here), not written out by name, let go, built again and read back. Reference rule
+        // (OpenROAD `repairClkNets`: `sta_->findDelays()` on the one `sta::Graph`, which every
+        // `repairNet` then reads and edits). On a large design the copy, the rebuild and the read-back
+        // were two minutes. Only with the values held by the graphs (`hold_values`); else by name.
+        for g in graphs.iter_mut() {
             // as `repairDesign`: the first scene's timer keeps the levels, cells and net
             // drivers and takes each edit; the others follow it
             let mut t = IncTimer::default();
@@ -598,16 +625,29 @@ pub fn repair_clk_nets(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers
             t.trace_edits = incs.is_empty();
             t.track_netlist(&netlist);
             t.relevelize(g).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
-            t.export(g);
+            if ctx.edit_log.hold_values {
+                t.hold_timed(g).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+            } else {
+                t.export(g);
+            }
             t.delays_exist = true;
             incs.push(t);
         }
-        drop(graphs);
+        if ctx.edit_log.hold_values {
+            // they stand at the log's start: the first `timer_held` takes them in place
+            for g in graphs.iter_mut() {
+                g.edit_seq = Some(ctx.edit_log.end());
+            }
+            held = Some((graphs, Arc::new(HashMap::new())));
+            // the one graph set built (`VYGES_RSZ_EDIT_STATS`): every later call edits it in place
+            ctx.edit_log.built += 1;
+        } else {
+            drop(graphs);
+        }
         drop(netlist);
+        crate::stage("rcn_export");
         ctx.timer = Some(incs);
-        ctx.edit_log.hold_values = !design.route_slacks_possible() && std::env::var_os("VYGES_RSZ_TIMER_MAPS").is_none();
     }
-    let mut held: Option<HeldGraphs<'_>> = None;
     // Each clock's network pins are taken BEFORE its repair ("make a copy in case the set of pins
     // is updated"); a later clock sees the buffers an earlier one inserted.
     for sources in clocks {
@@ -617,6 +657,7 @@ pub fn repair_clk_nets(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers
                 g
             });
             let h = timer_held(inputs, design, &annotated, &mut ctx, old)?;
+            crate::stage("rcn_timer_held");
             let g0 = &h.0[0];
             let d = timing::clock_pins(g0, sources).into_iter().filter(|&v| g0.vertices[v].is_driver).map(|v| g0.vname(v)).collect();
             held = Some(h);
@@ -677,6 +718,19 @@ pub fn repair_clk_nets(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers
             let index = graphs[0].pin_index();
             held = Some((graphs, index));
         }
+    }
+    let after_wanted = after.is_some();
+    if let (Some(after), Some((graphs, index))) = (after, if after_wanted { held.take() } else { None }) {
+        drop(index);
+        // the guard's `updateParasitics()`: each net left invalid estimated, its delays invalid
+        design.update_parasitics().map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+        // the graphs brought up to the last edit, then `findDelays()` on the first scene's
+        let (mut graphs, index) = timer_held(inputs, design, &annotated, &mut ctx, Some(graphs))?;
+        let incs = ctx.timer.as_mut().expect("held graphs run on the timer");
+        incs[0].find_delays(&mut graphs[0], design.parasitics(0), None).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+        crate::stage("rcn_after_delays");
+        after(&graphs[0]).map_err(|e| Stop::refused("RSZ-TIMER", e))?;
+        held = Some((graphs, index));
     }
     recycle_held(held);
     if std::env::var_os("VYGES_RSZ_EDIT_STATS").is_some() {
