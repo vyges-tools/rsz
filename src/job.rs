@@ -987,7 +987,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 let port_caps = port_caps_at(step["sdc"].as_str(), sdc.as_ref(), &libs, &netlist)?;
                 let mut design = CliDesign { constants: constants.clone(), constraints: constraints.clone(), alpha: routing_alpha, estimating, core, port_caps, sdc_pins: sdc.as_ref().map(sdc_cap_pins).unwrap_or_default(), ..CliDesign::new(&mut db, &rc, &liberty, &libs, &clock_sources, netlist, parasitics, info) };
                 let r = buffer_ports::buffer_ports(&mut design, &o, &weakest);
-                let parasitics = std::mem::take(&mut design.parasitics);
+                let parasitics = std::mem::take(&mut design.parasitics).into_scenes();
                 match r {
                     Ok(b) => buffered.push(b),
                     Err(Stop::Refused { msg, .. }) => return Err(format!("{msg} (not modelled)")),
@@ -1294,7 +1294,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                 let order = |p: &str| ids.get(p).copied().unwrap_or(u64::MAX);
                 let r = repair_design::repair_clk_nets(&inputs, &mut design, &clk_buffers, &clocks, &order, max_wire_length, &mut trace);
                 if estimated {
-                    carried = Some(std::mem::take(&mut design.parasitics));
+                    carried = Some(std::mem::take(&mut design.parasitics).into_scenes());
                 }
                 match r {
                     Ok(o) => {
@@ -1787,7 +1787,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         };
                         let pa = crate::repair_setup::PowerArgs { percent: a.recover_power_percent as f32, verbose: a.verbose, max_area };
                         let r = crate::repair_setup::recover_power(&ctx, &mut design, &pa);
-                        carried = Some(std::mem::take(&mut design.parasitics));
+                        carried = Some(std::mem::take(&mut design.parasitics).into_scenes());
                         let o = match r {
                             Ok(o) => o,
                             Err(Stop::Refused { msg, .. }) => {
@@ -1853,7 +1853,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         };
                         let hctx = crate::repair_hold::HoldCtx { libs: &libs, masters: &m, site_heights: &site_heights, dont_use: &dont_use, tgt_slews, time_scale, debug: &debug_levels };
                         let r = crate::repair_setup::repair_hold(&ctx, &hctx, &mut design, &ha);
-                        carried = Some(std::mem::take(&mut design.parasitics));
+                        carried = Some(std::mem::take(&mut design.parasitics).into_scenes());
                         let o = match r {
                             Ok(o) => o,
                             Err(Stop::Refused { msg, .. }) => {
@@ -1885,7 +1885,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                     }
                     if cmd == "resize_slacks" {
                         let r = crate::repair_setup::resize_slacks(&ctx, &mut design, &a);
-                        carried = Some(std::mem::take(&mut design.parasitics));
+                        carried = Some(std::mem::take(&mut design.parasitics).into_scenes());
                         let slacks = match r {
                             Ok((m, levels)) => {
                                 sta_levels = Some(levels);
@@ -1916,7 +1916,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         } else {
                             crate::repair_setup::fully_rebuffer(&ctx, &mut design, &a, user_pin)
                         };
-                        carried = Some(std::mem::take(&mut design.parasitics));
+                        carried = Some(std::mem::take(&mut design.parasitics).into_scenes());
                         let o = match r {
                             Ok(o) => o,
                             Err(Stop::Refused { msg, .. }) => {
@@ -1938,7 +1938,7 @@ pub fn run_owned(job: &Value, db: Db) -> Result<(Value, Db), String> {
                         continue;
                     }
                     let r = crate::repair_setup::repair_setup(&ctx, &mut design, &a);
-                    carried = Some(std::mem::take(&mut design.parasitics));
+                    carried = Some(std::mem::take(&mut design.parasitics).into_scenes());
                     let o = match r {
                         Ok(o) => o,
                         Err(Stop::Refused { msg, .. }) if measured => {

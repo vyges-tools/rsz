@@ -13,6 +13,7 @@ use vyges_sta::graph::NetParasitics;
 
 use crate::env::{est_stt, net_parasitic, PortCaps};
 use crate::preamble::Libs;
+use crate::scene_parasitics::SceneParasitics;
 use crate::timing::NetInfo;
 use crate as vyges_rsz;
 use crate::buffer_ports;
@@ -46,8 +47,8 @@ pub struct CliDesign<'a> {
     /// The database order of the netlist it was made for (and only that one, by pointer):
     /// [`CliDesign::refresh_touched`]'s edited path extends it rather than reading every name.
     pub inst_pos: Option<(std::sync::Weak<vyges_sta::netlist::Netlist>, DbOrder)>,
-    /// Per scene.
-    pub parasitics: Vec<HashMap<String, NetParasitics>>,
+    /// Per scene (equal scenes held once: [`SceneParasitics`]).
+    pub parasitics: SceneParasitics,
     pub invalid: BTreeSet<String>,
     pub info: NetInfo,
     /// `core_` and `core_exists_`.
@@ -691,7 +692,7 @@ pub struct TimerLog {
 /// What a journal level puts back on undo besides the database (the netlist is read from the
 /// database again, as the timer's network reads it live).
 pub struct JournalState {
-    pub parasitics: Vec<HashMap<String, NetParasitics>>,
+    pub parasitics: SceneParasitics,
     pub invalid: BTreeSet<String>,
     pub sdc_nets: BTreeSet<String>,
 }
@@ -716,7 +717,7 @@ impl<'a> CliDesign<'a> {
         libs: &'a Libs,
         clock_sources: &'a [String],
         netlist: vyges_sta::netlist::Netlist,
-        parasitics: Vec<HashMap<String, NetParasitics>>,
+        parasitics: impl Into<SceneParasitics>,
         info: NetInfo,
     ) -> Self {
         CliDesign {
@@ -732,7 +733,7 @@ impl<'a> CliDesign<'a> {
             netlist: std::sync::Arc::new(netlist),
             netlist_gen: 0,
             inst_pos: None,
-            parasitics,
+            parasitics: parasitics.into(),
             invalid: BTreeSet::new(),
             info,
             core: None,
@@ -1380,9 +1381,7 @@ impl CliDesign<'_> {
                     if self.undoing {
                         // `inDbNetDestroy` → `eraseParasitics`: the network goes with the net.
                         self.invalid.remove(*net);
-                        for map in self.parasitics.iter_mut() {
-                            map.remove(*net);
-                        }
+                        self.parasitics.remove(net);
                     }
                 }
                 ["swap_after", _, terms] => {
@@ -1477,9 +1476,7 @@ impl CliDesign<'_> {
             gr_trace(&format!("VYGR|est|cap|{net}|{:.9}", n.nodes.iter().map(|(_, c)| f64::from(*c)).sum::<f64>() * 1e12));
             let mut p = vyges_grt::timer::timer_network(net, &n);
             p.port_pin_caps = Some(crate::env::net_port_caps(&self.port_caps, &p.node_names));
-            for map in self.parasitics.iter_mut() {
-                map.insert(net.to_string(), p.clone());
-            }
+            self.parasitics.insert_all(net, &p);
         }
     }
 
@@ -1591,11 +1588,9 @@ impl CliDesign<'_> {
         // is timed on its pin caps alone until it is estimated again, as is the new output net.
         // Witness: a resistance-aware route update's mid-update slacks read the driver of a net a
         // repeater was just inserted on (repair_design -reroute on global-route parasitics).
-        for map in self.parasitics.iter_mut() {
-            map.remove(&original);
-            map.remove(&in_net);
-            map.remove(&out_net);
-        }
+        self.parasitics.remove(&original);
+        self.parasitics.remove(&in_net);
+        self.parasitics.remove(&out_net);
         self.invalidate(&in_net);
         self.invalidate(&out_net);
         touched.insert(in_net.clone());
@@ -1616,7 +1611,7 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
         Some(self.netlist_gen)
     }
     fn parasitics(&self, scene: usize) -> &HashMap<String, NetParasitics> {
-        &self.parasitics[scene]
+        self.parasitics.scene(scene)
     }
     fn net_info(&self) -> &NetInfo {
         &self.info
@@ -1633,7 +1628,7 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
         if self.gr.is_some() {
             // Under global-route parasitics: invalid or with no pi model (no network here — a net
             // with a route has one) → the dirty nets re-routed, then this net from its route.
-            if self.invalid.contains(net) || !self.parasitics[0].contains_key(net) {
+            if self.invalid.contains(net) || !self.parasitics.scene(0).contains_key(net) {
                 // c5943b20d8f: the other nets the router moved stay invalid until the next
                 // `updateParasitics` (re-estimated, their delays invalidated then); this one is
                 // estimated now and erased.
@@ -1646,7 +1641,7 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
             }
             return Ok(());
         }
-        if !self.estimating || !(self.invalid.contains(net) || !self.parasitics[0].contains_key(net)) {
+        if !self.estimating || !(self.invalid.contains(net) || !self.parasitics.scene(0).contains_key(net)) {
             return Ok(());
         }
         let Some(drvr) = vyges_rsz::design::Design::net_slot(self, net).map(|k| &self.netlist.nets[k]).and_then(|n| {
@@ -1688,15 +1683,14 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
             }
         }
         let e = vyges_est::placement::estimate_net_with_skips(self.db, &timing, skips, net, &drvr, self.alpha, &est_stt)?;
+        let mut per_scene = Vec::with_capacity(self.parasitics.len());
         for k in 0..self.parasitics.len() {
-            match net_parasitic(self.db, self.rc, &e, k)? {
-                Some(mut p) => {
-                    p.port_pin_caps = Some(crate::env::net_port_caps(&self.port_caps, &p.node_names));
-                    self.parasitics[k].insert(net.to_string(), p)
-                }
-                None => self.parasitics[k].remove(net),
-            };
+            per_scene.push(net_parasitic(self.db, self.rc, &e, k)?.map(|mut p| {
+                p.port_pin_caps = Some(crate::env::net_port_caps(&self.port_caps, &p.node_names));
+                p
+            }));
         }
+        self.parasitics.set(net, per_scene);
         self.invalid.remove(net);
         Ok(())
     }
@@ -1757,7 +1751,7 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
 
     fn ensure_routes(&mut self, net: &str) -> bool {
         self.pull_edits();
-        self.gr.is_some() && (self.invalid.contains(net) || !self.parasitics[0].contains_key(net))
+        self.gr.is_some() && (self.invalid.contains(net) || !self.parasitics.scene(0).contains_key(net))
     }
 
     fn pin_net(&self, pin: &str) -> Option<(String, bool)> {
@@ -1882,9 +1876,7 @@ impl vyges_rsz::design::Design for CliDesign<'_> {
             .collect();
         if self.estimating {
             for n in input_nets {
-                for k in 0..self.parasitics.len() {
-                    self.parasitics[k].remove(&n);
-                }
+                self.parasitics.remove(&n);
             }
         }
         Ok(())
@@ -2256,10 +2248,8 @@ impl vyges_rsz::repair_setup::SetupDesign for CliDesign<'_> {
         let supplies = self.other_iterm_nets(inst, &[&in_net, &out_net])?;
         let survivor = self.db.remove_buffer(inst, in_pin, out_pin).map_err(|e| e.to_string())?;
         self.area_incr(-master_area(self.db, &master));
-        for map in self.parasitics.iter_mut() {
-            map.remove(&in_net);
-            map.remove(&out_net);
-        }
+        self.parasitics.remove(&in_net);
+        self.parasitics.remove(&out_net);
         self.invalid.remove(&in_net);
         self.invalid.remove(&out_net);
         self.invalidate(&survivor);

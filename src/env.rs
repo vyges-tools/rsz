@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use vyges_opendb::Db;
+use crate::scene_parasitics::SceneParasitics;
 use vyges_sta::graph::NetParasitics;
 
 use crate::preamble::{Libs, Master};
@@ -139,11 +140,24 @@ pub fn placement_parasitics_held(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyge
     parasitics_held(db, rc, liberty, clock_sources, Propagation::All(propagated), alpha, scenes, port_caps, held, &NO_CONSTRAINTS)
 }
 
+/// [`placement_parasitics_held`] with each scene's map as the estimate made it: a scene whose RC
+/// reads alike an earlier one's ([`vyges_est::rc::Rc::same_corner_rc`]) is that scene's map, not
+/// estimated again.
+#[allow(clippy::too_many_arguments)]
+pub fn placement_parasitics_held_scenes(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagated: bool, alpha: f32, scenes: usize, port_caps: &PortCaps, held: Option<&vyges_est::placement::Skips>) -> Result<SceneParasitics, String> {
+    parasitics_scenes(db, rc, liberty, clock_sources, Propagation::All(propagated), alpha, scenes, port_caps, held, &NO_CONSTRAINTS)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn parasitics_held(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagation: Propagation<'_>, alpha: f32, scenes: usize, port_caps: &PortCaps, held: Option<&vyges_est::placement::Skips>, constraints: &vyges_est::sim::Constraints) -> Result<Vec<HashMap<String, NetParasitics>>, String> {
+    parasitics_scenes(db, rc, liberty, clock_sources, propagation, alpha, scenes, port_caps, held, constraints).map(SceneParasitics::into_scenes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn parasitics_scenes(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty::LibertyClocks, clock_sources: &[String], propagation: Propagation<'_>, alpha: f32, scenes: usize, port_caps: &PortCaps, held: Option<&vyges_est::placement::Skips>, constraints: &vyges_est::sim::Constraints) -> Result<SceneParasitics, String> {
     use vyges_est::placement::{estimate_wire_parasitics, estimate_wire_parasitics_with_skips, skips_with_clocks, skips_with_clocks_and_constants, skips_with_constants, Timing};
     if no_signal_cap(db, rc) {
-        return Ok(vec![HashMap::new(); scenes]);
+        return Ok(SceneParasitics::new(vec![HashMap::new(); scenes]));
     }
     // `isSkipPin`: an ideal clock's nets get no network; a propagated clock's do — per clock
     // (est 8e440c9, `ClkNetwork::findClkPins` from the ideal clocks only).
@@ -170,8 +184,19 @@ fn parasitics_held(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty
         (None, Propagation::PerClock(c)) => estimate_wire_parasitics_with_skips(db, &timing, &skips_with_clocks(db, &timing, c).map_err(|e| e.to_string())?, alpha, &est_stt),
     }
     .map_err(|e| e.to_string())?;
-    let mut out = vec![HashMap::new(); scenes];
-    for (k, map) in out.iter_mut().enumerate() {
+    // per scene ("make separate parasitics for each corner"); a scene whose RC reads alike an
+    // earlier one's estimates every net alike, so it is that scene's map
+    // (`VYGES_RSZ_EVERY_SCENE`: each scene estimated, then equal maps found by comparing them)
+    let tech = db.tech_get_name();
+    let every = std::env::var_os("VYGES_RSZ_EVERY_SCENE").is_some();
+    let mut maps: Vec<HashMap<String, NetParasitics>> = Vec::new();
+    let mut slot = Vec::with_capacity(scenes);
+    for k in 0..scenes {
+        if let Some(j) = (0..k).find(|&j| !every && rc.same_corner_rc(&tech, j, k)) {
+            slot.push(slot[j]);
+            continue;
+        }
+        let mut map = HashMap::new();
         for n in &nets {
             if let Some(mut p) = net_parasitic(db, rc, n, k)? {
                 // Reduced now, against the port loads in force now.
@@ -179,8 +204,10 @@ fn parasitics_held(db: &Db, rc: &vyges_est::rc::Rc, liberty: &vyges_est::liberty
                 map.insert(n.net.clone(), p);
             }
         }
+        slot.push(maps.len());
+        maps.push(map);
     }
-    Ok(out)
+    Ok(if every { SceneParasitics::new(maps) } else { SceneParasitics::from_slots(maps, slot) })
 }
 
 /// The estimator's state when a command first reads it: every net estimated on the design the

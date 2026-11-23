@@ -544,6 +544,26 @@ pub fn repair_clk_nets(inputs: &Inputs<'_>, design: &mut dyn Design, clk_buffers
     repair_clk_nets_then(inputs, design, clk_buffers, clocks, pin_order, max_wire_length, trace, None)
 }
 
+/// `VYGES_RSZ_STAGES`: what the repair's timing state holds, counted (a memory probe's
+/// attribution, not a measurement): per scene, the parasitics (nets, nodes, resistors, the bytes of
+/// their node names) and the graph (vertices, edges, delay rows, whether its structure is shared
+/// with the first scene's). One `VYGMEM` line each.
+fn mem_footprint(design: &dyn Design, graphs: &[Graph<'_>]) {
+    for (k, g) in graphs.iter().enumerate() {
+        let p = design.parasitics(k);
+        let (mut nodes, mut res, mut name_bytes, mut elmore) = (0usize, 0usize, 0usize, 0usize);
+        for (net, np) in p {
+            nodes += np.node_names.len();
+            res += np.network.resistors.len();
+            name_bytes += net.len() + np.node_names.iter().map(String::len).sum::<usize>();
+            elmore += np.pi.as_ref().map_or(0, |pi| pi.elmore.len());
+        }
+        let rows: usize = g.delay.iter().map(Vec::len).sum();
+        let shared = k > 0 && Arc::ptr_eq(&g.vertices, &graphs[0].vertices);
+        eprintln!("VYGMEM|scene {k}|parasitics nets {}|nodes {nodes}|resistors {res}|name bytes {name_bytes}|elmore {elmore}|graph vertices {}|edges {}|delay rows {rows}|structure shared {shared}|netlist insts {}|nets {}", p.len(), g.vertices.len(), g.edges.len(), g.netlist.insts.len(), g.netlist.nets.len());
+    }
+}
+
 /// What a caller reads from the repair's own first-scene timing graph once the repair is done:
 /// the graph brought up to the repair's last edit, its parasitics updated and its delays found
 /// ([`repair_clk_nets_then`]).
@@ -605,6 +625,9 @@ pub fn repair_clk_nets_then(inputs: &Inputs<'_>, design: &mut dyn Design, clk_bu
         let netlist = design.netlist_shared();
         let mut graphs = current_graphs(inputs, &netlist, &annotated)?;
         crate::stage("rcn_graphs");
+        if crate::prof::enabled() {
+            mem_footprint(&*design, &graphs);
+        }
         find_all_delays(&mut graphs, &*design, "repair_clk_nets")?;
         crate::stage("rcn_find_delays");
         design.start_timer_edits().map_err(|e| Stop::refused("RSZ-TIMER", e))?;
