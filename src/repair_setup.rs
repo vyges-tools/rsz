@@ -1086,7 +1086,8 @@ fn import_buffer_tree(ctx: &Ctx<'_>, g: &Graph<'_>, index: &HashMap<(&str, bool)
             continue;
         }
         let Some((inst, _)) = pin.rsplit_once('/') else { continue };
-        if !ctx.sizing.masters.get(cell_name).is_some_and(|m| m.logic_std) || is_port_buffer(g, inst) || !removable(inst, &in_port.name, &out_port.name) {
+        let vyges_sta::netlist::Conn::Inst(inst_index, _) = lv.conn.clone() else { continue };
+        if !ctx.sizing.masters.get(cell_name).is_some_and(|m| m.logic_std) || is_port_buffer(g, inst_index) || !removable(inst, &in_port.name, &out_port.name) {
             continue;
         }
         let out_pin = format!("{inst}/{}", out_port.name);
@@ -1120,13 +1121,28 @@ fn import_areas(ctx: &Ctx<'_>, nodes: &mut [rebuffer::Node], n: usize) -> f32 {
     a
 }
 
-/// `isPortBuffer`: a buffer with a terminal on a net that has exactly one instance pin and a port.
-fn is_port_buffer(g: &Graph<'_>, inst: &str) -> bool {
-    let prefix = format!("{inst}/");
-    g.netlist.nets.iter().any(|n| {
-        let on = n.pins.iter().any(|c| g.netlist.pin_name(c).starts_with(&prefix) && matches!(c, vyges_sta::netlist::Conn::Inst(..)));
-        let insts = n.pins.iter().filter(|c| matches!(c, vyges_sta::netlist::Conn::Inst(..))).count();
-        let ports = n.pins.iter().any(|c| matches!(c, vyges_sta::netlist::Conn::Port(_)));
+/// `isPortBuffer` (Rebuffer.cc): a buffer one of whose OWN terminals is on a net with exactly one
+/// instance pin and a port. The instance is the netlist's index (from the caller's vertex): the
+/// check compares indices, not pin names — by name it formatted every pin of the design per call,
+/// and a name prefix also took in a hierarchical child (`u1/x/A` for `u1`), which upstream's
+/// `dbInst::getITerms` never does.
+fn is_port_buffer(g: &Graph<'_>, inst: usize) -> bool {
+    is_port_buffer_in(&g.netlist, inst)
+}
+
+fn is_port_buffer_in(nl: &vyges_sta::netlist::Netlist, inst: usize) -> bool {
+    use vyges_sta::netlist::Conn;
+    nl.nets.iter().any(|n| {
+        let (mut insts, mut on, mut ports) = (0, false, false);
+        for c in &n.pins {
+            match c {
+                Conn::Inst(i, _) => {
+                    insts += 1;
+                    on |= *i == inst;
+                }
+                Conn::Port(_) => ports = true,
+            }
+        }
         on && insts == 1 && ports
     })
 }
@@ -1373,10 +1389,9 @@ impl Repair<'_, '_> {
                 if cell.port(port).is_some_and(|p| p.is_any_tristate()) {
                     continue;
                 }
-                let name = g.vname(d);
-                let Some((inst, _)) = name.rsplit_once('/') else { continue };
+                let vyges_sta::netlist::Conn::Inst(inst_index, _) = vx.conn.clone() else { continue };
                 let logic = ctx.sizing.masters.get(cell_name).is_some_and(|m| m.logic_std);
-                if !cell.is_buffer() || !logic || is_port_buffer(g, inst) {
+                if !cell.is_buffer() || !logic || is_port_buffer(g, inst_index) {
                     out.push(g.vname(d));
                 }
             }
@@ -6025,6 +6040,29 @@ fn over_max_area(design_area: f64, max_area: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Upstream rule (`isPortBuffer`, Rebuffer.cc at f11b4276): over the buffer's OWN terminals
+    /// (`dbInst::getITerms`), a net with exactly one instance terminal and at least one port. A
+    /// hierarchical child whose name extends the buffer's (`b/x`) is another instance.
+    #[test]
+    fn a_port_buffer_is_judged_by_its_own_terminals_nets() {
+        use vyges_sta::netlist::{inst, Conn, Net, Netlist, PortDir};
+        let pin = |i: usize, p: &str| Conn::Inst(i, p.into());
+        let nl = Netlist {
+            insts: vec![inst("b", "BUF"), inst("b/x", "BUF"), inst("c", "BUF"), inst("d", "BUF")],
+            ports: vec![("p".into(), PortDir::Input), ("q".into(), PortDir::Output)],
+            nets: vec![
+                Net { name: "n0".into(), pins: vec![pin(1, "A"), Conn::Port(0)] }.into(),
+                Net { name: "n1".into(), pins: vec![pin(1, "Z"), pin(0, "A")] }.into(),
+                Net { name: "n2".into(), pins: vec![pin(0, "Z"), pin(2, "A")] }.into(),
+                Net { name: "n3".into(), pins: vec![pin(2, "Z"), pin(3, "A"), Conn::Port(1)] }.into(),
+            ],
+        };
+        assert!(is_port_buffer_in(&nl, 1), "b/x alone with port p");
+        assert!(!is_port_buffer_in(&nl, 0), "b's nets each have two instance pins; b/x's port net is not b's");
+        assert!(!is_port_buffer_in(&nl, 2), "c's port net also has d");
+        assert!(!is_port_buffer_in(&nl, 3));
+    }
 
     /// Rule (`Rebuffer::loadSlewSatisfactory` / `Resizer::driveResistance(pin_)`, OpenROAD #12109):
     /// the rebuffered driver's resistance is the largest arc drive over its SEARCHED fanin edges,
